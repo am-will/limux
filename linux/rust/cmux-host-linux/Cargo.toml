@@ -1,0 +1,16 @@
+[package]
+name = "cmux-host-linux"
+version = "0.1.0"
+edition = "2021"
+authors = ["cmux contributors"]
+license = "MIT"
+
+[[bin]]
+name = "cmux-linux"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = "0.11"
+vte4 = { version = "0.10", features = ["v0_76"] }
+libadwaita = "0.9"
+uuid = { version = "1", features = ["v4"] }

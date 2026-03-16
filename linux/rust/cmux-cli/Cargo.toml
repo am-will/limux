@@ -1,0 +1,14 @@
+[package]
+name = "cmux-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cmux-control = { path = "../cmux-control" }
+cmux-protocol = { path = "../cmux-protocol" }
+serde_json.workspace = true
+tokio.workspace = true

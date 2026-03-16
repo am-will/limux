@@ -1,0 +1,22 @@
+[package]
+name = "cmux-control"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cmux-core = { path = "../cmux-core" }
+cmux-protocol = { path = "../cmux-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
