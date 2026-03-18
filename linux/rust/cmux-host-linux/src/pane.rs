@@ -403,10 +403,6 @@ fn add_terminal_tab_inner(
                     (cb.on_split)(&w, gtk::Orientation::Vertical);
                 }
             }),
-            get_reset_path: Box::new({
-                let wd = working_directory.map(|s| s.to_string());
-                move || wd.clone()
-            }),
         }
     };
 
