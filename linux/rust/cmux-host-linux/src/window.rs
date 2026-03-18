@@ -199,9 +199,9 @@ row:selected .cmux-ws-star-btn {
     color: rgba(255, 255, 255, 0.7);
     border: 1px solid transparent;
     border-radius: 6px;
-    padding: 6px 12px;
-    min-height: 28px;
-    max-height: 28px;
+    padding: 2px 12px;
+    min-height: 0;
+    max-height: 20px;
     transition: all 200ms ease;
 }
 .cmux-sidebar-btn:hover {
@@ -1055,7 +1055,7 @@ fn install_workspace_row_interactions(
         let state = state.clone();
         drag_source.connect_drag_begin(move |_, _| {
             let s = state.borrow();
-            s.new_ws_btn.set_label("\u{2716}");
+            s.new_ws_btn.set_label("\u{1F5D1}\u{FE0E}");
             s.new_ws_btn.add_css_class("cmux-sidebar-btn-trash");
         });
     }
