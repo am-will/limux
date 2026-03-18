@@ -201,7 +201,6 @@ row:selected .cmux-ws-star-btn {
     border-radius: 6px;
     padding: 6px 12px;
     min-height: 0;
-    max-height: 26px;
     transition: all 200ms ease;
 }
 .cmux-sidebar-btn:hover {
