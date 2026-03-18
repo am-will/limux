@@ -19,6 +19,8 @@ struct SavedWorkspace {
     favorite: bool,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    folder_path: Option<String>,
 }
 
 fn persistence_path() -> std::path::PathBuf {
@@ -46,6 +48,7 @@ fn save_workspaces(state: &State) {
             name: ws.name.clone(),
             favorite: ws.favorite,
             cwd: ws.cwd.borrow().clone(),
+            folder_path: ws.folder_path.clone(),
         })
         .collect();
     if let Ok(json) = serde_json::to_string_pretty(&saved) {
@@ -79,15 +82,19 @@ struct Workspace {
     favorite: bool,
     /// Last known working directory from the terminal (via OSC 7).
     cwd: Rc<RefCell<Option<String>>>,
+    /// The folder path this workspace was opened with.
+    folder_path: Option<String>,
+    /// Path label shown below workspace name in sidebar.
+    path_label: gtk::Label,
 }
 
 struct AppState {
     workspaces: Vec<Workspace>,
     active_idx: usize,
-    next_number: usize,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
     paned: gtk::Paned,
+    new_ws_btn: gtk::Button,
 }
 
 impl AppState {
@@ -190,31 +197,33 @@ row:selected .cmux-ws-star-btn {
 .cmux-sidebar-btn {
     background: rgba(255, 255, 255, 0.08);
     color: rgba(255, 255, 255, 0.7);
-    border: none;
+    border: 1px solid transparent;
     border-radius: 6px;
     padding: 6px 12px;
-    min-height: 0;
+    min-height: 28px;
+    max-height: 28px;
+    transition: all 200ms ease;
 }
 .cmux-sidebar-btn:hover {
     background: rgba(255, 255, 255, 0.14);
     color: white;
 }
-.cmux-trash-btn {
-    background: rgba(255, 255, 255, 0.08);
-    color: rgba(255, 255, 255, 0.5);
-    border: none;
-    border-radius: 6px;
-    padding: 6px;
-    min-height: 0;
-    min-width: 0;
-}
-.cmux-trash-btn:hover {
-    background: rgba(255, 80, 80, 0.25);
-    color: rgba(255, 80, 80, 0.9);
-}
-.cmux-trash-btn-active {
-    background: rgba(255, 80, 80, 0.35);
+.cmux-sidebar-btn-trash {
+    background: rgba(255, 60, 60, 0.25);
     color: rgba(255, 80, 80, 1);
+    border: 1px solid rgba(255, 80, 80, 0.5);
+}
+.cmux-sidebar-btn-trash-hover {
+    background: rgba(255, 60, 60, 0.45);
+    color: rgba(255, 90, 90, 1);
+    border: 1px solid rgba(255, 80, 80, 0.8);
+}
+.cmux-ws-path {
+    color: rgba(255, 255, 255, 0.3);
+    font-size: 10px;
+}
+row:selected .cmux-ws-path {
+    color: rgba(255, 255, 255, 0.5);
 }
 .cmux-content {
     background-color: rgba(23, 23, 23, 1);
@@ -300,42 +309,29 @@ pub fn build_window(app: &adw::Application) {
     let new_ws_btn = gtk::Button::builder()
         .label("New Workspace")
         .hexpand(true)
-        .build();
-    new_ws_btn.add_css_class("cmux-sidebar-btn");
-
-    let trash_btn = gtk::Button::builder()
-        .icon_name("user-trash-symbolic")
-        .tooltip_text("Drop workspace here to delete")
-        .build();
-    trash_btn.add_css_class("cmux-trash-btn");
-
-    // Trash visual feedback (drop handler wired after state is created)
-    let trash_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
-    trash_drop.set_preload(true);
-    {
-        let tb = trash_btn.clone();
-        trash_drop.connect_motion(move |_, _, _| {
-            tb.add_css_class("cmux-trash-btn-active");
-            gtk::gdk::DragAction::MOVE
-        });
-    }
-    {
-        let tb = trash_btn.clone();
-        trash_drop.connect_leave(move |_| {
-            tb.remove_css_class("cmux-trash-btn-active");
-        });
-    }
-    trash_btn.add_controller(trash_drop.clone());
-
-    let bottom_bar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
         .margin_start(6)
         .margin_end(6)
         .margin_bottom(6)
         .build();
-    bottom_bar.append(&new_ws_btn);
-    bottom_bar.append(&trash_btn);
+    new_ws_btn.add_css_class("cmux-sidebar-btn");
+
+    // Drop target on the button — intensifies when dragging over it
+    let btn_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+    btn_drop.set_preload(true);
+    {
+        let btn = new_ws_btn.clone();
+        btn_drop.connect_motion(move |_, _, _| {
+            btn.add_css_class("cmux-sidebar-btn-trash-hover");
+            gtk::gdk::DragAction::MOVE
+        });
+    }
+    {
+        let btn = new_ws_btn.clone();
+        btn_drop.connect_leave(move |_| {
+            btn.remove_css_class("cmux-sidebar-btn-trash-hover");
+        });
+    }
+    new_ws_btn.add_controller(btn_drop.clone());
 
     let sidebar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -345,7 +341,7 @@ pub fn build_window(app: &adw::Application) {
     sidebar.add_css_class("cmux-sidebar");
     sidebar.append(&sidebar_title);
     sidebar.append(&sidebar_scroll);
-    sidebar.append(&bottom_bar);
+    sidebar.append(&new_ws_btn);
 
     let main_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -364,10 +360,10 @@ pub fn build_window(app: &adw::Application) {
     let state: State = Rc::new(RefCell::new(AppState {
         workspaces: Vec::new(),
         active_idx: 0,
-        next_number: 1,
         stack: stack.clone(),
         sidebar_list: sidebar_list.clone(),
         paned: main_paned.clone(),
+        new_ws_btn: new_ws_btn.clone(),
     }));
 
     register_actions(&window, &state);
@@ -401,12 +397,14 @@ pub fn build_window(app: &adw::Application) {
         });
     }
 
-    // Wire up trash drop handler (needs state)
+    // Wire up drop-to-delete handler on the New Workspace button
     {
         let state = state.clone();
-        let tb = trash_btn.clone();
-        trash_drop.connect_drop(move |_, value, _, _| {
-            tb.remove_css_class("cmux-trash-btn-active");
+        let btn = new_ws_btn.clone();
+        btn_drop.connect_drop(move |_, value, _, _| {
+            btn.set_label("New Workspace");
+            btn.remove_css_class("cmux-sidebar-btn-trash");
+            btn.remove_css_class("cmux-sidebar-btn-trash-hover");
             if let Ok(workspace_id) = value.get::<String>() {
                 close_workspace_by_id(&state, &workspace_id);
                 save_workspaces(&state);
@@ -425,14 +423,16 @@ pub fn build_window(app: &adw::Application) {
         });
     }
 
-    // Restore saved workspaces, or create a default one
+    // Restore saved workspaces (if any). Empty start is fine — user clicks "New Workspace".
     let saved = load_workspaces();
-    if saved.is_empty() {
-        add_workspace(&state, None);
-    } else {
-        for sw in &saved {
-            add_workspace_with_name(&state, &sw.name, sw.favorite, sw.cwd.as_deref());
-        }
+    for sw in &saved {
+        add_workspace_with_name(
+            &state,
+            &sw.name,
+            sw.favorite,
+            sw.cwd.as_deref(),
+            sw.folder_path.as_deref(),
+        );
     }
     window.present();
 }
@@ -603,10 +603,12 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
 
 fn build_sidebar_row(
     name: &str,
+    folder_path: Option<&str>,
 ) -> (
     gtk::ListBoxRow,
     gtk::Label,
     gtk::Button,
+    gtk::Label,
     gtk::Label,
     gtk::Label,
 ) {
@@ -634,6 +636,20 @@ fn build_sidebar_row(
     top_row.append(&name_label);
     top_row.append(&favorite_button);
 
+    let path_label = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(16)
+        .build();
+    path_label.add_css_class("cmux-ws-path");
+    if let Some(p) = folder_path {
+        path_label.set_label(&abbreviate_path(p));
+        path_label.set_tooltip_text(Some(p));
+        path_label.set_visible(true);
+    } else {
+        path_label.set_visible(false);
+    }
+
     let notify_label = gtk::Label::builder()
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -648,12 +664,24 @@ fn build_sidebar_row(
         .build();
     vbox.add_css_class("cmux-sidebar-row-box");
     vbox.append(&top_row);
+    vbox.append(&path_label);
     vbox.append(&notify_label);
 
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&vbox));
 
-    (row, name_label, favorite_button, notify_dot, notify_label)
+    (row, name_label, favorite_button, notify_dot, notify_label, path_label)
+}
+
+/// Abbreviate a path by replacing the home directory with ~.
+fn abbreviate_path(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if path.starts_with(home_str.as_ref()) {
+            return format!("~{}", &path[home_str.len()..]);
+        }
+    }
+    path.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1051,23 @@ fn install_workspace_row_interactions(
             Some(gtk::gdk::ContentProvider::for_value(&payload))
         });
     }
+    {
+        let state = state.clone();
+        drag_source.connect_drag_begin(move |_, _| {
+            let s = state.borrow();
+            s.new_ws_btn.set_label("\u{2716}");
+            s.new_ws_btn.add_css_class("cmux-sidebar-btn-trash");
+        });
+    }
+    {
+        let state = state.clone();
+        drag_source.connect_drag_end(move |_, _, _| {
+            let s = state.borrow();
+            s.new_ws_btn.set_label("New Workspace");
+            s.new_ws_btn.remove_css_class("cmux-sidebar-btn-trash");
+            s.new_ws_btn.remove_css_class("cmux-sidebar-btn-trash-hover");
+        });
+    }
     row.add_controller(drag_source);
 
     // Drop target for sidebar reordering with visual feedback.
@@ -1081,41 +1126,72 @@ fn install_workspace_row_interactions(
     }
 }
 
-fn add_workspace(state: &State, working_directory: Option<&str>) {
-    let mut s = state.borrow_mut();
-    let number = s.next_number;
-    s.next_number += 1;
-
-    let id = uuid::Uuid::new_v4().to_string();
-    // Name from working directory if available, otherwise "Workspace N"
-    let name = if let Some(dir) = working_directory {
-        std::path::Path::new(dir)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("Workspace {number}"))
-    } else {
-        // Use current directory basename
-        std::env::current_dir()
-            .ok()
-            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
-            .unwrap_or_else(|| format!("Workspace {number}"))
+#[allow(deprecated)]
+fn add_workspace(state: &State, _working_directory: Option<&str>) {
+    // Open a folder chooser dialog (using FileChooserDialog to avoid portal crashes)
+    let window: Option<gtk::Window> = {
+        let s = state.borrow();
+        s.stack
+            .root()
+            .and_then(|r| r.downcast::<gtk::Window>().ok())
     };
+
+    let dialog = gtk::FileChooserDialog::new(
+        Some("Open Folder as Workspace"),
+        window.as_ref(),
+        gtk::FileChooserAction::SelectFolder,
+        &[
+            ("Cancel", gtk::ResponseType::Cancel),
+            ("Open", gtk::ResponseType::Accept),
+        ],
+    );
+    dialog.set_modal(true);
+
+    // Start in the home directory
+    if let Some(home) = dirs::home_dir() {
+        let home_file = gtk::gio::File::for_path(&home);
+        let _ = dialog.set_current_folder(Some(&home_file));
+    }
+
+    let state = state.clone();
+    dialog.connect_response(move |dlg, response| {
+        if response == gtk::ResponseType::Accept {
+            if let Some(file) = dlg.file() {
+                if let Some(path) = file.path() {
+                    let path_str = path.to_string_lossy().to_string();
+                    let folder_name = path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path_str.clone());
+                    create_workspace_with_folder(&state, &folder_name, &path_str);
+                }
+            }
+        }
+        dlg.close();
+    });
+
+    dialog.show();
+}
+
+fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
+    let mut s = state.borrow_mut();
+    let id = uuid::Uuid::new_v4().to_string();
     let stack_name = format!("ws-{id}");
 
-    // Create the initial pane for this workspace
-    let pane_widget = create_pane_for_workspace(state, &id, working_directory);
+    let pane_widget = create_pane_for_workspace(state, &id, Some(folder_path));
     let root: gtk::Widget = pane_widget.upcast();
 
     s.stack.add_named(&root, Some(&stack_name));
 
-    let (row, name_label, favorite_button, notify_dot, notify_label) = build_sidebar_row(&name);
+    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
+        build_sidebar_row(name, Some(folder_path));
     s.sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
-    let cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(Some(folder_path.to_string())));
     let ws = Workspace {
         id,
-        name,
+        name: name.to_string(),
         root,
         sidebar_row: row.clone(),
         name_label,
@@ -1125,6 +1201,8 @@ fn add_workspace(state: &State, working_directory: Option<&str>) {
         unread: false,
         favorite: false,
         cwd,
+        folder_path: Some(folder_path.to_string()),
+        path_label,
     };
 
     s.workspaces.push(ws);
@@ -1139,21 +1217,31 @@ fn add_workspace(state: &State, working_directory: Option<&str>) {
     save_workspaces(state);
 }
 
-fn add_workspace_with_name(state: &State, name: &str, favorite: bool, saved_cwd: Option<&str>) {
+fn add_workspace_with_name(
+    state: &State,
+    name: &str,
+    favorite: bool,
+    saved_cwd: Option<&str>,
+    folder_path: Option<&str>,
+) {
     let mut s = state.borrow_mut();
     let id = uuid::Uuid::new_v4().to_string();
     let stack_name = format!("ws-{id}");
 
-    let pane_widget = create_pane_for_workspace(state, &id, saved_cwd);
+    // Use folder_path for terminal cwd, fall back to saved_cwd
+    let working_dir = folder_path.or(saved_cwd);
+    let pane_widget = create_pane_for_workspace(state, &id, working_dir);
     let root: gtk::Widget = pane_widget.upcast();
 
     s.stack.add_named(&root, Some(&stack_name));
 
-    let (row, name_label, favorite_button, notify_dot, notify_label) = build_sidebar_row(name);
+    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
+        build_sidebar_row(name, folder_path);
     s.sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
-    let cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(saved_cwd.map(|s| s.to_string())));
+    let cwd: Rc<RefCell<Option<String>>> =
+        Rc::new(RefCell::new(working_dir.map(|s| s.to_string())));
     let ws = Workspace {
         id,
         name: name.to_string(),
@@ -1166,6 +1254,8 @@ fn add_workspace_with_name(state: &State, name: &str, favorite: bool, saved_cwd:
         unread: false,
         favorite,
         cwd,
+        folder_path: folder_path.map(|s| s.to_string()),
+        path_label,
     };
 
     if favorite {
@@ -1255,12 +1345,9 @@ fn close_workspace_by_id(state: &State, id: &str) {
     s.sidebar_list.remove(&ws.sidebar_row);
 
     if s.workspaces.is_empty() {
-        if let Some(root) = s.stack.root() {
-            if let Some(window) = root.downcast_ref::<gtk::Window>() {
-                drop(s);
-                window.close();
-            }
-        }
+        s.active_idx = 0;
+        drop(s);
+        save_workspaces(state);
         return;
     }
 
