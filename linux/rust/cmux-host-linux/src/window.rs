@@ -1613,7 +1613,7 @@ fn find_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
         if let Some(bx) = w.downcast_ref::<gtk::Box>() {
             let mut child = bx.first_child();
             while let Some(c) = child {
-                if c.has_css_class("cmux-pane-toolbar") {
+                if c.has_css_class("cmux-pane-header") {
                     return Some((ws_id, w));
                 }
                 child = c.next_sibling();
