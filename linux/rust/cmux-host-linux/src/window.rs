@@ -96,6 +96,9 @@ struct AppState {
     paned: gtk::Paned,
     new_ws_btn: gtk::Button,
     expand_btn: gtk::Button,
+    sidebar_animation: Option<adw::TimedAnimation>,
+    sidebar_animation_epoch: u64,
+    sidebar_expanded_width: i32,
 }
 
 impl AppState {
@@ -415,7 +418,20 @@ pub fn build_window(app: &adw::Application) {
         paned: main_paned.clone(),
         new_ws_btn: new_ws_btn.clone(),
         expand_btn: expand_btn.clone(),
+        sidebar_animation: None,
+        sidebar_animation_epoch: 0,
+        sidebar_expanded_width: SIDEBAR_WIDTH,
     }));
+
+    {
+        let state = state.clone();
+        main_paned.connect_position_notify(move |paned| {
+            let position = paned.position();
+            if position > 10 {
+                state.borrow_mut().sidebar_expanded_width = position;
+            }
+        });
+    }
 
     // Wire collapse button
     {
@@ -1542,17 +1558,34 @@ fn cycle_workspace(state: &State, direction: i32) {
 const SIDEBAR_WIDTH: i32 = 220;
 
 fn toggle_sidebar(state: &State) {
-    let s = state.borrow();
-    let paned = s.paned.clone();
-    let expand_btn = s.expand_btn.clone();
-    let sidebar = match s.paned.start_child() {
-        Some(sb) => sb,
-        None => return,
+    let (paned, expand_btn, sidebar, current, is_visible, target_width, prior_animation, epoch) = {
+        let mut s = state.borrow_mut();
+        let Some(sidebar) = s.paned.start_child() else {
+            return;
+        };
+        let current = s.paned.position();
+        let is_visible = current > 10; // treat < 10px as collapsed
+        if is_visible {
+            s.sidebar_expanded_width = current;
+        }
+        let target_width = s.sidebar_expanded_width.max(SIDEBAR_WIDTH);
+        let prior_animation = s.sidebar_animation.take();
+        s.sidebar_animation_epoch = s.sidebar_animation_epoch.wrapping_add(1);
+        (
+            s.paned.clone(),
+            s.expand_btn.clone(),
+            sidebar,
+            current,
+            is_visible,
+            target_width,
+            prior_animation,
+            s.sidebar_animation_epoch,
+        )
     };
-    drop(s);
 
-    let current = paned.position();
-    let is_visible = current > 10; // treat < 10px as collapsed
+    if let Some(animation) = prior_animation {
+        animation.pause();
+    }
 
     if is_visible {
         // Collapse: animate position to 0, then hide sidebar, show expand button
@@ -1571,12 +1604,27 @@ fn toggle_sidebar(state: &State) {
             .easing(adw::Easing::EaseInOutCubic)
             .target(&target)
             .build();
+        let state_for_done = state.clone();
+        let expand_btn_for_done = expand_btn.clone();
         animation.connect_done(move |_| {
-            sidebar.set_visible(false);
+            let is_current = {
+                let mut s = state_for_done.borrow_mut();
+                if s.sidebar_animation_epoch != epoch {
+                    false
+                } else {
+                    s.sidebar_animation = None;
+                    true
+                }
+            };
+            if is_current {
+                sidebar.set_visible(false);
+                expand_btn_for_done.set_visible(true);
+            }
         });
+        state.borrow_mut().sidebar_animation = Some(animation.clone());
         animation.play();
     } else {
-        // Expand: make sidebar visible, then animate position from 0 to SIDEBAR_WIDTH
+        // Expand: make sidebar visible, then animate position from 0 to remembered width
         sidebar.set_visible(true);
         paned.set_position(0);
         let target = adw::CallbackAnimationTarget::new({
@@ -1588,14 +1636,28 @@ fn toggle_sidebar(state: &State) {
         let animation = adw::TimedAnimation::builder()
             .widget(&paned)
             .value_from(0.0)
-            .value_to(SIDEBAR_WIDTH as f64)
+            .value_to(target_width as f64)
             .duration(200)
             .easing(adw::Easing::EaseInOutCubic)
             .target(&target)
             .build();
+        let state_for_done = state.clone();
+        let expand_btn_for_done = expand_btn.clone();
         animation.connect_done(move |_| {
-            expand_btn.set_visible(false);
+            let is_current = {
+                let mut s = state_for_done.borrow_mut();
+                if s.sidebar_animation_epoch != epoch {
+                    false
+                } else {
+                    s.sidebar_animation = None;
+                    true
+                }
+            };
+            if is_current {
+                expand_btn_for_done.set_visible(false);
+            }
         });
+        state.borrow_mut().sidebar_animation = Some(animation.clone());
         animation.play();
     }
 }
@@ -1799,9 +1861,13 @@ fn close_focused_tab(state: &State) {
 }
 
 fn add_tab_to_focused_pane(_state: &State, _browser: bool) {
-    // TODO: Keyboard-driven tab creation requires finding the pane's internal
-    // tab_strip and content_stack from the focused widget. For now, use the
-    // toolbar buttons. This will be wired up in a future refactor.
+    if let Some((_ws_id, pane_widget)) = find_focused_pane(_state) {
+        if _browser {
+            pane::add_browser_tab_to_pane(&pane_widget);
+        } else {
+            pane::add_terminal_tab_to_pane(&pane_widget);
+        }
+    }
 }
 
 /// Direction for pane navigation.

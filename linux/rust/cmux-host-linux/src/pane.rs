@@ -248,6 +248,9 @@ pub fn create_pane(callbacks: Rc<PaneCallbacks>, working_directory: Option<&str>
         tab_state: tab_state.clone(),
         tab_strip: tab_strip.clone(),
         content_stack: content_stack.clone(),
+        pane_outer: outer.clone(),
+        callbacks: callbacks.clone(),
+        working_directory: ws_wd.clone(),
     });
     unsafe {
         outer.set_data("cmux-pane-internals", internals);
@@ -318,6 +321,9 @@ pub struct PaneInternals {
     tab_state: Rc<std::cell::RefCell<TabState>>,
     tab_strip: gtk::Box,
     content_stack: gtk::Stack,
+    pane_outer: gtk::Box,
+    callbacks: Rc<PaneCallbacks>,
+    working_directory: Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl TabState {
@@ -527,67 +533,41 @@ fn add_browser_tab_inner(
 
 // Public wrappers for keyboard shortcut use
 #[allow(dead_code)]
-pub fn add_terminal_tab_to_notebook(
-    pane_widget: &gtk::Widget,
-    callbacks: &Rc<PaneCallbacks>,
-    working_directory: Option<&str>,
-) {
-    if let Some((header, content_stack, tab_state, pane_outer)) = find_pane_internals(pane_widget) {
-        if let Some(tab_strip) = find_tab_strip(&header) {
-            add_terminal_tab_inner(
-                &tab_strip,
-                &content_stack,
-                &tab_state,
-                callbacks,
-                working_directory,
-                &pane_outer,
-            );
-        }
+pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
+    if let Some(internals) = find_pane_internals(pane_widget) {
+        let dir = internals.working_directory.borrow().clone();
+        add_terminal_tab_inner(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &internals.callbacks,
+            dir.as_deref(),
+            &internals.pane_outer,
+        );
     }
 }
 
 #[allow(dead_code)]
-pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget, callbacks: &Rc<PaneCallbacks>) {
-    if let Some((header, content_stack, tab_state, pane_outer)) = find_pane_internals(pane_widget) {
-        if let Some(tab_strip) = find_tab_strip(&header) {
-            add_browser_tab_inner(
-                &tab_strip,
-                &content_stack,
-                &tab_state,
-                callbacks,
-                &pane_outer,
-            );
-        }
+pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
+    if let Some(internals) = find_pane_internals(pane_widget) {
+        add_browser_tab_inner(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &internals.callbacks,
+            &internals.pane_outer,
+        );
     }
 }
 
 #[allow(dead_code)]
-fn find_pane_internals(
-    _pane_widget: &gtk::Widget,
-) -> Option<(
-    gtk::Box,
-    gtk::Stack,
-    Rc<std::cell::RefCell<TabState>>,
-    gtk::Box,
-)> {
-    // For now, this is not easily retrievable since we don't store references.
-    // The toolbar buttons wire directly. Keyboard shortcuts go through the
-    // create_pane closures. This is a TODO for later refactoring.
-    None
-}
-
-#[allow(dead_code)]
-fn find_tab_strip(header: &gtk::Box) -> Option<gtk::Box> {
-    let mut child = header.first_child();
-    while let Some(c) = child {
-        if let Ok(bx) = c.clone().downcast::<gtk::Box>() {
-            if bx.hexpands() {
-                return Some(bx);
-            }
-        }
-        child = c.next_sibling();
+fn find_pane_internals(pane_widget: &gtk::Widget) -> Option<Rc<PaneInternals>> {
+    let outer = pane_widget.downcast_ref::<gtk::Box>()?;
+    unsafe {
+        outer
+            .data::<Rc<PaneInternals>>("cmux-pane-internals")
+            .map(|ptr| ptr.as_ref().clone())
     }
-    None
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,11 @@ struct SurfaceEntry {
     on_pwd_changed: Option<Box<dyn Fn(&str)>>,
     on_bell: Option<Box<dyn Fn()>>,
     on_close: Option<Box<dyn Fn()>>,
+    clipboard_context: *mut ClipboardContext,
+}
+
+struct ClipboardContext {
+    surface: Cell<ghostty_surface_t>,
 }
 
 thread_local! {
@@ -188,20 +193,17 @@ unsafe extern "C" fn ghostty_action_cb(
     }
 }
 
-/// Find the surface whose GLArea currently has focus, or fall back to any surface.
-/// Used by clipboard callbacks that receive null userdata.
-fn find_focused_surface() -> Option<ghostty_surface_t> {
-    SURFACE_MAP.with(|map| {
-        let m = map.borrow();
-        // Prefer the surface whose GLArea has focus
-        for (&key, entry) in m.iter() {
-            if entry.gl_area.has_focus() || entry.gl_area.is_focus() {
-                return Some(key as ghostty_surface_t);
-            }
-        }
-        // Fall back to any surface
-        m.keys().next().map(|&k| k as ghostty_surface_t)
-    })
+unsafe fn clipboard_surface_from_userdata(userdata: *mut c_void) -> Option<ghostty_surface_t> {
+    if userdata.is_null() {
+        return None;
+    }
+    let context = unsafe { &*(userdata as *const ClipboardContext) };
+    let surface = context.surface.get();
+    if surface.is_null() {
+        None
+    } else {
+        Some(surface)
+    }
 }
 
 unsafe extern "C" fn ghostty_read_clipboard_cb(
@@ -209,15 +211,9 @@ unsafe extern "C" fn ghostty_read_clipboard_cb(
     clipboard_type: c_int,
     state: *mut c_void,
 ) {
-    // userdata may be null if surface config userdata wasn't set.
-    // Fall back to finding the focused surface from our map.
-    let surface_ptr = if !userdata.is_null() {
-        userdata as ghostty_surface_t
-    } else {
-        match find_focused_surface() {
-            Some(s) => s,
-            None => return,
-        }
+    let surface_ptr = match unsafe { clipboard_surface_from_userdata(userdata) } {
+        Some(surface) => surface,
+        None => return,
     };
 
     let display = match gtk::gdk::Display::default() {
@@ -253,13 +249,9 @@ unsafe extern "C" fn ghostty_confirm_read_clipboard_cb(
     state: *mut c_void,
     _request_type: c_int,
 ) {
-    let surface_ptr = if !userdata.is_null() {
-        userdata as ghostty_surface_t
-    } else {
-        match find_focused_surface() {
-            Some(s) => s,
-            None => return,
-        }
+    let surface_ptr = match unsafe { clipboard_surface_from_userdata(userdata) } {
+        Some(surface) => surface,
+        None => return,
     };
     unsafe {
         ghostty_surface_complete_clipboard_request(surface_ptr, text, state, true);
@@ -307,13 +299,9 @@ unsafe extern "C" fn ghostty_write_clipboard_cb(
     }
 
     // Show "Copied to clipboard" toast on the surface's overlay
-    let surface_key = if !userdata.is_null() {
-        userdata as usize
-    } else {
-        match find_focused_surface() {
-            Some(s) => s as usize,
-            None => return,
-        }
+    let surface_key = match unsafe { clipboard_surface_from_userdata(userdata) } {
+        Some(surface) => surface as usize,
+        None => return,
     };
     SURFACE_MAP.with(|map| {
         if let Some(entry) = map.borrow().get(&surface_key) {
@@ -323,7 +311,11 @@ unsafe extern "C" fn ghostty_write_clipboard_cb(
 }
 
 unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_alive: bool) {
-    let surface_key = userdata as usize;
+    let Some(surface_key) =
+        (unsafe { clipboard_surface_from_userdata(userdata) }).map(|surface| surface as usize)
+    else {
+        return;
+    };
     glib::idle_add_local_once(move || {
         SURFACE_MAP.with(|map| {
             if let Some(entry) = map.borrow().get(&surface_key) {
@@ -368,6 +360,7 @@ pub fn create_terminal(
     let callbacks = Rc::new(callbacks);
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
+    let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> = Rc::new(Cell::new(ptr::null_mut()));
 
     // Create overlay early so closures can capture it for toast notifications
     let overlay = gtk::Overlay::new();
@@ -382,6 +375,7 @@ pub fn create_terminal(
         let surface_cell = surface_cell.clone();
         let callbacks = callbacks.clone();
         let had_focus = had_focus.clone();
+        let clipboard_context_cell = clipboard_context_cell.clone();
         gl_area.connect_realize(move |gl_area| {
             gl_area.make_current();
             if let Some(err) = gl_area.error() {
@@ -400,12 +394,16 @@ pub fn create_terminal(
 
             let app = ghostty_app();
             let mut config = unsafe { ghostty_surface_config_new() };
+            let clipboard_context = Box::into_raw(Box::new(ClipboardContext {
+                surface: Cell::new(ptr::null_mut()),
+            }));
             config.platform_tag = GHOSTTY_PLATFORM_LINUX;
             config.platform = ghostty_platform_u {
                 linux: ghostty_platform_linux_s {
                     reserved: ptr::null_mut(),
                 },
             };
+            config.userdata = clipboard_context.cast();
 
             let scale = gl_area.scale_factor() as f64;
             config.scale_factor = scale;
@@ -418,9 +416,16 @@ pub fn create_terminal(
 
             let surface = unsafe { ghostty_surface_new(app, &config) };
             if surface.is_null() {
+                unsafe {
+                    drop(Box::from_raw(clipboard_context));
+                }
                 eprintln!("cmux: failed to create ghostty surface");
                 return;
             }
+            unsafe {
+                (*clipboard_context).surface.set(surface);
+            }
+            clipboard_context_cell.set(clipboard_context);
 
             // Set initial size — GLArea gives unscaled CSS pixels,
             // Ghostty handles scaling internally via content_scale.
@@ -457,6 +462,7 @@ pub fn create_terminal(
                             let cb = callbacks.clone();
                             move || (cb.on_close)()
                         })),
+                        clipboard_context,
                     },
                 );
             });
@@ -696,13 +702,25 @@ pub fn create_terminal(
     // Clean up only when the widget is actually destroyed.
     {
         let surface_cell = surface_cell.clone();
+        let clipboard_context_cell = clipboard_context_cell.clone();
         overlay.connect_destroy(move |_| {
             if let Some(surface) = surface_cell.borrow_mut().take() {
                 let surface_key = surface as usize;
                 SURFACE_MAP.with(|map| {
-                    map.borrow_mut().remove(&surface_key);
+                    if let Some(entry) = map.borrow_mut().remove(&surface_key) {
+                        unsafe {
+                            drop(Box::from_raw(entry.clipboard_context));
+                        }
+                    }
                 });
                 unsafe { ghostty_surface_free(surface) };
+            } else {
+                let clipboard_context = clipboard_context_cell.replace(ptr::null_mut());
+                if !clipboard_context.is_null() {
+                    unsafe {
+                        drop(Box::from_raw(clipboard_context));
+                    }
+                }
             }
         });
     }

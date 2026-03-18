@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use cmux_control::socket_path::{resolve_socket_path, SocketMode};
@@ -12,8 +14,8 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-const HOOKS_PATH: &str = "/tmp/cmux-hooks-cli.json";
-const BUFFERS_PATH: &str = "/tmp/cmux-buffers-cli.json";
+const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const CLI_STATE_LOCK_RETRY: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdFormat {
@@ -346,10 +348,89 @@ fn read_json_map(path: &str) -> BTreeMap<String, String> {
     serde_json::from_str::<BTreeMap<String, String>>(&raw).unwrap_or_default()
 }
 
-fn write_json_map(path: &str, map: &BTreeMap<String, String>) -> Result<()> {
+fn write_json_map(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
     let encoded = serde_json::to_string_pretty(map).context("failed to encode json map")?;
-    fs::write(path, encoded).with_context(|| format!("failed to write {}", path))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), nonce));
+    fs::write(&tmp, encoded).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
+}
+
+fn socket_state_namespace(socket: &Path) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    socket.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn cli_state_dir(socket: &Path) -> PathBuf {
+    env::temp_dir()
+        .join("cmux-cli")
+        .join(socket_state_namespace(socket))
+}
+
+fn cli_state_path(socket: &Path, kind: &str) -> PathBuf {
+    cli_state_dir(socket).join(format!("{kind}.json"))
+}
+
+fn cli_state_lock_path(socket: &Path, kind: &str) -> PathBuf {
+    cli_state_dir(socket).join(format!("{kind}.lock"))
+}
+
+struct CliStateLock {
+    path: PathBuf,
+}
+
+impl Drop for CliStateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_cli_state_lock(socket: &Path, kind: &str) -> Result<CliStateLock> {
+    let dir = cli_state_dir(socket);
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let lock_path = cli_state_lock_path(socket, kind);
+    let deadline = Instant::now() + CLI_STATE_LOCK_TIMEOUT;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(CliStateLock { path: lock_path }),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    bail!("timed out acquiring CLI state lock {}", lock_path.display());
+                }
+                std::thread::sleep(CLI_STATE_LOCK_RETRY);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to create CLI state lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+}
+
+fn with_locked_json_map<T, F>(socket: &Path, kind: &str, update: F) -> Result<T>
+where
+    F: FnOnce(&mut BTreeMap<String, String>, &Path) -> Result<T>,
+{
+    let _lock = acquire_cli_state_lock(socket, kind)?;
+    let path = cli_state_path(socket, kind);
+    let path_str = path.to_string_lossy().to_string();
+    let mut map = read_json_map(&path_str);
+    update(&mut map, &path)
 }
 
 async fn resolve_current_workspace(client: &mut Client) -> Result<String> {
@@ -365,17 +446,14 @@ async fn call_in_workspace_scope(
     params: Value,
 ) -> Result<Value> {
     if let Some(target) = workspace {
-        let original = resolve_current_workspace(client).await?;
-        if original != target {
-            let _ = client
-                .call("workspace.select", json!({ "workspace_id": target }))
-                .await?;
-            let result = client.call(method, params).await;
-            let _ = client
-                .call("workspace.select", json!({ "workspace_id": original }))
-                .await;
-            return result;
-        }
+        let mut map = match params {
+            Value::Object(map) => map,
+            Value::Null => Map::new(),
+            _ => bail!("{method} requires object params for workspace-scoped calls"),
+        };
+        map.entry("workspace_id".to_string())
+            .or_insert(Value::String(target));
+        return client.call(method, Value::Object(map)).await;
     }
     client.call(method, params).await
 }
@@ -1539,32 +1617,36 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
         "set-hook" => {
             let list_mode = parse_flag(args, "--list");
             let unset = parse_opt(args, "--unset");
-            let mut hooks = read_json_map(HOOKS_PATH);
-            if list_mode {
-                let text = hooks
+            with_locked_json_map(&client.socket, "hooks", |hooks, path| {
+                if list_mode {
+                    let text = hooks
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Ok(json!({
+                        "text": text,
+                        "path": path.display().to_string(),
+                    }));
+                }
+                if let Some(name) = unset {
+                    hooks.remove(&name);
+                    write_json_map(path, hooks)?;
+                    return Ok(json!({"ok": true}));
+                }
+                let name = args
                     .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return Ok(json!({"text": text}));
-            }
-            if let Some(name) = unset {
-                hooks.remove(&name);
-                write_json_map(HOOKS_PATH, &hooks)?;
-                return Ok(json!({"ok": true}));
-            }
-            let name = args
-                .iter()
-                .find(|a| !a.starts_with('-'))
-                .cloned()
-                .unwrap_or_default();
-            let body = trailing_title(args).unwrap_or_default();
-            if name.is_empty() || body.is_empty() {
-                bail!("set-hook requires <name> <command>");
-            }
-            hooks.insert(name, body);
-            write_json_map(HOOKS_PATH, &hooks)?;
-            Ok(json!({"ok": true}))
+                    .find(|a| !a.starts_with('-'))
+                    .cloned()
+                    .unwrap_or_default();
+                let body = trailing_title(args).unwrap_or_default();
+                if name.is_empty() || body.is_empty() {
+                    bail!("set-hook requires <name> <command>");
+                }
+                hooks.insert(name, body);
+                write_json_map(path, hooks)?;
+                Ok(json!({"ok": true}))
+            })
         }
         "resize-pane" => {
             let workspace = parse_opt(args, "--workspace");
@@ -1596,23 +1678,26 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             let name =
                 parse_opt(args, "--name").ok_or_else(|| anyhow!("set-buffer requires --name"))?;
             let body = trailing_title(args).unwrap_or_default();
-            let mut buffers = read_json_map(BUFFERS_PATH);
-            buffers.insert(name, body);
-            write_json_map(BUFFERS_PATH, &buffers)?;
-            Ok(json!({"ok": true}))
+            with_locked_json_map(&client.socket, "buffers", |buffers, path| {
+                buffers.insert(name, body);
+                write_json_map(path, buffers)?;
+                Ok(json!({"ok": true}))
+            })
         }
         "list-buffers" => {
-            let buffers = read_json_map(BUFFERS_PATH);
-            let text = buffers.keys().cloned().collect::<Vec<_>>().join("\n");
-            Ok(json!({"text": text}))
+            with_locked_json_map(&client.socket, "buffers", |buffers, _path| {
+                let text = buffers.keys().cloned().collect::<Vec<_>>().join("\n");
+                Ok(json!({"text": text}))
+            })
         }
         "paste-buffer" => {
             let name =
                 parse_opt(args, "--name").ok_or_else(|| anyhow!("paste-buffer requires --name"))?;
             let workspace = parse_opt(args, "--workspace");
             let surface = parse_opt(args, "--surface");
-            let buffers = read_json_map(BUFFERS_PATH);
-            let text = buffers.get(&name).cloned().unwrap_or_default();
+            let text = with_locked_json_map(&client.socket, "buffers", |buffers, _path| {
+                Ok(buffers.get(&name).cloned().unwrap_or_default())
+            })?;
             let mut p = Map::new();
             if let Some(surface) = surface {
                 p.insert("surface_id".to_string(), Value::String(surface));
