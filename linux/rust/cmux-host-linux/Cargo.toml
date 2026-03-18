@@ -10,7 +10,7 @@ name = "cmux-linux"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["webkit"]
 webkit = ["dep:webkit6"]
 
 [dependencies]
