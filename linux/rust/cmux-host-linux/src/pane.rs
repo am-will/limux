@@ -942,8 +942,6 @@ fn remove_tab(
 
 #[cfg(feature = "webkit")]
 fn create_browser_widget() -> (gtk::Widget, String) {
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use webkit6::prelude::*;
 
     // Use a NetworkSession to avoid sandbox issues
@@ -957,7 +955,6 @@ fn create_browser_widget() -> (gtk::Widget, String) {
 
     // Set permissive settings
     if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
-        use webkit6::prelude::SettingsExt;
         settings.set_enable_developer_extras(true);
         settings.set_javascript_can_open_windows_automatically(true);
     }

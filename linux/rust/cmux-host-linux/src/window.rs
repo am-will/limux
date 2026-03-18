@@ -114,9 +114,9 @@ const CSS: &str = r#"
     background-color: rgba(25, 25, 25, 1);
 }
 .cmux-sidebar-row-box {
-    padding: 8px 6px 8px 6px;
+    padding: 8px 6px 8px 3px;
     border-radius: 6px;
-    margin: 2px 3px;
+    margin: 2px 3px 2px 1px;
 }
 .cmux-ws-name {
     color: rgba(255, 255, 255, 0.7);
@@ -368,13 +368,28 @@ pub fn build_window(app: &adw::Application) {
     register_actions(&window, &state);
     install_key_capture(&window, &state);
 
-    // Any click anywhere in the window commits an active sidebar rename
+    // Any click anywhere in the window commits an active sidebar rename,
+    // UNLESS the click is inside the rename Entry itself.
     {
         let sl = sidebar_list.clone();
+        let win = window.clone();
         let click_anywhere = gtk::GestureClick::new();
         click_anywhere.set_propagation_phase(gtk::PropagationPhase::Capture);
-        click_anywhere.connect_pressed(move |_, _, _, _| {
-            commit_any_active_rename(&sl);
+        click_anywhere.connect_pressed(move |_, _, x, y| {
+            if let Some(entry) = find_active_rename_entry(&sl) {
+                // Translate click coords from window to the entry's coordinate space
+                if let Some((ex, ey)) = win.translate_coordinates(&entry, x, y) {
+                    let alloc = entry.allocation();
+                    if ex >= 0.0
+                        && ey >= 0.0
+                        && ex <= alloc.width() as f64
+                        && ey <= alloc.height() as f64
+                    {
+                        return; // click is inside the entry
+                    }
+                }
+                commit_any_active_rename(&sl);
+            }
         });
         window.add_controller(click_anywhere);
     }
@@ -785,6 +800,31 @@ fn set_workspace_favorite_visual(workspace: &Workspace) {
             .favorite_button
             .remove_css_class("cmux-ws-star-btn-active");
     }
+}
+
+/// Find an active rename Entry in the sidebar (if any).
+fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
+    fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
+        if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+            return Some(entry.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(entry) = find_entry(&c) {
+                return Some(entry);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+    let mut row = sidebar_list.first_child();
+    while let Some(r) = row {
+        if let Some(entry) = find_entry(&r) {
+            return Some(entry);
+        }
+        row = r.next_sibling();
+    }
+    None
 }
 
 /// Find any active rename Entry in the sidebar and trigger its activate signal to commit.
