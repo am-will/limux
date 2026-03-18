@@ -1563,7 +1563,20 @@ fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
         };
 
         if let Some(sibling) = sibling {
-            // Clear focus before detaching children to avoid GTK focus tracking warnings
+            // Move focus to the sibling's GLArea before detaching to avoid
+            // GTK focus tracking warnings on ancestor Paneds.
+            if let Some(gl) = find_gl_area(&sibling) {
+                gl.grab_focus();
+            }
+
+            // Walk up and clear focus_child on all ancestor Paneds
+            let mut ancestor = paned.parent();
+            while let Some(a) = ancestor {
+                if let Some(ap) = a.downcast_ref::<gtk::Paned>() {
+                    ap.set_focus_child(gtk::Widget::NONE);
+                }
+                ancestor = a.parent();
+            }
             paned.set_focus_child(gtk::Widget::NONE);
             paned.set_start_child(gtk::Widget::NONE);
             paned.set_end_child(gtk::Widget::NONE);
