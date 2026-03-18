@@ -1810,10 +1810,18 @@ fn focus_pane_in_direction(state: &State, direction: Direction) {
     }
 }
 
-/// Recursively find the first GLArea inside a widget tree.
+/// Recursively find the first visible GLArea inside a widget tree.
+/// For gtk::Stack containers, only descend into the visible child.
 fn find_gl_area(widget: &gtk::Widget) -> Option<gtk::GLArea> {
     if let Some(gl) = widget.downcast_ref::<gtk::GLArea>() {
         return Some(gl.clone());
+    }
+    // For Stack widgets, only search the visible child
+    if let Some(stack) = widget.downcast_ref::<gtk::Stack>() {
+        if let Some(visible) = stack.visible_child() {
+            return find_gl_area(&visible);
+        }
+        return None;
     }
     let mut child = widget.first_child();
     while let Some(c) = child {
