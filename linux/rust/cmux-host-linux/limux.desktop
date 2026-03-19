@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Limux
+Comment=GPU-accelerated terminal workspace manager
+Exec=limux
+Icon=limux
+Terminal=false
+Type=Application
+Categories=System;TerminalEmulator;
+Keywords=terminal;multiplexer;ghostty;workspace;
+StartupNotify=true
+StartupWMClass=dev.cmux.linux

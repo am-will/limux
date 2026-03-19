@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=ghostty");
     println!("cargo:rustc-link-lib=dylib=epoxy");
 
+
     // Compile glad (GL loader) which libghostty depends on but doesn't
     // include when built as a shared library.
     let glad_src = ghostty_root.join("vendor/glad/src/gl.c");
