@@ -1,4 +1,5 @@
 target/
 zig/.zig-cache/
 zig/zig-out/
+dist/
 *.tar.gz
