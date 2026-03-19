@@ -1,71 +1,105 @@
-# cmux-linux Foundation
+# Limux
 
-This directory is the Linux port foundation for the cmux hybrid architecture:
+A GPU-accelerated terminal workspace manager for Linux, powered by Ghostty's rendering engine.
 
-- `rust/`: protocol, canonical core engine, control-plane adapters, host runtime, and CLI
-- `zig/`: Linux host scaffold and FFI boundary to the Rust control plane
+## Features
 
-Current canonical runtime entrypoint:
+- **GPU-rendered terminals** via embedded Ghostty (OpenGL)
+- **Workspaces** with folder-based naming, persistence across restarts, and sidebar management
+- **Split panes** (horizontal/vertical) with keyboard navigation
+- **Tabbed terminals** within each pane
+- **Built-in browser** (WebKitGTK)
+- **Right-click context menu** with copy, paste, split, clear
+- **Drag-and-drop** workspace reordering with favorites/pinning
+- **Animated sidebar** collapse/expand
 
-- `cmux-linux` (Rust host runtime, package `cmux-host-linux`)
+## Install
 
-## Quickstart
-
-Install GUI build dependencies (required for `--features gtk-ui`):
-
-Ubuntu/Debian:
-
-```bash
-sudo apt update
-sudo apt install -y libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev pkg-config build-essential
-```
-
-Homebrew (no sudo):
+Download the latest release tarball and run:
 
 ```bash
-brew install gtk4 libadwaita vte3
-eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+tar xzf limux-*-linux-x86_64.tar.gz
+cd limux-*-linux-x86_64
+sudo ./install.sh
 ```
 
-Verify pkg-config visibility:
+Then launch from your app menu or terminal:
 
 ```bash
-pkg-config --modversion gtk4 libadwaita-1 vte-2.91-gtk4
+limux
 ```
 
-Build Rust workspace:
+To uninstall:
 
 ```bash
-cargo build --manifest-path linux/Cargo.toml
+sudo ./install.sh --uninstall
 ```
 
-Run Linux host runtime in headless mode (starts control-plane socket server):
+### System dependencies
 
 ```bash
-cargo run --manifest-path linux/Cargo.toml -p cmux-host-linux --bin cmux-linux -- --headless
+# Ubuntu/Debian
+sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 ```
 
-Run Linux host runtime with GTK shell (when built with GTK feature and system deps):
+## Build from source
+
+### Prerequisites
+
+- Rust toolchain (stable)
+- GTK4, libadwaita, WebKitGTK dev packages
+- Pre-built `libghostty.so` (included in releases, or build from the Ghostty submodule with Zig)
 
 ```bash
-cargo run --manifest-path linux/Cargo.toml -p cmux-host-linux --features gtk-ui --bin cmux-linux
+# Install dev dependencies (Ubuntu/Debian)
+sudo apt install libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev pkg-config build-essential
+
+# Build
+cargo build --release
+
+# Run (point to libghostty.so location)
+LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/cmux-linux
 ```
 
-Smoke-test GTK mode headlessly (useful on CI/headless hosts):
+### Package a release tarball
 
 ```bash
-xvfb-run -a cargo run --manifest-path linux/Cargo.toml -p cmux-host-linux --features gtk-ui --bin cmux-linux -- --socket /tmp/cmux-gtk-smoke.sock
+./scripts/package.sh
 ```
 
-Build Zig host scaffold:
+This builds the binary, bundles `libghostty.so`, icons, and an install script into a tarball.
 
-```bash
-cd linux/zig
-zig build
+## Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+Shift+N` | New workspace (folder picker) |
+| `Ctrl+Shift+W` | Close workspace |
+| `Ctrl+Shift+Left/Right` | Cycle tabs in focused pane |
+| `Ctrl+Shift+D` | Split down |
+| `Ctrl+Shift+T` | New terminal tab |
+| `Ctrl+D` | Split right |
+| `Ctrl+W` | Close focused pane |
+| `Ctrl+B` | Toggle sidebar |
+| `Ctrl+T` | New terminal tab |
+| `Ctrl+Arrow` | Focus pane in direction |
+| `Ctrl+PageDown/Up` | Next/prev workspace |
+| `Ctrl+1-9` | Switch to workspace by number |
+
+## Architecture
+
+```
+rust/
+  cmux-host-linux/    # GTK4/Adwaita UI (window, sidebar, panes, tabs)
+  cmux-ghostty-sys/   # FFI bindings to libghostty
+  cmux-core/          # Command dispatcher and state engine
+  cmux-protocol/      # Socket wire format types
+  cmux-control/       # Unix socket server
+  cmux-cli/           # CLI client
 ```
 
-## Docs
+The terminal rendering is handled entirely by Ghostty's embedded library (`libghostty.so`), which provides GPU-accelerated OpenGL rendering. The UI layer is native GTK4 with libadwaita.
 
-- Linux architecture decisions: `docs/linux-port-architecture.md`
-- Rust usage notes: `linux/rust/README.md`
-- Zig host notes: `linux/zig/README.md`
+## License
+
+MIT
