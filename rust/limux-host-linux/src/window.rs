@@ -574,7 +574,7 @@ pub fn build_window(app: &adw::Application) {
 
     // GTK4/libadwaita always uses CSD and ignores the xdg-decoration negotiation.
     // Skip the header bar when the display provides its own window decorations:
-    // - X11: WMs always provide SSD (downcast to WaylandDisplay fails → default to true).
+    // - X11: keep showing the app header bar (downcast to WaylandDisplay fails).
     // - Wayland: if the compositor advertises xdg-decoration.
     let provides_decorations = gtk::gdk::Display::default()
         .and_then(|d| d.downcast::<gdk4_wayland::WaylandDisplay>().ok())
