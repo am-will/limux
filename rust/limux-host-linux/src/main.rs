@@ -43,7 +43,10 @@ fn main() {
     // Initialize Ghostty before GTK app starts
     terminal::init_ghostty();
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(adw::gio::ApplicationFlags::NON_UNIQUE)
+        .build();
 
     app.connect_activate(window::build_window);
 
