@@ -15,6 +15,7 @@ webkit = ["dep:webkit6"]
 
 [dependencies]
 gtk4 = { version = "0.11", features = ["v4_10"] }
+gdk4-wayland = "0.11"
 libadwaita = "0.9"
 uuid = { version = "1", features = ["v4"] }
 webkit6 = { version = "0.6", optional = true }

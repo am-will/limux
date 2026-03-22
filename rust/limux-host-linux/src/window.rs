@@ -306,8 +306,23 @@ pub fn build_window(app: &adw::Application) {
         .default_height(900)
         .build();
 
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&gtk::Label::builder().label(&title).build()));
+    // GTK4/libadwaita always uses CSD and ignores the xdg-decoration negotiation.
+    // Skip the header bar when the display provides its own window decorations:
+    // - X11: WMs always provide SSD (downcast to WaylandDisplay fails → default to true).
+    // - Wayland: if the compositor advertises xdg-decoration.
+    let provides_decorations = gtk::gdk::Display::default()
+        .and_then(|d| d.downcast::<gdk4_wayland::WaylandDisplay>().ok())
+        .map(|d| d.query_registry("zxdg_decoration_manager_v1"))
+        // Not a Wayland display (X11) → default to showing header bar
+        .unwrap_or(false);
+
+    let header = if provides_decorations {
+        None
+    } else {
+        let bar = adw::HeaderBar::new();
+        bar.set_title_widget(Some(&gtk::Label::builder().label(&title).build()));
+        Some(bar)
+    };
 
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::None);
@@ -407,7 +422,9 @@ pub fn build_window(app: &adw::Application) {
     content_overlay.add_overlay(&expand_btn);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    vbox.append(&header);
+    if let Some(ref header) = header {
+        vbox.append(header);
+    }
     vbox.append(&content_overlay);
     window.set_content(Some(&vbox));
 
