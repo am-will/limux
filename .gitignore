@@ -4,3 +4,8 @@ zig/zig-out/
 dist/
 *.tar.gz
 .worktrees/
+linux/
+__pycache__/
+*.py[cod]
+*.deb
+*.AppImage

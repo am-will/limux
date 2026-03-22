@@ -82,6 +82,16 @@ LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 
 This builds the binary, bundles `libghostty.so`, icons, and an install script into a tarball.
 
+## Development
+
+Run the canonical local quality gate before committing:
+
+```bash
+./scripts/check.sh
+```
+
+Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |

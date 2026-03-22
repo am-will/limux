@@ -26,14 +26,18 @@ unsafe impl Sync for GhosttyState {}
 
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 
+type TitleChangedCallback = dyn Fn(&str);
+type PwdChangedCallback = dyn Fn(&str);
+type VoidCallback = dyn Fn();
+
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
     gl_area: gtk::GLArea,
     toast_overlay: gtk::Overlay,
-    on_title_changed: Option<Box<dyn Fn(&str)>>,
-    on_pwd_changed: Option<Box<dyn Fn(&str)>>,
-    on_bell: Option<Box<dyn Fn()>>,
-    on_close: Option<Box<dyn Fn()>>,
+    on_title_changed: Option<Box<TitleChangedCallback>>,
+    on_pwd_changed: Option<Box<PwdChangedCallback>>,
+    on_bell: Option<Box<VoidCallback>>,
+    on_close: Option<Box<VoidCallback>>,
     clipboard_context: *mut ClipboardContext,
 }
 
@@ -332,12 +336,12 @@ unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_al
 // ---------------------------------------------------------------------------
 
 pub struct TerminalCallbacks {
-    pub on_title_changed: Box<dyn Fn(&str)>,
-    pub on_pwd_changed: Box<dyn Fn(&str)>,
-    pub on_bell: Box<dyn Fn()>,
-    pub on_close: Box<dyn Fn()>,
-    pub on_split_right: Box<dyn Fn()>,
-    pub on_split_down: Box<dyn Fn()>,
+    pub on_title_changed: Box<TitleChangedCallback>,
+    pub on_pwd_changed: Box<PwdChangedCallback>,
+    pub on_bell: Box<VoidCallback>,
+    pub on_close: Box<VoidCallback>,
+    pub on_split_right: Box<VoidCallback>,
+    pub on_split_down: Box<VoidCallback>,
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -360,7 +364,8 @@ pub fn create_terminal(
     let callbacks = Rc::new(callbacks);
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
-    let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> = Rc::new(Cell::new(ptr::null_mut()));
+    let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
+        Rc::new(Cell::new(ptr::null_mut()));
 
     // Create overlay early so closures can capture it for toast notifications
     let overlay = gtk::Overlay::new();
@@ -798,7 +803,6 @@ fn show_terminal_context_menu(
         if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
             let label = btn.label().unwrap_or_default().to_string();
             let pop = popover.clone();
-            let surface = surface;
             let cb = callbacks.clone();
 
             btn.connect_clicked(move |_| {
@@ -851,7 +855,11 @@ fn translate_key_event(
 
     // unshifted_codepoint must be the codepoint WITHOUT shift applied.
     // keyval already includes shift (e.g., Shift+a → 'A'), so use to_lower().
-    let unshifted = keyval.to_lower().to_unicode().map(|c| c as u32).unwrap_or(0);
+    let unshifted = keyval
+        .to_lower()
+        .to_unicode()
+        .map(|c| c as u32)
+        .unwrap_or(0);
 
     // Mark shift as consumed when it produced a different character
     // (e.g., a→A, 1→!). This tells Ghostty not to treat shift as

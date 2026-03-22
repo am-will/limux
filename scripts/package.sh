@@ -17,6 +17,18 @@ APP_ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons/app"
 DESKTOP_FILE="${ROOT_DIR}/rust/limux-host-linux/limux.desktop"
 OUT_DIR="${ROOT_DIR}/dist"
 
+remove_tree() {
+    local path="$1"
+
+    if [ ! -e "$path" ]; then
+        return 0
+    fi
+
+    find "$path" -depth -mindepth 1 ! -type d -exec rm -f {} +
+    find "$path" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
+    rmdir "$path" 2>/dev/null || true
+}
+
 echo "=== Limux Packager ==="
 echo "Version: ${VERSION}"
 echo "Arch:    ${ARCH}"
@@ -39,7 +51,8 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 # Clean staging and output
-rm -rf "$STAGE" "$OUT_DIR"
+remove_tree "$STAGE"
+remove_tree "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 # =========================================================================
@@ -92,7 +105,7 @@ populate_tree() {
 echo ""
 echo "--- Building tarball ---"
 TARBALL_STAGE="/tmp/${PKG_BASE}"
-rm -rf "$TARBALL_STAGE"
+remove_tree "$TARBALL_STAGE"
 mkdir -p "$TARBALL_STAGE"/{lib,share/applications,share/icons/hicolor/scalable/actions}
 
 cp "$BINARY" "$TARBALL_STAGE/limux"
@@ -146,11 +159,23 @@ need_root() {
     fi
 }
 
+remove_tree() {
+    local path="$1"
+
+    if [ ! -e "$path" ]; then
+        return 0
+    fi
+
+    find "$path" -depth -mindepth 1 ! -type d -exec rm -f {} +
+    find "$path" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
+    rmdir "$path" 2>/dev/null || true
+}
+
 if $UNINSTALL; then
     need_root "$@"
     echo "Uninstalling Limux..."
     rm -f "$PREFIX/bin/limux"
-    rm -rf "$PREFIX/lib/limux"
+    remove_tree "$PREFIX/lib/limux"
     rm -f /etc/ld.so.conf.d/limux.conf
     ldconfig 2>/dev/null || true
     rm -f "$PREFIX/share/applications/limux.desktop"
@@ -192,7 +217,7 @@ INSTALL_EOF
 
 chmod 755 "$TARBALL_STAGE/install.sh"
 tar -czf "$OUT_DIR/${PKG_BASE}.tar.gz" -C /tmp "${PKG_BASE}"
-rm -rf "$TARBALL_STAGE"
+remove_tree "$TARBALL_STAGE"
 echo "  -> dist/${PKG_BASE}.tar.gz"
 
 # =========================================================================
@@ -201,7 +226,7 @@ echo "  -> dist/${PKG_BASE}.tar.gz"
 echo ""
 echo "--- Building .deb ---"
 DEB_ROOT="$STAGE/deb"
-rm -rf "$DEB_ROOT"
+remove_tree "$DEB_ROOT"
 populate_tree "$DEB_ROOT"
 
 # ldconfig trigger

@@ -6,7 +6,10 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::layout_state::{self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState, WorkspaceState};
+use crate::layout_state::{
+    self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState,
+    WorkspaceState,
+};
 use crate::pane::{self, PaneCallbacks};
 
 // ---------------------------------------------------------------------------
@@ -131,7 +134,11 @@ fn restore_active_workspace(state: &State, index: usize) {
             None
         } else {
             let clamped = index.min(s.workspaces.len() - 1);
-            Some((clamped, s.workspaces[clamped].sidebar_row.clone(), s.sidebar_list.clone()))
+            Some((
+                clamped,
+                s.workspaces[clamped].sidebar_row.clone(),
+                s.sidebar_list.clone(),
+            ))
         }
     };
 
@@ -218,7 +225,8 @@ fn sidebar_is_visible(state: &AppState) -> bool {
 
 fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
     unsafe {
-        paned.data::<Rc<RefCell<f64>>>(SPLIT_RATIO_STATE_KEY)
+        paned
+            .data::<Rc<RefCell<f64>>>(SPLIT_RATIO_STATE_KEY)
             .map(|ptr| ptr.as_ref().clone())
     }
 }
@@ -538,7 +546,7 @@ pub fn build_window(app: &adw::Application) {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     // Try several possible icon locations
-    for candidate in &[
+    for path in [
         exe_dir
             .as_ref()
             .map(|d| d.join("../../rust/limux-host-linux/icons")),
@@ -547,11 +555,12 @@ pub fn build_window(app: &adw::Application) {
             env!("CARGO_MANIFEST_DIR"),
             "/icons"
         ))),
-    ] {
-        if let Some(path) = candidate {
-            if path.exists() {
-                icon_theme.add_search_path(path);
-            }
+    ]
+    .iter()
+    .flatten()
+    {
+        if path.exists() {
+            icon_theme.add_search_path(path);
         }
     }
 
@@ -1905,11 +1914,7 @@ fn split_pane(
         s.workspaces
             .iter()
             .find(|w| w.id == ws_id)
-            .and_then(|ws| {
-                ws.folder_path
-                    .clone()
-                    .or_else(|| ws.cwd.borrow().clone())
-            })
+            .and_then(|ws| ws.folder_path.clone().or_else(|| ws.cwd.borrow().clone()))
     };
     let new_pane = create_pane_for_workspace(state, ws_id, wd.as_deref(), None);
 
@@ -2209,7 +2214,6 @@ fn find_leaf_pane(widget: &gtk::Widget, axis: gtk::Orientation, prefer_start: bo
         widget.clone()
     }
 }
-
 
 fn mark_workspace_unread(state: &State, ws_id: &str) {
     let mut s = state.borrow_mut();

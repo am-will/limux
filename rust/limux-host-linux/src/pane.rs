@@ -18,13 +18,29 @@ use crate::terminal::{self, TerminalCallbacks};
 // Types
 // ---------------------------------------------------------------------------
 
+type PaneSplitCallback = dyn Fn(&gtk::Widget, gtk::Orientation);
+type PaneWidgetCallback = dyn Fn(&gtk::Widget);
+type PaneSignalCallback = dyn Fn();
+type PanePathCallback = dyn Fn(&str);
+
 pub struct PaneCallbacks {
-    pub on_split: Box<dyn Fn(&gtk::Widget, gtk::Orientation)>,
-    pub on_close_pane: Box<dyn Fn(&gtk::Widget)>,
-    pub on_bell: Box<dyn Fn()>,
-    pub on_pwd_changed: Box<dyn Fn(&str)>,
-    pub on_empty: Box<dyn Fn(&gtk::Widget)>,
-    pub on_state_changed: Box<dyn Fn()>,
+    pub on_split: Box<PaneSplitCallback>,
+    pub on_close_pane: Box<PaneWidgetCallback>,
+    pub on_bell: Box<PaneSignalCallback>,
+    pub on_pwd_changed: Box<PanePathCallback>,
+    pub on_empty: Box<PaneWidgetCallback>,
+    pub on_state_changed: Box<PaneSignalCallback>,
+}
+
+#[derive(Clone)]
+struct TabContextMenuContext {
+    tab_strip: gtk::Box,
+    content_stack: gtk::Stack,
+    tab_state: Rc<RefCell<TabState>>,
+    callbacks: Rc<PaneCallbacks>,
+    pane_outer: gtk::Box,
+    label: gtk::Label,
+    pin_icon: gtk::Label,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,9 +152,8 @@ pub fn create_pane(
     initial_state: Option<&PaneState>,
 ) -> gtk::Box {
     // Store workspace working directory for new tabs/splits to inherit
-    let ws_wd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(
-        working_directory.map(|s| s.to_string()),
-    ));
+    let ws_wd: Rc<RefCell<Option<String>>> =
+        Rc::new(RefCell::new(working_directory.map(|s| s.to_string())));
 
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -480,7 +495,13 @@ fn restore_tabs_from_state(
     let active_tab_id = saved_state
         .active_tab_id
         .as_deref()
-        .filter(|candidate| tab_state.borrow().tabs.iter().any(|tab| tab.id == *candidate))
+        .filter(|candidate| {
+            tab_state
+                .borrow()
+                .tabs
+                .iter()
+                .any(|tab| tab.id == *candidate)
+        })
         .map(|value| value.to_string())
         .or_else(|| tab_state.borrow().tabs.first().map(|tab| tab.id.clone()));
 
@@ -621,7 +642,12 @@ fn add_terminal_tab_inner(
         title_label.set_label(custom_name);
     }
     if options.as_ref().map(|value| value.pinned).unwrap_or(false) {
-        if let Some(entry) = tab_state.borrow().tabs.iter().find(|entry| entry.id == tab_id) {
+        if let Some(entry) = tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+        {
             apply_pin_visuals(&entry.tab_button, true);
         }
     }
@@ -689,7 +715,12 @@ fn add_browser_tab_inner(
         title_label.set_label(custom_name);
     }
     if options.as_ref().map(|value| value.pinned).unwrap_or(false) {
-        if let Some(entry) = tab_state.borrow().tabs.iter().find(|entry| entry.id == tab_id) {
+        if let Some(entry) = tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+        {
             apply_pin_visuals(&entry.tab_button, true);
         }
     }
@@ -774,8 +805,14 @@ fn apply_pin_visuals(tab_button: &gtk::Box, pinned: bool) {
     if let Some(close_widget) = tab_button.last_child() {
         close_widget.set_visible(!pinned);
     }
-    if let Some(inner_box) = tab_button.first_child().and_then(|child| child.downcast::<gtk::Box>().ok()) {
-        if let Some(pin_icon) = inner_box.first_child().and_then(|child| child.downcast::<gtk::Label>().ok()) {
+    if let Some(inner_box) = tab_button
+        .first_child()
+        .and_then(|child| child.downcast::<gtk::Box>().ok())
+    {
+        if let Some(pin_icon) = inner_box
+            .first_child()
+            .and_then(|child| child.downcast::<gtk::Label>().ok())
+        {
             pin_icon.set_label(if pinned { "📌" } else { "" });
             pin_icon.set_visible(pinned);
         }
@@ -855,8 +892,17 @@ fn build_tab_button(
         let lbl = label.clone();
         let pin = pin_icon.clone();
         let tb = tab_btn.clone();
+        let context = TabContextMenuContext {
+            tab_strip: ts,
+            content_stack: cs,
+            tab_state: state,
+            callbacks: cb,
+            pane_outer: po,
+            label: lbl,
+            pin_icon: pin,
+        };
         right_click.connect_pressed(move |_gesture, _, _x, _y| {
-            show_tab_context_menu(&tb, &tid, &ts, &cs, &state, &cb, &po, &lbl, &pin);
+            show_tab_context_menu(&tb, &tid, &context);
         });
     }
     tab_btn.add_controller(right_click);
@@ -913,17 +959,7 @@ fn build_tab_button(
     (tab_btn, label)
 }
 
-fn show_tab_context_menu(
-    tab_btn: &gtk::Box,
-    tab_id: &str,
-    tab_strip: &gtk::Box,
-    content_stack: &gtk::Stack,
-    tab_state: &Rc<RefCell<TabState>>,
-    callbacks: &Rc<PaneCallbacks>,
-    pane_outer: &gtk::Box,
-    label: &gtk::Label,
-    pin_icon: &gtk::Label,
-) {
+fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextMenuContext) {
     let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     menu_box.set_margin_top(4);
@@ -935,11 +971,11 @@ fn show_tab_context_menu(
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
     {
-        let lbl = label.clone();
-        let state = tab_state.clone();
+        let lbl = context.label.clone();
+        let state = context.tab_state.clone();
         let tid = tab_id.to_string();
         let menu_ref = menu.clone();
-        let callbacks = callbacks.clone();
+        let callbacks = context.callbacks.clone();
         rename_btn.connect_clicked(move |_| {
             menu_ref.popdown();
             show_rename_dialog(&lbl, &state, &tid, &callbacks);
@@ -947,7 +983,8 @@ fn show_tab_context_menu(
     }
 
     // Pin / Unpin
-    let is_pinned = tab_state
+    let is_pinned = context
+        .tab_state
         .borrow()
         .tabs
         .iter()
@@ -956,12 +993,12 @@ fn show_tab_context_menu(
     let pin_btn = gtk::Button::with_label(pin_label);
     pin_btn.add_css_class("flat");
     {
-        let state = tab_state.clone();
+        let state = context.tab_state.clone();
         let tid = tab_id.to_string();
-        let pin = pin_icon.clone();
+        let pin = context.pin_icon.clone();
         let close = tab_btn.last_child(); // close button
         let menu_ref = menu.clone();
-        let callbacks = callbacks.clone();
+        let callbacks = context.callbacks.clone();
         pin_btn.connect_clicked(move |_| {
             menu_ref.popdown();
             let mut ts = state.borrow_mut();
@@ -984,11 +1021,11 @@ fn show_tab_context_menu(
     close_btn.add_css_class("flat");
     {
         let tid = tab_id.to_string();
-        let ts = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state = tab_state.clone();
-        let cb = callbacks.clone();
-        let po = pane_outer.clone();
+        let ts = context.tab_strip.clone();
+        let cs = context.content_stack.clone();
+        let state = context.tab_state.clone();
+        let cb = context.callbacks.clone();
+        let po = context.pane_outer.clone();
         let menu_ref = menu.clone();
         close_btn.connect_clicked(move |_| {
             menu_ref.popdown();
@@ -1004,12 +1041,9 @@ fn show_tab_context_menu(
     menu.set_has_arrow(false);
 
     // Clean up popover when it closes
-    {
-        let _tb = tab_btn.clone();
-        menu.connect_closed(move |popover| {
-            popover.unparent();
-        });
-    }
+    menu.connect_closed(move |popover| {
+        popover.unparent();
+    });
 
     menu.popup();
 }
@@ -1112,8 +1146,7 @@ fn reorder_tab(
 
     // Move the tab entry
     let entry = ts.tabs.remove(src_idx);
-    let insert_at = if src_idx < tgt_idx { tgt_idx } else { tgt_idx };
-    ts.tabs.insert(insert_at, entry);
+    ts.tabs.insert(tgt_idx, entry);
 
     // Rebuild tab strip order
     // Remove all tab buttons then re-add in order

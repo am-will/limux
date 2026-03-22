@@ -101,8 +101,14 @@ pub struct TabState {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "tab_kind", rename_all = "snake_case")]
 pub enum TabContentState {
-    Terminal { #[serde(default)] cwd: Option<String> },
-    Browser { #[serde(default)] uri: Option<String> },
+    Terminal {
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    Browser {
+        #[serde(default)]
+        uri: Option<String>,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -269,7 +275,13 @@ pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
         state.active_workspace_index = state.workspaces.len() - 1;
     }
     for workspace in &mut state.workspaces {
-        normalize_layout(&mut workspace.layout, workspace.folder_path.as_deref().or(workspace.cwd.as_deref()));
+        normalize_layout(
+            &mut workspace.layout,
+            workspace
+                .folder_path
+                .as_deref()
+                .or(workspace.cwd.as_deref()),
+        );
     }
     state
 }
@@ -302,11 +314,13 @@ pub fn normalize_layout(layout: &mut LayoutNodeState, working_directory: Option<
 
 impl AppSessionState {
     pub fn from_legacy(workspaces: Vec<LegacySavedWorkspace>) -> Self {
-        let mut state = Self::default();
-        state.workspaces = workspaces
+        let workspaces = workspaces
             .into_iter()
             .map(|workspace| {
-                let working_directory = workspace.folder_path.as_deref().or(workspace.cwd.as_deref());
+                let working_directory = workspace
+                    .folder_path
+                    .as_deref()
+                    .or(workspace.cwd.as_deref());
                 let tab = TabState::terminal(default_tab_id("legacy-terminal"), working_directory);
                 WorkspaceState {
                     name: workspace.name,
@@ -322,7 +336,10 @@ impl AppSessionState {
                 }
             })
             .collect();
-        normalize_session(state)
+        normalize_session(Self {
+            workspaces,
+            ..Self::default()
+        })
     }
 }
 
