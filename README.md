@@ -23,13 +23,13 @@ Download the latest release from [GitHub Releases](https://github.com/am-will/li
 
 **Debian/Ubuntu (.deb)** — recommended, shows up in app launcher immediately:
 ```bash
-sudo apt install ./limux_0.1.1_amd64.deb
+sudo apt install ./limux_0.1.2_amd64.deb
 ```
 
 **AppImage** — portable, no install needed:
 ```bash
-chmod +x Limux-0.1.1-x86_64.AppImage
-./Limux-0.1.1-x86_64.AppImage
+chmod +x Limux-0.1.2-x86_64.AppImage
+./Limux-0.1.2-x86_64.AppImage
 ```
 
 **Tarball** — manual install:

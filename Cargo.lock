@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "limux-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "limux-control"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "limux-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "limux-protocol",
@@ -751,14 +751,14 @@ dependencies = [
 
 [[package]]
 name = "limux-ghostty-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "limux-host-linux"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs",
  "gtk4",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "limux-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
