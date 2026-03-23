@@ -87,11 +87,12 @@ mkdir -p "$OUT_DIR"
 # =========================================================================
 populate_tree() {
     local dest="$1"
-    local bindir="$dest/usr/local/bin"
-    local libdir="$dest/usr/local/lib/limux"
-    local ghostty_resdir="$dest/usr/local/share/limux"
-    local appdir="$dest/usr/local/share/applications"
-    local icondir="$dest/usr/local/share/icons/hicolor"
+    local prefix="${2:-/usr/local}"
+    local bindir="$dest${prefix}/bin"
+    local libdir="$dest${prefix}/lib/limux"
+    local ghostty_resdir="$dest${prefix}/share/limux"
+    local appdir="$dest${prefix}/share/applications"
+    local icondir="$dest${prefix}/share/icons/hicolor"
 
     mkdir -p "$bindir" "$libdir" "$ghostty_resdir" "$appdir" "$icondir/scalable/actions"
 
@@ -263,11 +264,11 @@ echo ""
 echo "--- Building .deb ---"
 DEB_ROOT="$STAGE/deb"
 remove_tree "$DEB_ROOT"
-populate_tree "$DEB_ROOT"
+populate_tree "$DEB_ROOT" "/usr"
 
 # ldconfig trigger
 mkdir -p "$DEB_ROOT/etc/ld.so.conf.d"
-echo "/usr/local/lib/limux" > "$DEB_ROOT/etc/ld.so.conf.d/limux.conf"
+echo "/usr/lib/limux" > "$DEB_ROOT/etc/ld.so.conf.d/limux.conf"
 
 # Control file
 INSTALLED_SIZE=$(du -sk "$DEB_ROOT" | cut -f1)
@@ -292,8 +293,8 @@ EOF
 cat > "$DEB_ROOT/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
 ldconfig 2>/dev/null || true
-gtk-update-icon-cache -f -t /usr/local/share/icons/hicolor 2>/dev/null || true
-update-desktop-database /usr/local/share/applications 2>/dev/null || true
+gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+update-desktop-database /usr/share/applications 2>/dev/null || true
 EOF
 chmod 755 "$DEB_ROOT/DEBIAN/postinst"
 
@@ -301,8 +302,8 @@ chmod 755 "$DEB_ROOT/DEBIAN/postinst"
 cat > "$DEB_ROOT/DEBIAN/postrm" << 'EOF'
 #!/bin/bash
 ldconfig 2>/dev/null || true
-gtk-update-icon-cache -f -t /usr/local/share/icons/hicolor 2>/dev/null || true
-update-desktop-database /usr/local/share/applications 2>/dev/null || true
+gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+update-desktop-database /usr/share/applications 2>/dev/null || true
 EOF
 chmod 755 "$DEB_ROOT/DEBIAN/postrm"
 
