@@ -565,12 +565,7 @@ pub fn create_terminal(
         let key_controller = gtk::EventControllerKey::new();
         key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_press.borrow() {
-                let text_char = keyval.to_unicode();
-                let mut text_buf = [0u8; 4];
-                let c_text = text_char
-                    .filter(|c| !c.is_control())
-                    .map(|c| c.encode_utf8(&mut text_buf) as &str)
-                    .and_then(|s| CString::new(s).ok());
+                let c_text = key_event_text(keyval);
 
                 let current_event = ctrl
                     .current_event()
@@ -922,6 +917,17 @@ fn translate_key_event(
     }
 }
 
+fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {
+    let ch = keyval.to_unicode()?;
+    if ch.is_control() {
+        return None;
+    }
+
+    let mut buf = [0u8; 4];
+    let s = ch.encode_utf8(&mut buf);
+    CString::new(s.as_bytes()).ok()
+}
+
 fn keyval_unicode_unshifted(
     widget: &gtk::Widget,
     key_event: &gtk::gdk::KeyEvent,
@@ -1098,5 +1104,17 @@ mod tests {
             fallback_unshifted_codepoint(gtk::gdk::Key::A),
             'a' as u32
         );
+    }
+
+    #[test]
+    fn key_event_text_preserves_printable_chords() {
+        let ctrl_shift_h = key_event_text(gtk::gdk::Key::H)
+            .and_then(|s| s.into_string().ok());
+        let alt_shift_gt = key_event_text(gtk::gdk::Key::greater)
+            .and_then(|s| s.into_string().ok());
+
+        assert_eq!(ctrl_shift_h.as_deref(), Some("H"));
+        assert_eq!(alt_shift_gt.as_deref(), Some(">"));
+        assert!(key_event_text(gtk::gdk::Key::BackSpace).is_none());
     }
 }
