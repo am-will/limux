@@ -563,7 +563,7 @@ pub fn create_terminal(
         let sc_press = surface_cell.clone();
         let sc_release = surface_cell.clone();
         let key_controller = gtk::EventControllerKey::new();
-        key_controller.connect_key_pressed(move |_ctrl, keyval, keycode, modifier| {
+        key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_press.borrow() {
                 let text_char = keyval.to_unicode();
                 let mut text_buf = [0u8; 4];
@@ -572,8 +572,19 @@ pub fn create_terminal(
                     .map(|c| c.encode_utf8(&mut text_buf) as &str)
                     .and_then(|s| CString::new(s).ok());
 
-                let mut event =
-                    translate_key_event(GHOSTTY_ACTION_PRESS, keyval, keycode, modifier);
+                let current_event = ctrl
+                    .current_event()
+                    .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+                let widget = ctrl.widget();
+
+                let mut event = translate_key_event(
+                    GHOSTTY_ACTION_PRESS,
+                    widget.as_ref(),
+                    current_event.as_ref(),
+                    keyval,
+                    keycode,
+                    modifier,
+                );
                 if let Some(ref ct) = c_text {
                     event.text = ct.as_ptr();
                 }
@@ -586,9 +597,20 @@ pub fn create_terminal(
             glib::Propagation::Proceed
         });
 
-        key_controller.connect_key_released(move |_ctrl, keyval, keycode, modifier| {
+        key_controller.connect_key_released(move |ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_release.borrow() {
-                let event = translate_key_event(GHOSTTY_ACTION_RELEASE, keyval, keycode, modifier);
+                let current_event = ctrl
+                    .current_event()
+                    .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+                let widget = ctrl.widget();
+                let event = translate_key_event(
+                    GHOSTTY_ACTION_RELEASE,
+                    widget.as_ref(),
+                    current_event.as_ref(),
+                    keyval,
+                    keycode,
+                    modifier,
+                );
                 unsafe { ghostty_surface_key(surface, event) };
             }
         });
@@ -860,6 +882,8 @@ fn show_terminal_context_menu(
 
 fn translate_key_event(
     action: c_int,
+    widget: Option<&gtk::Widget>,
+    key_event: Option<&gtk::gdk::KeyEvent>,
     keyval: gtk::gdk::Key,
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
@@ -878,24 +902,14 @@ fn translate_key_event(
         mods |= GHOSTTY_MODS_SUPER;
     }
 
-    // unshifted_codepoint must be the codepoint WITHOUT shift applied.
-    // keyval already includes shift (e.g., Shift+a → 'A'), so use to_lower().
-    let unshifted = keyval
-        .to_lower()
-        .to_unicode()
-        .map(|c| c as u32)
-        .unwrap_or(0);
+    let unshifted = widget
+        .zip(key_event)
+        .and_then(|(widget, key_event)| keyval_unicode_unshifted(widget, key_event, keycode))
+        .unwrap_or_else(|| fallback_unshifted_codepoint(keyval));
 
-    // Mark shift as consumed when it produced a different character
-    // (e.g., a→A, 1→!). This tells Ghostty not to treat shift as
-    // a separate modifier for keybinding matching.
-    let mut consumed: c_int = GHOSTTY_MODS_NONE;
-    if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-        let shifted = keyval.to_unicode().map(|c| c as u32).unwrap_or(0);
-        if shifted != 0 && shifted != unshifted {
-            consumed |= GHOSTTY_MODS_SHIFT;
-        }
-    }
+    let consumed = key_event
+        .map(translate_consumed_mods)
+        .unwrap_or_else(|| fallback_consumed_mods(keyval, modifier));
 
     ghostty_input_key_s {
         action,
@@ -905,6 +919,74 @@ fn translate_key_event(
         text: ptr::null(),
         unshifted_codepoint: unshifted,
         composing: false,
+    }
+}
+
+fn keyval_unicode_unshifted(
+    widget: &gtk::Widget,
+    key_event: &gtk::gdk::KeyEvent,
+    keycode: u32,
+) -> Option<u32> {
+    widget
+        .display()
+        .map_keycode(keycode)
+        .and_then(|entries| {
+            entries
+                .into_iter()
+                .find(|(keymap_key, _)| {
+                    keymap_key.group() == key_event.layout() as i32 && keymap_key.level() == 0
+                })
+                .and_then(|(_, key)| key.to_unicode())
+        })
+        .map(|ch| ch as u32)
+        .filter(|codepoint| *codepoint != 0)
+}
+
+fn translate_consumed_mods(key_event: &gtk::gdk::KeyEvent) -> c_int {
+    let consumed = key_event.consumed_modifiers() & gtk::gdk::MODIFIER_MASK;
+    translate_mouse_mods(consumed)
+}
+
+fn fallback_consumed_mods(
+    keyval: gtk::gdk::Key,
+    modifier: gtk::gdk::ModifierType,
+) -> c_int {
+    let mut consumed: c_int = GHOSTTY_MODS_NONE;
+    if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        let shifted = keyval.to_unicode().map(|c| c as u32).unwrap_or(0);
+        let unshifted = fallback_unshifted_codepoint(keyval);
+        if shifted != 0 && shifted != unshifted {
+            consumed |= GHOSTTY_MODS_SHIFT;
+        }
+    }
+    consumed
+}
+
+fn fallback_unshifted_codepoint(keyval: gtk::gdk::Key) -> u32 {
+    match keyval.to_unicode() {
+        Some('!') => '1' as u32,
+        Some('@') => '2' as u32,
+        Some('#') => '3' as u32,
+        Some('$') => '4' as u32,
+        Some('%') => '5' as u32,
+        Some('^') => '6' as u32,
+        Some('&') => '7' as u32,
+        Some('*') => '8' as u32,
+        Some('(') => '9' as u32,
+        Some(')') => '0' as u32,
+        Some('_') => '-' as u32,
+        Some('+') => '=' as u32,
+        Some('{') => '[' as u32,
+        Some('}') => ']' as u32,
+        Some('|') => '\\' as u32,
+        Some(':') => ';' as u32,
+        Some('"') => '\'' as u32,
+        Some('<') => ',' as u32,
+        Some('>') => '.' as u32,
+        Some('?') => '/' as u32,
+        Some('~') => '`' as u32,
+        Some(ch) => ch.to_lowercase().next().map(|c| c as u32).unwrap_or(0),
+        None => 0,
     }
 }
 
@@ -1001,6 +1083,20 @@ mod tests {
         assert_eq!(
             ghostty_color_scheme_for_dark_mode(false),
             GHOSTTY_COLOR_SCHEME_LIGHT
+        );
+    }
+
+    #[test]
+    fn fallback_unshifted_codepoint_maps_shifted_symbols() {
+        assert_eq!(fallback_unshifted_codepoint(gtk::gdk::Key::exclam), '1' as u32);
+        assert_eq!(fallback_unshifted_codepoint(gtk::gdk::Key::plus), '=' as u32);
+        assert_eq!(
+            fallback_unshifted_codepoint(gtk::gdk::Key::underscore),
+            '-' as u32
+        );
+        assert_eq!(
+            fallback_unshifted_codepoint(gtk::gdk::Key::A),
+            'a' as u32
         );
     }
 }

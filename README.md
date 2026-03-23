@@ -107,11 +107,10 @@ Repository maintainability rules live in [`docs/maintainability.md`](docs/mainta
 | `Ctrl+Shift+W` | Close workspace |
 | `Ctrl+Shift+Left/Right` | Cycle tabs in focused pane |
 | `Ctrl+Shift+D` | Split down |
+| `Ctrl+Shift+R` | Split right |
 | `Ctrl+Shift+T` | New terminal tab |
-| `Ctrl+D` | Split right |
-| `Ctrl+W` | Close focused pane |
-| `Ctrl+B` | Toggle sidebar |
-| `Ctrl+T` | New terminal tab |
+| `Ctrl+Shift+Q` | Close focused pane |
+| `Ctrl+Shift+B` | Toggle sidebar |
 | `Ctrl+Arrow` | Focus pane in direction |
 | `Ctrl+PageDown/Up` | Next/prev workspace |
 | `Ctrl+1-9` | Switch to workspace by number |

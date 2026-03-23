@@ -620,7 +620,7 @@ pub fn build_window(app: &adw::Application) {
     let collapse_btn = gtk::Button::with_label("\u{00AB}"); // «
     collapse_btn.add_css_class("flat");
     collapse_btn.add_css_class("limux-sidebar-collapse");
-    collapse_btn.set_tooltip_text(Some("Hide sidebar (Ctrl+B)"));
+    collapse_btn.set_tooltip_text(Some("Hide sidebar (Ctrl+Shift+B)"));
 
     let sidebar_title = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -680,7 +680,7 @@ pub fn build_window(app: &adw::Application) {
     // Expand tab — small button on the left edge when sidebar is hidden
     let expand_btn = gtk::Button::with_label("\u{00BB}"); // »
     expand_btn.add_css_class("limux-sidebar-expand");
-    expand_btn.set_tooltip_text(Some("Show sidebar (Ctrl+B)"));
+    expand_btn.set_tooltip_text(Some("Show sidebar (Ctrl+Shift+B)"));
     expand_btn.set_valign(gtk::Align::Center);
     expand_btn.set_halign(gtk::Align::Start);
     expand_btn.set_visible(false);
@@ -887,29 +887,24 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
                 split_focused_pane(&state, gtk::Orientation::Vertical);
                 true
             }
+            // Ctrl+Shift+R → split right
+            (true, true, gdk::Key::R | gdk::Key::r) => {
+                split_focused_pane(&state, gtk::Orientation::Horizontal);
+                true
+            }
             // Ctrl+Shift+T → new terminal tab in focused pane
             (true, true, gdk::Key::T | gdk::Key::t) => {
                 add_tab_to_focused_pane(&state, false);
                 true
             }
-            // Ctrl+D → split right
-            (true, false, gdk::Key::d) => {
-                split_focused_pane(&state, gtk::Orientation::Horizontal);
-                true
-            }
-            // Ctrl+W → close focused tab/pane
-            (true, false, gdk::Key::w) => {
+            // Ctrl+Shift+Q → close focused tab/pane
+            (true, true, gdk::Key::Q | gdk::Key::q) => {
                 close_focused_tab(&state);
                 true
             }
-            // Ctrl+B → toggle sidebar
-            (true, false, gdk::Key::b) => {
+            // Ctrl+Shift+B → toggle sidebar
+            (true, true, gdk::Key::B | gdk::Key::b) => {
                 toggle_sidebar(&state);
-                true
-            }
-            // Ctrl+T → new terminal tab
-            (true, false, gdk::Key::t) => {
-                add_tab_to_focused_pane(&state, false);
                 true
             }
             // Ctrl+PageDown → next workspace
