@@ -953,10 +953,7 @@ fn translate_consumed_mods(key_event: &gtk::gdk::KeyEvent) -> c_int {
     translate_mouse_mods(consumed)
 }
 
-fn fallback_consumed_mods(
-    keyval: gtk::gdk::Key,
-    modifier: gtk::gdk::ModifierType,
-) -> c_int {
+fn fallback_consumed_mods(keyval: gtk::gdk::Key, modifier: gtk::gdk::ModifierType) -> c_int {
     let mut consumed: c_int = GHOSTTY_MODS_NONE;
     if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
         let shifted = keyval.to_unicode().map(|c| c as u32).unwrap_or(0);
@@ -1094,24 +1091,26 @@ mod tests {
 
     #[test]
     fn fallback_unshifted_codepoint_maps_shifted_symbols() {
-        assert_eq!(fallback_unshifted_codepoint(gtk::gdk::Key::exclam), '1' as u32);
-        assert_eq!(fallback_unshifted_codepoint(gtk::gdk::Key::plus), '=' as u32);
+        assert_eq!(
+            fallback_unshifted_codepoint(gtk::gdk::Key::exclam),
+            '1' as u32
+        );
+        assert_eq!(
+            fallback_unshifted_codepoint(gtk::gdk::Key::plus),
+            '=' as u32
+        );
         assert_eq!(
             fallback_unshifted_codepoint(gtk::gdk::Key::underscore),
             '-' as u32
         );
-        assert_eq!(
-            fallback_unshifted_codepoint(gtk::gdk::Key::A),
-            'a' as u32
-        );
+        assert_eq!(fallback_unshifted_codepoint(gtk::gdk::Key::A), 'a' as u32);
     }
 
     #[test]
     fn key_event_text_preserves_printable_chords() {
-        let ctrl_shift_h = key_event_text(gtk::gdk::Key::H)
-            .and_then(|s| s.into_string().ok());
-        let alt_shift_gt = key_event_text(gtk::gdk::Key::greater)
-            .and_then(|s| s.into_string().ok());
+        let ctrl_shift_h = key_event_text(gtk::gdk::Key::H).and_then(|s| s.into_string().ok());
+        let alt_shift_gt =
+            key_event_text(gtk::gdk::Key::greater).and_then(|s| s.into_string().ok());
 
         assert_eq!(ctrl_shift_h.as_deref(), Some("H"));
         assert_eq!(alt_shift_gt.as_deref(), Some(">"));
