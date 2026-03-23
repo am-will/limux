@@ -1,0 +1,54 @@
+name: Publish to AUR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (without v prefix)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  aur-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate AUR PKGBUILD
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          TARBALL_URL="https://github.com/am-will/limux/releases/download/v${VERSION}/limux-${VERSION}-linux-x86_64.tar.gz"
+
+          curl -fL "$TARBALL_URL" -o /tmp/limux.tar.gz
+          SHA256=$(sha256sum /tmp/limux.tar.gz | awk '{print $1}')
+
+          sed -e "s/@@VERSION@@/$VERSION/" \
+              -e "s/@@SHA256@@/$SHA256/" \
+              PKGBUILD.template > PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: limux-bin
+          pkgbuild: PKGBUILD
+          commit_username: "Anton Barchukov"
+          commit_email: anton@barchukov.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "chore: bump to ${{ steps.version.outputs.version }}"
+          force_push: true
