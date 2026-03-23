@@ -285,22 +285,32 @@ pub fn create_pane(
     // Flag set by workspace drag begin/end in window.rs
     let workspace_dragging = Rc::new(Cell::new(false));
 
+    // Build PaneInternals early so callbacks and tab setup can share it
+    let pane_id = next_pane_id();
+    let internals = Rc::new(PaneInternals {
+        pane_id,
+        tab_state: tab_state.clone(),
+        tab_strip: tab_strip.clone(),
+        content_stack: content_stack.clone(),
+        pane_outer: outer.clone(),
+        callbacks: callbacks.clone(),
+        working_directory: ws_wd.clone(),
+        drop_indicator: drop_indicator.clone(),
+        workspace_dragging: workspace_dragging.clone(),
+    });
+
     // Unified drop target on tab_overlay — determines insertion index from
     // the x coordinate so tabs land *between* existing tabs, not on top.
     // Also manages the drop-insert indicator widget.
     {
-        let strip = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state = tab_state.clone();
-        let cb = callbacks.clone();
-        let po = outer.clone();
         let indicator = drop_indicator.clone();
+        let tgt = internals.clone();
 
         let strip_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
 
         // Position the indicator during drag motion
         {
-            let state = state.clone();
+            let state = internals.tab_state.clone();
             let indicator = indicator.clone();
             let ws_drag = workspace_dragging.clone();
             strip_drop.connect_motion(move |_, _x, _y| {
@@ -335,29 +345,19 @@ pub fn create_pane(
                 return false;
             };
 
-            let target_pane_id = unsafe {
-                po.data::<Rc<PaneInternals>>("limux-pane-internals")
-                    .map(|ptr| ptr.as_ref().pane_id)
-                    .unwrap_or(0)
-            };
+            let insert_idx =
+                find_insert_index(&tgt.tab_state, x, src_pane_id == tgt.pane_id, src_tid);
 
-            let insert_idx = find_insert_index(&state, x, src_pane_id == target_pane_id, &src_tid);
-
-            if src_pane_id == target_pane_id {
-                reorder_tab_to_index(&strip, &state, &cb, src_tid, insert_idx);
-            } else {
-                if let Some(src_internals) = lookup_pane_internals(src_pane_id) {
-                    move_tab_between_panes(
-                        &src_internals,
-                        &strip,
-                        &cs,
-                        &state,
-                        &cb,
-                        &po,
-                        src_tid,
-                        insert_idx,
-                    );
-                }
+            if src_pane_id == tgt.pane_id {
+                reorder_tab_to_index(
+                    &tgt.tab_strip,
+                    &tgt.tab_state,
+                    &tgt.callbacks,
+                    src_tid,
+                    insert_idx,
+                );
+            } else if let Some(src_internals) = lookup_pane_internals(src_pane_id) {
+                move_tab_between_panes(&src_internals, &tgt, src_tid, insert_idx);
             }
 
             indicator.set_visible(false);
@@ -369,52 +369,24 @@ pub fn create_pane(
     }
 
     if let Some(saved_state) = initial_state {
-        restore_tabs_from_state(
-            &tab_strip,
-            &content_stack,
-            &tab_state,
-            &callbacks,
-            working_directory,
-            &outer,
-            &drop_indicator,
-            saved_state,
-        );
+        restore_tabs_from_state(&internals, working_directory, saved_state);
     } else {
-        add_terminal_tab_inner(
-            &tab_strip,
-            &content_stack,
-            &tab_state,
-            &callbacks,
-            working_directory,
-            &outer,
-            &drop_indicator,
-            None,
-        );
+        add_terminal_tab_inner(&internals, working_directory, None);
     }
 
     // Wire action buttons
     {
-        let ts = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state = tab_state.clone();
-        let cb = callbacks.clone();
-        let ow = outer.clone();
+        let i = internals.clone();
         let wd = ws_wd.clone();
-        let di = drop_indicator.clone();
         new_term_btn.connect_clicked(move |_| {
             let dir = wd.borrow().clone();
-            add_terminal_tab_inner(&ts, &cs, &state, &cb, dir.as_deref(), &ow, &di, None);
+            add_terminal_tab_inner(&i, dir.as_deref(), None);
         });
     }
     {
-        let ts = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state = tab_state.clone();
-        let cb = callbacks.clone();
-        let ow = outer.clone();
-        let di = drop_indicator.clone();
+        let i = internals.clone();
         new_browser_btn.connect_clicked(move |_| {
-            add_browser_tab_inner(&ts, &cs, &state, &cb, &ow, &di, None);
+            add_browser_tab_inner(&i, None);
         });
     }
     {
@@ -440,18 +412,6 @@ pub fn create_pane(
     }
 
     // Store internals on the outer widget so external code to cycle tabs
-    let pane_id = next_pane_id();
-    let internals = Rc::new(PaneInternals {
-        pane_id,
-        tab_state: tab_state.clone(),
-        tab_strip: tab_strip.clone(),
-        content_stack: content_stack.clone(),
-        pane_outer: outer.clone(),
-        callbacks: callbacks.clone(),
-        working_directory: ws_wd.clone(),
-        drop_indicator: drop_indicator.clone(),
-        workspace_dragging: workspace_dragging.clone(),
-    });
     register_pane(pane_id, &internals);
     unsafe {
         outer.set_data("limux-pane-internals", internals);
@@ -613,39 +573,20 @@ struct BrowserTabOptions<'a> {
 }
 
 fn restore_tabs_from_state(
-    tab_strip: &gtk::Box,
-    content_stack: &gtk::Stack,
-    tab_state: &Rc<RefCell<TabState>>,
-    callbacks: &Rc<PaneCallbacks>,
+    internals: &Rc<PaneInternals>,
     working_directory: Option<&str>,
-    pane_outer: &gtk::Box,
-    drop_indicator: &gtk::Box,
     saved_state: &PaneState,
 ) {
     if saved_state.tabs.is_empty() {
-        add_terminal_tab_inner(
-            tab_strip,
-            content_stack,
-            tab_state,
-            callbacks,
-            working_directory,
-            pane_outer,
-            drop_indicator,
-            None,
-        );
+        add_terminal_tab_inner(internals, working_directory, None);
         return;
     }
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
             TabContentState::Terminal { cwd } => add_terminal_tab_inner(
-                tab_strip,
-                content_stack,
-                tab_state,
-                callbacks,
+                internals,
                 cwd.as_deref().or(working_directory),
-                pane_outer,
-                drop_indicator,
                 Some(TerminalTabOptions {
                     id: Some(saved_tab.id.as_str()),
                     custom_name: saved_tab.custom_name.as_deref(),
@@ -654,12 +595,7 @@ fn restore_tabs_from_state(
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
-                tab_strip,
-                content_stack,
-                tab_state,
-                callbacks,
-                pane_outer,
-                drop_indicator,
+                internals,
                 Some(BrowserTabOptions {
                     id: Some(saved_tab.id.as_str()),
                     custom_name: saved_tab.custom_name.as_deref(),
@@ -674,28 +610,36 @@ fn restore_tabs_from_state(
         .active_tab_id
         .as_deref()
         .filter(|candidate| {
-            tab_state
+            internals
+                .tab_state
                 .borrow()
                 .tabs
                 .iter()
                 .any(|tab| tab.id == *candidate)
         })
         .map(|value| value.to_string())
-        .or_else(|| tab_state.borrow().tabs.first().map(|tab| tab.id.clone()));
+        .or_else(|| {
+            internals
+                .tab_state
+                .borrow()
+                .tabs
+                .first()
+                .map(|tab| tab.id.clone())
+        });
 
     if let Some(active_tab_id) = active_tab_id {
-        activate_tab(tab_strip, content_stack, tab_state, &active_tab_id);
+        activate_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &active_tab_id,
+        );
     }
 }
 
 fn add_terminal_tab_inner(
-    tab_strip: &gtk::Box,
-    content_stack: &gtk::Stack,
-    tab_state: &Rc<RefCell<TabState>>,
-    callbacks: &Rc<PaneCallbacks>,
+    internals: &Rc<PaneInternals>,
     working_directory: Option<&str>,
-    pane_outer: &gtk::Box,
-    drop_indicator: &gtk::Box,
     options: Option<TerminalTabOptions<'_>>,
 ) {
     let tab_id = options
@@ -704,16 +648,7 @@ fn add_terminal_tab_inner(
         .unwrap_or_else(next_tab_id);
 
     // Tab label button
-    let (tab_btn, title_label) = build_tab_button(
-        "Terminal",
-        &tab_id,
-        tab_strip,
-        content_stack,
-        tab_state,
-        callbacks,
-        pane_outer,
-        drop_indicator,
-    );
+    let (tab_btn, title_label) = build_tab_button("Terminal", &tab_id, internals);
 
     // Build Ghostty terminal callbacks for title/bell/close
     let term_cwd = Rc::new(RefCell::new(
@@ -724,16 +659,16 @@ fn add_terminal_tab_inner(
     ));
     let term_callbacks = {
         let tl = title_label.clone();
-        let state_for_title = tab_state.clone();
+        let state_for_title = internals.tab_state.clone();
         let tid_for_title = tab_id.clone();
-        let cb_bell = callbacks.clone();
-        let ts = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state_for_close = tab_state.clone();
+        let cb_bell = internals.callbacks.clone();
+        let ts = internals.tab_strip.clone();
+        let cs = internals.content_stack.clone();
+        let state_for_close = internals.tab_state.clone();
         let tid_for_close = tab_id.clone();
-        let cb_close = callbacks.clone();
-        let po = pane_outer.clone();
-        let cb_state = callbacks.clone();
+        let cb_close = internals.callbacks.clone();
+        let po = internals.pane_outer.clone();
+        let cb_state = internals.callbacks.clone();
         let term_cwd_for_pwd = term_cwd.clone();
 
         TerminalCallbacks {
@@ -759,7 +694,7 @@ fn add_terminal_tab_inner(
                 (cb_bell.on_bell)();
             }),
             on_pwd_changed: Box::new({
-                let cb_pwd = callbacks.clone();
+                let cb_pwd = internals.callbacks.clone();
                 move |pwd: &str| {
                     *term_cwd_for_pwd.borrow_mut() = Some(pwd.to_string());
                     (cb_pwd.on_pwd_changed)(pwd);
@@ -778,16 +713,16 @@ fn add_terminal_tab_inner(
                 });
             }),
             on_split_right: Box::new({
-                let cb = callbacks.clone();
-                let po = pane_outer.clone();
+                let cb = internals.callbacks.clone();
+                let po = internals.pane_outer.clone();
                 move || {
                     let w: gtk::Widget = po.clone().upcast();
                     (cb.on_split)(&w, gtk::Orientation::Horizontal);
                 }
             }),
             on_split_down: Box::new({
-                let cb = callbacks.clone();
-                let po = pane_outer.clone();
+                let cb = internals.callbacks.clone();
+                let po = internals.pane_outer.clone();
                 move || {
                     let w: gtk::Widget = po.clone().upcast();
                     (cb.on_split)(&w, gtk::Orientation::Vertical);
@@ -799,13 +734,13 @@ fn add_terminal_tab_inner(
     let term = terminal::create_terminal(working_directory, term_callbacks);
 
     let widget: gtk::Widget = term.clone().upcast();
-    content_stack.add_named(&widget, Some(&tab_id));
+    internals.content_stack.add_named(&widget, Some(&tab_id));
 
     // Append the tab button to the strip AFTER all setup is done
-    tab_strip.append(&tab_btn);
+    internals.tab_strip.append(&tab_btn);
 
     {
-        let mut ts = tab_state.borrow_mut();
+        let mut ts = internals.tab_state.borrow_mut();
         ts.tabs.push(TabEntry {
             id: tab_id.clone(),
             tab_button: tab_btn,
@@ -825,7 +760,8 @@ fn add_terminal_tab_inner(
         title_label.set_label(custom_name);
     }
     if options.as_ref().map(|value| value.pinned).unwrap_or(false) {
-        if let Some(entry) = tab_state
+        if let Some(entry) = internals
+            .tab_state
             .borrow()
             .tabs
             .iter()
@@ -835,22 +771,19 @@ fn add_terminal_tab_inner(
         }
     }
 
-    activate_tab(tab_strip, content_stack, tab_state, &tab_id);
+    activate_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        &tab_id,
+    );
     term.grab_focus();
     if options.is_none() {
-        (callbacks.on_state_changed)();
+        (internals.callbacks.on_state_changed)();
     }
 }
 
-fn add_browser_tab_inner(
-    tab_strip: &gtk::Box,
-    content_stack: &gtk::Stack,
-    tab_state: &Rc<RefCell<TabState>>,
-    callbacks: &Rc<PaneCallbacks>,
-    pane_outer: &gtk::Box,
-    drop_indicator: &gtk::Box,
-    options: Option<BrowserTabOptions<'_>>,
-) {
+fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
@@ -863,27 +796,18 @@ fn add_browser_tab_inner(
     let (widget, title) = create_browser_widget(
         options.as_ref().and_then(|value| value.uri),
         saved_uri.clone(),
-        callbacks.clone(),
+        internals.callbacks.clone(),
     );
 
-    let (tab_btn, title_label) = build_tab_button(
-        &title,
-        &tab_id,
-        tab_strip,
-        content_stack,
-        tab_state,
-        callbacks,
-        pane_outer,
-        drop_indicator,
-    );
+    let (tab_btn, title_label) = build_tab_button(&title, &tab_id, internals);
 
-    content_stack.add_named(&widget, Some(&tab_id));
+    internals.content_stack.add_named(&widget, Some(&tab_id));
 
     // Append the tab button to the strip AFTER all setup is done
-    tab_strip.append(&tab_btn);
+    internals.tab_strip.append(&tab_btn);
 
     {
-        let mut ts = tab_state.borrow_mut();
+        let mut ts = internals.tab_state.borrow_mut();
         ts.tabs.push(TabEntry {
             id: tab_id.clone(),
             tab_button: tab_btn,
@@ -903,7 +827,8 @@ fn add_browser_tab_inner(
         title_label.set_label(custom_name);
     }
     if options.as_ref().map(|value| value.pinned).unwrap_or(false) {
-        if let Some(entry) = tab_state
+        if let Some(entry) = internals
+            .tab_state
             .borrow()
             .tabs
             .iter()
@@ -913,9 +838,14 @@ fn add_browser_tab_inner(
         }
     }
 
-    activate_tab(tab_strip, content_stack, tab_state, &tab_id);
+    activate_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        &tab_id,
+    );
     if options.is_none() {
-        (callbacks.on_state_changed)();
+        (internals.callbacks.on_state_changed)();
     }
 }
 
@@ -924,31 +854,14 @@ fn add_browser_tab_inner(
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
     if let Some(internals) = find_pane_internals(pane_widget) {
         let dir = internals.working_directory.borrow().clone();
-        add_terminal_tab_inner(
-            &internals.tab_strip,
-            &internals.content_stack,
-            &internals.tab_state,
-            &internals.callbacks,
-            dir.as_deref(),
-            &internals.pane_outer,
-            &internals.drop_indicator,
-            None,
-        );
+        add_terminal_tab_inner(&internals, dir.as_deref(), None);
     }
 }
 
 #[allow(dead_code)]
 pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
     if let Some(internals) = find_pane_internals(pane_widget) {
-        add_browser_tab_inner(
-            &internals.tab_strip,
-            &internals.content_stack,
-            &internals.tab_state,
-            &internals.callbacks,
-            &internals.pane_outer,
-            &internals.drop_indicator,
-            None,
-        );
+        add_browser_tab_inner(&internals, None);
     }
 }
 
@@ -1024,16 +937,7 @@ pub fn move_tab_to_pane(source_pane: &gtk::Widget, source_tab_id: &str, target_p
     }
     // Compute length BEFORE the call so the borrow is dropped
     let target_len = tgt_internals.tab_state.borrow().tabs.len();
-    move_tab_between_panes(
-        &src_internals,
-        &tgt_internals.tab_strip,
-        &tgt_internals.content_stack,
-        &tgt_internals.tab_state,
-        &tgt_internals.callbacks,
-        &tgt_internals.pane_outer,
-        source_tab_id,
-        target_len,
-    );
+    move_tab_between_panes(&src_internals, &tgt_internals, source_tab_id, target_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,12 +947,7 @@ pub fn move_tab_to_pane(source_pane: &gtk::Widget, source_tab_id: &str, target_p
 fn build_tab_button(
     title: &str,
     tab_id: &str,
-    tab_strip: &gtk::Box,
-    content_stack: &gtk::Stack,
-    tab_state: &Rc<RefCell<TabState>>,
-    callbacks: &Rc<PaneCallbacks>,
-    pane_outer: &gtk::Box,
-    drop_indicator: &gtk::Box,
+    internals: &Rc<PaneInternals>,
 ) -> (gtk::Box, gtk::Label) {
     let pin_icon = gtk::Label::new(None);
     pin_icon.add_css_class("limux-pin-icon");
@@ -1086,13 +985,13 @@ fn build_tab_button(
     click.set_button(1);
     {
         let tid = tab_id.to_string();
-        let ts = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state = tab_state.clone();
-        let callbacks = callbacks.clone();
+        let ts = internals.tab_strip.clone();
+        let cs = internals.content_stack.clone();
+        let state = internals.tab_state.clone();
+        let cb = internals.callbacks.clone();
         click.connect_pressed(move |_, _, _, _| {
             activate_tab(&ts, &cs, &state, &tid);
-            (callbacks.on_state_changed)();
+            (cb.on_state_changed)();
         });
     }
     tab_btn.add_controller(click);
@@ -1102,11 +1001,11 @@ fn build_tab_button(
     right_click.set_button(3);
     {
         let tid = tab_id.to_string();
-        let ts = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state = tab_state.clone();
-        let cb = callbacks.clone();
-        let po = pane_outer.clone();
+        let ts = internals.tab_strip.clone();
+        let cs = internals.content_stack.clone();
+        let state = internals.tab_state.clone();
+        let cb = internals.callbacks.clone();
+        let po = internals.pane_outer.clone();
         let lbl = label.clone();
         let pin = pin_icon.clone();
         let tb = tab_btn.clone();
@@ -1130,10 +1029,10 @@ fn build_tab_button(
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     {
         let tid = tab_id.to_string();
-        let po = pane_outer.clone();
-        let state = tab_state.clone();
-        let indicator_begin = drop_indicator.clone();
-        let indicator_end = drop_indicator.clone();
+        let po = internals.pane_outer.clone();
+        let state = internals.tab_state.clone();
+        let indicator_begin = internals.drop_indicator.clone();
+        let indicator_end = internals.drop_indicator.clone();
         drag_source.connect_prepare(move |_src, _x, _y| {
             let pid = unsafe {
                 po.data::<Rc<PaneInternals>>("limux-pane-internals")
@@ -1160,11 +1059,11 @@ fn build_tab_button(
     // Close button click
     {
         let tid = tab_id.to_string();
-        let ts = tab_strip.clone();
-        let cs = content_stack.clone();
-        let state = tab_state.clone();
-        let cb = callbacks.clone();
-        let po = pane_outer.clone();
+        let ts = internals.tab_strip.clone();
+        let cs = internals.content_stack.clone();
+        let state = internals.tab_state.clone();
+        let cb = internals.callbacks.clone();
+        let po = internals.pane_outer.clone();
         close_btn.connect_clicked(move |_| {
             let is_pinned = state.borrow().tabs.iter().any(|e| e.id == tid && e.pinned);
             if !is_pinned {
@@ -1451,11 +1350,7 @@ fn reorder_tab_to_index(
 /// `insert_idx`: absolute index in the target pane's tab list.
 fn move_tab_between_panes(
     src_internals: &Rc<PaneInternals>,
-    target_tab_strip: &gtk::Box,
-    target_content_stack: &gtk::Stack,
-    target_tab_state: &Rc<std::cell::RefCell<TabState>>,
-    target_callbacks: &Rc<PaneCallbacks>,
-    target_pane_outer: &gtk::Box,
+    tgt_internals: &Rc<PaneInternals>,
     src_tab_id: &str,
     insert_idx: usize,
 ) {
@@ -1497,18 +1392,18 @@ fn move_tab_between_panes(
     entry.content = content_widget.clone();
 
     {
-        let mut tgt_ts = target_tab_state.borrow_mut();
+        let mut tgt_ts = tgt_internals.tab_state.borrow_mut();
         let clamped = insert_idx.min(tgt_ts.tabs.len());
         tgt_ts.tabs.insert(clamped, entry);
     }
 
     // ---- Phase 3: ALL UI work deferred to idle to avoid RefCell conflicts ----
 
-    let target_strip = target_tab_strip.clone();
-    let target_cs = target_content_stack.clone();
-    let target_state = target_tab_state.clone();
-    let target_cb = target_callbacks.clone();
-    let target_outer = target_pane_outer.clone();
+    let target_strip = tgt_internals.tab_strip.clone();
+    let target_cs = tgt_internals.content_stack.clone();
+    let target_state = tgt_internals.tab_state.clone();
+    let target_cb = tgt_internals.callbacks.clone();
+    let target_outer = tgt_internals.pane_outer.clone();
     let content = content_widget;
     let tid = new_tab_id;
 
@@ -1519,15 +1414,23 @@ fn move_tab_between_panes(
     let src_callbacks = src_internals.callbacks.clone();
     let src_outer = src_internals.pane_outer.clone();
 
-    glib::idle_add_local_once(move || {
-        // Look up the indicator for the target pane
-        let target_indicator = find_pane_internals(&target_outer.clone().upcast())
-            .map(|i| i.drop_indicator.clone())
-            .unwrap_or_else(|| gtk::Box::new(gtk::Orientation::Vertical, 0));
+    // Build an owned PaneInternals for the target (idle callback requires 'static)
+    let tgt = Rc::new(PaneInternals {
+        pane_id: tgt_internals.pane_id,
+        tab_strip: target_strip,
+        content_stack: target_cs,
+        tab_state: target_state,
+        callbacks: target_cb,
+        pane_outer: target_outer,
+        working_directory: tgt_internals.working_directory.clone(),
+        drop_indicator: tgt_internals.drop_indicator.clone(),
+        workspace_dragging: tgt_internals.workspace_dragging.clone(),
+    });
 
+    glib::idle_add_local_once(move || {
         // Get the title from the stored entry
         let title = {
-            let ts = target_state.borrow();
+            let ts = tgt.tab_state.borrow();
             ts.tabs
                 .iter()
                 .find(|e| e.id == tid)
@@ -1536,23 +1439,14 @@ fn move_tab_between_panes(
         };
 
         // Create the real tab button (this may trigger GTK signals — safe now)
-        let (new_tab_btn, new_title_label) = build_tab_button(
-            &title,
-            &tid,
-            &target_strip,
-            &target_cs,
-            &target_state,
-            &target_cb,
-            &target_outer,
-            &target_indicator,
-        );
+        let (new_tab_btn, new_title_label) = build_tab_button(&title, &tid, &tgt);
 
         // Add the content widget to the stack
-        target_cs.add_named(&content, Some(&tid));
+        tgt.content_stack.add_named(&content, Some(&tid));
 
         // Update the stored entry with the real button, collecting old placeholder
         let placeholder = {
-            let mut ts = target_state.borrow_mut();
+            let mut ts = tgt.tab_state.borrow_mut();
             if let Some(entry) = ts.tabs.iter_mut().find(|e| e.id == tid) {
                 let old = entry.tab_button.clone();
                 entry.tab_button = new_tab_btn;
@@ -1565,11 +1459,12 @@ fn move_tab_between_panes(
 
         // Remove the placeholder if it's actually in the strip
         if placeholder.parent().is_some() {
-            target_strip.remove(&placeholder);
+            tgt.tab_strip.remove(&placeholder);
         }
 
         // Rebuild strip order: remove all existing buttons, then re-add in order
-        let buttons: Vec<gtk::Box> = target_state
+        let buttons: Vec<gtk::Box> = tgt
+            .tab_state
             .borrow()
             .tabs
             .iter()
@@ -1577,14 +1472,14 @@ fn move_tab_between_panes(
             .collect();
         for btn in &buttons {
             if btn.parent().is_some() {
-                target_strip.remove(btn);
+                tgt.tab_strip.remove(btn);
             }
         }
         for btn in &buttons {
-            target_strip.append(btn);
+            tgt.tab_strip.append(btn);
         }
 
-        activate_tab(&target_strip, &target_cs, &target_state, &tid);
+        activate_tab(&tgt.tab_strip, &tgt.content_stack, &tgt.tab_state, &tid);
 
         // Source pane cleanup — deferred to avoid RefCell conflicts with GTK
         // callbacks that may fire during widget removal (click/drag handlers).
