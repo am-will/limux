@@ -52,7 +52,11 @@ pub extern "C" fn limux_control_init() -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn limux_control_dispatch(message_ptr: *const u8, message_len: usize) -> i32 {
+/// # Safety
+///
+/// `message_ptr` must point to a readable buffer of exactly `message_len` bytes
+/// for the duration of this call.
+pub unsafe extern "C" fn limux_control_dispatch(message_ptr: *const u8, message_len: usize) -> i32 {
     if message_ptr.is_null() {
         return 2;
     }
@@ -118,7 +122,10 @@ mod tests {
         assert_eq!(limux_control_init(), 0);
 
         let message = b"{\"id\":\"ffi-1\",\"method\":\"system.ping\",\"params\":{}}";
-        assert_eq!(limux_control_dispatch(message.as_ptr(), message.len()), 0);
+        assert_eq!(
+            unsafe { limux_control_dispatch(message.as_ptr(), message.len()) },
+            0
+        );
 
         limux_control_shutdown();
     }
@@ -127,7 +134,10 @@ mod tests {
     fn ffi_dispatch_rejects_invalid_payload() {
         limux_control_shutdown();
         let bad = b"not-json";
-        assert_eq!(limux_control_dispatch(bad.as_ptr(), bad.len()), 2);
+        assert_eq!(
+            unsafe { limux_control_dispatch(bad.as_ptr(), bad.len()) },
+            2
+        );
         limux_control_shutdown();
     }
 }

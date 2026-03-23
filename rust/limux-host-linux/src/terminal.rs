@@ -26,14 +26,18 @@ unsafe impl Sync for GhosttyState {}
 
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 
+type TitleChangedCallback = dyn Fn(&str);
+type PwdChangedCallback = dyn Fn(&str);
+type VoidCallback = dyn Fn();
+
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
     gl_area: gtk::GLArea,
     toast_overlay: gtk::Overlay,
-    on_title_changed: Option<Box<dyn Fn(&str)>>,
-    on_pwd_changed: Option<Box<dyn Fn(&str)>>,
-    on_bell: Option<Box<dyn Fn()>>,
-    on_close: Option<Box<dyn Fn()>>,
+    on_title_changed: Option<Box<TitleChangedCallback>>,
+    on_pwd_changed: Option<Box<PwdChangedCallback>>,
+    on_bell: Option<Box<VoidCallback>>,
+    on_close: Option<Box<VoidCallback>>,
     clipboard_context: *mut ClipboardContext,
 }
 
@@ -89,6 +93,32 @@ pub fn init_ghostty() {
 
 fn ghostty_app() -> ghostty_app_t {
     GHOSTTY.get().expect("ghostty not initialized").app
+}
+
+fn ghostty_color_scheme_for_dark_mode(dark: bool) -> c_int {
+    if dark {
+        GHOSTTY_COLOR_SCHEME_DARK
+    } else {
+        GHOSTTY_COLOR_SCHEME_LIGHT
+    }
+}
+
+pub fn sync_color_scheme(dark: bool) {
+    let scheme = ghostty_color_scheme_for_dark_mode(dark);
+    let app = ghostty_app();
+
+    unsafe {
+        ghostty_app_set_color_scheme(app, scheme);
+    }
+
+    SURFACE_MAP.with(|map| {
+        for surface_key in map.borrow().keys() {
+            let surface = *surface_key as ghostty_surface_t;
+            unsafe {
+                ghostty_surface_set_color_scheme(surface, scheme);
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -332,12 +362,12 @@ unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_al
 // ---------------------------------------------------------------------------
 
 pub struct TerminalCallbacks {
-    pub on_title_changed: Box<dyn Fn(&str)>,
-    pub on_pwd_changed: Box<dyn Fn(&str)>,
-    pub on_bell: Box<dyn Fn()>,
-    pub on_close: Box<dyn Fn()>,
-    pub on_split_right: Box<dyn Fn()>,
-    pub on_split_down: Box<dyn Fn()>,
+    pub on_title_changed: Box<TitleChangedCallback>,
+    pub on_pwd_changed: Box<PwdChangedCallback>,
+    pub on_bell: Box<VoidCallback>,
+    pub on_close: Box<VoidCallback>,
+    pub on_split_right: Box<VoidCallback>,
+    pub on_split_down: Box<VoidCallback>,
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -472,7 +502,6 @@ pub fn create_terminal(
             *surface_cell.borrow_mut() = Some(surface);
 
             unsafe {
-                ghostty_surface_set_color_scheme(surface, GHOSTTY_COLOR_SCHEME_DARK);
                 ghostty_surface_set_focus(surface, true);
             }
 
@@ -885,7 +914,6 @@ fn show_terminal_context_menu(
         if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
             let label = btn.label().unwrap_or_default().to_string();
             let pop = popover.clone();
-            let surface = surface;
             let cb = callbacks.clone();
 
             btn.connect_clicked(move |_| {
@@ -938,7 +966,11 @@ fn translate_key_event(
 
     // unshifted_codepoint must be the codepoint WITHOUT shift applied.
     // keyval already includes shift (e.g., Shift+a → 'A'), so use to_lower().
-    let unshifted = keyval.to_lower().to_unicode().map(|c| c as u32).unwrap_or(0);
+    let unshifted = keyval
+        .to_lower()
+        .to_unicode()
+        .map(|c| c as u32)
+        .unwrap_or(0);
 
     // Mark shift as consumed when it produced a different character
     // (e.g., a→A, 1→!). This tells Ghostty not to treat shift as
@@ -1040,4 +1072,21 @@ fn translate_mouse_mods(state: gtk::gdk::ModifierType) -> c_int {
         mods |= GHOSTTY_MODS_SUPER;
     }
     mods
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_dark_mode_to_ghostty_color_scheme() {
+        assert_eq!(
+            ghostty_color_scheme_for_dark_mode(true),
+            GHOSTTY_COLOR_SCHEME_DARK
+        );
+        assert_eq!(
+            ghostty_color_scheme_for_dark_mode(false),
+            GHOSTTY_COLOR_SCHEME_LIGHT
+        );
+    }
 }

@@ -174,6 +174,73 @@ const COMMANDS: &[&str] = &[
     "debug.window.screenshot",
 ];
 
+type CommandPaletteSpec = (
+    &'static str,
+    &'static str,
+    Option<(&'static str, &'static str)>,
+);
+
+const COMMAND_PALETTE_COMMAND_SPECS: [CommandPaletteSpec; 14] = [
+    (
+        "palette.renameTab",
+        "Rename Tab",
+        Some(("rename_tab", "cmd+r")),
+    ),
+    (
+        "palette.renameWorkspace",
+        "Rename Workspace",
+        Some(("rename_workspace", "cmd+shift+r")),
+    ),
+    (
+        "palette.terminalOpenDirectory",
+        "Open Directory",
+        Some(("open_directory", "cmd+shift+o")),
+    ),
+    (
+        "palette.newWindow",
+        "New Window",
+        Some(("new_window", "cmd+shift+n")),
+    ),
+    (
+        "palette.closeWindow",
+        "Close Window",
+        Some(("close_window", "cmd+ctrl+w")),
+    ),
+    (
+        "palette.newWorkspace",
+        "New Workspace",
+        Some(("new_workspace", "cmd+t")),
+    ),
+    (
+        "palette.closeWorkspace",
+        "Close Workspace",
+        Some(("close_workspace", "cmd+shift+w")),
+    ),
+    (
+        "palette.splitRight",
+        "Split Right",
+        Some(("split_right", "cmd+d")),
+    ),
+    (
+        "palette.splitDown",
+        "Split Down",
+        Some(("split_down", "cmd+shift+d")),
+    ),
+    (
+        "palette.newTerminal",
+        "New Terminal",
+        Some(("new_terminal", "cmd+enter")),
+    ),
+    (
+        "palette.toggleSidebar",
+        "Toggle Sidebar",
+        Some(("toggle_sidebar", "cmd+b")),
+    ),
+    ("palette.focusNext", "Focus Next", None),
+    ("palette.focusPrev", "Focus Previous", None),
+    ("palette.reloadConfig", "Reload Config", None),
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceInfo {
     pub id: u64,
@@ -422,6 +489,69 @@ impl Default for BrowserState {
             next_tab_id: 1,
         }
     }
+}
+
+fn apply_named_surface_action(surface: &mut SurfaceState, action_key: &str, title: Option<&str>) {
+    match action_key {
+        "rename" => {
+            if let Some(title) = title {
+                surface.title = title.to_string();
+            }
+        }
+        "clear_name" => {
+            surface.title = format!("surface-{}", surface.id);
+        }
+        "pin" => {
+            surface.pinned = true;
+        }
+        "unpin" => {
+            surface.pinned = false;
+        }
+        "mark_unread" => {
+            surface.unread = true;
+        }
+        "mark_read" => {
+            surface.unread = false;
+        }
+        _ => {}
+    }
+}
+
+fn normalize_notification_content(
+    params: &Map<String, Value>,
+) -> Result<(String, String, String), CommandError> {
+    let message = optional_string_param(params, "message")?.unwrap_or_default();
+    let mut title = optional_string_param(params, "title")?.unwrap_or_default();
+    let subtitle = optional_string_param(params, "subtitle")?.unwrap_or_default();
+    let body = optional_string_param(params, "body")?.unwrap_or_default();
+    if title.is_empty() && !message.is_empty() {
+        title = message;
+    }
+    Ok((title, subtitle, body))
+}
+
+fn notification_row(notification: &NotificationInfo) -> Value {
+    json!({
+        "id": encode_handle_id(notification.id),
+        "message": notification.message,
+        "title": notification.title,
+        "subtitle": notification.subtitle,
+        "body": notification.body,
+        "surface_id": notification.surface_id.map(encode_handle_id),
+        "workspace_id": notification.workspace_id.map(encode_handle_id),
+        "is_read": !notification.unread,
+        "unread": notification.unread,
+    })
+}
+
+fn created_notification_response(notification: Option<NotificationInfo>) -> Value {
+    let Some(notification) = notification else {
+        return json!({ "suppressed": true });
+    };
+    json!({
+        "notification_id": encode_handle_id(notification.id),
+        "notification": notification_row(&notification)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1723,9 +1853,7 @@ impl ControlState {
             .join(" ");
 
         if self.app_is_active() {
-            if surface_id.is_none() {
-                return None;
-            }
+            surface_id?;
             if let Some((_, _, _, focused_surface_id)) = focused_handles(self) {
                 if surface_id == Some(focused_surface_id) {
                     return None;
@@ -2114,74 +2242,15 @@ impl ControlState {
     }
 
     fn command_palette_command_rows(&self, query: &str) -> Vec<PaletteRow> {
-        let command_specs: [(&str, &str, Option<(&str, &str)>); 14] = [
-            (
-                "palette.renameTab",
-                "Rename Tab",
-                Some(("rename_tab", "cmd+r")),
-            ),
-            (
-                "palette.renameWorkspace",
-                "Rename Workspace",
-                Some(("rename_workspace", "cmd+shift+r")),
-            ),
-            (
-                "palette.terminalOpenDirectory",
-                "Open Directory",
-                Some(("open_directory", "cmd+shift+o")),
-            ),
-            (
-                "palette.newWindow",
-                "New Window",
-                Some(("new_window", "cmd+shift+n")),
-            ),
-            (
-                "palette.closeWindow",
-                "Close Window",
-                Some(("close_window", "cmd+ctrl+w")),
-            ),
-            (
-                "palette.newWorkspace",
-                "New Workspace",
-                Some(("new_workspace", "cmd+t")),
-            ),
-            (
-                "palette.closeWorkspace",
-                "Close Workspace",
-                Some(("close_workspace", "cmd+shift+w")),
-            ),
-            (
-                "palette.splitRight",
-                "Split Right",
-                Some(("split_right", "cmd+d")),
-            ),
-            (
-                "palette.splitDown",
-                "Split Down",
-                Some(("split_down", "cmd+shift+d")),
-            ),
-            (
-                "palette.newTerminal",
-                "New Terminal",
-                Some(("new_terminal", "cmd+enter")),
-            ),
-            (
-                "palette.toggleSidebar",
-                "Toggle Sidebar",
-                Some(("toggle_sidebar", "cmd+b")),
-            ),
-            ("palette.focusNext", "Focus Next", None),
-            ("palette.focusPrev", "Focus Previous", None),
-            ("palette.reloadConfig", "Reload Config", None),
-        ];
-
         let raw_query = query.trim();
         let normalized_query = raw_query
             .trim_start_matches('>')
             .trim()
             .to_ascii_lowercase();
         let mut rows = Vec::new();
-        for (order, (command_id, title, shortcut_spec)) in command_specs.iter().enumerate() {
+        for (order, (command_id, title, shortcut_spec)) in
+            COMMAND_PALETTE_COMMAND_SPECS.iter().enumerate()
+        {
             let search_text = format!("{command_id} {title}").to_ascii_lowercase();
             let compact_search = search_text.replace(' ', "");
             let compact_query = normalized_query.replace(' ', "");
@@ -2247,12 +2316,11 @@ impl ControlState {
             let workspace_matches =
                 normalized_query.is_empty() || workspace_search.contains(&normalized_query);
             if workspace_matches {
-                let score = if normalized_query.is_empty() {
-                    100
-                } else if workspace
-                    .name
-                    .to_ascii_lowercase()
-                    .starts_with(&normalized_query)
+                let score = if normalized_query.is_empty()
+                    || workspace
+                        .name
+                        .to_ascii_lowercase()
+                        .starts_with(&normalized_query)
                 {
                     100
                 } else {
@@ -3882,7 +3950,10 @@ fn handle_browser_extended_command(
                 ];
             }
             if script.contains("window.emitConsoleAndError") {
-                state.browser.console.push("limux-console-entry".to_string());
+                state
+                    .browser
+                    .console
+                    .push("limux-console-entry".to_string());
                 state.browser.errors.push("limux-boom".to_string());
             }
             let value = state
@@ -5499,36 +5570,10 @@ fn handle_command(
             let (workspace_id, surface_id) =
                 resolve_surface_target(state, workspace_hint, surface_hint)?;
 
-            let updated =
-                update_surface_metadata(
-                    state,
-                    workspace_id,
-                    surface_id,
-                    |surface| match action_key.as_str() {
-                        "rename" => {
-                            if let Some(title) = title.clone() {
-                                surface.title = title;
-                            }
-                        }
-                        "clear_name" => {
-                            surface.title = format!("surface-{}", surface.id);
-                        }
-                        "pin" => {
-                            surface.pinned = true;
-                        }
-                        "unpin" => {
-                            surface.pinned = false;
-                        }
-                        "mark_unread" => {
-                            surface.unread = true;
-                        }
-                        "mark_read" => {
-                            surface.unread = false;
-                        }
-                        _ => {}
-                    },
-                )
-                .ok_or_else(|| CommandError::not_found("surface not found"))?;
+            let updated = update_surface_metadata(state, workspace_id, surface_id, |surface| {
+                apply_named_surface_action(surface, &action_key, title.as_deref())
+            })
+            .ok_or_else(|| CommandError::not_found("surface not found"))?;
 
             Ok(json!({
                 "ok": true,
@@ -5545,78 +5590,30 @@ fn handle_command(
 
         "notification.create" => {
             let params = params_object(params)?;
-            let message = optional_string_param(params, "message")?.unwrap_or_default();
-            let mut title = optional_string_param(params, "title")?.unwrap_or_default();
-            let subtitle = optional_string_param(params, "subtitle")?.unwrap_or_default();
-            let body = optional_string_param(params, "body")?.unwrap_or_default();
-            if title.is_empty() && !message.is_empty() {
-                title = message;
-            }
+            let (title, subtitle, body) = normalize_notification_content(params)?;
             let surface_id = optional_u64_param_any(params, &["surface_id", "id"])?;
             let workspace_id = Some(state.current_workspace_id);
-            let notification = state.create_notification(
-                title.clone(),
-                subtitle.clone(),
-                body.clone(),
+            Ok(created_notification_response(state.create_notification(
+                title,
+                subtitle,
+                body,
                 surface_id,
                 workspace_id,
-            );
-            if notification.is_none() {
-                return Ok(json!({ "suppressed": true }));
-            }
-            let notification = notification.expect("notification exists");
-            Ok(json!({
-                "notification_id": encode_handle_id(notification.id),
-                "notification": {
-                    "id": encode_handle_id(notification.id),
-                    "message": notification.message,
-                    "title": notification.title,
-                    "subtitle": notification.subtitle,
-                    "body": notification.body,
-                    "surface_id": notification.surface_id.map(encode_handle_id),
-                    "workspace_id": notification.workspace_id.map(encode_handle_id),
-                    "is_read": !notification.unread,
-                    "unread": notification.unread
-                }
-            }))
+            )))
         }
         "notification.create_for_surface" => {
             let params = params_object(params)?;
-            let message = optional_string_param(params, "message")?.unwrap_or_default();
-            let mut title = optional_string_param(params, "title")?.unwrap_or_default();
-            let subtitle = optional_string_param(params, "subtitle")?.unwrap_or_default();
-            let body = optional_string_param(params, "body")?.unwrap_or_default();
-            if title.is_empty() && !message.is_empty() {
-                title = message;
-            }
+            let (title, subtitle, body) = normalize_notification_content(params)?;
             let surface_id = optional_u64_param_any(params, &["surface_id", "id"])?
                 .ok_or_else(|| CommandError::invalid_params("surface_id is required"))?;
             let workspace_id = find_workspace_for_surface(state, surface_id);
-            let notification = state.create_notification(
-                title.clone(),
-                subtitle.clone(),
-                body.clone(),
+            Ok(created_notification_response(state.create_notification(
+                title,
+                subtitle,
+                body,
                 Some(surface_id),
                 workspace_id,
-            );
-            if notification.is_none() {
-                return Ok(json!({ "suppressed": true }));
-            }
-            let notification = notification.expect("notification exists");
-            Ok(json!({
-                "notification_id": encode_handle_id(notification.id),
-                "notification": {
-                    "id": encode_handle_id(notification.id),
-                    "message": notification.message,
-                    "title": notification.title,
-                    "subtitle": notification.subtitle,
-                    "body": notification.body,
-                    "surface_id": notification.surface_id.map(encode_handle_id),
-                    "workspace_id": notification.workspace_id.map(encode_handle_id),
-                    "is_read": !notification.unread,
-                    "unread": notification.unread
-                }
-            }))
+            )))
         }
         "notification.list" => {
             let params = params_object(params)?;
@@ -5631,44 +5628,14 @@ fn handle_command(
             } else {
                 state.notifications.clone()
             };
-            let rows: Vec<Value> = notifications
-                .into_iter()
-                .map(|item| {
-                    json!({
-                        "id": encode_handle_id(item.id),
-                        "message": item.message,
-                        "title": item.title,
-                        "subtitle": item.subtitle,
-                        "body": item.body,
-                        "surface_id": item.surface_id.map(encode_handle_id),
-                        "workspace_id": item.workspace_id.map(encode_handle_id),
-                        "is_read": !item.unread,
-                        "unread": item.unread,
-                    })
-                })
-                .collect();
+            let rows: Vec<Value> = notifications.iter().map(notification_row).collect();
             Ok(json!({ "notifications": rows }))
         }
         "notification.clear" => {
             let params = params_object(params)?;
             let id = optional_u64_param_any(params, &["id", "notification_id"])?;
             let notifications = state.clear_notification(id);
-            let rows: Vec<Value> = notifications
-                .into_iter()
-                .map(|item| {
-                    json!({
-                        "id": encode_handle_id(item.id),
-                        "message": item.message,
-                        "title": item.title,
-                        "subtitle": item.subtitle,
-                        "body": item.body,
-                        "surface_id": item.surface_id.map(encode_handle_id),
-                        "workspace_id": item.workspace_id.map(encode_handle_id),
-                        "is_read": !item.unread,
-                        "unread": item.unread,
-                    })
-                })
-                .collect();
+            let rows: Vec<Value> = notifications.iter().map(notification_row).collect();
             Ok(json!({ "notifications": rows }))
         }
 
@@ -6033,36 +6000,10 @@ fn handle_command(
             let (workspace_id, surface_id) =
                 resolve_surface_target(state, workspace_hint, tab_hint)?;
 
-            let updated =
-                update_surface_metadata(
-                    state,
-                    workspace_id,
-                    surface_id,
-                    |surface| match action_key.as_str() {
-                        "rename" => {
-                            if let Some(title) = title.clone() {
-                                surface.title = title;
-                            }
-                        }
-                        "clear_name" => {
-                            surface.title = format!("surface-{}", surface.id);
-                        }
-                        "pin" => {
-                            surface.pinned = true;
-                        }
-                        "unpin" => {
-                            surface.pinned = false;
-                        }
-                        "mark_unread" => {
-                            surface.unread = true;
-                        }
-                        "mark_read" => {
-                            surface.unread = false;
-                        }
-                        _ => {}
-                    },
-                )
-                .ok_or_else(|| CommandError::not_found("tab not found"))?;
+            let updated = update_surface_metadata(state, workspace_id, surface_id, |surface| {
+                apply_named_surface_action(surface, &action_key, title.as_deref())
+            })
+            .ok_or_else(|| CommandError::not_found("tab not found"))?;
 
             Ok(json!({
                 "ok": true,
@@ -6372,8 +6313,7 @@ mod tests {
             "XDG_DATA_DIRS should contain resources path"
         );
         assert!(
-            xdg_entries.iter().any(|entry| *entry == "/usr/local/share")
-                && xdg_entries.iter().any(|entry| *entry == "/usr/share"),
+            xdg_entries.contains(&"/usr/local/share") && xdg_entries.contains(&"/usr/share"),
             "XDG_DATA_DIRS should contain standard default entries"
         );
 

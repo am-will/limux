@@ -1,9 +1,9 @@
 [package]
 name = "limux-ghostty-sys"
-version = "0.1.0"
-edition = "2021"
-authors = ["limux contributors"]
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 build = "build.rs"
 
 [build-dependencies]

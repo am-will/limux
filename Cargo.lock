@@ -362,6 +362,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdk4-wayland"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7027433b8f19075ab22f01d0e0ba4373e303ffdb4ce4f846a2763cb020ea9bdc"
+dependencies = [
+ "gdk4",
+ "gdk4-wayland-sys",
+ "gio",
+ "glib",
+ "libc",
+]
+
+[[package]]
+name = "gdk4-wayland-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "653cafb8715f2ac1c56edaf8060d9360ae3acbe3c6fb61b676a2917d42b668cf"
+dependencies = [
+ "glib-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -713,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "limux-cli"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -725,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "limux-control"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -739,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "limux-core"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "limux-protocol",
@@ -751,28 +775,30 @@ dependencies = [
 
 [[package]]
 name = "limux-ghostty-sys"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "limux-host-linux"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "dirs",
+ "gdk4-wayland",
  "gtk4",
  "libadwaita",
  "limux-ghostty-sys",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
  "webkit6",
 ]
 
 [[package]]
 name = "limux-protocol"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",

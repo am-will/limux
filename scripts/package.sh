@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Read version from Cargo.toml (single source of truth)
-VERSION="${1:-$(grep '^version' "$ROOT_DIR/rust/limux-host-linux/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')}"
+# Read version from workspace Cargo.toml (single source of truth)
+VERSION="${1:-$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 ARCH="$(uname -m)"
 DEB_ARCH="amd64"
 [ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
@@ -12,10 +12,40 @@ DEB_ARCH="amd64"
 PKG_BASE="limux-${VERSION}-linux-${ARCH}"
 STAGE="/tmp/limux-staging"
 GHOSTTY_SO="${ROOT_DIR}/ghostty/zig-out/lib/libghostty.so"
+GHOSTTY_SHARE_DIR=""
 ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons"
 APP_ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons/app"
 DESKTOP_FILE="${ROOT_DIR}/rust/limux-host-linux/limux.desktop"
 OUT_DIR="${ROOT_DIR}/dist"
+
+remove_tree() {
+    local path="$1"
+
+    if [ ! -e "$path" ]; then
+        return 0
+    fi
+
+    find "$path" -depth -mindepth 1 ! -type d -exec rm -f {} +
+    find "$path" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
+    rmdir "$path" 2>/dev/null || true
+}
+
+resolve_ghostty_share_dir() {
+    local candidate
+
+    for candidate in \
+        "${ROOT_DIR}/ghostty/zig-out/share/ghostty" \
+        "/usr/local/share/ghostty" \
+        "/usr/share/ghostty"
+    do
+        if [ -d "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
 
 echo "=== Limux Packager ==="
 echo "Version: ${VERSION}"
@@ -25,6 +55,15 @@ echo "Arch:    ${ARCH}"
 if [ ! -f "$GHOSTTY_SO" ]; then
     echo "ERROR: libghostty.so not found at ${GHOSTTY_SO}"
     echo "Build it first: cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast"
+    exit 1
+fi
+
+if ! GHOSTTY_SHARE_DIR="$(resolve_ghostty_share_dir)"; then
+    echo "ERROR: Ghostty resources directory not found."
+    echo "Looked for:"
+    echo "  ${ROOT_DIR}/ghostty/zig-out/share/ghostty"
+    echo "  /usr/local/share/ghostty"
+    echo "  /usr/share/ghostty"
     exit 1
 fi
 
@@ -39,7 +78,8 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 # Clean staging and output
-rm -rf "$STAGE" "$OUT_DIR"
+remove_tree "$STAGE"
+remove_tree "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 # =========================================================================
@@ -49,10 +89,11 @@ populate_tree() {
     local dest="$1"
     local bindir="$dest/usr/local/bin"
     local libdir="$dest/usr/local/lib/limux"
+    local ghostty_resdir="$dest/usr/local/share/limux"
     local appdir="$dest/usr/local/share/applications"
     local icondir="$dest/usr/local/share/icons/hicolor"
 
-    mkdir -p "$bindir" "$libdir" "$appdir" "$icondir/scalable/actions"
+    mkdir -p "$bindir" "$libdir" "$ghostty_resdir" "$appdir" "$icondir/scalable/actions"
 
     # Binary
     cp "$BINARY" "$bindir/limux"
@@ -62,6 +103,9 @@ populate_tree() {
     # Shared library
     cp "$GHOSTTY_SO" "$libdir/libghostty.so"
     strip --strip-debug "$libdir/libghostty.so"
+
+    # Ghostty resources required for named themes and shell integration
+    cp -r "$GHOSTTY_SHARE_DIR" "$ghostty_resdir/ghostty"
 
     # Desktop file
     cp "$DESKTOP_FILE" "$appdir/limux.desktop"
@@ -92,14 +136,15 @@ populate_tree() {
 echo ""
 echo "--- Building tarball ---"
 TARBALL_STAGE="/tmp/${PKG_BASE}"
-rm -rf "$TARBALL_STAGE"
-mkdir -p "$TARBALL_STAGE"/{lib,share/applications,share/icons/hicolor/scalable/actions}
+remove_tree "$TARBALL_STAGE"
+mkdir -p "$TARBALL_STAGE"/{lib,share/limux,share/applications,share/icons/hicolor/scalable/actions}
 
 cp "$BINARY" "$TARBALL_STAGE/limux"
 strip "$TARBALL_STAGE/limux"
 chmod 755 "$TARBALL_STAGE/limux"
 cp "$GHOSTTY_SO" "$TARBALL_STAGE/lib/libghostty.so"
 strip --strip-debug "$TARBALL_STAGE/lib/libghostty.so"
+cp -r "$GHOSTTY_SHARE_DIR" "$TARBALL_STAGE/share/limux/ghostty"
 cp "$DESKTOP_FILE" "$TARBALL_STAGE/share/applications/limux.desktop"
 
 if [ -d "$ICONS_DIR/hicolor" ]; then
@@ -146,11 +191,24 @@ need_root() {
     fi
 }
 
+remove_tree() {
+    local path="$1"
+
+    if [ ! -e "$path" ]; then
+        return 0
+    fi
+
+    find "$path" -depth -mindepth 1 ! -type d -exec rm -f {} +
+    find "$path" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
+    rmdir "$path" 2>/dev/null || true
+}
+
 if $UNINSTALL; then
     need_root "$@"
     echo "Uninstalling Limux..."
     rm -f "$PREFIX/bin/limux"
-    rm -rf "$PREFIX/lib/limux"
+    remove_tree "$PREFIX/lib/limux"
+    remove_tree "$PREFIX/share/limux"
     rm -f /etc/ld.so.conf.d/limux.conf
     ldconfig 2>/dev/null || true
     rm -f "$PREFIX/share/applications/limux.desktop"
@@ -171,6 +229,9 @@ echo "Installing Limux to ${PREFIX}..."
 
 install -Dm755 "$SCRIPT_DIR/limux" "$PREFIX/bin/limux"
 install -Dm644 "$SCRIPT_DIR/lib/libghostty.so" "$PREFIX/lib/limux/libghostty.so"
+if [ -d "$SCRIPT_DIR/share/limux" ]; then
+    cp -r "$SCRIPT_DIR/share/limux" "$PREFIX/share/"
+fi
 echo "$PREFIX/lib/limux" > /etc/ld.so.conf.d/limux.conf
 ldconfig 2>/dev/null || true
 install -Dm644 "$SCRIPT_DIR/share/applications/limux.desktop" "$PREFIX/share/applications/limux.desktop"
@@ -192,7 +253,7 @@ INSTALL_EOF
 
 chmod 755 "$TARBALL_STAGE/install.sh"
 tar -czf "$OUT_DIR/${PKG_BASE}.tar.gz" -C /tmp "${PKG_BASE}"
-rm -rf "$TARBALL_STAGE"
+remove_tree "$TARBALL_STAGE"
 echo "  -> dist/${PKG_BASE}.tar.gz"
 
 # =========================================================================
@@ -201,7 +262,7 @@ echo "  -> dist/${PKG_BASE}.tar.gz"
 echo ""
 echo "--- Building .deb ---"
 DEB_ROOT="$STAGE/deb"
-rm -rf "$DEB_ROOT"
+remove_tree "$DEB_ROOT"
 populate_tree "$DEB_ROOT"
 
 # ldconfig trigger
@@ -255,9 +316,10 @@ echo "  -> dist/limux_${VERSION}_${DEB_ARCH}.deb"
 echo ""
 echo "--- Building AppImage ---"
 APPDIR="$STAGE/Limux.AppDir"
-rm -rf "$APPDIR"
+remove_tree "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
-         "$APPDIR/usr/share/icons/hicolor/scalable/actions"
+         "$APPDIR/usr/share/icons/hicolor/scalable/actions" \
+         "$APPDIR/usr/share/limux"
 
 # Binary
 cp "$BINARY" "$APPDIR/usr/bin/limux"
@@ -267,6 +329,9 @@ chmod 755 "$APPDIR/usr/bin/limux"
 # Shared library
 cp "$GHOSTTY_SO" "$APPDIR/usr/lib/libghostty.so"
 strip --strip-debug "$APPDIR/usr/lib/libghostty.so"
+
+# Ghostty resources required for named themes and shell integration
+cp -r "$GHOSTTY_SHARE_DIR" "$APPDIR/usr/share/limux/ghostty"
 
 # Desktop file (at AppDir root and in usr/share)
 cp "$DESKTOP_FILE" "$APPDIR/limux.desktop"

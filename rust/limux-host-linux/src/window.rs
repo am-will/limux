@@ -6,55 +6,11 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
+use crate::layout_state::{
+    self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState,
+    WorkspaceState,
+};
 use crate::pane::{self, PaneCallbacks};
-
-// ---------------------------------------------------------------------------
-// Workspace persistence
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct SavedWorkspace {
-    name: String,
-    favorite: bool,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    folder_path: Option<String>,
-}
-
-fn persistence_path() -> std::path::PathBuf {
-    let dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
-        .join("limux");
-    std::fs::create_dir_all(&dir).ok();
-    dir.join("workspaces.json")
-}
-
-fn load_workspaces() -> Vec<SavedWorkspace> {
-    let path = persistence_path();
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_workspaces(state: &State) {
-    let s = state.borrow();
-    let saved: Vec<SavedWorkspace> = s
-        .workspaces
-        .iter()
-        .map(|ws| SavedWorkspace {
-            name: ws.name.clone(),
-            favorite: ws.favorite,
-            cwd: ws.cwd.borrow().clone(),
-            folder_path: ws.folder_path.clone(),
-        })
-        .collect();
-    if let Ok(json) = serde_json::to_string_pretty(&saved) {
-        let path = persistence_path();
-        std::fs::write(&path, json).ok();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // State
@@ -99,6 +55,8 @@ struct AppState {
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
+    persistence_suspended: bool,
+    save_queued: bool,
 }
 
 impl AppState {
@@ -108,6 +66,313 @@ impl AppState {
 }
 
 type State = Rc<RefCell<AppState>>;
+const SPLIT_RATIO_STATE_KEY: &str = "limux-split-ratio-state";
+
+fn request_session_save(state: &State) {
+    let should_schedule = {
+        let mut s = state.borrow_mut();
+        if s.persistence_suspended || s.save_queued {
+            false
+        } else {
+            s.save_queued = true;
+            true
+        }
+    };
+
+    if !should_schedule {
+        return;
+    }
+
+    let state = state.clone();
+    glib::idle_add_local_once(move || {
+        let should_save = {
+            let mut s = state.borrow_mut();
+            let should_save = s.save_queued && !s.persistence_suspended;
+            s.save_queued = false;
+            should_save
+        };
+        if should_save {
+            save_session_now(&state);
+        }
+    });
+}
+
+fn save_session_now(state: &State) {
+    let session = snapshot_session_state(state);
+    if let Err(err) = layout_state::save_session_atomic(&session) {
+        eprintln!("limux: failed to save session state: {err}");
+    }
+}
+
+fn suspend_persistence(state: &State, suspended: bool) {
+    state.borrow_mut().persistence_suspended = suspended;
+}
+
+fn apply_loaded_session(state: &State, loaded: LoadedSession) {
+    suspend_persistence(state, true);
+
+    let restored_any = !loaded.state.workspaces.is_empty();
+    if restored_any {
+        for workspace in &loaded.state.workspaces {
+            add_workspace_from_state(state, workspace);
+        }
+        restore_active_workspace(state, loaded.state.active_workspace_index);
+        apply_sidebar_state_immediately(state, &loaded.state.sidebar);
+    }
+
+    suspend_persistence(state, false);
+
+    if restored_any || matches!(loaded.source, layout_state::SessionLoadSource::Legacy) {
+        save_session_now(state);
+    }
+}
+
+fn restore_active_workspace(state: &State, index: usize) {
+    let maybe_row = {
+        let s = state.borrow();
+        if s.workspaces.is_empty() {
+            None
+        } else {
+            let clamped = index.min(s.workspaces.len() - 1);
+            Some((
+                clamped,
+                s.workspaces[clamped].sidebar_row.clone(),
+                s.sidebar_list.clone(),
+            ))
+        }
+    };
+
+    if let Some((index, row, sidebar_list)) = maybe_row {
+        switch_workspace(state, index);
+        sidebar_list.select_row(Some(&row));
+    }
+}
+
+fn apply_sidebar_state_immediately(state: &State, sidebar_state: &layout_state::SidebarState) {
+    let (paned, expand_btn, sidebar, width) = {
+        let mut s = state.borrow_mut();
+        s.sidebar_expanded_width = sidebar_state.width.max(SIDEBAR_WIDTH);
+        let sidebar = match s.paned.start_child() {
+            Some(sidebar) => sidebar,
+            None => return,
+        };
+        (
+            s.paned.clone(),
+            s.expand_btn.clone(),
+            sidebar,
+            s.sidebar_expanded_width,
+        )
+    };
+
+    if sidebar_state.visible {
+        sidebar.set_visible(true);
+        paned.set_position(width);
+        expand_btn.set_visible(false);
+    } else {
+        // Apply restored sidebar visibility directly; using the animated toggle path during
+        // startup would create flicker and extra persistence churn while restore is suspended.
+        sidebar.set_visible(false);
+        paned.set_position(0);
+        expand_btn.set_visible(true);
+    }
+}
+
+fn snapshot_session_state(state: &State) -> AppSessionState {
+    let s = state.borrow();
+    let sidebar_visible = sidebar_is_visible(&s);
+    let sidebar_width = if sidebar_visible {
+        s.paned.position()
+    } else {
+        s.sidebar_expanded_width
+    }
+    .max(SIDEBAR_WIDTH);
+
+    let workspaces = s
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let cwd = workspace.cwd.borrow().clone();
+            let folder_path = workspace.folder_path.clone();
+            let working_directory = folder_path.clone().or(cwd.clone());
+            WorkspaceState {
+                name: workspace.name.clone(),
+                favorite: workspace.favorite,
+                cwd,
+                folder_path,
+                layout: snapshot_layout_node(&workspace.root, working_directory.as_deref()),
+            }
+        })
+        .collect();
+
+    layout_state::normalize_session(AppSessionState {
+        version: layout_state::SESSION_VERSION,
+        active_workspace_index: s.active_idx,
+        sidebar: layout_state::SidebarState {
+            visible: sidebar_visible,
+            width: sidebar_width,
+        },
+        workspaces,
+    })
+}
+
+fn sidebar_is_visible(state: &AppState) -> bool {
+    state
+        .paned
+        .start_child()
+        .map(|sidebar| sidebar.is_visible() && state.paned.position() > 10)
+        .unwrap_or(false)
+}
+
+fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
+    unsafe {
+        paned
+            .data::<Rc<RefCell<f64>>>(SPLIT_RATIO_STATE_KEY)
+            .map(|ptr| ptr.as_ref().clone())
+    }
+}
+
+fn update_split_ratio_state(paned: &gtk::Paned, ratio: f64) {
+    let ratio = layout_state::clamp_split_ratio(ratio);
+    if let Some(stored_ratio) = split_ratio_state(paned) {
+        *stored_ratio.borrow_mut() = ratio;
+    } else {
+        unsafe {
+            paned.set_data(SPLIT_RATIO_STATE_KEY, Rc::new(RefCell::new(ratio)));
+        }
+    }
+}
+
+fn snapshot_layout_node(widget: &gtk::Widget, working_directory: Option<&str>) -> LayoutNodeState {
+    if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+        let size = if paned.orientation() == gtk::Orientation::Horizontal {
+            paned.allocation().width()
+        } else {
+            paned.allocation().height()
+        };
+        let ratio = layout_state::snapshot_split_ratio(
+            paned.position(),
+            size,
+            split_ratio_state(paned).map(|ratio| *ratio.borrow()),
+        );
+        update_split_ratio_state(paned, ratio);
+        let start = paned
+            .start_child()
+            .map(|child| snapshot_layout_node(&child, working_directory))
+            .unwrap_or_else(|| LayoutNodeState::Pane(PaneState::fallback(working_directory)));
+        let end = paned
+            .end_child()
+            .map(|child| snapshot_layout_node(&child, working_directory))
+            .unwrap_or_else(|| LayoutNodeState::Pane(PaneState::fallback(working_directory)));
+        return LayoutNodeState::Split(SplitState {
+            orientation: if paned.orientation() == gtk::Orientation::Horizontal {
+                SplitOrientation::Horizontal
+            } else {
+                SplitOrientation::Vertical
+            },
+            ratio,
+            start: Box::new(start),
+            end: Box::new(end),
+        });
+    }
+
+    pane::snapshot_pane_state(widget)
+        .map(LayoutNodeState::Pane)
+        .unwrap_or_else(|| LayoutNodeState::Pane(PaneState::fallback(working_directory)))
+}
+
+fn build_workspace_root(
+    state: &State,
+    ws_id: &str,
+    working_directory: Option<&str>,
+    layout: Option<&LayoutNodeState>,
+) -> gtk::Widget {
+    match layout {
+        Some(layout) => build_layout_widget(state, ws_id, working_directory, layout),
+        None => create_pane_for_workspace(state, ws_id, working_directory, None).upcast(),
+    }
+}
+
+fn build_layout_widget(
+    state: &State,
+    ws_id: &str,
+    working_directory: Option<&str>,
+    layout: &LayoutNodeState,
+) -> gtk::Widget {
+    match layout {
+        LayoutNodeState::Pane(pane_state) => {
+            create_pane_for_workspace(state, ws_id, working_directory, Some(pane_state)).upcast()
+        }
+        LayoutNodeState::Split(split_state) => {
+            let orientation = match split_state.orientation {
+                SplitOrientation::Horizontal => gtk::Orientation::Horizontal,
+                SplitOrientation::Vertical => gtk::Orientation::Vertical,
+            };
+            let paned = gtk::Paned::builder()
+                .orientation(orientation)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            update_split_ratio_state(&paned, split_state.ratio);
+            attach_split_position_persistence(state, &paned);
+            let start = build_layout_widget(state, ws_id, working_directory, &split_state.start);
+            let end = build_layout_widget(state, ws_id, working_directory, &split_state.end);
+            paned.set_start_child(Some(&start));
+            paned.set_end_child(Some(&end));
+            apply_split_ratio_after_layout(&paned, orientation, split_state.ratio);
+            paned.upcast()
+        }
+    }
+}
+
+fn apply_split_ratio_after_layout(paned: &gtk::Paned, orientation: gtk::Orientation, ratio: f64) {
+    let ratio = layout_state::clamp_split_ratio(ratio);
+    let apply_ratio = move |paned: &gtk::Paned| {
+        let allocation = paned.allocation();
+        let size = if orientation == gtk::Orientation::Horizontal {
+            allocation.width()
+        } else {
+            allocation.height()
+        };
+        if size <= 0 {
+            return false;
+        }
+        paned.set_position(layout_state::split_position_from_ratio(ratio, size));
+        update_split_ratio_state(paned, ratio);
+        true
+    };
+
+    let paned_for_idle = paned.clone();
+    glib::idle_add_local_once(move || {
+        let _ = apply_ratio(&paned_for_idle);
+    });
+
+    let paned_for_map = paned.clone();
+    // Hidden workspaces may not have a real allocation during initial restore, so retry when the
+    // split is actually mapped instead of collapsing the divider to an arbitrary fallback pixel.
+    paned.connect_map(move |_| {
+        let _ = apply_ratio(&paned_for_map);
+    });
+}
+
+fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
+    update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
+    let state = state.clone();
+    paned.connect_position_notify(move |paned| {
+        let allocation = paned.allocation();
+        let size = if paned.orientation() == gtk::Orientation::Horizontal {
+            allocation.width()
+        } else {
+            allocation.height()
+        };
+        let ratio = layout_state::snapshot_split_ratio(
+            paned.position(),
+            size,
+            split_ratio_state(paned).map(|ratio| *ratio.borrow()),
+        );
+        update_split_ratio_state(paned, ratio);
+        request_session_save(&state);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // CSS
@@ -273,7 +538,11 @@ pub fn build_window(app: &adw::Application) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+    let style_manager = adw::StyleManager::default();
+    crate::terminal::sync_color_scheme(style_manager.is_dark());
+    style_manager.connect_dark_notify(|style_manager| {
+        crate::terminal::sync_color_scheme(style_manager.is_dark());
+    });
 
     // Register custom icons — look for icons dir relative to the executable
     let icon_theme = gtk::IconTheme::for_display(&gtk::gdk::Display::default().expect("display"));
@@ -281,7 +550,7 @@ pub fn build_window(app: &adw::Application) {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     // Try several possible icon locations
-    for candidate in &[
+    for path in [
         exe_dir
             .as_ref()
             .map(|d| d.join("../../rust/limux-host-linux/icons")),
@@ -290,11 +559,12 @@ pub fn build_window(app: &adw::Application) {
             env!("CARGO_MANIFEST_DIR"),
             "/icons"
         ))),
-    ] {
-        if let Some(path) = candidate {
-            if path.exists() {
-                icon_theme.add_search_path(path);
-            }
+    ]
+    .iter()
+    .flatten()
+    {
+        if path.exists() {
+            icon_theme.add_search_path(path);
         }
     }
 
@@ -306,8 +576,21 @@ pub fn build_window(app: &adw::Application) {
         .default_height(900)
         .build();
 
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&gtk::Label::builder().label(&title).build()));
+    // On Wayland compositors with xdg-decoration support, the compositor
+    // already provides the window chrome, so keep Limux from rendering a
+    // duplicate header bar. X11 continues to use the in-app header.
+    let provides_decorations = gtk::gdk::Display::default()
+        .and_then(|display| display.downcast::<gdk4_wayland::WaylandDisplay>().ok())
+        .map(|display| display.query_registry("zxdg_decoration_manager_v1"))
+        .unwrap_or(false);
+
+    let header = if provides_decorations {
+        None
+    } else {
+        let bar = adw::HeaderBar::new();
+        bar.set_title_widget(Some(&gtk::Label::builder().label(&title).build()));
+        Some(bar)
+    };
 
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::None);
@@ -407,7 +690,9 @@ pub fn build_window(app: &adw::Application) {
     content_overlay.add_overlay(&expand_btn);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    vbox.append(&header);
+    if let Some(ref header) = header {
+        vbox.append(header);
+    }
     vbox.append(&content_overlay);
     window.set_content(Some(&vbox));
 
@@ -422,14 +707,24 @@ pub fn build_window(app: &adw::Application) {
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
+        persistence_suspended: false,
+        save_queued: false,
     }));
 
     {
         let state = state.clone();
         main_paned.connect_position_notify(move |paned| {
             let position = paned.position();
-            if position > 10 {
-                state.borrow_mut().sidebar_expanded_width = position;
+            let should_save = if position > 10 {
+                let mut s = state.borrow_mut();
+                let changed = s.sidebar_expanded_width != position;
+                s.sidebar_expanded_width = position;
+                changed
+            } else {
+                false
+            };
+            if should_save {
+                request_session_save(&state);
             }
         });
     }
@@ -506,33 +801,22 @@ pub fn build_window(app: &adw::Application) {
             btn.remove_css_class("limux-sidebar-btn-trash-hover");
             if let Ok(workspace_id) = value.get::<String>() {
                 close_workspace_by_id(&state, &workspace_id);
-                save_workspaces(&state);
                 return true;
             }
             false
         });
     }
 
-    // Save workspaces (including latest CWD) on window close
+    // Save the full session on window close.
     {
         let state = state.clone();
         window.connect_close_request(move |_| {
-            save_workspaces(&state);
+            save_session_now(&state);
             glib::Propagation::Proceed
         });
     }
 
-    // Restore saved workspaces (if any). Empty start is fine — user clicks "New Workspace".
-    let saved = load_workspaces();
-    for sw in &saved {
-        add_workspace_with_name(
-            &state,
-            &sw.name,
-            sw.favorite,
-            sw.cwd.as_deref(),
-            sw.folder_path.as_deref(),
-        );
-    }
+    apply_loaded_session(&state, layout_state::load_session());
     window.present();
 }
 
@@ -845,7 +1129,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         delete_btn.connect_clicked(move |_| {
             pop.popdown();
             close_workspace_by_id(&state, &ws_id);
-            save_workspaces(&state);
+            request_session_save(&state);
         });
     }
     {
@@ -1010,7 +1294,7 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
                     workspace.name = next_name;
                 }
                 drop(s);
-                save_workspaces(&state_for_commit);
+                request_session_save(&state_for_commit);
             }
 
             label_for_commit.set_visible(true);
@@ -1115,7 +1399,7 @@ fn reorder_workspace_by_id(
     if let Some(row) = row_to_select {
         sidebar_list.select_row(Some(&row));
     }
-    save_workspaces(state);
+    request_session_save(state);
 
     true
 }
@@ -1165,7 +1449,7 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
     if let Some(row) = row_to_select {
         sidebar_list.select_row(Some(&row));
     }
-    save_workspaces(state);
+    request_session_save(state);
 }
 
 fn install_workspace_row_interactions(
@@ -1321,77 +1605,38 @@ fn add_workspace(state: &State, _working_directory: Option<&str>) {
 }
 
 fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
-    let mut s = state.borrow_mut();
-    let id = uuid::Uuid::new_v4().to_string();
-    let stack_name = format!("ws-{id}");
-
-    let pane_widget = create_pane_for_workspace(state, &id, Some(folder_path));
-    let root: gtk::Widget = pane_widget.upcast();
-
-    s.stack.add_named(&root, Some(&stack_name));
-
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(name, Some(folder_path));
-    s.sidebar_list.append(&row);
-    install_workspace_row_interactions(state, &id, &row, &favorite_button);
-
-    let cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(Some(folder_path.to_string())));
-    let ws = Workspace {
-        id,
+    let workspace = WorkspaceState {
         name: name.to_string(),
-        root,
-        sidebar_row: row.clone(),
-        name_label,
-        favorite_button,
-        notify_dot,
-        notify_label,
-        unread: false,
         favorite: false,
-        cwd,
+        cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
-        path_label,
+        layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     };
-
-    s.workspaces.push(ws);
-    let new_idx = s.workspaces.len() - 1;
-    s.active_idx = new_idx;
-    s.stack.set_visible_child_name(&stack_name);
-
-    let sidebar_list = s.sidebar_list.clone();
-    drop(s);
-
-    sidebar_list.select_row(Some(&row));
-    save_workspaces(state);
+    add_workspace_from_state(state, &workspace);
+    request_session_save(state);
 }
 
-fn add_workspace_with_name(
-    state: &State,
-    name: &str,
-    favorite: bool,
-    saved_cwd: Option<&str>,
-    folder_path: Option<&str>,
-) {
+fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
     let mut s = state.borrow_mut();
     let id = uuid::Uuid::new_v4().to_string();
     let stack_name = format!("ws-{id}");
-
-    // Use folder_path for terminal cwd, fall back to saved_cwd
-    let working_dir = folder_path.or(saved_cwd);
-    let pane_widget = create_pane_for_workspace(state, &id, working_dir);
-    let root: gtk::Widget = pane_widget.upcast();
+    let working_dir = workspace
+        .folder_path
+        .as_deref()
+        .or(workspace.cwd.as_deref());
+    let root = build_workspace_root(state, &id, working_dir, Some(&workspace.layout));
 
     s.stack.add_named(&root, Some(&stack_name));
 
     let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(name, folder_path);
+        build_sidebar_row(&workspace.name, workspace.folder_path.as_deref());
     s.sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
-    let cwd: Rc<RefCell<Option<String>>> =
-        Rc::new(RefCell::new(working_dir.map(|s| s.to_string())));
+    let cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(workspace.cwd.clone()));
     let ws = Workspace {
         id,
-        name: name.to_string(),
+        name: workspace.name.clone(),
         root,
         sidebar_row: row.clone(),
         name_label,
@@ -1399,13 +1644,13 @@ fn add_workspace_with_name(
         notify_dot,
         notify_label,
         unread: false,
-        favorite,
+        favorite: workspace.favorite,
         cwd,
-        folder_path: folder_path.map(|s| s.to_string()),
+        folder_path: workspace.folder_path.clone(),
         path_label,
     };
 
-    if favorite {
+    if workspace.favorite {
         set_workspace_favorite_visual(&ws);
     }
 
@@ -1425,6 +1670,7 @@ fn create_pane_for_workspace(
     state: &State,
     ws_id: &str,
     working_directory: Option<&str>,
+    initial_state: Option<&PaneState>,
 ) -> gtk::Box {
     let state_for_split = state.clone();
     let state_for_close = state.clone();
@@ -1466,9 +1712,13 @@ fn create_pane_for_workspace(
         on_empty: Box::new(move |pane_widget| {
             remove_pane(&state_for_empty, &ws_id_empty, pane_widget);
         }),
+        on_state_changed: Box::new({
+            let state = state.clone();
+            move || request_session_save(&state)
+        }),
     });
 
-    pane::create_pane(callbacks, working_directory)
+    pane::create_pane(callbacks, working_directory, initial_state)
 }
 
 fn close_workspace(state: &State) {
@@ -1494,7 +1744,7 @@ fn close_workspace_by_id(state: &State, id: &str) {
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
-        save_workspaces(state);
+        request_session_save(state);
         return;
     }
 
@@ -1509,7 +1759,7 @@ fn close_workspace_by_id(state: &State, id: &str) {
     drop(s);
 
     sidebar_list.select_row(Some(&row));
-    save_workspaces(state);
+    request_session_save(state);
 }
 
 fn switch_workspace(state: &State, idx: usize) {
@@ -1535,6 +1785,8 @@ fn switch_workspace(state: &State, idx: usize) {
             row_box.remove_css_class("limux-sidebar-row-unread");
         }
     }
+    drop(s);
+    request_session_save(state);
 }
 
 fn cycle_workspace(state: &State, direction: i32) {
@@ -1620,6 +1872,7 @@ fn toggle_sidebar(state: &State) {
             if is_current {
                 sidebar.set_visible(false);
                 expand_btn_for_done.set_visible(true);
+                request_session_save(&state_for_done);
             }
         });
         state.borrow_mut().sidebar_animation = Some(animation.clone());
@@ -1656,6 +1909,7 @@ fn toggle_sidebar(state: &State) {
             };
             if is_current {
                 expand_btn_for_done.set_visible(false);
+                request_session_save(&state_for_done);
             }
         });
         state.borrow_mut().sidebar_animation = Some(animation.clone());
@@ -1679,13 +1933,9 @@ fn split_pane(
         s.workspaces
             .iter()
             .find(|w| w.id == ws_id)
-            .and_then(|ws| {
-                ws.folder_path
-                    .clone()
-                    .or_else(|| ws.cwd.borrow().clone())
-            })
+            .and_then(|ws| ws.folder_path.clone().or_else(|| ws.cwd.borrow().clone()))
     };
-    let new_pane = create_pane_for_workspace(state, ws_id, wd.as_deref());
+    let new_pane = create_pane_for_workspace(state, ws_id, wd.as_deref(), None);
 
     let parent = pane_widget.parent();
 
@@ -1694,6 +1944,8 @@ fn split_pane(
         .hexpand(true)
         .vexpand(true)
         .build();
+    update_split_ratio_state(&new_paned, layout_state::DEFAULT_SPLIT_RATIO);
+    attach_split_position_persistence(state, &new_paned);
 
     if let Some(parent) = parent {
         if let Some(paned_parent) = parent.downcast_ref::<gtk::Paned>() {
@@ -1737,6 +1989,7 @@ fn split_pane(
             }
         });
     }
+    request_session_save(state);
 }
 
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
@@ -1803,7 +2056,9 @@ fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
     } else if parent.downcast_ref::<gtk::Stack>().is_some() {
         // This is the only pane in the workspace — close the workspace
         close_workspace_by_id(state, ws_id);
+        return;
     }
+    request_session_save(state);
 }
 
 /// Find the focused pane widget (a gtk::Box with class limux-pane-toolbar child)
@@ -1978,7 +2233,6 @@ fn find_leaf_pane(widget: &gtk::Widget, axis: gtk::Orientation, prefer_start: bo
         widget.clone()
     }
 }
-
 
 fn mark_workspace_unread(state: &State, ws_id: &str) {
     let mut s = state.borrow_mut();
