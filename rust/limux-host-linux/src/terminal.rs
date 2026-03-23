@@ -732,6 +732,42 @@ pub fn create_terminal(
         gl_area.add_controller(focus_ctrl);
     }
 
+    // File drop: accept files dragged from a file manager and paste their
+    // shell-escaped paths into the terminal.
+    {
+        let surface_cell = surface_cell.clone();
+        let drop_target =
+            gtk::DropTarget::new(gtk::gdk::FileList::static_type(), gtk::gdk::DragAction::COPY);
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            let Some(surface) = *surface_cell.borrow() else {
+                return false;
+            };
+            let Ok(file_list) = value.get::<gtk::gdk::FileList>() else {
+                return false;
+            };
+            let files = file_list.files();
+            if files.is_empty() {
+                return false;
+            }
+            let paths: Vec<String> = files
+                .iter()
+                .filter_map(|f| f.path())
+                .map(|p| shell_escape(p.to_string_lossy().as_ref()))
+                .collect();
+            if paths.is_empty() {
+                return false;
+            }
+            let text = paths.join(" ");
+            if let Ok(cstr) = CString::new(text.as_bytes()) {
+                unsafe {
+                    ghostty_surface_text(surface, cstr.as_ptr(), cstr.as_bytes().len());
+                }
+            }
+            true
+        });
+        gl_area.add_controller(drop_target);
+    }
+
     // On unrealize: deinit GL resources but keep the surface alive.
     // GTK unrealizes widgets during reparenting (splits), and we need
     // the terminal/pty to survive. The GL resources will be recreated
@@ -1056,6 +1092,16 @@ fn show_clipboard_toast(overlay: &gtk::Overlay) {
     }
 }
 
+/// Shell-escape a path so it can be safely pasted into a terminal.
+fn shell_escape(s: &str) -> String {
+    if s.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'-' || b == b'_'
+    }) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn translate_mouse_mods(state: gtk::gdk::ModifierType) -> c_int {
     let mut mods: c_int = GHOSTTY_MODS_NONE;
     if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
@@ -1115,5 +1161,27 @@ mod tests {
         assert_eq!(ctrl_shift_h.as_deref(), Some("H"));
         assert_eq!(alt_shift_gt.as_deref(), Some(">"));
         assert!(key_event_text(gtk::gdk::Key::BackSpace).is_none());
+    }
+
+    #[test]
+    fn shell_escape_preserves_simple_paths() {
+        assert_eq!(shell_escape("/home/user/file.txt"), "/home/user/file.txt");
+        assert_eq!(shell_escape("/tmp/a-b_c.rs"), "/tmp/a-b_c.rs");
+    }
+
+    #[test]
+    fn shell_escape_quotes_paths_with_spaces() {
+        assert_eq!(
+            shell_escape("/home/user/my file.txt"),
+            "'/home/user/my file.txt'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_handles_single_quotes() {
+        assert_eq!(
+            shell_escape("/home/user/it's a file"),
+            "'/home/user/it'\\''s a file'"
+        );
     }
 }
