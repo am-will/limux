@@ -552,30 +552,54 @@ pub fn create_terminal(
             }
         });
     }
-
     // Keyboard input
     //
-    // Send key events with the text field populated. Ghostty uses the
-    // text field for actual character input and the keycode for bindings.
-    // Do NOT use ghostty_surface_text() for regular typing — Ghostty
-    // treats that as a paste, causing "pasting..." indicators in apps.
+    // Send key events with the text field populated for actual printable
+    // typing. Ghostty uses the text field for character input and the
+    // keycode/modifier fields for bindings.
+    //
+    // Do NOT use ghostty_surface_text() for regular typing — Ghostty treats
+    // that as paste, causing "pasting..." indicators in apps.
+    fn key_event_text(keyval: gtk::gdk::Key, modifier: gtk::gdk::ModifierType) -> Option<CString> {
+        if modifier.intersects(
+            gtk::gdk::ModifierType::CONTROL_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK,
+        ) {
+            return None;
+        }
+
+        let ch = keyval.to_unicode()?;
+        if ch.is_control() {
+            return None;
+        }
+
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        CString::new(s.as_bytes()).ok()
+    }
+
     {
         let sc_press = surface_cell.clone();
         let sc_release = surface_cell.clone();
+        let display_press = gl_area.display();
+        let display_release = display_press.clone();
         let key_controller = gtk::EventControllerKey::new();
+
         key_controller.connect_key_pressed(move |_ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_press.borrow() {
-                let text_char = keyval.to_unicode();
-                let mut text_buf = [0u8; 4];
-                let c_text = text_char
-                    .filter(|c| !c.is_control())
-                    .map(|c| c.encode_utf8(&mut text_buf) as &str)
-                    .and_then(|s| CString::new(s).ok());
+                let c_text = key_event_text(keyval, modifier);
 
-                let mut event =
-                    translate_key_event(GHOSTTY_ACTION_PRESS, keyval, keycode, modifier);
-                if let Some(ref ct) = c_text {
-                    event.text = ct.as_ptr();
+                let mut event = translate_key_event(
+                    &display_press,
+                    GHOSTTY_ACTION_PRESS,
+                    keyval,
+                    keycode,
+                    modifier,
+                );
+
+                if let Some(ref text) = c_text {
+                    event.text = text.as_ptr();
                 }
 
                 let consumed = unsafe { ghostty_surface_key(surface, event) };
@@ -583,19 +607,28 @@ pub fn create_terminal(
                     return glib::Propagation::Stop;
                 }
             }
+
             glib::Propagation::Proceed
         });
 
         key_controller.connect_key_released(move |_ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_release.borrow() {
-                let event = translate_key_event(GHOSTTY_ACTION_RELEASE, keyval, keycode, modifier);
-                unsafe { ghostty_surface_key(surface, event) };
+                let event = translate_key_event(
+                    &display_release,
+                    GHOSTTY_ACTION_RELEASE,
+                    keyval,
+                    keycode,
+                    modifier,
+                );
+
+                unsafe {
+                    ghostty_surface_key(surface, event);
+                }
             }
         });
 
         gl_area.add_controller(key_controller);
     }
-
     // Mouse buttons (also handles click-to-focus) — skip right-click (handled below)
     {
         let surface_cell = surface_cell.clone();
@@ -858,13 +891,9 @@ fn show_terminal_context_menu(
 // Key translation
 // ---------------------------------------------------------------------------
 
-fn translate_key_event(
-    action: c_int,
-    keyval: gtk::gdk::Key,
-    keycode: u32,
-    modifier: gtk::gdk::ModifierType,
-) -> ghostty_input_key_s {
-    let mut mods: c_int = GHOSTTY_MODS_NONE;
+fn gdk_mods_to_ghostty(modifier: gtk::gdk::ModifierType) -> c_int {
+    let mut mods = GHOSTTY_MODS_NONE;
+
     if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
         mods |= GHOSTTY_MODS_SHIFT;
     }
@@ -878,32 +907,85 @@ fn translate_key_event(
         mods |= GHOSTTY_MODS_SUPER;
     }
 
-    // unshifted_codepoint must be the codepoint WITHOUT shift applied.
-    // keyval already includes shift (e.g., Shift+a → 'A'), so use to_lower().
-    let unshifted = keyval
-        .to_lower()
-        .to_unicode()
-        .map(|c| c as u32)
-        .unwrap_or(0);
+    mods
+}
 
-    // Mark shift as consumed when it produced a different character
-    // (e.g., a→A, 1→!). This tells Ghostty not to treat shift as
-    // a separate modifier for keybinding matching.
-    let mut consumed: c_int = GHOSTTY_MODS_NONE;
+fn keycode_levels(
+    display: &gtk::gdk::Display,
+    keycode: u32,
+) -> (Option<gtk::gdk::Key>, Option<gtk::gdk::Key>) {
+    let mut base = None;
+    let mut shifted = None;
+
+    if let Some(entries) = display.map_keycode(keycode) {
+        for (kmk, key) in entries {
+            if kmk.group() != 0 {
+                continue;
+            }
+
+            match kmk.level() {
+                0 => base = Some(key),
+                1 => shifted = Some(key),
+                _ => {}
+            }
+        }
+    }
+
+    (base, shifted)
+}
+
+fn key_to_codepoint(key: Option<gtk::gdk::Key>) -> u32 {
+    key.and_then(|k| k.to_unicode())
+        .map(|c| c as u32)
+        .unwrap_or(0)
+}
+
+fn translate_key_event(
+    display: &gtk::gdk::Display,
+    action: c_int,
+    keyval: gtk::gdk::Key,
+    keycode: u32,
+    modifier: gtk::gdk::ModifierType,
+) -> ghostty_input_key_s {
+    let mods = gdk_mods_to_ghostty(modifier);
+
+    let (base_key, shifted_key) = keycode_levels(display, keycode);
+
+    // Fallback to the current keyval if keymap lookup fails.
+    let unshifted_codepoint = {
+        let cp = key_to_codepoint(base_key);
+        if cp != 0 {
+            cp
+        } else {
+            keyval.to_unicode().map(|c| c as u32).unwrap_or(0)
+        }
+    };
+
+    let mut consumed_mods = GHOSTTY_MODS_NONE;
+
     if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-        let shifted = keyval.to_unicode().map(|c| c as u32).unwrap_or(0);
-        if shifted != 0 && shifted != unshifted {
-            consumed |= GHOSTTY_MODS_SHIFT;
+        let shifted_codepoint = key_to_codepoint(shifted_key);
+
+        // Consume Shift only when it actually changes the printable symbol for
+        // this physical key, e.g.:
+        // - a -> A
+        // - 1 -> !
+        // - / -> ?
+        if unshifted_codepoint != 0
+            && shifted_codepoint != 0
+            && shifted_codepoint != unshifted_codepoint
+        {
+            consumed_mods |= GHOSTTY_MODS_SHIFT;
         }
     }
 
     ghostty_input_key_s {
         action,
         mods,
-        consumed_mods: consumed,
+        consumed_mods,
         keycode,
         text: ptr::null(),
-        unshifted_codepoint: unshifted,
+        unshifted_codepoint,
         composing: false,
     }
 }
