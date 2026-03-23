@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
+use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -751,16 +752,16 @@ pub fn create_terminal(
             if files.is_empty() {
                 return false;
             }
-            let paths: Vec<String> = files
+            let paths: Vec<Vec<u8>> = files
                 .iter()
                 .filter_map(|f| f.path())
-                .map(|p| shell_escape(p.to_string_lossy().as_ref()))
+                .map(|p| shell_escape_bytes(p.as_os_str().as_bytes()))
                 .collect();
             if paths.is_empty() {
                 return false;
             }
-            let text = paths.join(" ");
-            if let Ok(cstr) = CString::new(text.as_bytes()) {
+            let text: Vec<u8> = paths.join(&b' ');
+            if let Ok(cstr) = CString::new(text) {
                 unsafe {
                     ghostty_surface_text(surface, cstr.as_ptr(), cstr.as_bytes().len());
                 }
@@ -1095,13 +1096,23 @@ fn show_clipboard_toast(overlay: &gtk::Overlay) {
 }
 
 /// Shell-escape a path so it can be safely pasted into a terminal.
-fn shell_escape(s: &str) -> String {
-    if s.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'-' || b == b'_')
+/// Operates on raw bytes to preserve non-UTF-8 filenames on Linux.
+fn shell_escape_bytes(s: &[u8]) -> Vec<u8> {
+    if s.iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'-' || b == b'_')
     {
-        return s.to_string();
+        return s.to_vec();
     }
-    format!("'{}'", s.replace('\'', "'\\''"))
+    let mut out = vec![b'\''];
+    for &b in s {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    out
 }
 
 fn translate_mouse_mods(state: gtk::gdk::ModifierType) -> c_int {
@@ -1167,23 +1178,32 @@ mod tests {
 
     #[test]
     fn shell_escape_preserves_simple_paths() {
-        assert_eq!(shell_escape("/home/user/file.txt"), "/home/user/file.txt");
-        assert_eq!(shell_escape("/tmp/a-b_c.rs"), "/tmp/a-b_c.rs");
+        assert_eq!(
+            shell_escape_bytes(b"/home/user/file.txt"),
+            b"/home/user/file.txt"
+        );
+        assert_eq!(shell_escape_bytes(b"/tmp/a-b_c.rs"), b"/tmp/a-b_c.rs");
     }
 
     #[test]
     fn shell_escape_quotes_paths_with_spaces() {
         assert_eq!(
-            shell_escape("/home/user/my file.txt"),
-            "'/home/user/my file.txt'"
+            shell_escape_bytes(b"/home/user/my file.txt"),
+            b"'/home/user/my file.txt'"
         );
     }
 
     #[test]
     fn shell_escape_handles_single_quotes() {
         assert_eq!(
-            shell_escape("/home/user/it's a file"),
-            "'/home/user/it'\\''s a file'"
+            shell_escape_bytes(b"/home/user/it's a file"),
+            b"'/home/user/it'\\''s a file'"
         );
+    }
+
+    #[test]
+    fn shell_escape_preserves_non_utf8_bytes() {
+        let path = b"/home/user/\xff\xfefile.txt";
+        assert_eq!(shell_escape_bytes(path), b"'/home/user/\xff\xfefile.txt'");
     }
 }
