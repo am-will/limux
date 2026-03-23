@@ -736,8 +736,10 @@ pub fn create_terminal(
     // shell-escaped paths into the terminal.
     {
         let surface_cell = surface_cell.clone();
-        let drop_target =
-            gtk::DropTarget::new(gtk::gdk::FileList::static_type(), gtk::gdk::DragAction::COPY);
+        let drop_target = gtk::DropTarget::new(
+            gtk::gdk::FileList::static_type(),
+            gtk::gdk::DragAction::COPY,
+        );
         drop_target.connect_drop(move |_target, value, _x, _y| {
             let Some(surface) = *surface_cell.borrow() else {
                 return false;
@@ -1094,9 +1096,9 @@ fn show_clipboard_toast(overlay: &gtk::Overlay) {
 
 /// Shell-escape a path so it can be safely pasted into a terminal.
 fn shell_escape(s: &str) -> String {
-    if s.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'-' || b == b'_'
-    }) {
+    if s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'-' || b == b'_')
+    {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
