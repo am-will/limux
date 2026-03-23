@@ -654,11 +654,14 @@ pub fn create_terminal(
                 let current_event = ctrl
                     .current_event()
                     .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+                // gtk4-rs 0.6: widget() returns gtk::Widget (non-optional).
+                // gtk4-rs 0.7+: widget() returns Option<gtk::Widget>.
+                // Wrap in Some() so translate_key_event receives Option<&gtk::Widget>.
                 let widget = ctrl.widget();
 
                 let mut event = translate_key_event(
                     GHOSTTY_ACTION_PRESS,
-                    widget.as_ref(),
+                    Some(&widget),
                     current_event.as_ref(),
                     keyval,
                     keycode,
@@ -681,10 +684,11 @@ pub fn create_terminal(
                 let current_event = ctrl
                     .current_event()
                     .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+                // gtk4-rs 0.6: widget() returns gtk::Widget (non-optional); wrap in Some().
                 let widget = ctrl.widget();
                 let event = translate_key_event(
                     GHOSTTY_ACTION_RELEASE,
-                    widget.as_ref(),
+                    Some(&widget),
                     current_event.as_ref(),
                     keyval,
                     keycode,
@@ -1472,7 +1476,8 @@ mod glx_compat {
         if libgl.is_null() {
             return Err("libGL.so.1 not loaded".into());
         }
-        let gpa_ptr = unsafe { dlsym(libgl, b"glXGetProcAddressARB\0".as_ptr() as *const c_char) };
+        let gpa_name = CString::new("glXGetProcAddressARB").unwrap();
+        let gpa_ptr = unsafe { dlsym(libgl, gpa_name.as_ptr()) };
         if gpa_ptr.is_null() {
             return Err("glXGetProcAddressARB not found".into());
         }
