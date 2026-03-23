@@ -21,15 +21,15 @@ https://github.com/user-attachments/assets/6f3047c2-e2b6-49f2-b536-570a1570d0f8
 
 Download the latest release from [GitHub Releases](https://github.com/am-will/limux/releases).
 
-**Debian/Ubuntu (.deb)** — recommended, shows up in app launcher immediately:
+**Debian/Ubuntu (.deb)** — recommended:
 ```bash
-sudo apt install ./limux_0.1.5_amd64.deb
+sudo dpkg -i ./limux_0.1.6_amd64.deb
 ```
 
 **AppImage** — portable, no install needed:
 ```bash
-chmod +x Limux-0.1.5-x86_64.AppImage
-./Limux-0.1.5-x86_64.AppImage
+chmod +x Limux-0.1.6-x86_64.AppImage
+./Limux-0.1.6-x86_64.AppImage
 ```
 
 **Tarball** — manual install:

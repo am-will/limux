@@ -15,7 +15,8 @@ GHOSTTY_SO="${ROOT_DIR}/ghostty/zig-out/lib/libghostty.so"
 GHOSTTY_SHARE_DIR=""
 ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons"
 APP_ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons/app"
-DESKTOP_FILE="${ROOT_DIR}/rust/limux-host-linux/limux.desktop"
+DESKTOP_FILE="${ROOT_DIR}/rust/limux-host-linux/dev.limux.linux.desktop"
+METADATA_FILE="${ROOT_DIR}/rust/limux-host-linux/dev.limux.linux.metainfo.xml"
 OUT_DIR="${ROOT_DIR}/dist"
 
 remove_tree() {
@@ -92,9 +93,10 @@ populate_tree() {
     local libdir="$dest${prefix}/lib/limux"
     local ghostty_resdir="$dest${prefix}/share/limux"
     local appdir="$dest${prefix}/share/applications"
+    local metadatadir="$dest${prefix}/share/metainfo"
     local icondir="$dest${prefix}/share/icons/hicolor"
 
-    mkdir -p "$bindir" "$libdir" "$ghostty_resdir" "$appdir" "$icondir/scalable/actions"
+    mkdir -p "$bindir" "$libdir" "$ghostty_resdir" "$appdir" "$metadatadir" "$icondir/scalable/actions"
 
     # Binary
     cp "$BINARY" "$bindir/limux"
@@ -109,7 +111,8 @@ populate_tree() {
     cp -r "$GHOSTTY_SHARE_DIR" "$ghostty_resdir/ghostty"
 
     # Desktop file
-    cp "$DESKTOP_FILE" "$appdir/limux.desktop"
+    cp "$DESKTOP_FILE" "$appdir/dev.limux.linux.desktop"
+    cp "$METADATA_FILE" "$metadatadir/dev.limux.linux.metainfo.xml"
 
     # Action icons
     if [ -d "$ICONS_DIR/hicolor" ]; then
@@ -139,6 +142,7 @@ echo "--- Building tarball ---"
 TARBALL_STAGE="/tmp/${PKG_BASE}"
 remove_tree "$TARBALL_STAGE"
 mkdir -p "$TARBALL_STAGE"/{lib,share/limux,share/applications,share/icons/hicolor/scalable/actions}
+mkdir -p "$TARBALL_STAGE/share/metainfo"
 
 cp "$BINARY" "$TARBALL_STAGE/limux"
 strip "$TARBALL_STAGE/limux"
@@ -146,7 +150,8 @@ chmod 755 "$TARBALL_STAGE/limux"
 cp "$GHOSTTY_SO" "$TARBALL_STAGE/lib/libghostty.so"
 strip --strip-debug "$TARBALL_STAGE/lib/libghostty.so"
 cp -r "$GHOSTTY_SHARE_DIR" "$TARBALL_STAGE/share/limux/ghostty"
-cp "$DESKTOP_FILE" "$TARBALL_STAGE/share/applications/limux.desktop"
+cp "$DESKTOP_FILE" "$TARBALL_STAGE/share/applications/dev.limux.linux.desktop"
+cp "$METADATA_FILE" "$TARBALL_STAGE/share/metainfo/dev.limux.linux.metainfo.xml"
 
 if [ -d "$ICONS_DIR/hicolor" ]; then
     cp -r "$ICONS_DIR/hicolor/scalable" "$TARBALL_STAGE/share/icons/hicolor/" 2>/dev/null || true
@@ -213,6 +218,8 @@ if $UNINSTALL; then
     rm -f /etc/ld.so.conf.d/limux.conf
     ldconfig 2>/dev/null || true
     rm -f "$PREFIX/share/applications/limux.desktop"
+    rm -f "$PREFIX/share/applications/dev.limux.linux.desktop"
+    rm -f "$PREFIX/share/metainfo/dev.limux.linux.metainfo.xml"
     for size in 16 32 128 256 512; do
         rm -f "$PREFIX/share/icons/hicolor/${size}x${size}/apps/limux.png"
     done
@@ -221,6 +228,7 @@ if $UNINSTALL; then
     rm -f "$PREFIX/share/icons/hicolor/scalable/actions/limux-split-vertical-symbolic.svg"
     gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
     update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
+    appstreamcli refresh-cache --force 2>/dev/null || true
     echo "Limux uninstalled."
     exit 0
 fi
@@ -235,12 +243,15 @@ if [ -d "$SCRIPT_DIR/share/limux" ]; then
 fi
 echo "$PREFIX/lib/limux" > /etc/ld.so.conf.d/limux.conf
 ldconfig 2>/dev/null || true
-install -Dm644 "$SCRIPT_DIR/share/applications/limux.desktop" "$PREFIX/share/applications/limux.desktop"
+rm -f "$PREFIX/share/applications/limux.desktop"
+install -Dm644 "$SCRIPT_DIR/share/applications/dev.limux.linux.desktop" "$PREFIX/share/applications/dev.limux.linux.desktop"
+install -Dm644 "$SCRIPT_DIR/share/metainfo/dev.limux.linux.metainfo.xml" "$PREFIX/share/metainfo/dev.limux.linux.metainfo.xml"
 if [ -d "$SCRIPT_DIR/share/icons" ]; then
     cp -r "$SCRIPT_DIR/share/icons/hicolor" "$PREFIX/share/icons/"
 fi
 gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
 update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
+appstreamcli refresh-cache --force 2>/dev/null || true
 
 echo ""
 echo "Limux installed successfully!"
@@ -293,8 +304,11 @@ EOF
 cat > "$DEB_ROOT/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
 ldconfig 2>/dev/null || true
+rm -f /usr/share/applications/limux.desktop
+rm -f /usr/local/share/applications/limux.desktop
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 update-desktop-database /usr/share/applications 2>/dev/null || true
+appstreamcli refresh-cache --force 2>/dev/null || true
 EOF
 chmod 755 "$DEB_ROOT/DEBIAN/postinst"
 
@@ -304,6 +318,7 @@ cat > "$DEB_ROOT/DEBIAN/postrm" << 'EOF'
 ldconfig 2>/dev/null || true
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 update-desktop-database /usr/share/applications 2>/dev/null || true
+appstreamcli refresh-cache --force 2>/dev/null || true
 EOF
 chmod 755 "$DEB_ROOT/DEBIAN/postrm"
 
@@ -319,6 +334,7 @@ echo "--- Building AppImage ---"
 APPDIR="$STAGE/Limux.AppDir"
 remove_tree "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
+         "$APPDIR/usr/share/metainfo" \
          "$APPDIR/usr/share/icons/hicolor/scalable/actions" \
          "$APPDIR/usr/share/limux"
 
@@ -335,8 +351,9 @@ strip --strip-debug "$APPDIR/usr/lib/libghostty.so"
 cp -r "$GHOSTTY_SHARE_DIR" "$APPDIR/usr/share/limux/ghostty"
 
 # Desktop file (at AppDir root and in usr/share)
-cp "$DESKTOP_FILE" "$APPDIR/limux.desktop"
-cp "$DESKTOP_FILE" "$APPDIR/usr/share/applications/limux.desktop"
+cp "$DESKTOP_FILE" "$APPDIR/dev.limux.linux.desktop"
+cp "$DESKTOP_FILE" "$APPDIR/usr/share/applications/dev.limux.linux.desktop"
+cp "$METADATA_FILE" "$APPDIR/usr/share/metainfo/dev.limux.linux.metainfo.xml"
 
 # Icons
 if [ -d "$ICONS_DIR/hicolor" ]; then
@@ -396,5 +413,5 @@ ls -lh "$OUT_DIR"/ 2>/dev/null
 echo ""
 echo "Install options:"
 echo "  Tarball:   tar xzf dist/${PKG_BASE}.tar.gz && cd ${PKG_BASE} && sudo ./install.sh"
-echo "  Deb:       sudo apt install ./dist/limux_${VERSION}_${DEB_ARCH}.deb"
+echo "  Deb:       sudo dpkg -i ./dist/limux_${VERSION}_${DEB_ARCH}.deb"
 echo "  AppImage:  chmod +x dist/Limux-${VERSION}-${ARCH}.AppImage && ./dist/Limux-${VERSION}-${ARCH}.AppImage"

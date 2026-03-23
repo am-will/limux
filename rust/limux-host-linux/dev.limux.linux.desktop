@@ -1,11 +1,14 @@
 [Desktop Entry]
+Version=1.0
 Name=Limux
 Comment=GPU-accelerated terminal workspace manager
 Exec=limux
+TryExec=limux
 Icon=limux
 Terminal=false
 Type=Application
-Categories=System;TerminalEmulator;
+Categories=Utility;TerminalEmulator;
 Keywords=terminal;multiplexer;ghostty;workspace;
 StartupNotify=true
 StartupWMClass=dev.limux.linux
+X-GNOME-UsesNotifications=true
