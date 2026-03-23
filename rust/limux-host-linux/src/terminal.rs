@@ -1,4 +1,5 @@
 use gtk::glib;
+use gtk::glib::signal::Inhibit;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
@@ -52,8 +53,9 @@ thread_local! {
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
 pub fn init_ghostty() {
     GHOSTTY.get_or_init(|| {
-        unsafe {
-            ghostty_init(0, ptr::null_mut());
+        let rc = unsafe { ghostty_init(0, ptr::null_mut()) };
+        if rc != 0 {
+            eprintln!("limux: ghostty_init failed with code {rc}");
         }
 
         let config = unsafe {
@@ -76,6 +78,9 @@ pub fn init_ghostty() {
         };
 
         let app = unsafe { ghostty_app_new(&runtime_config, config) };
+        if app.is_null() {
+            eprintln!("limux: ghostty_app_new returned null — terminals will not work");
+        }
 
         // Ghostty's GTK apprt calls core_app.tick() on every GLib main
         // loop iteration to drain the app mailbox (which includes
@@ -84,7 +89,7 @@ pub fn init_ghostty() {
         // We replicate this with a high-frequency timer (~8ms ≈ 120Hz).
         glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
             unsafe { ghostty_app_tick(app) };
-            glib::ControlFlow::Continue
+            glib::Continue(true)
         });
 
         GhosttyState { app }
@@ -385,6 +390,12 @@ pub fn create_terminal(
     gl_area.set_auto_render(true);
     gl_area.set_focusable(true);
     gl_area.set_can_focus(true);
+    // Ghostty requires desktop OpenGL 4.3+ (not OpenGL ES).
+    // GTK 4.6 on Ubuntu 22.04 always creates a 3.2 core context regardless
+    // of set_required_version(4,3). We work around this by creating a raw
+    // GLX 4.3 context in connect_realize after GTK's context is current.
+    gl_area.set_use_es(false);
+    gl_area.set_required_version(4, 3);
 
     let wd = working_directory.map(|s| s.to_string());
     let callbacks = Rc::new(callbacks);
@@ -392,6 +403,8 @@ pub fn create_terminal(
     let had_focus = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
+    let glx_ctx_cell: Rc<RefCell<Option<glx_compat::Glx43Ctx>>> =
+        Rc::new(RefCell::new(None));
 
     // Create overlay early so closures can capture it for toast notifications
     let overlay = gtk::Overlay::new();
@@ -407,11 +420,42 @@ pub fn create_terminal(
         let callbacks = callbacks.clone();
         let had_focus = had_focus.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
+        let glx_ctx_cell = glx_ctx_cell.clone();
         gl_area.connect_realize(move |gl_area| {
             gl_area.make_current();
             if let Some(err) = gl_area.error() {
                 eprintln!("limux: GLArea error after make_current: {err}");
                 return;
+            }
+
+            // Create (or reuse) the OpenGL 4.3 context. GTK's 3.2 context is
+            // current here, so EGL/GLX can query the current display/drawable.
+            if glx_ctx_cell.borrow().is_none() {
+                match glx_compat::create_glx43_context() {
+                    Ok(ctx) => {
+                        *glx_ctx_cell.borrow_mut() = Some(ctx);
+                    }
+                    Err(e) => {
+                        // OpenGL 4.3 is required by Ghostty. Without it the
+                        // terminal cannot render. Show a persistent in-app error
+                        // so the failure is visible even without a terminal open.
+                        let hint = "Hint: set LIMUX_GL_BACKEND=egl or LIMUX_GL_BACKEND=glx \
+                                    to force a specific backend.";
+                        let msg = format!(
+                            "limux: OpenGL 4.3 context creation failed — \
+                             terminal cannot start.\n{e}\n{hint}"
+                        );
+                        eprintln!("{msg}");
+                        show_gl_error_toast(&overlay_for_map, &msg);
+                        return;
+                    }
+                }
+            }
+            // Make the 4.3 context current (falls back gracefully if absent)
+            if let Some(ctx) = glx_ctx_cell.borrow().as_ref() {
+                if let Err(e) = ctx.make_current() {
+                    eprintln!("limux: GLX make_current failed: {e}");
+                }
             }
 
             // If the surface already exists (reparenting from a split),
@@ -444,6 +488,17 @@ pub fn create_terminal(
             if let Some(ref cwd) = c_wd {
                 config.working_directory = cwd.as_ptr();
             }
+
+            // Set LIMUX_PANE_ID so processes inside the terminal can identify their pane.
+            let pane_id = uuid::Uuid::new_v4().to_string();
+            let c_pane_id_key = CString::new("LIMUX_PANE_ID").expect("static key");
+            let c_pane_id_val = CString::new(pane_id.as_str()).expect("uuid is valid CString");
+            let mut env_var_list = vec![ghostty_env_var_s {
+                key: c_pane_id_key.as_ptr(),
+                value: c_pane_id_val.as_ptr(),
+            }];
+            config.env_vars = env_var_list.as_mut_ptr();
+            config.env_var_count = env_var_list.len();
 
             let surface = unsafe { ghostty_surface_new(app, &config) };
             if surface.is_null() {
@@ -507,17 +562,46 @@ pub fn create_terminal(
             // Grab GTK focus so key events reach this widget
             had_focus.set(true);
             gl_area.grab_focus();
+
+            // Request an immediate render so PTY output from the initial
+            // shell prompt is displayed without waiting for the 8ms tick.
+            gl_area.queue_render();
         });
     }
 
     // On render: draw the surface.
+    // GTK has already made its 3.2 context current when this fires.
+    // We switch to our 4.3 context (EGL or GLX) before drawing so that
+    // Ghostty's OpenGL 4.3 calls succeed. If the context switch fails we
+    // skip the draw rather than letting Ghostty invoke 4.3 APIs on a 3.2
+    // context (which would produce GL errors or a crash).
     {
         let surface_cell = surface_cell.clone();
+        let glx_ctx_cell = glx_ctx_cell.clone();
         gl_area.connect_render(move |_gl_area, _context| {
             if let Some(surface) = *surface_cell.borrow() {
-                unsafe { ghostty_surface_draw(surface) };
+                // Require the 4.3 context to be available and current.
+                // GTK's 3.2 context is already current here; make_current()
+                // fetches the EGL/GLX drawable from it and switches to 4.3.
+                let ctx_ok = if let Some(ctx) = glx_ctx_cell.borrow().as_ref() {
+                    match ctx.make_current() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("limux: render: context switch failed: {e}");
+                            false
+                        }
+                    }
+                } else {
+                    // No 4.3 context was created (driver limitation).
+                    // Drawing with a 3.2 context would cause GL errors.
+                    false
+                };
+
+                if ctx_ok {
+                    unsafe { ghostty_surface_draw(surface) };
+                }
             }
-            glib::Propagation::Stop
+            Inhibit(true)
         });
     }
 
@@ -586,10 +670,10 @@ pub fn create_terminal(
 
                 let consumed = unsafe { ghostty_surface_key(surface, event) };
                 if consumed {
-                    return glib::Propagation::Stop;
+                    return Inhibit(true);
                 }
             }
-            glib::Propagation::Proceed
+            Inhibit(false)
         });
 
         key_controller.connect_key_released(move |ctrl, keyval, keycode, modifier| {
@@ -705,7 +789,7 @@ pub fn create_terminal(
                 // GTK and Ghostty use opposite scroll conventions — negate both axes
                 unsafe { ghostty_surface_mouse_scroll(surface, -dx, -dy, mods) };
             }
-            glib::Propagation::Stop
+            Inhibit(true)
         });
         gl_area.add_controller(scroll);
     }
@@ -750,7 +834,12 @@ pub fn create_terminal(
     {
         let surface_cell = surface_cell.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
+        let glx_ctx_cell = glx_ctx_cell.clone();
         overlay.connect_destroy(move |_| {
+            // Destroy the raw GLX 4.3 context we created
+            if let Some(ctx) = glx_ctx_cell.borrow_mut().take() {
+                ctx.destroy();
+            }
             if let Some(surface) = surface_cell.borrow_mut().take() {
                 let surface_key = surface as usize;
                 SURFACE_MAP.with(|map| {
@@ -993,6 +1082,65 @@ fn fallback_unshifted_codepoint(keyval: gtk::gdk::Key) -> u32 {
     }
 }
 
+/// Show a persistent OpenGL error toast centered in the terminal.
+/// The toast must be manually dismissed via the × button; there is no auto-dismiss
+/// because an OpenGL 4.3 failure is fatal for the terminal and must not be missed.
+fn show_gl_error_toast(overlay: &gtk::Overlay, message: &str) {
+    let toast = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    toast.set_halign(gtk::Align::Center);
+    toast.set_valign(gtk::Align::Center);
+    toast.set_margin_start(24);
+    toast.set_margin_end(24);
+
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(
+        "box.limux-gl-error { \
+            background: rgba(160, 30, 30, 0.95); \
+            color: white; \
+            border-radius: 8px; \
+            padding: 14px 20px; \
+            font-size: 12px; \
+        } \
+        box.limux-gl-error label { color: white; } \
+        box.limux-gl-error button { \
+            color: rgba(255,255,255,0.7); \
+            border: none; \
+            background: none; \
+            min-height: 0; min-width: 0; \
+            padding: 0 4px; \
+        } \
+        box.limux-gl-error button:hover { color: white; }",
+    );
+    gtk::style_context_add_provider_for_display(
+        &gtk::gdk::Display::default().expect("display"),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    toast.add_css_class("limux-gl-error");
+    let label = gtk::Label::new(Some(message));
+    label.set_wrap(true);
+    label.set_max_width_chars(60);
+    label.set_selectable(true); // allow copying the error text
+    let close_btn = gtk::Button::with_label("\u{00D7}"); // ×
+    close_btn.set_halign(gtk::Align::End);
+    toast.append(&label);
+    toast.append(&close_btn);
+    toast.set_can_target(false);
+
+    overlay.add_overlay(&toast);
+
+    // Close button dismisses
+    {
+        let t = toast.clone();
+        let o = overlay.clone();
+        close_btn.set_can_target(true);
+        close_btn.connect_clicked(move |_| {
+            o.remove_overlay(&t);
+        });
+    }
+}
+
 /// Show a brief "Copied to clipboard" toast at the bottom of the terminal.
 fn show_clipboard_toast(overlay: &gtk::Overlay) {
     let toast = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1071,6 +1219,434 @@ fn translate_mouse_mods(state: gtk::gdk::ModifierType) -> c_int {
         mods |= GHOSTTY_MODS_SUPER;
     }
     mods
+}
+
+// ---------------------------------------------------------------------------
+// OpenGL 4.3 context creation (EGL-first, GLX fallback)
+// GTK 4.6 uses EGL even on X11, so we try EGL before GLX.
+// ---------------------------------------------------------------------------
+
+mod glx_compat {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_void};
+
+    extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    const RTLD_NOW: c_int = 0x2;
+    const RTLD_NOLOAD: c_int = 0x4;
+
+    // GLX attribute constants
+    const GLX_CONTEXT_MAJOR_VERSION_ARB: c_int = 0x2091;
+    const GLX_CONTEXT_MINOR_VERSION_ARB: c_int = 0x2092;
+    const GLX_CONTEXT_PROFILE_MASK_ARB: c_int = 0x9126;
+    const GLX_CONTEXT_CORE_PROFILE_BIT_ARB: c_int = 0x0001;
+    const GLX_FBCONFIG_ID: c_int = 0x8013;
+
+    // EGL attribute constants
+    const EGL_CONFIG_ID: c_int = 0x3028;
+    const EGL_CONTEXT_MAJOR_VERSION: c_int = 0x3098;
+    const EGL_CONTEXT_MINOR_VERSION: c_int = 0x30FB;
+    const EGL_CONTEXT_OPENGL_PROFILE_MASK: c_int = 0x30FD;
+    const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: c_int = 0x00000001;
+    const EGL_OPENGL_API: c_int = 0x30A2;
+    const EGL_DRAW: c_int = 0x3059;
+    const EGL_READ: c_int = 0x305A;
+    const EGL_NONE: c_int = 0x3038;
+
+    // ----- GLX function pointer types -----
+    type FnGetProcAddress = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type FnGlxGetCurrentDisplay = unsafe extern "C" fn() -> *mut c_void;
+    type FnGlxGetCurrentDrawable = unsafe extern "C" fn() -> usize;
+    type FnGlxGetCurrentContext = unsafe extern "C" fn() -> *mut c_void;
+    type FnGlxQueryContext =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, *mut c_int) -> c_int;
+    type FnGlxChooseFBConfig =
+        unsafe extern "C" fn(*mut c_void, c_int, *const c_int, *mut c_int) -> *mut *mut c_void;
+    type FnGlxCreateContextAttribsARB =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, c_int, *const c_int)
+            -> *mut c_void;
+    type FnGlxMakeCurrent = unsafe extern "C" fn(*mut c_void, usize, *mut c_void) -> c_int;
+    type FnGlxDestroyContext = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    type FnGlxGetFBConfigAttrib =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, *mut c_int) -> c_int;
+
+    // ----- EGL function pointer types -----
+    type FnEglGetCurrentDisplay = unsafe extern "C" fn() -> *mut c_void;
+    type FnEglGetCurrentContext = unsafe extern "C" fn() -> *mut c_void;
+    type FnEglGetCurrentSurface = unsafe extern "C" fn(c_int) -> *mut c_void;
+    type FnEglQueryContext =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, *mut c_int) -> c_int;
+    type FnEglGetConfigs =
+        unsafe extern "C" fn(*mut c_void, *mut *mut c_void, c_int, *mut c_int) -> c_int;
+    type FnEglGetConfigAttrib =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, *mut c_int) -> c_int;
+    type FnEglBindAPI = unsafe extern "C" fn(c_int) -> c_int;
+    type FnEglCreateContext =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const c_int) -> *mut c_void;
+    type FnEglMakeCurrent =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> c_int;
+    type FnEglDestroyContext = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+
+    enum CtxImpl {
+        Glx {
+            display: *mut c_void,
+            ctx: *mut c_void,
+            fn_make_current: FnGlxMakeCurrent,
+            fn_get_drawable: FnGlxGetCurrentDrawable,
+            fn_destroy: FnGlxDestroyContext,
+        },
+        Egl {
+            display: *mut c_void,
+            ctx: *mut c_void,
+            fn_make_current: FnEglMakeCurrent,
+            fn_get_surface: FnEglGetCurrentSurface,
+            fn_destroy: FnEglDestroyContext,
+        },
+    }
+
+    /// OpenGL 4.3 context created via raw GLX or EGL (GTK 4.6 uses EGL on X11).
+    pub struct Glx43Ctx {
+        inner: CtxImpl,
+    }
+
+    impl Glx43Ctx {
+        /// Make this context current. Fetches drawable/surface fresh each call.
+        pub fn make_current(&self) -> Result<(), String> {
+            match &self.inner {
+                CtxImpl::Glx { display, ctx, fn_make_current, fn_get_drawable, .. } => {
+                    let drawable = unsafe { fn_get_drawable() };
+                    if drawable == 0 {
+                        return Err("glXGetCurrentDrawable returned 0".into());
+                    }
+                    let ok = unsafe { fn_make_current(*display, drawable, *ctx) };
+                    if ok == 0 {
+                        Err("glXMakeCurrent failed".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+                CtxImpl::Egl { display, ctx, fn_make_current, fn_get_surface, .. } => {
+                    let draw = unsafe { fn_get_surface(EGL_DRAW) };
+                    let read = unsafe { fn_get_surface(EGL_READ) };
+                    let ok = unsafe { fn_make_current(*display, draw, read, *ctx) };
+                    if ok == 0 {
+                        Err("eglMakeCurrent failed".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+
+        pub fn destroy(self) {
+            match self.inner {
+                CtxImpl::Glx { display, ctx, fn_destroy, .. } => unsafe {
+                    fn_destroy(display, ctx)
+                },
+                CtxImpl::Egl { display, ctx, fn_destroy, .. } => unsafe {
+                    fn_destroy(display, ctx);
+                },
+            }
+        }
+    }
+
+    unsafe fn transmute_fn<T: Copy>(ptr: *mut c_void) -> T {
+        unsafe { *(&ptr as *const *mut c_void as *const T) }
+    }
+
+    fn dlsym_load(handle: *mut c_void, name: &str) -> Result<*mut c_void, String> {
+        let cname = CString::new(name).unwrap();
+        let ptr = unsafe { dlsym(handle, cname.as_ptr()) };
+        if ptr.is_null() {
+            Err(format!("dlsym could not load '{name}'"))
+        } else {
+            Ok(ptr)
+        }
+    }
+
+    /// Try EGL path (GTK 4.6 default on X11).
+    fn try_egl() -> Result<Glx43Ctx, String> {
+        let libegl_name = CString::new("libEGL.so.1").unwrap();
+        let libegl = unsafe { dlopen(libegl_name.as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
+        if libegl.is_null() {
+            return Err("libEGL.so.1 not loaded".into());
+        }
+        let fn_get_display: FnEglGetCurrentDisplay =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglGetCurrentDisplay")?) };
+        let fn_get_context: FnEglGetCurrentContext =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglGetCurrentContext")?) };
+        let fn_get_surface: FnEglGetCurrentSurface =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglGetCurrentSurface")?) };
+        let fn_query_context: FnEglQueryContext =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglQueryContext")?) };
+        let fn_get_configs: FnEglGetConfigs =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglGetConfigs")?) };
+        let fn_get_config_attrib: FnEglGetConfigAttrib =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglGetConfigAttrib")?) };
+        let fn_bind_api: FnEglBindAPI =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglBindAPI")?) };
+        let fn_create_context: FnEglCreateContext =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglCreateContext")?) };
+        let fn_make_current: FnEglMakeCurrent =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglMakeCurrent")?) };
+        let fn_destroy: FnEglDestroyContext =
+            unsafe { transmute_fn(dlsym_load(libegl, "eglDestroyContext")?) };
+
+        let display = unsafe { fn_get_display() };
+        if display.is_null() {
+            return Err("eglGetCurrentDisplay returned NULL — no current EGL context".into());
+        }
+        let share_ctx = unsafe { fn_get_context() };
+        if share_ctx.is_null() {
+            return Err("eglGetCurrentContext returned NULL".into());
+        }
+
+        // Find EGL config matching the current context's config
+        let mut config_id: c_int = 0;
+        unsafe { fn_query_context(display, share_ctx, EGL_CONFIG_ID, &mut config_id) };
+
+        let mut n_configs: c_int = 0;
+        unsafe { fn_get_configs(display, std::ptr::null_mut(), 0, &mut n_configs) };
+        let mut configs: Vec<*mut c_void> = vec![std::ptr::null_mut(); n_configs as usize];
+        if n_configs > 0 {
+            unsafe { fn_get_configs(display, configs.as_mut_ptr(), n_configs, &mut n_configs) };
+        }
+        let mut chosen: *mut c_void = std::ptr::null_mut();
+        for &cfg in &configs {
+            let mut id: c_int = 0;
+            unsafe { fn_get_config_attrib(display, cfg, EGL_CONFIG_ID, &mut id) };
+            if id == config_id {
+                chosen = cfg;
+                break;
+            }
+        }
+        if chosen.is_null() && !configs.is_empty() {
+            chosen = configs[0];
+        }
+        if chosen.is_null() {
+            return Err("could not find matching EGL config".into());
+        }
+
+        // Bind desktop OpenGL API and create 4.3 core context
+        unsafe { fn_bind_api(EGL_OPENGL_API) };
+        let attribs: [c_int; 7] = [
+            EGL_CONTEXT_MAJOR_VERSION, 4,
+            EGL_CONTEXT_MINOR_VERSION, 3,
+            EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            EGL_NONE,
+        ];
+        let ctx_43 = unsafe { fn_create_context(display, chosen, share_ctx, attribs.as_ptr()) };
+        if ctx_43.is_null() {
+            return Err("eglCreateContext(4.3) returned NULL".into());
+        }
+        let draw = unsafe { fn_get_surface(EGL_DRAW) };
+        let read = unsafe { fn_get_surface(EGL_READ) };
+        let ok = unsafe { fn_make_current(display, draw, read, ctx_43) };
+        if ok == 0 {
+            unsafe { fn_destroy(display, ctx_43) };
+            return Err("eglMakeCurrent(4.3 ctx) failed".into());
+        }
+        eprintln!("limux: loaded OpenGL 4.3 (EGL backend)");
+        Ok(Glx43Ctx {
+            inner: CtxImpl::Egl { display, ctx: ctx_43, fn_make_current, fn_get_surface, fn_destroy },
+        })
+    }
+
+    /// Try GLX path (fallback for GTK+GLX setups).
+    fn load_glx_proc(get_proc: FnGetProcAddress, name: &str) -> Result<*mut c_void, String> {
+        let cname = CString::new(name).unwrap();
+        let ptr = unsafe { get_proc(cname.as_ptr()) };
+        if ptr.is_null() {
+            Err(format!("glXGetProcAddressARB could not load '{name}'"))
+        } else {
+            Ok(ptr)
+        }
+    }
+
+    fn try_glx() -> Result<Glx43Ctx, String> {
+        let libgl_name = CString::new("libGL.so.1").unwrap();
+        let libgl = unsafe { dlopen(libgl_name.as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
+        if libgl.is_null() {
+            return Err("libGL.so.1 not loaded".into());
+        }
+        let gpa_ptr = unsafe { dlsym(libgl, b"glXGetProcAddressARB\0".as_ptr() as *const c_char) };
+        if gpa_ptr.is_null() {
+            return Err("glXGetProcAddressARB not found".into());
+        }
+        let get_proc: FnGetProcAddress = unsafe { transmute_fn(gpa_ptr) };
+
+        let fn_get_display: FnGlxGetCurrentDisplay =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXGetCurrentDisplay")?) };
+        let fn_get_drawable: FnGlxGetCurrentDrawable =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXGetCurrentDrawable")?) };
+        let fn_get_context: FnGlxGetCurrentContext =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXGetCurrentContext")?) };
+        let fn_query_context: FnGlxQueryContext =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXQueryContext")?) };
+        let fn_choose_fbconfig: FnGlxChooseFBConfig =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXChooseFBConfig")?) };
+        let fn_create_ctx: FnGlxCreateContextAttribsARB =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXCreateContextAttribsARB")?) };
+        let fn_make_current: FnGlxMakeCurrent =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXMakeCurrent")?) };
+        let fn_destroy: FnGlxDestroyContext =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXDestroyContext")?) };
+        let fn_get_fbconfig_attrib: FnGlxGetFBConfigAttrib =
+            unsafe { transmute_fn(load_glx_proc(get_proc, "glXGetFBConfigAttrib")?) };
+
+        // 4. Query current display / drawable / context from GTK's 3.2 ctx
+        let display = unsafe { fn_get_display() };
+        if display.is_null() {
+            return Err("glXGetCurrentDisplay returned NULL".into());
+        }
+        let drawable = unsafe { fn_get_drawable() };
+        if drawable == 0 {
+            return Err("glXGetCurrentDrawable returned 0 — no current drawable".into());
+        }
+        let share_ctx = unsafe { fn_get_context() };
+        if share_ctx.is_null() {
+            return Err("glXGetCurrentContext returned NULL — no current context".into());
+        }
+
+        // 5. Get the FBConfig ID from the current context, then retrieve the FBConfig
+        let mut fbconfig_id: c_int = 0;
+        let qc_result =
+            unsafe { fn_query_context(display, share_ctx, GLX_FBCONFIG_ID, &mut fbconfig_id) };
+        if qc_result != 0 {
+            return Err(format!(
+                "glXQueryContext(GLX_FBCONFIG_ID) failed with {qc_result}"
+            ));
+        }
+
+        // Get screen number from context
+        // GLX_SCREEN = 0x800C
+        let mut screen: c_int = 0;
+        unsafe { fn_query_context(display, share_ctx, 0x800C, &mut screen) };
+
+        // Choose FBConfig matching the ID from the current context
+        let mut n_configs: c_int = 0;
+        let fbconfigs_ptr =
+            unsafe { fn_choose_fbconfig(display, screen, std::ptr::null(), &mut n_configs) };
+        if fbconfigs_ptr.is_null() || n_configs == 0 {
+            return Err("glXChooseFBConfig returned no configs".into());
+        }
+        let fbconfigs = unsafe { std::slice::from_raw_parts(fbconfigs_ptr, n_configs as usize) };
+
+        // Find the FBConfig whose ID matches
+        let mut chosen_fbconfig: *mut c_void = std::ptr::null_mut();
+        for &fb in fbconfigs {
+            let mut id: c_int = 0;
+            unsafe { fn_get_fbconfig_attrib(display, fb, GLX_FBCONFIG_ID, &mut id) };
+            if id == fbconfig_id {
+                chosen_fbconfig = fb;
+                break;
+            }
+        }
+
+        // Free the list returned by glXChooseFBConfig (it's an Xlib-allocated array)
+        // We need XFree for this; use dlsym on libX11.
+        {
+            let libx11_name = CString::new("libX11.so.6").unwrap();
+            let libx11 = unsafe { dlopen(libx11_name.as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
+            if !libx11.is_null() {
+                let xfree_name = CString::new("XFree").unwrap();
+                let xfree_ptr = unsafe { dlsym(libx11, xfree_name.as_ptr()) };
+                if !xfree_ptr.is_null() {
+                    let xfree: unsafe extern "C" fn(*mut c_void) =
+                        unsafe { transmute_fn(xfree_ptr) };
+                    unsafe { xfree(fbconfigs_ptr as *mut c_void) };
+                }
+            }
+        }
+
+        if chosen_fbconfig.is_null() {
+            // Fall back to first config if no exact match
+            // Re-query since we freed the list above
+            let mut n2: c_int = 0;
+            let fb2 =
+                unsafe { fn_choose_fbconfig(display, screen, std::ptr::null(), &mut n2) };
+            if fb2.is_null() || n2 == 0 {
+                return Err("glXChooseFBConfig fallback returned no configs".into());
+            }
+            chosen_fbconfig = unsafe { *fb2 };
+            // Leak fb2 list (minor; only happens once on mismatch)
+        }
+
+        // 6. Create the 4.3 core context sharing objects with GTK's 3.2 ctx
+        let attribs: [c_int; 7] = [
+            GLX_CONTEXT_MAJOR_VERSION_ARB,
+            4,
+            GLX_CONTEXT_MINOR_VERSION_ARB,
+            3,
+            GLX_CONTEXT_PROFILE_MASK_ARB,
+            GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
+            0, // terminator
+        ];
+        let ctx_43 = unsafe {
+            fn_create_ctx(display, chosen_fbconfig, share_ctx, 1, attribs.as_ptr())
+        };
+        if ctx_43.is_null() {
+            return Err(
+                "glXCreateContextAttribsARB returned NULL — driver may not support OpenGL 4.3"
+                    .into(),
+            );
+        }
+
+        // 7. Make the 4.3 context current
+        let ok = unsafe { fn_make_current(display, drawable, ctx_43) };
+        if ok == 0 {
+            unsafe { fn_destroy(display, ctx_43) };
+            return Err("glXMakeCurrent(4.3 ctx) returned False".into());
+        }
+
+        eprintln!("limux: loaded OpenGL 4.3 (GLX backend)");
+        Ok(Glx43Ctx {
+            inner: CtxImpl::Glx {
+                display,
+                ctx: ctx_43,
+                fn_make_current,
+                fn_get_drawable,
+                fn_destroy,
+            },
+        })
+    }
+
+    /// Public entry point: select backend via LIMUX_GL_BACKEND env var.
+    ///
+    /// LIMUX_GL_BACKEND=auto  (default) — try EGL first, then GLX
+    /// LIMUX_GL_BACKEND=egl            — force EGL only
+    /// LIMUX_GL_BACKEND=glx            — force GLX only
+    ///
+    /// EGL is tried first by default because GTK 4.6 on Ubuntu 22.04 uses
+    /// EGL even on X11 (not GLX), so glXGetCurrentDisplay() returns NULL.
+    pub fn create_glx43_context() -> Result<Glx43Ctx, String> {
+        let backend = std::env::var("LIMUX_GL_BACKEND")
+            .unwrap_or_else(|_| "auto".to_string());
+
+        match backend.to_lowercase().as_str() {
+            "egl" => {
+                eprintln!("limux: LIMUX_GL_BACKEND=egl — using EGL backend");
+                try_egl()
+            }
+            "glx" => {
+                eprintln!("limux: LIMUX_GL_BACKEND=glx — using GLX backend");
+                try_glx()
+            }
+            _ => {
+                // auto (default): EGL first (GTK 4.6 on X11 uses EGL), then GLX
+                match try_egl() {
+                    Ok(ctx) => Ok(ctx),
+                    Err(egl_err) => {
+                        eprintln!("limux: EGL 4.3 failed ({egl_err}), trying GLX...");
+                        try_glx()
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

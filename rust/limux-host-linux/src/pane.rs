@@ -1118,10 +1118,9 @@ fn show_rename_dialog(
         let do_rename = do_rename.clone();
         let focus_controller = gtk::EventControllerFocus::new();
         focus_controller.connect_leave(move |ctrl| {
-            if let Some(widget) = ctrl.widget() {
-                if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                    do_rename(entry);
-                }
+            let widget = ctrl.widget();
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                do_rename(entry);
             }
         });
         entry.add_controller(focus_controller);

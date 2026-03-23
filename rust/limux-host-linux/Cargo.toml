@@ -10,15 +10,27 @@ name = "limux"
 path = "src/main.rs"
 
 [features]
-default = ["webkit"]
-webkit = ["dep:webkit6"]
+default = []
+# webkit is a no-op stub retained for build-script compatibility.
+# WebKitGTK 6 (webkit6 crate) requires a newer system library than
+# Ubuntu 22.04 ships; re-enable by adding `webkit6 = { version = "0.6",
+# optional = true }` to [dependencies] once the target platform ships it.
+webkit = []
 
 [dependencies]
-gtk4 = { version = "0.11", features = ["v4_10"] }
-gdk4-wayland = "0.11"
-libadwaita = "0.9"
+# gtk4 = "0.6" targets the gtk4-rs 0.6.x Rust bindings.
+# No version features (v4_2, v4_4, v4_6 …) are requested so the binary
+# runs on any GTK 4.x system library — including Ubuntu 22.04's GTK 4.6.
+# On newer distributions (GTK 4.8 / 4.10 / 4.14 …) the same crate version
+# continues to work because GTK is backward-compatible at the API level.
+gtk4 = { version = "0.6" }
+# Must match the gtk4 series (0.6 ↔ gdk4-wayland 0.6).
+gdk4-wayland = "0.6"
+# libadwaita 0.3 wraps libadwaita-1 C library >= 1.0.
+# Ubuntu 22.04 ships libadwaita 1.1.x which satisfies this requirement.
+# Version-gated features (v1_2, v1_3 …) are intentionally omitted.
+libadwaita = "0.3"
 uuid = { version = "1", features = ["v4"] }
-webkit6 = { version = "0.6", optional = true }
 limux-ghostty-sys = { path = "../limux-ghostty-sys" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
+use gtk::glib::signal::Inhibit;
 use gtk4 as gtk;
 use libadwaita as adw;
 
@@ -101,6 +102,42 @@ fn save_session_now(state: &State) {
     let session = snapshot_session_state(state);
     if let Err(err) = layout_state::save_session_atomic(&session) {
         eprintln!("limux: failed to save session state: {err}");
+    }
+    write_live_state(state);
+}
+
+/// Write a machine-readable live state JSON for external tools (e.g., Claude Code MCP).
+/// Path: ~/.local/share/limux/live-state.json
+fn write_live_state(state: &State) {
+    let s = state.borrow();
+    let workspaces: Vec<serde_json::Value> = s
+        .workspaces
+        .iter()
+        .enumerate()
+        .map(|(i, ws)| {
+            let cwd = ws.cwd.borrow().clone();
+            serde_json::json!({
+                "id": ws.id,
+                "name": ws.name,
+                "cwd": cwd,
+                "folder_path": ws.folder_path,
+                "active": i == s.active_idx,
+            })
+        })
+        .collect();
+
+    let live = serde_json::json!({
+        "version": 1,
+        "pid": std::process::id(),
+        "workspaces": workspaces,
+    });
+
+    let dir = layout_state::persistence_dir();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let path = dir.join("live-state.json");
+        if let Ok(json) = serde_json::to_vec_pretty(&live) {
+            let _ = std::fs::write(path, json);
+        }
     }
 }
 
@@ -812,7 +849,7 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         window.connect_close_request(move |_| {
             save_session_now(&state);
-            glib::Propagation::Proceed
+            Inhibit(false)
         });
     }
 
@@ -887,29 +924,24 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
                 split_focused_pane(&state, gtk::Orientation::Vertical);
                 true
             }
+            // Ctrl+Shift+R → split right (avoids Ctrl+D terminal conflict)
+            (true, true, gdk::Key::R | gdk::Key::r) => {
+                split_focused_pane(&state, gtk::Orientation::Horizontal);
+                true
+            }
             // Ctrl+Shift+T → new terminal tab in focused pane
             (true, true, gdk::Key::T | gdk::Key::t) => {
                 add_tab_to_focused_pane(&state, false);
                 true
             }
-            // Ctrl+D → split right
-            (true, false, gdk::Key::d) => {
-                split_focused_pane(&state, gtk::Orientation::Horizontal);
-                true
-            }
-            // Ctrl+W → close focused tab/pane
-            (true, false, gdk::Key::w) => {
+            // Ctrl+Shift+X → close focused tab/pane
+            (true, true, gdk::Key::X | gdk::Key::x) => {
                 close_focused_tab(&state);
                 true
             }
-            // Ctrl+B → toggle sidebar
-            (true, false, gdk::Key::b) => {
+            // Ctrl+Shift+B → toggle sidebar
+            (true, true, gdk::Key::B | gdk::Key::b) => {
                 toggle_sidebar(&state);
-                true
-            }
-            // Ctrl+T → new terminal tab
-            (true, false, gdk::Key::t) => {
-                add_tab_to_focused_pane(&state, false);
                 true
             }
             // Ctrl+PageDown → next workspace
@@ -920,23 +952,6 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
             // Ctrl+PageUp → prev workspace
             (true, false, gdk::Key::Page_Up) => {
                 cycle_workspace(&state, -1);
-                true
-            }
-            // Ctrl+Arrow → focus pane in direction
-            (true, false, gdk::Key::Left) => {
-                focus_pane_in_direction(&state, Direction::Left);
-                true
-            }
-            (true, false, gdk::Key::Right) => {
-                focus_pane_in_direction(&state, Direction::Right);
-                true
-            }
-            (true, false, gdk::Key::Up) => {
-                focus_pane_in_direction(&state, Direction::Up);
-                true
-            }
-            (true, false, gdk::Key::Down) => {
-                focus_pane_in_direction(&state, Direction::Down);
                 true
             }
             // Ctrl+1-9 → switch to workspace by index
@@ -981,9 +996,9 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
         };
 
         if matched {
-            glib::Propagation::Stop
+            Inhibit(true)
         } else {
-            glib::Propagation::Proceed
+            Inhibit(false)
         }
     });
 
@@ -1312,10 +1327,9 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
         let commit = commit.clone();
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |controller| {
-            if let Some(widget) = controller.widget() {
-                if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                    commit(entry);
-                }
+            let widget = controller.widget();
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                commit(entry);
             }
         });
         entry.add_controller(focus);
@@ -1703,10 +1717,13 @@ fn create_pane_for_workspace(
             let ws_id = ws_id_pwd.clone();
             let pwd = pwd.to_string();
             glib::idle_add_local_once(move || {
-                let s = state.borrow();
-                if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
-                    *ws.cwd.borrow_mut() = Some(pwd);
+                {
+                    let s = state.borrow();
+                    if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
+                        *ws.cwd.borrow_mut() = Some(pwd);
+                    }
                 }
+                write_live_state(&state);
             });
         }),
         on_empty: Box::new(move |pane_widget| {
@@ -1763,29 +1780,36 @@ fn close_workspace_by_id(state: &State, id: &str) {
 }
 
 fn switch_workspace(state: &State, idx: usize) {
-    let mut s = state.borrow_mut();
-    if idx >= s.workspaces.len() || idx == s.active_idx {
-        return;
-    }
-    s.active_idx = idx;
-    let stack_name = format!("ws-{}", s.workspaces[idx].id);
-    s.stack.set_visible_child_name(&stack_name);
-
-    // Clear unread
-    let ws = &mut s.workspaces[idx];
-    if ws.unread {
-        ws.unread = false;
-        ws.notify_dot.remove_css_class("limux-notify-dot");
-        ws.notify_dot.add_css_class("limux-notify-dot-hidden");
-        ws.notify_label.remove_css_class("limux-notify-msg-unread");
-        ws.notify_label.add_css_class("limux-notify-msg");
-        ws.notify_label.set_visible(false);
-        // Remove glow pulse from sidebar row
-        if let Some(row_box) = ws.sidebar_row.child() {
-            row_box.remove_css_class("limux-sidebar-row-unread");
+    // Collect everything we need and drop the borrow *before* calling GTK methods
+    // that trigger signals synchronously (e.g. set_visible_child_name → connect_map
+    // → connect_position_notify → request_session_save → borrow_mut → panic).
+    let (stack, stack_name) = {
+        let mut s = state.borrow_mut();
+        if idx >= s.workspaces.len() || idx == s.active_idx {
+            return;
         }
-    }
-    drop(s);
+        s.active_idx = idx;
+        let stack_name = format!("ws-{}", s.workspaces[idx].id);
+
+        // Clear unread notification state while still holding the borrow.
+        let ws = &mut s.workspaces[idx];
+        if ws.unread {
+            ws.unread = false;
+            ws.notify_dot.remove_css_class("limux-notify-dot");
+            ws.notify_dot.add_css_class("limux-notify-dot-hidden");
+            ws.notify_label.remove_css_class("limux-notify-msg-unread");
+            ws.notify_label.add_css_class("limux-notify-msg");
+            ws.notify_label.set_visible(false);
+            // Remove glow pulse from sidebar row
+            if let Some(row_box) = ws.sidebar_row.child() {
+                row_box.remove_css_class("limux-sidebar-row-unread");
+            }
+        }
+
+        (s.stack.clone(), stack_name)
+    }; // borrow_mut released here — safe to call GTK methods that re-enter state
+
+    stack.set_visible_child_name(&stack_name);
     request_session_save(state);
 }
 
@@ -2127,6 +2151,7 @@ fn add_tab_to_focused_pane(_state: &State, _browser: bool) {
 }
 
 /// Direction for pane navigation.
+#[allow(dead_code)]
 enum Direction {
     Left,
     Right,
@@ -2135,6 +2160,7 @@ enum Direction {
 }
 
 /// Focus the neighboring pane in the given direction by walking the gtk::Paned tree.
+#[allow(dead_code)]
 fn focus_pane_in_direction(state: &State, direction: Direction) {
     let (_ws_id, pane_widget) = match find_focused_pane(state) {
         Some(v) => v,
@@ -2212,6 +2238,7 @@ fn find_gl_area(widget: &gtk::Widget) -> Option<gtk::GLArea> {
 /// When encountering a gtk::Paned matching `axis`, prefer `start_child` if
 /// `prefer_start` is true (to find the nearest edge). For Paned widgets on
 /// the other axis, prefer start_child (arbitrary but consistent).
+#[allow(dead_code)]
 fn find_leaf_pane(widget: &gtk::Widget, axis: gtk::Orientation, prefer_start: bool) -> gtk::Widget {
     if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
         let pick_start = if paned.orientation() == axis {
