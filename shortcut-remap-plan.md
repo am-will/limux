@@ -42,27 +42,27 @@ T1 ── T2 ── T3 ── T4 ──┬── T5 ── T6
 - **location**: `rust/limux-host-linux/src/shortcut_config.rs` (new), `rust/limux-host-linux/src/window.rs`, `rust/limux-host-linux/src/main.rs`, `rust/limux-host-linux/src/pane.rs`
 - **description**: Create the first-class host shortcut definition layer. Each definition should capture stable shortcut ID, default binding, runtime owner, whether it registers a GTK accelerator, the dispatch target used by capture-phase routing, and the human-readable label/tooltip name. This is the canonical registry that both `register_actions()` and `install_key_capture()` will consume. The layer should also decide which actions remain direct helper dispatches and which are backed by `gio::SimpleAction`.
 - **validation**: There is one authoritative metadata table for host shortcuts, and every current shortcut from T1 maps to exactly one runtime dispatch target and one visibility policy.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Verified existing branch state rather than re-implementing. `rust/limux-host-linux/src/shortcut_config.rs` already provides the canonical host shortcut metadata layer with stable IDs, config keys, action names, labels, GTK registration policy, and runtime command targets. Validation command: `cargo test -p limux-host-linux shortcut_config::tests -- --nocapture` passed, confirming the 25-definition table, uniqueness invariants, the GTK accelerator subset, and canonical runtime command mapping. Non-blocking note for follow-up: `find_by_action_name` is currently unused and triggers a `dead_code` warning.
+- **files edited/created**: `rust/limux-host-linux/src/shortcut_config.rs`, `shortcut-remap-plan.md`
 
 ### T3: Implement Config Schema, Path Resolution, and Validation Rules
 - **depends_on**: [T2]
 - **location**: `rust/limux-host-linux/src/shortcut_config.rs` (new), `rust/limux-host-linux/Cargo.toml`
 - **description**: Implement the dedicated host-side shortcut config loader and merger. The config file should live at `dirs::config_dir()/limux/config.json` with deterministic overrides for tests. The schema should support omitted values for defaults and empty-string or `null` values for explicit unbinding. Make the contract explicit for these cases: `config_dir()` returning `None`, unreadable files, invalid JSON, unknown shortcut IDs, duplicate active bindings, malformed bindings, and any binding that cannot be represented consistently across GTK accelerator registration and capture-phase normalization. Use clear logging plus fallback-to-default behavior for runtime file/load failures, and fail validation for ambiguous active duplicate bindings.
 - **validation**: The loader resolves the expected config path, merges overrides over defaults, preserves explicit unbinds, warns or errors exactly as specified for invalid inputs, and always returns a deterministic effective registry.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Verified existing branch state rather than re-implementing. `rust/limux-host-linux/src/shortcut_config.rs` already resolves `dirs::config_dir()/limux/config.json`, loads JSON overrides under the top-level `shortcuts` key, supports explicit unbinding via `null` or empty string, warns on unknown IDs, falls back to defaults on missing files and invalid JSON, and rejects duplicate active bindings before runtime use. Validation command: `cargo test -p limux-host-linux shortcut_config::tests -- --nocapture` passed.
+- **files edited/created**: `rust/limux-host-linux/src/shortcut_config.rs`, `shortcut-remap-plan.md`
 
 ### T4: Add Unit Tests for Config Loading and Normalization
 - **depends_on**: [T3]
 - **location**: `rust/limux-host-linux/src/shortcut_config.rs`
 - **description**: Add focused unit tests for config path derivation, default loading when no file exists, override application, explicit unbinding, invalid JSON fallback, unknown shortcut IDs, duplicate-binding rejection, malformed accelerator rejection, and normalization round-trips between stored values and runtime representations. Keep these tests pure and tempdir-driven so they do not depend on GTK startup.
 - **validation**: `cargo test -p limux-host-linux` covers the config contract and fails if loader behavior regresses on any supported edge case.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Verified existing branch state rather than re-implementing. The targeted suite in `rust/limux-host-linux/src/shortcut_config.rs` already covers path derivation, normalized shortcut round-trips, override application, explicit unbinding, unknown ID warnings, duplicate-binding rejection, invalid JSON fallback, missing-file defaults, GTK accelerator exposure for unbound actions, and runtime combo-to-command routing. Validation command: `cargo test -p limux-host-linux shortcut_config::tests -- --nocapture` passed with 12 tests.
+- **files edited/created**: `rust/limux-host-linux/src/shortcut_config.rs`, `shortcut-remap-plan.md`
 
 ### T5: Switch GTK Accelerators and Capture-Phase Dispatch to the Same Registry
 - **depends_on**: [T4]
