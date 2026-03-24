@@ -387,6 +387,13 @@ extern "C" {
     ) -> bool;
     pub fn ghostty_surface_mouse_pos(surface: ghostty_surface_t, x: f64, y: f64, mods: c_int);
     pub fn ghostty_surface_mouse_scroll(surface: ghostty_surface_t, x: f64, y: f64, mods: c_int);
+    pub fn ghostty_surface_ime_point(
+        surface: ghostty_surface_t,
+        x: *mut f64,
+        y: *mut f64,
+        width: *mut f64,
+        height: *mut f64,
+    );
     pub fn ghostty_surface_request_close(surface: ghostty_surface_t);
     pub fn ghostty_surface_set_color_scheme(surface: ghostty_surface_t, scheme: c_int);
 

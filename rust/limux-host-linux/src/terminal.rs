@@ -392,6 +392,8 @@ pub fn create_terminal(
     let had_focus = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
+    // Store IMContext globally so it can be updated after widget mapping
+    let im_context_cell: Rc<RefCell<Option<gtk::IMMulticontext>>> = Rc::new(RefCell::new(None));
 
     // Create overlay early so closures can capture it for toast notifications
     let overlay = gtk::Overlay::new();
@@ -521,6 +523,18 @@ pub fn create_terminal(
         });
     }
 
+    // On map: set up IME context after widget is mapped
+    {
+        let gl = gl_area.clone();
+        let ov = overlay.clone();
+        let im_context_cell_for_map = im_context_cell.clone();
+        gl.connect_map(move |_gl_area| {
+            if let Some(im_context) = im_context_cell_for_map.borrow().as_ref() {
+                im_context.set_client_widget(Some(&ov));
+            }
+        });
+    }
+
     // On resize: update Ghostty's terminal grid size and queue a redraw.
     // The actual GL viewport is set by GTK when the render signal fires,
     // so we must NOT call ghostty_surface_draw here — the viewport would
@@ -557,13 +571,85 @@ pub fn create_terminal(
     //
     // Send key events with the text field populated. Ghostty uses the
     // text field for actual character input and the keycode for bindings.
-    // Do NOT use ghostty_surface_text() for regular typing — Ghostty
-    // treats that as a paste, causing "pasting..." indicators in apps.
+    // For IME (Chinese/Japanese/Korean) input, we use GTK4's IMContext
+    // to handle composition and send the final text via ghostty_surface_text.
     {
         let sc_press = surface_cell.clone();
         let sc_release = surface_cell.clone();
+        let sc_commit = surface_cell.clone();
+        let ime_filtering = Rc::new(Cell::new(false));
+
         let key_controller = gtk::EventControllerKey::new();
+
+        // Create IMMulticontext for CJK input method support
+        let im_context = gtk::IMMulticontext::new();
+
+        // Store IMContext globally for access from other handlers (like map)
+        *im_context_cell.borrow_mut() = Some(im_context.clone());
+
+        // Set the widget that the IME should use for positioning
+        im_context.set_client_widget(Some(&overlay));
+
+        // Function to update IME cursor location using Ghostty's actual cursor position
+        let im_ctx = im_context.clone();
+        let sc = sc_commit.clone();
+        let update_ime_cursor = Rc::new(move || {
+            if let Some(surface) = *sc.borrow() {
+                let mut x: f64 = 0.0;
+                let mut y: f64 = 0.0;
+                let mut w: f64 = 0.0;
+                let mut h: f64 = 0.0;
+                unsafe {
+                    ghostty_surface_ime_point(surface, &mut x, &mut y, &mut w, &mut h);
+                }
+                let rect = gtk::gdk::Rectangle::new(
+                    x.max(0.0) as i32,
+                    y.max(0.0) as i32,
+                    w.max(10.0) as i32,
+                    h.max(10.0) as i32,
+                );
+                im_ctx.set_cursor_location(&rect);
+            }
+        });
+
+        // Update on IME composition and focus events
+        let ime_filtering_for_key = ime_filtering.clone();
+        let update_ime_cursor1 = update_ime_cursor.clone();
+        key_controller.connect_im_update(move |_ctrl| {
+            ime_filtering_for_key.set(true);
+            update_ime_cursor1();
+        });
+
+        let focus_controller = gtk::EventControllerFocus::new();
+        let update_ime_cursor2 = update_ime_cursor.clone();
+        focus_controller.connect_enter(move |_| {
+            update_ime_cursor2();
+        });
+        gl_area.add_controller(focus_controller);
+
+        // Send committed IME text to Ghostty
+        let sc_commit_clone = sc_commit.clone();
+        im_context.connect_commit(move |_im_context, text| {
+            if let Some(surface) = *sc_commit_clone.borrow() {
+                if let Ok(c_text) = CString::new(text) {
+                    unsafe {
+                        ghostty_surface_text(surface, c_text.as_ptr(), text.len());
+                    }
+                }
+            }
+        });
+
+        key_controller.set_im_context(Some(&im_context));
+
+        // Update cursor location on each key press
+        let update_ime_cursor3 = update_ime_cursor.clone();
         key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
+            // Reset the IME filtering flag for this key press
+            ime_filtering.set(false);
+
+            // Update IME cursor location
+            update_ime_cursor3();
+
             if let Some(surface) = *sc_press.borrow() {
                 let c_text = key_event_text(keyval);
 
@@ -582,6 +668,11 @@ pub fn create_terminal(
                 );
                 if let Some(ref ct) = c_text {
                     event.text = ct.as_ptr();
+                }
+
+                // Mark that we're in composition if IME is active
+                if ime_filtering.get() {
+                    event.composing = true;
                 }
 
                 let consumed = unsafe { ghostty_surface_key(surface, event) };
