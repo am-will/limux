@@ -24,6 +24,39 @@ fn next_pane_id() -> u32 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// Tab drag state (checked by window.rs during drop target motion)
+// ---------------------------------------------------------------------------
+
+type TabDragCallback = dyn Fn(bool);
+
+thread_local! {
+    static TAB_DRAGGING: Cell<bool> = const { Cell::new(false) };
+    static TAB_DRAG_LISTENERS: RefCell<Vec<Box<TabDragCallback>>> = RefCell::new(Vec::new());
+}
+
+/// Returns true when a tab drag is in progress.
+pub fn is_tab_dragging() -> bool {
+    TAB_DRAGGING.with(|c| c.get())
+}
+
+/// Register a callback invoked when tab drag state changes.
+/// Receives `true` when a drag begins, `false` when it ends.
+pub fn on_tab_drag_change(callback: impl Fn(bool) + 'static) {
+    TAB_DRAG_LISTENERS.with(|listeners| {
+        listeners.borrow_mut().push(Box::new(callback));
+    });
+}
+
+fn set_tab_dragging(active: bool) {
+    TAB_DRAGGING.with(|c| c.set(active));
+    TAB_DRAG_LISTENERS.with(|listeners| {
+        for cb in listeners.borrow().iter() {
+            cb(active);
+        }
+    });
+}
+
 thread_local! {
     static PANE_REGISTRY: RefCell<std::collections::HashMap<u32, std::rc::Weak<PaneInternals>>>
         = RefCell::new(std::collections::HashMap::new());
@@ -921,6 +954,26 @@ fn apply_pin_visuals(tab_button: &gtk::Box, pinned: bool) {
     }
 }
 
+/// Look up the title of a tab by its ID within a pane widget.
+pub fn tab_title(pane_widget: &gtk::Widget, tab_id: &str) -> Option<String> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    let entry = tab_state.tabs.iter().find(|t| t.id == tab_id)?;
+    Some(entry.title_label.label().to_string())
+}
+
+/// Look up the working directory of a terminal tab by its ID within a pane widget.
+/// Returns `None` for non-terminal tabs or if no cwd is available yet.
+pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<String> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    let entry = tab_state.tabs.iter().find(|t| t.id == tab_id)?;
+    match &entry.kind {
+        TabKind::Terminal { cwd } => cwd.borrow().clone(),
+        TabKind::Browser { .. } => None,
+    }
+}
+
 /// Move a tab from a source pane to a target pane by widget reference.
 /// Used for cross-workspace tab dragging (sidebar drops).
 pub fn move_tab_to_pane(source_pane: &gtk::Widget, source_tab_id: &str, target_pane: &gtk::Widget) {
@@ -1042,6 +1095,7 @@ fn build_tab_button(
             Some(gtk::gdk::ContentProvider::for_value(&val))
         });
         drag_source.connect_drag_begin(move |src, _drag| {
+            set_tab_dragging(true);
             if let Some(w) = src.widget() {
                 let alloc = w.allocation();
                 position_indicator(&state, &indicator_begin, (alloc.x() + alloc.width()) as f64);
@@ -1050,6 +1104,7 @@ fn build_tab_button(
             }
         });
         drag_source.connect_drag_end(move |_, _, _| {
+            set_tab_dragging(false);
             indicator_end.set_visible(false);
         });
     }

@@ -65,6 +65,12 @@ impl AppState {
     fn active_workspace(&self) -> Option<&Workspace> {
         self.workspaces.get(self.active_idx)
     }
+
+    fn workspace_for_widget(&self, widget: &gtk::Widget) -> Option<&Workspace> {
+        self.workspaces
+            .iter()
+            .find(|ws| widget.is_ancestor(&ws.root))
+    }
 }
 
 type State = Rc<RefCell<AppState>>;
@@ -491,6 +497,17 @@ row:selected .limux-ws-star-btn {
     color: rgba(255, 90, 90, 1);
     border: 1px solid rgba(255, 80, 80, 0.8);
 }
+.limux-tab-drag-active {
+    background-color: rgba(0, 145, 255, 0.12);
+    border-width: 1px;
+    border-style: dashed;
+    border-color: rgba(0, 145, 255, 0.6);
+    border-radius: 8px;
+}
+.limux-sidebar-btn.limux-tab-drop-target {
+    background-color: rgba(0, 145, 255, 0.28);
+    border-color: rgba(0, 145, 255, 0.9);
+}
 .limux-ws-path {
     color: rgba(255, 255, 255, 0.3);
     font-size: 12px;
@@ -645,13 +662,17 @@ pub fn build_window(app: &adw::Application) {
         .build();
     new_ws_btn.add_css_class("limux-sidebar-btn");
 
-    // Drop target on the button — intensifies when dragging over it
+    // Drop target on the button — handles workspace deletion and tab-to-new-workspace
     let btn_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
     btn_drop.set_preload(true);
     {
         let btn = new_ws_btn.clone();
         btn_drop.connect_motion(move |_, _, _| {
-            btn.add_css_class("limux-sidebar-btn-trash-hover");
+            if pane::is_tab_dragging() {
+                btn.add_css_class("limux-tab-drop-target");
+            } else {
+                btn.add_css_class("limux-sidebar-btn-trash-hover");
+            }
             gtk::gdk::DragAction::MOVE
         });
     }
@@ -659,6 +680,7 @@ pub fn build_window(app: &adw::Application) {
         let btn = new_ws_btn.clone();
         btn_drop.connect_leave(move |_| {
             btn.remove_css_class("limux-sidebar-btn-trash-hover");
+            btn.remove_css_class("limux-tab-drop-target");
         });
     }
     new_ws_btn.add_controller(btn_drop.clone());
@@ -797,7 +819,22 @@ pub fn build_window(app: &adw::Application) {
         });
     }
 
-    // Wire up drop-to-delete handler on the New Workspace button
+    // Show dashed border on the button when any tab drag is active
+    {
+        let btn = new_ws_btn.clone();
+        pane::on_tab_drag_change(move |dragging| {
+            if dragging {
+                btn.add_css_class("limux-tab-drag-active");
+            } else {
+                btn.remove_css_class("limux-tab-drag-active");
+                btn.remove_css_class("limux-tab-drop-target");
+            }
+        });
+    }
+
+    // Wire up drop handler on the New Workspace button
+    // - Tab drag ("pane_id:tab_id") → create a new workspace for the tab
+    // - Workspace drag (plain ID) → delete the workspace
     {
         let state = state.clone();
         let btn = new_ws_btn.clone();
@@ -805,8 +842,16 @@ pub fn build_window(app: &adw::Application) {
             btn.set_label("New Workspace");
             btn.remove_css_class("limux-sidebar-btn-trash");
             btn.remove_css_class("limux-sidebar-btn-trash-hover");
-            if let Ok(workspace_id) = value.get::<String>() {
-                close_workspace_by_id(&state, &workspace_id);
+            btn.remove_css_class("limux-tab-drop-target");
+            if let Ok(drag_data) = value.get::<String>() {
+                // Tab drag format: "pane_id:tab_id"
+                if let Some((pane_id_str, tab_id)) = drag_data.split_once(':') {
+                    if let Ok(pane_id) = pane_id_str.parse::<u32>() {
+                        return create_workspace_for_tab(&state, pane_id, tab_id);
+                    }
+                }
+                // Workspace drag: plain workspace_id → delete
+                close_workspace_by_id(&state, &drag_data);
                 return true;
             }
             false
@@ -1751,6 +1796,46 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     };
     add_workspace_from_state(state, &workspace);
     request_session_save(state);
+}
+
+/// Create a new workspace and move a tab from an existing pane into it.
+fn create_workspace_for_tab(state: &State, pane_id: u32, tab_id: &str) -> bool {
+    let Some(src_widget) = pane::find_pane_widget_by_id(pane_id) else {
+        return false;
+    };
+
+    // Derive a workspace name from the tab title
+    let tab_title = pane::tab_title(&src_widget, tab_id).unwrap_or_else(|| "Workspace".into());
+
+    // Prefer the terminal tab's own cwd; fall back to the source workspace's directory.
+    let tab_cwd = pane::tab_working_directory(&src_widget, tab_id);
+    let working_dir = tab_cwd.or_else(|| {
+        let s = state.borrow();
+        s.workspace_for_widget(&src_widget)
+            .and_then(|ws| ws.folder_path.clone().or_else(|| ws.cwd.borrow().clone()))
+    });
+
+    let workspace = WorkspaceState {
+        name: tab_title,
+        favorite: false,
+        cwd: working_dir.clone(),
+        folder_path: working_dir.clone(),
+        layout: LayoutNodeState::Pane(PaneState::fallback(working_dir.as_deref())),
+    };
+    add_workspace_from_state(state, &workspace);
+
+    // Find the new workspace's root pane and move the tab into it
+    let target_pane = {
+        let s = state.borrow();
+        s.workspaces.last().map(|ws| ws.root.clone())
+    };
+
+    if let Some(root) = target_pane {
+        pane::move_tab_to_pane(&src_widget, tab_id, &root);
+    }
+
+    request_session_save(state);
+    true
 }
 
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
