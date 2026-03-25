@@ -1,6 +1,7 @@
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
+use shell_quote::Bash;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1106,25 +1107,10 @@ fn dropped_file_text(file_list: &gtk::gdk::FileList) -> Option<CString> {
     )
 }
 
-/// Shell-escape a path so it can be safely pasted into a terminal.
-/// Operates on raw bytes to preserve non-UTF-8 filenames on Linux.
+/// Bash-escape a path so it can be safely pasted into the terminal without
+/// sending raw control bytes to Ghostty.
 fn shell_escape_bytes(s: &[u8]) -> Vec<u8> {
-    if s.iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'-' || b == b'_')
-    {
-        return s.to_vec();
-    }
-
-    let mut out = vec![b'\''];
-    for &b in s {
-        if b == b'\'' {
-            out.extend_from_slice(b"'\\''");
-        } else {
-            out.push(b);
-        }
-    }
-    out.push(b'\'');
-    out
+    Bash::quote_vec(s)
 }
 
 fn shell_escape_joined_bytes<I, B>(paths: I) -> Option<CString>
@@ -1222,7 +1208,7 @@ mod tests {
     fn shell_escape_quotes_paths_with_spaces() {
         assert_eq!(
             shell_escape_bytes(b"/home/user/my file.txt"),
-            b"'/home/user/my file.txt'"
+            b"$'/home/user/my file.txt'"
         );
     }
 
@@ -1230,14 +1216,26 @@ mod tests {
     fn shell_escape_handles_single_quotes() {
         assert_eq!(
             shell_escape_bytes(b"/tmp/it's a file"),
-            b"'/tmp/it'\\''s a file'"
+            b"$'/tmp/it\\'s a file'"
         );
     }
 
     #[test]
     fn shell_escape_preserves_non_utf8_bytes() {
         let path = b"/home/user/\xff\xfefile.txt";
-        assert_eq!(shell_escape_bytes(path), b"'/home/user/\xff\xfefile.txt'");
+        assert_eq!(
+            shell_escape_bytes(path),
+            b"$'/home/user/\\xFF\\xFEfile.txt'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_hex_escapes_terminal_control_bytes() {
+        let path = b"/tmp/line\nbreak\tand\x03escape\x1b";
+        assert_eq!(
+            shell_escape_bytes(path),
+            b"$'/tmp/line\\nbreak\\tand\\x03escape\\e'"
+        );
     }
 
     #[test]
@@ -1247,12 +1245,13 @@ mod tests {
             b"/tmp/space name".as_slice(),
             b"/tmp/it's".as_slice(),
             b"/tmp/\xff\xfe".as_slice(),
+            b"/tmp/line\nbreak".as_slice(),
         ])
         .expect("drop payload must be NUL-free");
 
         assert_eq!(
             text.as_bytes(),
-            b"/tmp/plain '/tmp/space name' '/tmp/it'\\''s' '/tmp/\xff\xfe'"
+            b"/tmp/plain $'/tmp/space name' $'/tmp/it\\'s' $'/tmp/\\xFF\\xFE' $'/tmp/line\\nbreak'"
         );
     }
 

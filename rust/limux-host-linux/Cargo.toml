@@ -23,6 +23,7 @@ limux-ghostty-sys = { path = "../limux-ghostty-sys" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+shell-quote = { version = "0.7.2", default-features = false, features = ["bash"] }
 
 [dev-dependencies]
 tempfile.workspace = true

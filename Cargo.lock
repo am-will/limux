@@ -791,6 +791,7 @@ dependencies = [
  "limux-ghostty-sys",
  "serde",
  "serde_json",
+ "shell-quote",
  "tempfile",
  "uuid",
  "webkit6",
@@ -1036,6 +1037,12 @@ checksum = "f8bbf91e5a4d6315eee45e704372590b30e260ee83af6639d64557f51b067776"
 dependencies = [
  "serde_core",
 ]
+
+[[package]]
+name = "shell-quote"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb502615975ae2365825521fa1529ca7648fd03ce0b0746604e0683856ecd7e4"
 
 [[package]]
 name = "shlex"
