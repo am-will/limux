@@ -499,6 +499,24 @@ pub fn create_terminal(
     let callbacks = Rc::new(callbacks);
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
+
+    // Input method context for dead-key / compose-key support.
+    // Dead keys (e.g. ~ and ' on European layouts) require an IM context
+    // to compose the final character before sending it to the terminal.
+    let im_context = gtk::IMMulticontext::new();
+    let im_composing = Rc::new(Cell::new(false));
+    // Track whether we're inside a key-pressed handler, and what the
+    // composing state was *before* the IM processed the event.  This is
+    // needed because ibus and fcitx call commit/preedit-end in different
+    // orders — see Ghostty's IMKeyEvent enum for the same pattern.
+    #[derive(Copy, Clone, PartialEq)]
+    enum InKeyEvent {
+        No,
+        WasComposing,
+        WasNotComposing,
+    }
+    let in_key_event = Rc::new(Cell::new(InKeyEvent::No));
+    let im_buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
 
@@ -655,6 +673,21 @@ pub fn create_terminal(
         });
     }
 
+    // Connect IM context to the GLArea widget for dead-key support
+    {
+        let im = im_context.clone();
+        let gl = gl_area.clone();
+        gl_area.connect_realize(move |_| {
+            im.set_client_widget(Some(&gl));
+        });
+    }
+    {
+        let im = im_context.clone();
+        gl_area.connect_unrealize(move |_| {
+            im.set_client_widget(gtk::Widget::NONE);
+        });
+    }
+
     // On render: draw the surface.
     {
         let surface_cell = surface_cell.clone();
@@ -704,17 +737,120 @@ pub fn create_terminal(
     // text field for actual character input and the keycode for bindings.
     // Do NOT use ghostty_surface_text() for regular typing — Ghostty
     // treats that as a paste, causing "pasting..." indicators in apps.
+    //
+    // Key events are filtered through the IM context manually (NOT via
+    // set_im_context, which would double-filter). This matches Ghostty's
+    // own approach and handles dead-key / compose sequences correctly.
+    //
+    // Callback ordering varies between input methods:
+    //   ibus:  commit → preedit-end
+    //   fcitx: preedit-end → commit
+    // The in_key_event state disambiguates these cases.
     {
+        // IM commit: called when the IM produces final text.
+        // When called during a key event with prior composing state
+        // (or outside a key event entirely), send directly to the terminal.
+        // When called during a normal (non-composing) key event, buffer
+        // the text so the key-pressed handler can attach it.
+        let im_buf_commit = im_buf.clone();
+        let im_composing_commit = im_composing.clone();
+        let in_key_event_commit = in_key_event.clone();
+        let sc_commit = surface_cell.clone();
+        im_context.connect_commit(move |_, text| {
+            match in_key_event_commit.get() {
+                InKeyEvent::WasNotComposing => {
+                    // Normal key press — buffer for key-pressed handler
+                    *im_buf_commit.borrow_mut() = text.as_bytes().to_vec();
+                }
+                _ => {
+                    // Composing or outside key event (on-screen keyboard) —
+                    // send directly to terminal as a keyless text event.
+                    im_composing_commit.set(false);
+                    if let Some(surface) = *sc_commit.borrow() {
+                        if let Ok(c_text) = CString::new(text) {
+                            let event = ghostty_input_key_s {
+                                action: GHOSTTY_ACTION_PRESS,
+                                mods: GHOSTTY_MODS_NONE,
+                                consumed_mods: GHOSTTY_MODS_NONE,
+                                keycode: 0,
+                                text: c_text.as_ptr(),
+                                unshifted_codepoint: 0,
+                                composing: false,
+                            };
+                            unsafe {
+                                ghostty_surface_key(surface, event);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // IM preedit-start: entering dead-key / compose state
+        let im_composing_start = im_composing.clone();
+        im_context.connect_preedit_start(move |_| {
+            im_composing_start.set(true);
+        });
+
+        // IM preedit-end: leaving compose state
+        let im_composing_end = im_composing.clone();
+        im_context.connect_preedit_end(move |_| {
+            im_composing_end.set(false);
+        });
+
         let sc_press = surface_cell.clone();
         let sc_release = surface_cell.clone();
+        let im_press = im_context.clone();
+        let im_release = im_context.clone();
+        let im_composing_press = im_composing.clone();
+        let im_buf_press = im_buf.clone();
+        let in_key_event_press = in_key_event.clone();
+        let in_key_event_release = in_key_event.clone();
         let key_controller = gtk::EventControllerKey::new();
-        key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
-            if let Some(surface) = *sc_press.borrow() {
-                let c_text = key_event_text(keyval);
 
-                let current_event = ctrl
-                    .current_event()
-                    .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+        // Do NOT use set_im_context — it would double-filter events.
+        // We call filter_keypress manually below.
+
+        key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
+            // Record composing state *before* IM processing and clear buffer
+            in_key_event_press.set(if im_composing_press.get() {
+                InKeyEvent::WasComposing
+            } else {
+                InKeyEvent::WasNotComposing
+            });
+            im_buf_press.borrow_mut().clear();
+
+            let current_event = ctrl
+                .current_event()
+                .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+
+            // Filter through IM context — may trigger commit/preedit callbacks
+            let im_filtered = current_event
+                .as_ref()
+                .map(|ev| im_press.filter_keypress(ev))
+                .unwrap_or(false);
+
+            // Reset in_key_event so commit callbacks outside key events
+            // are handled correctly
+            let was = in_key_event_press.replace(InKeyEvent::No);
+
+            if im_filtered {
+                // IM absorbed the event — check why
+                if im_composing_press.get() {
+                    // Still composing (preedit in progress) — absorb key
+                    return glib::Propagation::Stop;
+                }
+                if was == InKeyEvent::WasComposing {
+                    // Was composing, now done — commit handler sent the text
+                    return glib::Propagation::Stop;
+                }
+                if im_buf_press.borrow().is_empty() {
+                    // IM consumed the event but produced no text
+                    return glib::Propagation::Stop;
+                }
+            }
+
+            if let Some(surface) = *sc_press.borrow() {
                 let widget = ctrl.widget();
 
                 let mut event = translate_key_event(
@@ -725,7 +861,21 @@ pub fn create_terminal(
                     keycode,
                     modifier,
                 );
-                if let Some(ref ct) = c_text {
+
+                // Use text from IM buffer if available (committed by IM),
+                // otherwise fall back to direct keyval conversion
+                let buf = im_buf_press.borrow();
+                let c_text_from_im = if !buf.is_empty() {
+                    CString::new(buf.as_slice()).ok()
+                } else {
+                    None
+                };
+                let c_text_direct = if c_text_from_im.is_none() {
+                    key_event_text(keyval)
+                } else {
+                    None
+                };
+                if let Some(ref ct) = c_text_from_im.as_ref().or(c_text_direct.as_ref()) {
                     event.text = ct.as_ptr();
                 }
 
@@ -738,6 +888,16 @@ pub fn create_terminal(
         });
 
         key_controller.connect_key_released(move |ctrl, keyval, keycode, modifier| {
+            // Let IM context see release events
+            if let Some(ev) = ctrl
+                .current_event()
+                .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok())
+            {
+                in_key_event_release.set(InKeyEvent::WasNotComposing);
+                im_release.filter_keypress(&ev);
+                in_key_event_release.set(InKeyEvent::No);
+            }
+
             if let Some(surface) = *sc_release.borrow() {
                 let current_event = ctrl
                     .current_event()
@@ -855,21 +1015,25 @@ pub fn create_terminal(
         gl_area.add_controller(scroll);
     }
 
-    // Focus
+    // Focus — also notify the IM context so it can show/hide popups
     {
         let surface_cell = surface_cell.clone();
         let had_focus_enter = had_focus.clone();
         let had_focus_leave = had_focus.clone();
+        let im_focus_in = im_context.clone();
+        let im_focus_out = im_context.clone();
         let focus_ctrl = gtk::EventControllerFocus::new();
         let sc = surface_cell.clone();
         focus_ctrl.connect_enter(move |_| {
             had_focus_enter.set(true);
+            im_focus_in.focus_in();
             if let Some(surface) = *sc.borrow() {
                 unsafe { ghostty_surface_set_focus(surface, true) };
             }
         });
         focus_ctrl.connect_leave(move |_| {
             had_focus_leave.set(false);
+            im_focus_out.focus_out();
             if let Some(surface) = *surface_cell.borrow() {
                 unsafe { ghostty_surface_set_focus(surface, false) };
             }
