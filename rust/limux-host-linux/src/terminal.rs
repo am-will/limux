@@ -59,9 +59,14 @@ pub struct TerminalHandle {
     gl_area: gtk::GLArea,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
+    callbacks: Rc<RefCell<TerminalCallbacks>>,
 }
 
 impl TerminalHandle {
+    pub fn replace_callbacks(&self, callbacks: TerminalCallbacks) {
+        *self.callbacks.borrow_mut() = callbacks;
+    }
+
     pub fn perform_binding_action(&self, action: &str) -> bool {
         let surface = *self.surface_cell.borrow();
         surface_action(surface, action);
@@ -496,7 +501,7 @@ pub fn create_terminal(
     gl_area.set_can_focus(true);
 
     let wd = working_directory.map(|s| s.to_string());
-    let callbacks = Rc::new(callbacks);
+    let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
@@ -529,6 +534,7 @@ pub fn create_terminal(
         gl_area: gl_area.clone(),
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
+        callbacks: callbacks.clone(),
     };
 
     {
@@ -624,19 +630,31 @@ pub fn create_terminal(
                         toast_overlay: overlay_for_map.clone(),
                         on_title_changed: Some(Box::new({
                             let cb = callbacks.clone();
-                            move |title| (cb.on_title_changed)(title)
+                            move |title| {
+                                let callbacks = cb.borrow();
+                                (callbacks.on_title_changed)(title);
+                            }
                         })),
                         on_pwd_changed: Some(Box::new({
                             let cb = callbacks.clone();
-                            move |pwd| (cb.on_pwd_changed)(pwd)
+                            move |pwd| {
+                                let callbacks = cb.borrow();
+                                (callbacks.on_pwd_changed)(pwd);
+                            }
                         })),
                         on_bell: Some(Box::new({
                             let cb = callbacks.clone();
-                            move || (cb.on_bell)()
+                            move || {
+                                let callbacks = cb.borrow();
+                                (callbacks.on_bell)();
+                            }
                         })),
                         on_close: Some(Box::new({
                             let cb = callbacks.clone();
-                            move || (cb.on_close)()
+                            move || {
+                                let callbacks = cb.borrow();
+                                (callbacks.on_close)();
+                            }
                         })),
                         clipboard_context,
                     },
@@ -962,7 +980,7 @@ fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
 fn show_terminal_context_menu(
     gl_area: &gtk::GLArea,
     surface: Option<ghostty_surface_t>,
-    callbacks: &Rc<TerminalCallbacks>,
+    callbacks: &Rc<RefCell<TerminalCallbacks>>,
     x: f64,
     y: f64,
 ) {
@@ -1026,13 +1044,20 @@ fn show_terminal_context_menu(
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
                     "Paste" => surface_action(surface, "paste_from_clipboard"),
-                    "Split Right" => (cb.on_split_right)(),
-                    "Split Down" => (cb.on_split_down)(),
+                    "Split Right" => {
+                        let callbacks = cb.borrow();
+                        (callbacks.on_split_right)();
+                    }
+                    "Split Down" => {
+                        let callbacks = cb.borrow();
+                        (callbacks.on_split_down)();
+                    }
                     "Keybinds" => {
                         let anchor: gtk::Widget = gl_area.clone().upcast();
                         let cb = cb.clone();
                         glib::timeout_add_local_once(Duration::from_millis(80), move || {
-                            (cb.on_open_keybinds)(&anchor);
+                            let callbacks = cb.borrow();
+                            (callbacks.on_open_keybinds)(&anchor);
                         });
                     }
                     "Clear" => surface_action(surface, "clear_screen"),
