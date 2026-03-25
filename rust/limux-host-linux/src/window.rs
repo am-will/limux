@@ -2331,10 +2331,12 @@ fn create_pane_for_workspace(
                 &ws_id_split,
                 pane_widget,
                 orientation,
-                None,
-                false,
-                false,
-                true,
+                SplitPaneOptions {
+                    initial_state: None,
+                    skip_default_tab: false,
+                    new_pane_first: false,
+                    persist: true,
+                },
             );
         }),
         on_close_pane: Box::new(move |pane_widget| {
@@ -2657,15 +2659,19 @@ fn toggle_sidebar(state: &State) {
 // Split / close pane operations
 // ---------------------------------------------------------------------------
 
+struct SplitPaneOptions {
+    initial_state: Option<PaneState>,
+    skip_default_tab: bool,
+    new_pane_first: bool,
+    persist: bool,
+}
+
 fn split_pane(
     state: &State,
     ws_id: &str,
     pane_widget: &gtk::Widget,
     orientation: gtk::Orientation,
-    initial_state: Option<PaneState>,
-    skip_default_tab: bool,
-    new_pane_first: bool,
-    persist: bool,
+    options: SplitPaneOptions,
 ) -> gtk::Widget {
     // Use the workspace's folder_path (or current cwd) for the new pane
     let (shortcuts, wd) = {
@@ -2683,8 +2689,8 @@ fn split_pane(
         &shortcuts,
         ws_id,
         wd.as_deref(),
-        initial_state.as_ref(),
-        skip_default_tab,
+        options.initial_state.as_ref(),
+        options.skip_default_tab,
     );
 
     let parent = pane_widget.parent();
@@ -2721,7 +2727,7 @@ fn split_pane(
         }
     }
 
-    if new_pane_first {
+    if options.new_pane_first {
         new_paned.set_start_child(Some(&new_pane));
         new_paned.set_end_child(Some(pane_widget));
     } else {
@@ -2744,7 +2750,7 @@ fn split_pane(
             }
         });
     }
-    if persist {
+    if options.persist {
         request_session_save(state);
     }
     new_pane.upcast()
@@ -2842,10 +2848,12 @@ fn handle_split_with_tab(
         ws_id,
         target_pane,
         orientation,
-        None,
-        true,
-        new_pane_first,
-        false,
+        SplitPaneOptions {
+            initial_state: None,
+            skip_default_tab: true,
+            new_pane_first,
+            persist: false,
+        },
     );
     if pane::move_tab_to_pane(source_pane, tab_id, &new_pane) {
         request_session_save(state);
@@ -2993,10 +3001,12 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
                 &ws_id,
                 &pane_widget,
                 gtk::Orientation::Horizontal,
-                Some(PaneState::browser_only(uri.as_deref())),
-                false,
-                false,
-                true,
+                SplitPaneOptions {
+                    initial_state: Some(PaneState::browser_only(uri.as_deref())),
+                    skip_default_tab: false,
+                    new_pane_first: false,
+                    persist: true,
+                },
             );
             true
         }
@@ -3011,10 +3021,12 @@ fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
             &ws_id,
             &pane_widget,
             orientation,
-            None,
-            false,
-            false,
-            true,
+            SplitPaneOptions {
+                initial_state: None,
+                skip_default_tab: false,
+                new_pane_first: false,
+                persist: true,
+            },
         );
     }
 }
