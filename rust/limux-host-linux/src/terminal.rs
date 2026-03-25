@@ -487,6 +487,44 @@ struct ImState {
     buf: RefCell<Vec<u8>>,
 }
 
+fn preedit_text_is_visible(surface: ghostty_surface_t, text: &str) {
+    unsafe {
+        ghostty_surface_preedit(surface, text.as_ptr().cast(), text.len());
+    }
+}
+
+fn clear_preedit_text(surface: ghostty_surface_t) {
+    unsafe {
+        ghostty_surface_preedit(surface, b"".as_ptr().cast(), 0);
+    }
+}
+
+fn update_im_cursor_location(surface: ghostty_surface_t, context: &gtk::IMMulticontext) {
+    let mut x = 0.0;
+    let mut y = 0.0;
+    let mut width = 0.0;
+    let mut height = 0.0;
+    unsafe {
+        ghostty_surface_ime_point(surface, &mut x, &mut y, &mut width, &mut height);
+    }
+
+    context.set_cursor_location(&gtk::gdk::Rectangle::new(
+        x.round() as i32,
+        y.round() as i32,
+        width.max(1.0).round() as i32,
+        height.max(1.0).round() as i32,
+    ));
+}
+
+fn filtered_press_should_stop(
+    filtered: bool,
+    composing: bool,
+    was: InKeyEvent,
+    has_buffered_text: bool,
+) -> bool {
+    filtered && (composing || was == InKeyEvent::WasComposing || !has_buffered_text)
+}
+
 // ---------------------------------------------------------------------------
 // Surface creation
 // ---------------------------------------------------------------------------
@@ -766,6 +804,7 @@ pub fn create_terminal(
                     // send directly to terminal as a keyless text event.
                     im_commit.composing.set(false);
                     if let Some(surface) = *sc_commit.borrow() {
+                        clear_preedit_text(surface);
                         if let Ok(c_text) = CString::new(text) {
                             let event = ghostty_input_key_s {
                                 action: GHOSTTY_ACTION_PRESS,
@@ -789,12 +828,28 @@ pub fn create_terminal(
         let im_start = im.clone();
         im.context.connect_preedit_start(move |_| {
             im_start.composing.set(true);
+            im_start.buf.borrow_mut().clear();
+        });
+
+        // IM preedit-changed: update the visible preedit text at the cursor
+        let im_changed = im.clone();
+        let sc_changed = surface_cell.clone();
+        im.context.connect_preedit_changed(move |_| {
+            im_changed.composing.set(true);
+            if let Some(surface) = *sc_changed.borrow() {
+                let (preedit, _, _) = im_changed.context.preedit_string();
+                preedit_text_is_visible(surface, preedit.as_str());
+            }
         });
 
         // IM preedit-end: leaving compose state
         let im_end = im.clone();
+        let sc_end = surface_cell.clone();
         im.context.connect_preedit_end(move |_| {
             im_end.composing.set(false);
+            if let Some(surface) = *sc_end.borrow() {
+                clear_preedit_text(surface);
+            }
         });
 
         let sc_press = surface_cell.clone();
@@ -807,6 +862,14 @@ pub fn create_terminal(
         // We call filter_keypress manually below.
 
         key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
+            let current_event = ctrl
+                .current_event()
+                .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+
+            if let Some(surface) = *sc_press.borrow() {
+                update_im_cursor_location(surface, &im_press.context);
+            }
+
             // Record composing state *before* IM processing and clear buffer
             im_press.in_key_event.set(if im_press.composing.get() {
                 InKeyEvent::WasComposing
@@ -814,10 +877,6 @@ pub fn create_terminal(
                 InKeyEvent::WasNotComposing
             });
             im_press.buf.borrow_mut().clear();
-
-            let current_event = ctrl
-                .current_event()
-                .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
 
             // Filter through IM context — may trigger commit/preedit callbacks
             let im_filtered = current_event
@@ -829,20 +888,13 @@ pub fn create_terminal(
             // are handled correctly
             let was = im_press.in_key_event.replace(InKeyEvent::No);
 
-            if im_filtered {
-                // IM absorbed the event — check why
-                if im_press.composing.get() {
-                    // Still composing (preedit in progress) — absorb key
-                    return glib::Propagation::Stop;
-                }
-                if was == InKeyEvent::WasComposing {
-                    // Was composing, now done — commit handler sent the text
-                    return glib::Propagation::Stop;
-                }
-                if im_press.buf.borrow().is_empty() {
-                    // IM consumed the event but produced no text
-                    return glib::Propagation::Stop;
-                }
+            if filtered_press_should_stop(
+                im_filtered,
+                im_press.composing.get(),
+                was,
+                !im_press.buf.borrow().is_empty(),
+            ) {
+                return glib::Propagation::Stop;
             }
 
             if let Some(surface) = *sc_press.borrow() {
@@ -856,6 +908,7 @@ pub fn create_terminal(
                     keycode,
                     modifier,
                 );
+                event.composing = im_press.composing.get();
 
                 // Use text from IM buffer if available (committed by IM),
                 // otherwise fall back to direct keyval conversion.
@@ -875,8 +928,13 @@ pub fn create_terminal(
                     event.text = ct.as_ptr();
                 }
 
+                let composing = event.composing;
                 let consumed = unsafe { ghostty_surface_key(surface, event) };
                 if consumed {
+                    if composing {
+                        im_press.context.reset();
+                        clear_preedit_text(surface);
+                    }
                     return glib::Propagation::Stop;
                 }
             }
@@ -1506,6 +1564,40 @@ mod tests {
         assert_eq!(ctrl_shift_h.as_deref(), Some("H"));
         assert_eq!(alt_shift_gt.as_deref(), Some(">"));
         assert!(key_event_text(gtk::gdk::Key::BackSpace).is_none());
+    }
+
+    #[test]
+    fn filtered_press_stop_logic_covers_key_ime_states() {
+        assert!(filtered_press_should_stop(
+            true,
+            true,
+            InKeyEvent::WasNotComposing,
+            false
+        ));
+        assert!(filtered_press_should_stop(
+            true,
+            false,
+            InKeyEvent::WasComposing,
+            true
+        ));
+        assert!(filtered_press_should_stop(
+            true,
+            false,
+            InKeyEvent::WasNotComposing,
+            false
+        ));
+        assert!(!filtered_press_should_stop(
+            true,
+            false,
+            InKeyEvent::WasNotComposing,
+            true
+        ));
+        assert!(!filtered_press_should_stop(
+            false,
+            true,
+            InKeyEvent::WasComposing,
+            false
+        ));
     }
 
     #[test]

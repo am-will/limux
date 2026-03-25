@@ -60,6 +60,8 @@ struct AppState {
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
     paned: gtk::Paned,
+    collapse_btn: gtk::Button,
+    expand_btn: gtk::Button,
     new_ws_btn: gtk::Button,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
@@ -676,9 +678,16 @@ pub fn build_window(app: &adw::Application) {
         .orientation(gtk::Orientation::Horizontal)
         .margin_top(8)
         .margin_bottom(4)
+        .margin_start(6)
         .margin_end(6)
         .build();
     sidebar_title.append(&sidebar_title_label);
+
+    let collapse_btn = gtk::Button::builder().label("<").build();
+    collapse_btn.add_css_class("flat");
+    collapse_btn.add_css_class("limux-sidebar-collapse");
+    collapse_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts, true)));
+    sidebar_title.append(&collapse_btn);
 
     {
         let window = window.clone();
@@ -743,11 +752,27 @@ pub fn build_window(app: &adw::Application) {
         .end_child(&stack)
         .build();
 
+    let expand_btn = gtk::Button::builder()
+        .label(">")
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    expand_btn.add_css_class("flat");
+    expand_btn.add_css_class("limux-sidebar-expand");
+    expand_btn.set_margin_top(12);
+    expand_btn.set_margin_bottom(12);
+    expand_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts, false)));
+
+    let content_overlay = gtk::Overlay::new();
+    content_overlay.set_child(Some(&main_paned));
+    content_overlay.add_overlay(&expand_btn);
+
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if let Some(ref header) = header {
         vbox.append(header);
     }
-    vbox.append(&main_paned);
+    vbox.append(&content_overlay);
     window.set_content(Some(&vbox));
 
     let state: State = Rc::new(RefCell::new(AppState {
@@ -761,6 +786,8 @@ pub fn build_window(app: &adw::Application) {
         stack: stack.clone(),
         sidebar_list: sidebar_list.clone(),
         paned: main_paned.clone(),
+        collapse_btn: collapse_btn.clone(),
+        expand_btn: expand_btn.clone(),
         new_ws_btn: new_ws_btn.clone(),
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
@@ -770,6 +797,20 @@ pub fn build_window(app: &adw::Application) {
     }));
 
     apply_shortcuts_to_application(app, &state.borrow().shortcuts);
+
+    {
+        let state = state.clone();
+        collapse_btn.connect_clicked(move |_| {
+            toggle_sidebar(&state);
+        });
+    }
+
+    {
+        let state = state.clone();
+        expand_btn.connect_clicked(move |_| {
+            toggle_sidebar(&state);
+        });
+    }
 
     {
         let state = state.clone();
