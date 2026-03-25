@@ -8,7 +8,6 @@ mod window;
 use adw::prelude::*;
 use libadwaita as adw;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 const APP_ID: &str = "dev.limux.linux";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -100,17 +99,9 @@ fn main() {
         .flags(adw::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    let shortcuts = Rc::new(shortcut_config::load_shortcuts());
-    for warning in &shortcuts.warnings {
-        eprintln!("limux: {warning}");
-    }
-
-    {
-        let shortcuts = shortcuts.clone();
-        app.connect_activate(move |app| {
-            window::build_window(app, shortcuts.clone());
-        });
-    }
+    app.connect_activate(move |app| {
+        window::build_window(app);
+    });
     app.run();
 }
 

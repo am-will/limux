@@ -545,7 +545,13 @@ row:selected .limux-ws-path {
 // Window construction
 // ---------------------------------------------------------------------------
 
-pub fn build_window(app: &adw::Application, shortcuts: Rc<ResolvedShortcutConfig>) {
+pub fn build_window(app: &adw::Application) {
+    let display = gtk::gdk::Display::default().expect("display");
+    let shortcuts = Rc::new(shortcut_config::load_shortcuts_for_display(&display));
+    for warning in &shortcuts.warnings {
+        eprintln!("limux: {warning}");
+    }
+
     // Load CSS
     let provider = gtk::CssProvider::new();
     let all_css = format!(
@@ -555,7 +561,7 @@ pub fn build_window(app: &adw::Application, shortcuts: Rc<ResolvedShortcutConfig
     );
     provider.load_from_data(&all_css);
     gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().expect("display"),
+        &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
@@ -567,7 +573,7 @@ pub fn build_window(app: &adw::Application, shortcuts: Rc<ResolvedShortcutConfig
     });
 
     // Register custom icons — look for icons dir relative to the executable
-    let icon_theme = gtk::IconTheme::for_display(&gtk::gdk::Display::default().expect("display"));
+    let icon_theme = gtk::IconTheme::for_display(&display);
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -601,8 +607,10 @@ pub fn build_window(app: &adw::Application, shortcuts: Rc<ResolvedShortcutConfig
     // On Wayland compositors with xdg-decoration support, the compositor
     // already provides the window chrome, so keep Limux from rendering a
     // duplicate header bar. X11 continues to use the in-app header.
-    let provides_decorations = gtk::gdk::Display::default()
-        .and_then(|display| display.downcast::<gdk4_wayland::WaylandDisplay>().ok())
+    let provides_decorations = display
+        .clone()
+        .downcast::<gdk4_wayland::WaylandDisplay>()
+        .ok()
         .map(|display| display.query_registry("zxdg_decoration_manager_v1"))
         .unwrap_or(false);
 
@@ -887,10 +895,17 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
 
     let state = state.clone();
-    key_controller.connect_key_pressed(move |_, keyval, _keycode, modifier| {
+    key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
         let matched = {
             let s = state.borrow();
-            shortcut_command_from_key_event(&s.shortcuts, keyval, modifier)
+            let display = controller.widget().map(|widget| widget.display());
+            shortcut_command_from_key_press(
+                &s.shortcuts,
+                display.as_ref(),
+                keyval,
+                keycode,
+                modifier,
+            )
         }
         .map(|command| {
             dispatch_shortcut_command(&state, command);
@@ -908,12 +923,25 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
     window.add_controller(key_controller);
 }
 
+#[cfg(test)]
 fn shortcut_command_from_key_event(
     shortcuts: &ResolvedShortcutConfig,
     keyval: gtk::gdk::Key,
     modifier: gtk::gdk::ModifierType,
 ) -> Option<ShortcutCommand> {
     shortcut_config::NormalizedShortcut::from_gdk_key(keyval, modifier)
+        .map(|shortcut| shortcut.to_runtime_combo())
+        .and_then(|combo| shortcuts.command_for_runtime_combo(&combo))
+}
+
+fn shortcut_command_from_key_press(
+    shortcuts: &ResolvedShortcutConfig,
+    display: Option<&gtk::gdk::Display>,
+    keyval: gtk::gdk::Key,
+    keycode: u32,
+    modifier: gtk::gdk::ModifierType,
+) -> Option<ShortcutCommand> {
+    shortcut_config::NormalizedShortcut::from_gdk_key_event(display, keyval, keycode, modifier)
         .map(|shortcut| shortcut.to_runtime_combo())
         .and_then(|combo| shortcuts.command_for_runtime_combo(&combo))
 }
@@ -1018,7 +1046,11 @@ fn persist_shortcut_binding(
     };
 
     shortcut_config::write_shortcuts(&path, &updated).map_err(|err| err.to_string())?;
-    let reloaded = shortcut_config::load_shortcuts_or_default(&path);
+    let display = {
+        let s = state.borrow();
+        s.stack.display()
+    };
+    let reloaded = shortcut_config::load_shortcuts_or_default_with_display(&path, Some(&display));
     if !reloaded.warnings.is_empty() {
         return Err(reloaded.warnings.join("; "));
     }

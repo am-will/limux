@@ -125,6 +125,8 @@ pub fn build_keybind_editor(
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     outer.add_css_class("limux-keybind-editor");
     outer.set_width_request(540);
+    outer.set_focusable(true);
+    outer.set_can_focus(true);
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     header.add_css_class("limux-keybind-header");
@@ -161,7 +163,6 @@ pub fn build_keybind_editor(
 
     for definition in shortcut_config::definitions() {
         let shortcut_id = definition.id;
-        let config_key = definition.config_key;
 
         let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
         row.add_css_class("limux-keybind-row");
@@ -224,7 +225,8 @@ pub fn build_keybind_editor(
             let errors = errors.clone();
             let rows = rows.clone();
             let state = state.clone();
-            binding_button.connect_clicked(move |button| {
+            let outer = outer.clone();
+            binding_button.connect_clicked(move |_| {
                 *listening.borrow_mut() = Some(shortcut_id);
                 errors.borrow_mut().remove(&shortcut_id);
                 refresh_rows(
@@ -233,57 +235,70 @@ pub fn build_keybind_editor(
                     *listening.borrow(),
                     &errors.borrow(),
                 );
-                button.grab_focus();
+                outer.grab_focus();
             });
         }
+    }
 
-        {
-            let listening = listening.clone();
-            let errors = errors.clone();
-            let rows = rows.clone();
-            let state = state.clone();
-            let on_capture = on_capture.clone();
-            let key_controller = gtk::EventControllerKey::new();
-            key_controller.connect_key_pressed(move |_, keyval, _keycode, modifier| {
-                if *listening.borrow() != Some(shortcut_id) {
-                    return gtk::glib::Propagation::Proceed;
+    {
+        let listening = listening.clone();
+        let errors = errors.clone();
+        let rows = rows.clone();
+        let state = state.clone();
+        let on_capture = on_capture.clone();
+        let key_controller = gtk::EventControllerKey::new();
+        key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
+            let Some(shortcut_id) = *listening.borrow() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let Some(definition) = shortcut_config::definitions()
+                .iter()
+                .find(|definition| definition.id == shortcut_id)
+            else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let display = controller.widget().map(|widget| widget.display());
+
+            match capture_outcome_for_key_press(
+                display.as_ref(),
+                keyval,
+                keycode,
+                modifier,
+                definition.config_key,
+            ) {
+                CaptureOutcome::ContinueListening => {
+                    return gtk::glib::Propagation::Stop;
                 }
-
-                match capture_outcome_for_key_event(keyval, modifier, config_key) {
-                    CaptureOutcome::ContinueListening => {
-                        return gtk::glib::Propagation::Stop;
-                    }
-                    CaptureOutcome::CancelListening => {
+                CaptureOutcome::CancelListening => {
+                    *listening.borrow_mut() = None;
+                    errors.borrow_mut().remove(&shortcut_id);
+                }
+                CaptureOutcome::Capture(binding) => match on_capture(shortcut_id, binding) {
+                    Ok(updated) => {
+                        *state.borrow_mut() = updated;
                         *listening.borrow_mut() = None;
                         errors.borrow_mut().remove(&shortcut_id);
                     }
-                    CaptureOutcome::Capture(binding) => match on_capture(shortcut_id, binding) {
-                        Ok(updated) => {
-                            *state.borrow_mut() = updated;
-                            *listening.borrow_mut() = None;
-                            errors.borrow_mut().remove(&shortcut_id);
-                        }
-                        Err(err) => {
-                            *listening.borrow_mut() = None;
-                            errors.borrow_mut().insert(shortcut_id, err);
-                        }
-                    },
-                    CaptureOutcome::Error(message) => {
+                    Err(err) => {
                         *listening.borrow_mut() = None;
-                        errors.borrow_mut().insert(shortcut_id, message);
+                        errors.borrow_mut().insert(shortcut_id, err);
                     }
+                },
+                CaptureOutcome::Error(message) => {
+                    *listening.borrow_mut() = None;
+                    errors.borrow_mut().insert(shortcut_id, message);
                 }
+            }
 
-                refresh_rows(
-                    &rows.borrow(),
-                    &state.borrow(),
-                    *listening.borrow(),
-                    &errors.borrow(),
-                );
-                gtk::glib::Propagation::Stop
-            });
-            binding_button.add_controller(key_controller);
-        }
+            refresh_rows(
+                &rows.borrow(),
+                &state.borrow(),
+                *listening.borrow(),
+                &errors.borrow(),
+            );
+            gtk::glib::Propagation::Stop
+        });
+        outer.add_controller(key_controller);
     }
 
     refresh_rows(&rows.borrow(), shortcuts, None, &HashMap::new());
@@ -345,8 +360,19 @@ fn refresh_rows(
     }
 }
 
+#[cfg(test)]
 fn capture_outcome_for_key_event(
     keyval: gtk::gdk::Key,
+    modifier: gtk::gdk::ModifierType,
+    config_key: &str,
+) -> CaptureOutcome {
+    capture_outcome_for_key_press(None, keyval, 0, modifier, config_key)
+}
+
+fn capture_outcome_for_key_press(
+    display: Option<&gtk::gdk::Display>,
+    keyval: gtk::gdk::Key,
+    keycode: u32,
     modifier: gtk::gdk::ModifierType,
     config_key: &str,
 ) -> CaptureOutcome {
@@ -354,7 +380,8 @@ fn capture_outcome_for_key_event(
         return CaptureOutcome::CancelListening;
     }
 
-    let Some(binding) = NormalizedShortcut::from_gdk_key(keyval, modifier) else {
+    let Some(binding) = NormalizedShortcut::from_gdk_key_event(display, keyval, keycode, modifier)
+    else {
         return CaptureOutcome::ContinueListening;
     };
 

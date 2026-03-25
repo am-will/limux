@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gtk4::gdk;
+use gtk4::gdk::prelude::DisplayExtManual;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -476,9 +477,18 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 25] = [
 ];
 
 impl NormalizedShortcut {
+    #[cfg(test)]
     pub fn from_gdk_key(keyval: gdk::Key, modifier: gdk::ModifierType) -> Option<Self> {
-        let key_name = keyval.name()?;
-        let key = normalize_runtime_key(key_name.as_str());
+        Self::from_gdk_key_event(None, keyval, 0, modifier)
+    }
+
+    pub fn from_gdk_key_event(
+        display: Option<&gdk::Display>,
+        keyval: gdk::Key,
+        keycode: u32,
+        modifier: gdk::ModifierType,
+    ) -> Option<Self> {
+        let key = normalized_event_key(display, keyval, keycode)?;
         if is_modifier_only_key(&key) {
             return None;
         }
@@ -770,15 +780,31 @@ pub fn default_shortcuts() -> ResolvedShortcutConfig {
     }
 }
 
+#[cfg(test)]
 pub fn resolve_shortcuts_from_str(
     raw: &str,
 ) -> Result<ResolvedShortcutConfig, ShortcutConfigError> {
-    let parsed: ShortcutConfigFile = serde_json::from_str(raw)
-        .map_err(|err| ShortcutConfigError::InvalidJson(err.to_string()))?;
-    resolve_shortcuts_from_file(parsed)
+    resolve_shortcuts_from_str_with_display(raw, None)
 }
 
+pub fn resolve_shortcuts_from_str_with_display(
+    raw: &str,
+    display: Option<&gdk::Display>,
+) -> Result<ResolvedShortcutConfig, ShortcutConfigError> {
+    let parsed: ShortcutConfigFile = serde_json::from_str(raw)
+        .map_err(|err| ShortcutConfigError::InvalidJson(err.to_string()))?;
+    resolve_shortcuts_from_file(parsed, display)
+}
+
+#[cfg(test)]
 pub fn load_shortcuts_or_default(path: &Path) -> ResolvedShortcutConfig {
+    load_shortcuts_or_default_with_display(path, None)
+}
+
+pub fn load_shortcuts_or_default_with_display(
+    path: &Path,
+    display: Option<&gdk::Display>,
+) -> ResolvedShortcutConfig {
     if !path.exists() {
         return default_shortcuts();
     }
@@ -795,7 +821,7 @@ pub fn load_shortcuts_or_default(path: &Path) -> ResolvedShortcutConfig {
         }
     };
 
-    match resolve_shortcuts_from_str(&raw) {
+    match resolve_shortcuts_from_str_with_display(&raw, display) {
         Ok(config) => config,
         Err(err) => {
             let mut defaults = default_shortcuts();
@@ -808,7 +834,7 @@ pub fn load_shortcuts_or_default(path: &Path) -> ResolvedShortcutConfig {
     }
 }
 
-pub fn load_shortcuts() -> ResolvedShortcutConfig {
+pub fn load_shortcuts_for_display(display: &gdk::Display) -> ResolvedShortcutConfig {
     let Some(path) = config_path() else {
         let mut defaults = default_shortcuts();
         defaults
@@ -816,7 +842,7 @@ pub fn load_shortcuts() -> ResolvedShortcutConfig {
             .push("config_dir unavailable; using default shortcuts".to_string());
         return defaults;
     };
-    load_shortcuts_or_default(&path)
+    load_shortcuts_or_default_with_display(&path, Some(display))
 }
 
 pub fn write_shortcuts(
@@ -835,6 +861,7 @@ pub fn write_shortcuts(
 
 fn resolve_shortcuts_from_file(
     parsed: ShortcutConfigFile,
+    display: Option<&gdk::Display>,
 ) -> Result<ResolvedShortcutConfig, ShortcutConfigError> {
     let mut resolved = default_shortcuts();
 
@@ -853,7 +880,10 @@ fn resolve_shortcuts_from_file(
                 if trimmed.is_empty() {
                     None
                 } else {
-                    Some(NormalizedShortcut::parse(trimmed)?)
+                    Some(canonicalize_loaded_binding(
+                        display,
+                        NormalizedShortcut::parse(trimmed)?,
+                    ))
                 }
             }
             _ => {
@@ -977,6 +1007,92 @@ fn definition_by_config_key(config_key: &str) -> Option<&'static ShortcutDefinit
 
 fn definition_by_id(id: ShortcutId) -> Option<&'static ShortcutDefinition> {
     definitions().iter().find(|definition| definition.id == id)
+}
+
+fn normalized_event_key(
+    display: Option<&gdk::Display>,
+    keyval: gdk::Key,
+    keycode: u32,
+) -> Option<String> {
+    let resolved = display
+        .and_then(|display| unshifted_keyval_for_event(display, keyval, keycode))
+        .unwrap_or(keyval);
+    resolved
+        .name()
+        .map(|key_name| normalize_runtime_key(key_name.as_str()))
+}
+
+fn unshifted_keyval_for_event(
+    display: &gdk::Display,
+    keyval: gdk::Key,
+    keycode: u32,
+) -> Option<gdk::Key> {
+    if keycode == 0 {
+        return None;
+    }
+
+    let keyval_mappings = display.map_keyval(keyval)?;
+    let keycode_mappings = display.map_keycode(keycode)?;
+    unshifted_keyval_from_mappings(keycode, &keyval_mappings, &keycode_mappings)
+}
+
+fn canonicalize_loaded_binding(
+    display: Option<&gdk::Display>,
+    binding: NormalizedShortcut,
+) -> NormalizedShortcut {
+    let Some(display) = display else {
+        return binding;
+    };
+    let Some(keyval) = gdk::Key::from_name(runtime_key_to_gtk_key(&binding.key)) else {
+        return binding;
+    };
+    let Some(unshifted) = unshifted_keyval_for_loaded_binding(display, keyval) else {
+        return binding;
+    };
+    let Some(key_name) = unshifted.name() else {
+        return binding;
+    };
+
+    NormalizedShortcut {
+        key: normalize_runtime_key(key_name.as_str()),
+        ..binding
+    }
+}
+
+fn unshifted_keyval_for_loaded_binding(
+    display: &gdk::Display,
+    keyval: gdk::Key,
+) -> Option<gdk::Key> {
+    let keyval_mappings = display.map_keyval(keyval)?;
+    for mapping in keyval_mappings {
+        let keycode_mappings = display.map_keycode(mapping.keycode())?;
+        if let Some(unshifted) = unshifted_keyval_from_mappings(
+            mapping.keycode(),
+            std::slice::from_ref(&mapping),
+            &keycode_mappings,
+        ) {
+            return Some(unshifted);
+        }
+    }
+    None
+}
+
+fn unshifted_keyval_from_mappings(
+    keycode: u32,
+    keyval_mappings: &[gdk::KeymapKey],
+    keycode_mappings: &[(gdk::KeymapKey, gdk::Key)],
+) -> Option<gdk::Key> {
+    let group = keyval_mappings
+        .iter()
+        .find(|mapping| mapping.keycode() == keycode)
+        .map(gdk::KeymapKey::group)?;
+
+    keycode_mappings
+        .iter()
+        .find(|(mapping, _)| {
+            mapping.keycode() == keycode && mapping.group() == group && mapping.level() == 0
+        })
+        .map(|(_, key)| *key)
 }
 
 fn normalize_runtime_key(key: &str) -> String {
@@ -1103,6 +1219,29 @@ mod tests {
         let shortcut = NormalizedShortcut::parse("<Shift><Ctrl>Page_Down").unwrap();
         assert_eq!(shortcut.to_gtk_accel(), "<Ctrl><Shift>Page_Down");
         assert_eq!(shortcut.to_runtime_combo(), "ctrl+shift+page_down");
+    }
+
+    #[test]
+    fn unshifted_keyval_from_mappings_uses_same_group_level_zero_key() {
+        let keyval_mappings = vec![gdk::KeymapKey::new(10, 1, 1)];
+        let keycode_mappings = vec![
+            (gdk::KeymapKey::new(10, 0, 0), gdk::Key::_1),
+            (gdk::KeymapKey::new(10, 1, 0), gdk::Key::_0),
+            (gdk::KeymapKey::new(10, 1, 1), gdk::Key::parenleft),
+        ];
+
+        let unshifted =
+            unshifted_keyval_from_mappings(10, &keyval_mappings, &keycode_mappings).unwrap();
+        assert_eq!(unshifted, gdk::Key::_0);
+
+        let shortcut = NormalizedShortcut::from_gdk_key_event(
+            None,
+            unshifted,
+            10,
+            gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
+        )
+        .unwrap();
+        assert_eq!(shortcut.to_display_label(), "Ctrl+Shift+0");
     }
 
     #[test]
