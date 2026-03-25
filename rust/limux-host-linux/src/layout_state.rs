@@ -109,6 +109,7 @@ pub enum TabContentState {
         #[serde(default)]
         uri: Option<String>,
     },
+    Keybinds {},
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -524,6 +525,37 @@ mod tests {
             }
             other => panic!("expected terminal fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn keybind_tab_round_trips_through_session_json() {
+        let state = AppSessionState {
+            workspaces: vec![WorkspaceState {
+                name: "workspace".to_string(),
+                favorite: false,
+                cwd: None,
+                folder_path: None,
+                layout: LayoutNodeState::Pane(PaneState {
+                    active_tab_id: Some("keybinds-1".to_string()),
+                    tabs: vec![TabState {
+                        id: "keybinds-1".to_string(),
+                        custom_name: None,
+                        pinned: false,
+                        content: TabContentState::Keybinds {},
+                    }],
+                }),
+            }],
+            ..AppSessionState::default()
+        };
+
+        let raw = serde_json::to_string(&state).expect("serialize session");
+        let decoded: AppSessionState = serde_json::from_str(&raw).expect("deserialize session");
+
+        let LayoutNodeState::Pane(pane) = &decoded.workspaces[0].layout else {
+            panic!("expected pane");
+        };
+        assert_eq!(pane.active_tab_id.as_deref(), Some("keybinds-1"));
+        assert!(matches!(pane.tabs[0].content, TabContentState::Keybinds {}));
     }
 
     #[test]

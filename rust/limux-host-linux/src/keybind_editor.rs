@@ -18,11 +18,8 @@ enum CaptureOutcome {
 
 pub const KEYBIND_EDITOR_CSS: &str = r#"
 .limux-keybind-editor {
-    background: linear-gradient(180deg, rgba(24, 24, 24, 0.98), rgba(18, 18, 18, 0.98));
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 16px;
-    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.45);
-    padding: 12px;
+    background: linear-gradient(180deg, rgba(22, 22, 22, 0.98), rgba(16, 16, 16, 0.98));
+    padding: 14px;
 }
 .limux-keybind-header {
     margin-bottom: 8px;
@@ -36,19 +33,6 @@ pub const KEYBIND_EDITOR_CSS: &str = r#"
     color: rgba(255, 255, 255, 0.62);
     font-size: 12px;
     margin-bottom: 10px;
-}
-.limux-keybind-close {
-    background: rgba(255, 255, 255, 0.05);
-    border: none;
-    border-radius: 999px;
-    color: rgba(255, 255, 255, 0.7);
-    min-width: 28px;
-    min-height: 28px;
-    padding: 0;
-}
-.limux-keybind-close:hover {
-    background: rgba(255, 255, 255, 0.12);
-    color: white;
 }
 .limux-keybind-scroll viewport {
     background: transparent;
@@ -98,27 +82,11 @@ struct RowWidgets {
 }
 
 pub fn build_keybind_editor(
-    anchor: &gtk::Widget,
     shortcuts: &ResolvedShortcutConfig,
     on_capture: Rc<
         dyn Fn(ShortcutId, NormalizedShortcut) -> Result<ResolvedShortcutConfig, String>,
     >,
-) -> gtk::Popover {
-    let popover = gtk::Popover::new();
-    popover.set_parent(anchor);
-    popover.set_has_arrow(false);
-    popover.set_autohide(true);
-    popover.set_focusable(true);
-    popover.set_can_focus(true);
-    popover.set_focus_on_click(true);
-    popover.set_position(gtk::PositionType::Bottom);
-    let allocation = anchor.allocation();
-    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-        allocation.width() / 2,
-        allocation.height() / 2,
-        1,
-        1,
-    )));
+) -> gtk::Widget {
 
     let state = Rc::new(RefCell::new(shortcuts.clone()));
     let listening = Rc::new(RefCell::new(None::<ShortcutId>));
@@ -140,18 +108,7 @@ pub fn build_keybind_editor(
         .hexpand(true)
         .build();
     title.add_css_class("limux-keybind-title");
-
-    let close_btn = gtk::Button::with_label("×");
-    close_btn.add_css_class("limux-keybind-close");
-    {
-        let popover = popover.clone();
-        close_btn.connect_clicked(move |_| {
-            popover.popdown();
-        });
-    }
-
     header.append(&title);
-    header.append(&close_btn);
 
     let hint = gtk::Label::builder()
         .label(
@@ -302,17 +259,7 @@ pub fn build_keybind_editor(
             );
             gtk::glib::Propagation::Stop
         });
-        popover.add_controller(key_controller);
-    }
-
-    {
-        let popover = popover.clone();
-        popover.clone().connect_map(move |_| {
-            let popover = popover.clone();
-            gtk::glib::idle_add_local_once(move || {
-                popover.grab_focus();
-            });
-        });
+        outer.add_controller(key_controller);
     }
 
     refresh_rows(&rows.borrow(), shortcuts, None, &HashMap::new());
@@ -328,9 +275,7 @@ pub fn build_keybind_editor(
     outer.append(&header);
     outer.append(&hint);
     outer.append(&scroller);
-
-    popover.set_child(Some(&outer));
-    popover
+    outer.upcast()
 }
 
 fn binding_button_label(

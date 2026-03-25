@@ -11,8 +11,9 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
+use crate::keybind_editor;
 use crate::layout_state::{PaneState, TabContentState, TabState as SavedTabState};
-use crate::shortcut_config::{ResolvedShortcutConfig, ShortcutId};
+use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 use crate::terminal::{self, TerminalCallbacks};
 
 // ---------------------------------------------------------------------------
@@ -23,12 +24,17 @@ type PaneSplitCallback = dyn Fn(&gtk::Widget, gtk::Orientation);
 type PaneWidgetCallback = dyn Fn(&gtk::Widget);
 type PaneSignalCallback = dyn Fn();
 type PanePathCallback = dyn Fn(&str);
+type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
+type PaneShortcutCaptureCallback =
+    dyn Fn(ShortcutId, NormalizedShortcut) -> Result<ResolvedShortcutConfig, String>;
 
 pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneSignalCallback>,
     pub on_open_keybinds: Box<PaneWidgetCallback>,
+    pub current_shortcuts: Box<PaneShortcutStateCallback>,
+    pub on_capture_shortcut: Rc<PaneShortcutCaptureCallback>,
     pub on_pwd_changed: Box<PanePathCallback>,
     pub on_empty: Box<PaneWidgetCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
@@ -367,6 +373,7 @@ pub fn cycle_tab_in_pane(pane_widget: &gtk::Widget, delta: i32) {
 enum TabKind {
     Terminal { cwd: Rc<RefCell<Option<String>>> },
     Browser { uri: Rc<RefCell<Option<String>>> },
+    Keybinds,
 }
 
 struct TabEntry {
@@ -478,6 +485,12 @@ struct BrowserTabOptions<'a> {
     uri: Option<&'a str>,
 }
 
+struct KeybindsTabOptions<'a> {
+    id: Option<&'a str>,
+    custom_name: Option<&'a str>,
+    pinned: bool,
+}
+
 fn restore_tabs_from_state(
     tab_strip: &gtk::Box,
     content_stack: &gtk::Stack,
@@ -527,6 +540,20 @@ fn restore_tabs_from_state(
                     custom_name: saved_tab.custom_name.as_deref(),
                     pinned: saved_tab.pinned,
                     uri: uri.as_deref(),
+                }),
+            ),
+            TabContentState::Keybinds {} => add_keybind_editor_tab_inner(
+                tab_strip,
+                content_stack,
+                tab_state,
+                callbacks,
+                pane_outer,
+                (callbacks.current_shortcuts)(),
+                callbacks.on_capture_shortcut.clone(),
+                Some(KeybindsTabOptions {
+                    id: Some(saved_tab.id.as_str()),
+                    custom_name: saved_tab.custom_name.as_deref(),
+                    pinned: saved_tab.pinned,
                 }),
             ),
         }
@@ -655,8 +682,11 @@ fn add_terminal_tab_inner(
             }),
             on_open_keybinds: Box::new({
                 let cb = callbacks.clone();
+                let po = pane_outer.clone();
                 move |anchor| {
-                    (cb.on_open_keybinds)(anchor);
+                    let _ = anchor;
+                    let pane_widget: gtk::Widget = po.clone().upcast();
+                    (cb.on_open_keybinds)(&pane_widget);
                 }
             }),
         }
@@ -777,6 +807,69 @@ fn add_browser_tab_inner(
     }
 }
 
+fn add_keybind_editor_tab_inner(
+    tab_strip: &gtk::Box,
+    content_stack: &gtk::Stack,
+    tab_state: &Rc<RefCell<TabState>>,
+    callbacks: &Rc<PaneCallbacks>,
+    pane_outer: &gtk::Box,
+    shortcuts: Rc<ResolvedShortcutConfig>,
+    on_capture: Rc<PaneShortcutCaptureCallback>,
+    options: Option<KeybindsTabOptions<'_>>,
+) {
+    let tab_id = options
+        .as_ref()
+        .and_then(|value| value.id.map(|id| id.to_string()))
+        .unwrap_or_else(next_tab_id);
+
+    let (tab_btn, title_label) = build_tab_button(
+        "Keybinds",
+        &tab_id,
+        tab_strip,
+        content_stack,
+        tab_state,
+        callbacks,
+        pane_outer,
+    );
+
+    let widget = keybind_editor::build_keybind_editor(&shortcuts, on_capture);
+    content_stack.add_named(&widget, Some(&tab_id));
+
+    {
+        let mut ts = tab_state.borrow_mut();
+        ts.tabs.push(TabEntry {
+            id: tab_id.clone(),
+            tab_button: tab_btn,
+            title_label: title_label.clone(),
+            content: widget,
+            custom_name: options
+                .as_ref()
+                .and_then(|value| value.custom_name.map(|name| name.to_string())),
+            pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
+            kind: TabKind::Keybinds,
+        });
+    }
+
+    if let Some(custom_name) = options.as_ref().and_then(|value| value.custom_name) {
+        title_label.set_label(custom_name);
+    }
+    if options.as_ref().map(|value| value.pinned).unwrap_or(false) {
+        if let Some(entry) = tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+        {
+            apply_pin_visuals(&entry.tab_button, true);
+        }
+    }
+
+    activate_tab(tab_strip, content_stack, tab_state, &tab_id);
+    if options.is_none() {
+        (callbacks.on_state_changed)();
+    }
+}
+
 // Public wrappers for keyboard shortcut use
 #[allow(dead_code)]
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
@@ -803,6 +896,43 @@ pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
             &internals.tab_state,
             &internals.callbacks,
             &internals.pane_outer,
+            None,
+        );
+    }
+}
+
+pub fn add_keybind_editor_tab_to_pane(
+    pane_widget: &gtk::Widget,
+    shortcuts: Rc<ResolvedShortcutConfig>,
+    on_capture: Rc<PaneShortcutCaptureCallback>,
+) {
+    if let Some(internals) = find_pane_internals(pane_widget) {
+        if let Some(existing_id) = internals
+            .tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .find(|entry| matches!(entry.kind, TabKind::Keybinds))
+            .map(|entry| entry.id.clone())
+        {
+            activate_tab(
+                &internals.tab_strip,
+                &internals.content_stack,
+                &internals.tab_state,
+                &existing_id,
+            );
+            (internals.callbacks.on_state_changed)();
+            return;
+        }
+
+        add_keybind_editor_tab_inner(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &internals.callbacks,
+            &internals.pane_outer,
+            shortcuts,
+            on_capture,
             None,
         );
     }
@@ -857,6 +987,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
                 TabKind::Browser { uri } => TabContentState::Browser {
                     uri: uri.borrow().clone(),
                 },
+                TabKind::Keybinds => TabContentState::Keybinds {},
             };
             SavedTabState {
                 id: entry.id.clone(),

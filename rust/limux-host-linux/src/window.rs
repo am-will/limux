@@ -57,7 +57,6 @@ struct AppState {
     new_ws_btn: gtk::Button,
     collapse_btn: gtk::Button,
     expand_btn: gtk::Button,
-    keybind_editor: Option<gtk::Popover>,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
@@ -737,7 +736,6 @@ pub fn build_window(app: &adw::Application) {
         new_ws_btn: new_ws_btn.clone(),
         collapse_btn: collapse_btn.clone(),
         expand_btn: expand_btn.clone(),
-        keybind_editor: None,
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
@@ -1059,15 +1057,7 @@ fn persist_shortcut_binding(
     Ok(reloaded)
 }
 
-fn open_keybind_editor(state: &State, anchor: &gtk::Widget) {
-    let existing = {
-        let mut s = state.borrow_mut();
-        s.keybind_editor.take()
-    };
-    if let Some(popover) = existing {
-        popover.popdown();
-    }
-
+fn open_keybind_editor_tab(state: &State, pane_widget: &gtk::Widget) {
     let shortcuts = {
         let s = state.borrow();
         s.shortcuts.clone()
@@ -1081,27 +1071,7 @@ fn open_keybind_editor(state: &State, anchor: &gtk::Widget) {
         let state = state.clone();
         Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
     };
-    let popover = keybind_editor::build_keybind_editor(anchor, &shortcuts, on_capture);
-
-    {
-        let state = state.clone();
-        popover.connect_closed(move |popover: &gtk::Popover| {
-            let clear_ref = {
-                let s = state.borrow();
-                s.keybind_editor
-                    .as_ref()
-                    .map(|current| current == popover)
-                    .unwrap_or(false)
-            };
-            if clear_ref {
-                state.borrow_mut().keybind_editor = None;
-            }
-            popover.unparent();
-        });
-    }
-
-    state.borrow_mut().keybind_editor = Some(popover.clone());
-    popover.popup();
+    pane::add_keybind_editor_tab_to_pane(pane_widget, shortcuts, on_capture);
 }
 
 fn activate_workspace_shortcut(state: &State, idx: usize) {
@@ -1844,8 +1814,19 @@ fn create_pane_for_workspace(
             });
         }),
         on_open_keybinds: Box::new(move |anchor| {
-            open_keybind_editor(&state_for_keybinds, anchor);
+            open_keybind_editor_tab(&state_for_keybinds, anchor);
         }),
+        current_shortcuts: Box::new({
+            let state = state.clone();
+            move || {
+                let s = state.borrow();
+                s.shortcuts.clone()
+            }
+        }),
+        on_capture_shortcut: {
+            let state = state.clone();
+            Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
+        },
         on_pwd_changed: Box::new(move |pwd: &str| {
             let state = state_for_pwd.clone();
             let ws_id = ws_id_pwd.clone();
