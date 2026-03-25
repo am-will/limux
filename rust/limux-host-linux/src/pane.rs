@@ -456,13 +456,28 @@ pub fn install_content_drop_overlay(pane_outer: &gtk::Box) {
 
     content_stack.add_controller(content_drop);
 
-    // Show/hide overlay_box when tab drag state changes
+    // Show/hide overlay_box when tab drag state changes, and disable
+    // webview hit-testing so the DropTarget on content_stack can receive
+    // events that WebKit would otherwise intercept.
     let ob = overlay_box.clone();
     let ws_drag = internals.workspace_dragging.clone();
+    let cs = internals.content_stack.clone();
     let listener_id = on_tab_drag_change(move |dragging| {
         ob.set_visible(dragging && !ws_drag.get());
         if !dragging {
             clear_classes(&ob);
+        }
+        // Toggle webview event targeting during tab drags so WebKit
+        // doesn't intercept events meant for the content_stack DropTarget
+        let mut child = cs.first_child();
+        while let Some(w) = child {
+            child = w.next_sibling();
+            if w.has_css_class("limux-browser") {
+                // Second child of the browser vbox is the webview
+                if let Some(webview) = w.first_child().and_then(|c| c.next_sibling()) {
+                    webview.set_can_target(!dragging);
+                }
+            }
         }
     });
 
@@ -1672,6 +1687,22 @@ fn move_tab_between_panes(
         (entry, content, src_is_empty, src_new_active)
     };
 
+    // Clear focus before removing content to prevent GTK focus-tracking
+    // warnings on ancestor Paneds when a focused widget is reparented.
+    if let Some(toplevel) = content_widget
+        .root()
+        .and_then(|r| r.downcast::<gtk::Window>().ok())
+    {
+        gtk::prelude::GtkWindowExt::set_focus(&toplevel, gtk::Widget::NONE);
+    }
+    let mut ancestor = src_internals.content_stack.parent();
+    while let Some(a) = ancestor {
+        if let Some(p) = a.downcast_ref::<gtk::Paned>() {
+            p.set_focus_child(gtk::Widget::NONE);
+        }
+        ancestor = a.parent();
+    }
+
     // Remove content from source stack synchronously (required before the
     // target-side idle callback can add it — a widget can't have two parents).
     src_internals.content_stack.remove(&content_widget);
@@ -1958,6 +1989,7 @@ fn create_browser_widget(
     vbox.append(&webview.clone());
     vbox.set_hexpand(true);
     vbox.set_vexpand(true);
+    vbox.add_css_class("limux-browser");
 
     // Load default URL only on the first map. The WebView preserves its
     // page and history across reparenting (splits), so we must not reload.
