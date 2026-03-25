@@ -53,6 +53,110 @@ thread_local! {
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
 }
 
+#[derive(Clone)]
+pub struct TerminalHandle {
+    surface_cell: Rc<RefCell<Option<ghostty_surface_t>>>,
+    gl_area: gtk::GLArea,
+    search_bar: gtk::SearchBar,
+    search_entry: gtk::SearchEntry,
+}
+
+impl TerminalHandle {
+    pub fn perform_binding_action(&self, action: &str) -> bool {
+        let surface = *self.surface_cell.borrow();
+        surface_action(surface, action);
+        surface.is_some()
+    }
+
+    pub fn show_find(&self) -> bool {
+        self.search_bar.set_search_mode(true);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+        if !self.search_entry.text().is_empty() {
+            self.apply_search_query(self.search_entry.text().as_str());
+        }
+        true
+    }
+
+    pub fn find_next(&self) -> bool {
+        if !self.search_bar.is_search_mode() || self.search_entry.text().is_empty() {
+            return false;
+        }
+        self.perform_binding_action("navigate_search:next")
+    }
+
+    pub fn find_previous(&self) -> bool {
+        if !self.search_bar.is_search_mode() || self.search_entry.text().is_empty() {
+            return false;
+        }
+        self.perform_binding_action("navigate_search:previous")
+    }
+
+    pub fn hide_find(&self) -> bool {
+        if !self.search_bar.is_search_mode() {
+            return false;
+        }
+        self.perform_binding_action("end_search");
+        self.search_bar.set_search_mode(false);
+        self.gl_area.grab_focus();
+        true
+    }
+
+    pub fn use_selection_for_find(&self) -> bool {
+        let selection = self.read_selection_text();
+        if selection.is_empty() {
+            return false;
+        }
+
+        self.search_bar.set_search_mode(true);
+        self.search_entry.set_text(&selection);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+        self.apply_search_query(&selection);
+        true
+    }
+
+    fn apply_search_query(&self, query: &str) -> bool {
+        let surface = *self.surface_cell.borrow();
+        surface_action(surface, &terminal_search_action(query));
+        surface.is_some()
+    }
+
+    fn read_selection_text(&self) -> String {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return String::new();
+        };
+
+        let mut text = ghostty_text_s {
+            tl_px_x: 0.0,
+            tl_px_y: 0.0,
+            offset_start: 0,
+            offset_len: 0,
+            text: ptr::null(),
+            text_len: 0,
+        };
+
+        let has_selection = unsafe { ghostty_surface_read_selection(surface, &mut text) };
+        if !has_selection || text.text.is_null() || text.text_len == 0 {
+            return String::new();
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(text.text as *const u8, text.text_len) };
+        let selection = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { ghostty_surface_free_text(surface, &mut text) };
+        selection
+    }
+}
+
+pub struct TerminalWidget {
+    pub overlay: gtk::Overlay,
+    pub handle: TerminalHandle,
+}
+
+fn terminal_search_action(query: &str) -> String {
+    format!("search:{query}")
+}
+
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
 pub fn init_ghostty() {
     GHOSTTY.get_or_init(|| {
@@ -380,7 +484,7 @@ pub struct TerminalCallbacks {
 pub fn create_terminal(
     working_directory: Option<&str>,
     callbacks: TerminalCallbacks,
-) -> gtk::Overlay {
+) -> TerminalWidget {
     let gl_area = gtk::GLArea::new();
     gl_area.set_hexpand(true);
     gl_area.set_vexpand(true);
@@ -403,6 +507,42 @@ pub fn create_terminal(
     overlay.set_child(Some(&gl_area));
     overlay.set_hexpand(true);
     overlay.set_vexpand(true);
+
+    let search_entry = gtk::SearchEntry::builder()
+        .hexpand(true)
+        .placeholder_text("Find in terminal")
+        .build();
+    let search_bar = gtk::SearchBar::new();
+    search_bar.set_show_close_button(true);
+    search_bar.connect_entry(&search_entry);
+    search_bar.set_child(Some(&search_entry));
+    search_bar.set_key_capture_widget(Some(&gl_area));
+    search_bar.set_valign(gtk::Align::Start);
+    search_bar.set_halign(gtk::Align::Fill);
+    search_bar.set_margin_top(8);
+    search_bar.set_margin_start(8);
+    search_bar.set_margin_end(8);
+    overlay.add_overlay(&search_bar);
+
+    let handle = TerminalHandle {
+        surface_cell: surface_cell.clone(),
+        gl_area: gl_area.clone(),
+        search_bar: search_bar.clone(),
+        search_entry: search_entry.clone(),
+    };
+
+    {
+        let handle = handle.clone();
+        search_entry.connect_search_changed(move |entry| {
+            handle.apply_search_query(entry.text().as_str());
+        });
+    }
+    {
+        let handle = handle.clone();
+        search_entry.connect_stop_search(move |_| {
+            handle.hide_find();
+        });
+    }
 
     // On realize: create the Ghostty surface
     {
@@ -804,7 +944,7 @@ pub fn create_terminal(
         });
     }
 
-    overlay
+    TerminalWidget { overlay, handle }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,6 +1322,13 @@ mod tests {
             '-' as u32
         );
         assert_eq!(fallback_unshifted_codepoint(gtk::gdk::Key::A), 'a' as u32);
+    }
+
+    #[test]
+    fn terminal_search_action_formats_queries_for_ghostty() {
+        assert_eq!(terminal_search_action(""), "search:");
+        assert_eq!(terminal_search_action("needle"), "search:needle");
+        assert_eq!(terminal_search_action("two words"), "search:two words");
     }
 
     #[test]

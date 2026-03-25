@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::gdk::prelude::ToplevelExt;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
@@ -60,8 +61,6 @@ struct AppState {
     sidebar_list: gtk::ListBox,
     paned: gtk::Paned,
     new_ws_btn: gtk::Button,
-    collapse_btn: gtk::Button,
-    expand_btn: gtk::Button,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
@@ -161,31 +160,24 @@ fn restore_active_workspace(state: &State, index: usize) {
 }
 
 fn apply_sidebar_state_immediately(state: &State, sidebar_state: &layout_state::SidebarState) {
-    let (paned, expand_btn, sidebar, width) = {
+    let (paned, sidebar, width) = {
         let mut s = state.borrow_mut();
         s.sidebar_expanded_width = sidebar_state.width.max(SIDEBAR_WIDTH);
         let sidebar = match s.paned.start_child() {
             Some(sidebar) => sidebar,
             None => return,
         };
-        (
-            s.paned.clone(),
-            s.expand_btn.clone(),
-            sidebar,
-            s.sidebar_expanded_width,
-        )
+        (s.paned.clone(), sidebar, s.sidebar_expanded_width)
     };
 
     if sidebar_state.visible {
         sidebar.set_visible(true);
         paned.set_position(width);
-        expand_btn.set_visible(false);
     } else {
         // Apply restored sidebar visibility directly; using the animated toggle path during
         // startup would create flicker and extra persistence churn while restore is suspended.
         sidebar.set_visible(false);
         paned.set_position(0);
-        expand_btn.set_visible(true);
     }
 }
 
@@ -239,6 +231,27 @@ fn sidebar_is_visible(state: &AppState) -> bool {
         .start_child()
         .map(|sidebar| sidebar.is_visible() && state.paned.position() > 10)
         .unwrap_or(false)
+}
+
+fn begin_window_move_from_widget(
+    widget: &impl IsA<gtk::Widget>,
+    window: &adw::ApplicationWindow,
+    device: &gtk::gdk::Device,
+    button: i32,
+    x: f64,
+    y: f64,
+    timestamp: u32,
+) {
+    let Some((surface_x, surface_y)) = widget.translate_coordinates(window, x, y) else {
+        return;
+    };
+    let Some(surface) = window.surface() else {
+        return;
+    };
+    let Ok(toplevel) = surface.dynamic_cast::<gtk::gdk::Toplevel>() else {
+        return;
+    };
+    toplevel.begin_move(device, button, surface_x, surface_y, timestamp);
 }
 
 fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
@@ -659,11 +672,6 @@ pub fn build_window(app: &adw::Application) {
         .build();
     sidebar_title_label.add_css_class("limux-sidebar-title");
 
-    let collapse_btn = gtk::Button::with_label("\u{00AB}"); // «
-    collapse_btn.add_css_class("flat");
-    collapse_btn.add_css_class("limux-sidebar-collapse");
-    collapse_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts, true)));
-
     let sidebar_title = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_top(8)
@@ -671,7 +679,23 @@ pub fn build_window(app: &adw::Application) {
         .margin_end(6)
         .build();
     sidebar_title.append(&sidebar_title_label);
-    sidebar_title.append(&collapse_btn);
+
+    {
+        let window = window.clone();
+        let drag_title = sidebar_title.clone();
+        let drag = gtk::GestureClick::new();
+        drag.set_button(1);
+        drag.connect_pressed(move |gesture, _, x, y| {
+            let Some(device) = gesture.current_event_device() else {
+                return;
+            };
+            let button = gesture.current_button() as i32;
+            let timestamp = gesture.current_event_time();
+            begin_window_move_from_widget(&drag_title, &window, &device, button, x, y, timestamp);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        sidebar_title.add_controller(drag);
+    }
 
     let new_ws_btn = gtk::Button::builder()
         .label("New Workspace")
@@ -719,23 +743,11 @@ pub fn build_window(app: &adw::Application) {
         .end_child(&stack)
         .build();
 
-    // Expand tab — small button on the left edge when sidebar is hidden
-    let expand_btn = gtk::Button::with_label("\u{00BB}"); // »
-    expand_btn.add_css_class("limux-sidebar-expand");
-    expand_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts, false)));
-    expand_btn.set_valign(gtk::Align::Center);
-    expand_btn.set_halign(gtk::Align::Start);
-    expand_btn.set_visible(false);
-
-    let content_overlay = gtk::Overlay::new();
-    content_overlay.set_child(Some(&main_paned));
-    content_overlay.add_overlay(&expand_btn);
-
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if let Some(ref header) = header {
         vbox.append(header);
     }
-    vbox.append(&content_overlay);
+    vbox.append(&main_paned);
     window.set_content(Some(&vbox));
 
     let state: State = Rc::new(RefCell::new(AppState {
@@ -750,8 +762,6 @@ pub fn build_window(app: &adw::Application) {
         sidebar_list: sidebar_list.clone(),
         paned: main_paned.clone(),
         new_ws_btn: new_ws_btn.clone(),
-        collapse_btn: collapse_btn.clone(),
-        expand_btn: expand_btn.clone(),
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
@@ -783,22 +793,6 @@ pub fn build_window(app: &adw::Application) {
             if should_save {
                 request_session_save(&state);
             }
-        });
-    }
-
-    // Wire collapse button
-    {
-        let state = state.clone();
-        collapse_btn.connect_clicked(move |_| {
-            toggle_sidebar(&state);
-        });
-    }
-
-    // Wire expand button
-    {
-        let state = state.clone();
-        expand_btn.connect_clicked(move |_| {
-            toggle_sidebar(&state);
         });
     }
 

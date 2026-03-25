@@ -254,6 +254,16 @@ pub struct ghostty_clipboard_content_s {
     pub data: *const c_char,
 }
 
+#[repr(C)]
+pub struct ghostty_text_s {
+    pub tl_px_x: f64,
+    pub tl_px_y: f64,
+    pub offset_start: u32,
+    pub offset_len: u32,
+    pub text: *const c_char,
+    pub text_len: usize,
+}
+
 // Target
 #[repr(C)]
 pub struct ghostty_target_s {
@@ -397,6 +407,11 @@ extern "C" {
         action_len: usize,
     ) -> bool;
     pub fn ghostty_surface_has_selection(surface: ghostty_surface_t) -> bool;
+    pub fn ghostty_surface_read_selection(
+        surface: ghostty_surface_t,
+        text: *mut ghostty_text_s,
+    ) -> bool;
+    pub fn ghostty_surface_free_text(surface: ghostty_surface_t, text: *mut ghostty_text_s);
 
     // Clipboard
     pub fn ghostty_surface_complete_clipboard_request(
