@@ -13,7 +13,7 @@ resolver = "2"
 authors = ["limux contributors"]
 edition = "2021"
 license = "MIT"
-version = "0.1.8"
+version = "0.1.9"
 
 [workspace.dependencies]
 anyhow = "1.0"
