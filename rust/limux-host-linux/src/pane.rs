@@ -149,6 +149,7 @@ type PaneSignalCallback = dyn Fn();
 type PanePathCallback = dyn Fn(&str);
 type PaneDesktopNotificationCallback = dyn Fn(&str, &str);
 type PaneEmptyCallback = dyn Fn(&gtk::Widget, PaneEmptyReason);
+type PaneOpenBrowserHereCallback = dyn Fn(&gtk::Widget);
 type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
 type PaneShortcutCaptureCallback =
     dyn Fn(ShortcutId, Option<NormalizedShortcut>) -> Result<ResolvedShortcutConfig, String>;
@@ -159,6 +160,7 @@ pub struct PaneCallbacks {
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneSignalCallback>,
     pub on_desktop_notification: Box<PaneDesktopNotificationCallback>,
+    pub on_open_browser_here: Box<PaneOpenBrowserHereCallback>,
     pub on_open_keybinds: Box<PaneWidgetCallback>,
     pub current_shortcuts: Box<PaneShortcutStateCallback>,
     pub on_capture_shortcut: Rc<PaneShortcutCaptureCallback>,
@@ -799,6 +801,7 @@ fn make_terminal_callbacks(
     let callbacks_for_bell = internals.callbacks.clone();
     let callbacks_for_pwd = internals.callbacks.clone();
     let callbacks_for_close = internals.callbacks.clone();
+    let callbacks_for_browser_here = internals.callbacks.clone();
     let callbacks_for_split_right = internals.callbacks.clone();
     let callbacks_for_split_down = internals.callbacks.clone();
     let callbacks_for_keybinds = internals.callbacks.clone();
@@ -858,6 +861,13 @@ fn make_terminal_callbacks(
                     PaneEmptyReason::ClosedLastTab,
                 );
             });
+        }),
+        on_open_browser_here: Box::new({
+            let pane_outer = internals.pane_outer.clone();
+            move || {
+                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
+                (callbacks_for_browser_here.on_open_browser_here)(&pane_widget);
+            }
         }),
         on_split_right: Box::new({
             let pane_outer = internals.pane_outer.clone();

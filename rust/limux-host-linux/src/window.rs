@@ -2400,6 +2400,9 @@ fn create_pane_for_workspace(
                 mark_workspace_unread_with_message(&state, &ws_id, &message);
             });
         }),
+        on_open_browser_here: Box::new(move |pane_widget| {
+            pane::add_browser_tab_to_pane(pane_widget);
+        }),
         on_open_keybinds: Box::new(move |anchor| {
             open_keybind_editor_tab(&state_for_keybinds, anchor);
         }),
