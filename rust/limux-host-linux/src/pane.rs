@@ -165,6 +165,7 @@ pub struct PaneCallbacks {
     pub on_pwd_changed: Box<PanePathCallback>,
     pub on_empty: Box<PaneEmptyCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
+    pub hover_terminal_focus: bool,
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
 }
 
@@ -902,7 +903,13 @@ fn add_terminal_tab_inner(
     ));
     let term_callbacks = make_terminal_callbacks(internals, &tab_id, &title_label, &term_cwd);
 
-    let term = terminal::create_terminal(working_directory, term_callbacks);
+    let term = terminal::create_terminal(
+        working_directory,
+        terminal::TerminalOptions {
+            hover_focus: internals.callbacks.hover_terminal_focus,
+        },
+        term_callbacks,
+    );
     let widget: gtk::Widget = term.overlay.clone().upcast();
     internals.content_stack.add_named(&widget, Some(&tab_id));
 

@@ -164,6 +164,11 @@ fn terminal_search_action(query: &str) -> String {
     format!("search:{query}")
 }
 
+fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
+    had_focus.set(true);
+    gl_area.grab_focus();
+}
+
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
 pub fn init_ghostty() {
     GHOSTTY.get_or_init(|| {
@@ -567,10 +572,16 @@ pub struct TerminalCallbacks {
     pub on_open_keybinds: Box<WidgetCallback>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminalOptions {
+    pub hover_focus: bool,
+}
+
 /// Create a new Ghostty-powered terminal widget.
 /// Returns an Overlay (GLArea + toast layer) for embedding in the pane.
 pub fn create_terminal(
     working_directory: Option<&str>,
+    options: TerminalOptions,
     callbacks: TerminalCallbacks,
 ) -> TerminalWidget {
     let gl_area = gtk::GLArea::new();
@@ -584,6 +595,7 @@ pub fn create_terminal(
     gl_area.set_can_focus(true);
 
     let wd = working_directory.map(|s| s.to_string());
+    let hover_focus = options.hover_focus;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
@@ -757,9 +769,8 @@ pub fn create_terminal(
                 ghostty_surface_set_focus(surface, true);
             }
 
-            // Grab GTK focus so key events reach this widget
-            had_focus.set(true);
-            gl_area.grab_focus();
+            // Grab GTK focus so key events reach this widget.
+            request_terminal_focus(gl_area, &had_focus);
         });
     }
 
@@ -877,8 +888,7 @@ pub fn create_terminal(
         click.connect_pressed(move |gesture, _n, x, y| {
             let btn = gesture.current_button();
             // Grab keyboard focus on any click
-            had_focus.set(true);
-            gl_for_focus.grab_focus();
+            request_terminal_focus(&gl_for_focus, &had_focus);
             // Skip right-click — context menu handles it
             if btn == 3 {
                 return;
@@ -936,7 +946,24 @@ pub fn create_terminal(
     // Mouse motion
     {
         let surface_cell = surface_cell.clone();
+        let surface_cell_for_enter = surface_cell.clone();
+        let gl_for_focus = gl_area.clone();
+        let had_focus = had_focus.clone();
         let motion = gtk::EventControllerMotion::new();
+        motion.connect_enter(move |ctrl, x, y| {
+            if hover_focus {
+                // Match common Hyprland/Omarchy-style focus-follows-mouse behavior:
+                // as soon as the pointer enters a terminal, focus it so typing works
+                // immediately without an extra click.
+                request_terminal_focus(&gl_for_focus, &had_focus);
+            }
+
+            if let Some(surface) = *surface_cell_for_enter.borrow() {
+                let mods = translate_mouse_mods(ctrl.current_event_state());
+                unsafe { ghostty_surface_mouse_pos(surface, x, y, mods) };
+            }
+        });
+        let surface_cell = surface_cell.clone();
         motion.connect_motion(move |ctrl, x, y| {
             if let Some(surface) = *surface_cell.borrow() {
                 let mods = translate_mouse_mods(ctrl.current_event_state());

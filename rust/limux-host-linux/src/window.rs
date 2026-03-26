@@ -7,6 +7,7 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
+use crate::app_config;
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState,
@@ -54,6 +55,7 @@ struct AppState {
     window: adw::ApplicationWindow,
     top_bar: Option<adw::HeaderBar>,
     top_bar_visible: bool,
+    config: Rc<app_config::AppConfig>,
     workspaces: Vec<Workspace>,
     active_idx: usize,
     shortcuts: Rc<ResolvedShortcutConfig>,
@@ -622,6 +624,12 @@ row:selected .limux-ws-path {
 
 pub fn build_window(app: &adw::Application) {
     let display = gtk::gdk::Display::default().expect("display");
+    let loaded_config = app_config::load();
+    for warning in &loaded_config.warnings {
+        eprintln!("limux: {warning}");
+    }
+    let config = Rc::new(loaded_config.config);
+
     let shortcuts = Rc::new(shortcut_config::load_shortcuts_for_display(&display));
     for warning in &shortcuts.warnings {
         eprintln!("limux: {warning}");
@@ -812,6 +820,7 @@ pub fn build_window(app: &adw::Application) {
         window: window.clone(),
         top_bar: header.clone(),
         top_bar_visible: true,
+        config,
         workspaces: Vec::new(),
         active_idx: 0,
         shortcuts,
@@ -1341,7 +1350,7 @@ fn persist_shortcut_binding(
             .map_err(|err| err.to_string())?
     };
 
-    let Some(path) = shortcut_config::config_path() else {
+    let Some(path) = shortcut_config::shortcuts_path() else {
         return Err("config directory unavailable".to_string());
     };
 
@@ -2365,6 +2374,10 @@ fn create_pane_for_workspace(
     let ws_id_empty = ws_id.to_string();
     let state_for_split_with_tab = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
+    let hover_terminal_focus = {
+        let s = state.borrow();
+        s.config.focus.hover_terminal_focus
+    };
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
@@ -2433,6 +2446,7 @@ fn create_pane_for_workspace(
             let state = state.clone();
             move || request_session_save(&state)
         }),
+        hover_terminal_focus,
         on_split_with_tab: Box::new(
             move |source_pane, target_pane, orientation, tab_id, new_pane_first| {
                 handle_split_with_tab(

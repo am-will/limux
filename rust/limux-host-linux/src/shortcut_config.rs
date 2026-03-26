@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 pub const CONFIG_DIR_NAME: &str = "limux";
-pub const CONFIG_FILE_NAME: &str = "config.json";
+pub const SHORTCUTS_FILE_NAME: &str = "shortcuts.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
@@ -1155,12 +1155,21 @@ impl ShortcutDefinition {
     }
 }
 
-pub fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|base| config_path_in(&base))
+pub fn config_dir_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|base| config_dir_path_in(&base))
 }
 
-pub fn config_path_in(base: &Path) -> PathBuf {
-    base.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME)
+pub fn config_dir_path_in(base: &Path) -> PathBuf {
+    base.join(CONFIG_DIR_NAME)
+}
+
+pub fn shortcuts_path() -> Option<PathBuf> {
+    config_dir_path().map(|dir| dir.join(SHORTCUTS_FILE_NAME))
+}
+
+#[cfg(test)]
+pub fn shortcuts_path_in(base: &Path) -> PathBuf {
+    config_dir_path_in(base).join(SHORTCUTS_FILE_NAME)
 }
 
 pub fn default_shortcuts() -> ResolvedShortcutConfig {
@@ -1231,7 +1240,7 @@ pub fn load_shortcuts_or_default_with_display(
 }
 
 pub fn load_shortcuts_for_display(display: &gdk::Display) -> ResolvedShortcutConfig {
-    let Some(path) = config_path() else {
+    let Some(path) = shortcuts_path() else {
         let mut defaults = default_shortcuts();
         defaults
             .warnings
@@ -1391,7 +1400,7 @@ fn temp_config_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(CONFIG_FILE_NAME);
+        .unwrap_or(SHORTCUTS_FILE_NAME);
     path.with_file_name(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()))
 }
 
@@ -1671,11 +1680,20 @@ mod tests {
     }
 
     #[test]
-    fn config_path_in_uses_limux_config_json() {
+    fn config_dir_path_in_uses_limux_config_dir() {
         let base = Path::new("/tmp/example");
         assert_eq!(
-            config_path_in(base),
-            PathBuf::from("/tmp/example/limux/config.json")
+            config_dir_path_in(base),
+            PathBuf::from("/tmp/example/limux")
+        );
+    }
+
+    #[test]
+    fn shortcuts_path_in_uses_limux_shortcuts_json() {
+        let base = Path::new("/tmp/example");
+        assert_eq!(
+            shortcuts_path_in(base),
+            PathBuf::from("/tmp/example/limux/shortcuts.json")
         );
     }
 
@@ -1747,7 +1765,7 @@ mod tests {
     #[test]
     fn load_shortcuts_or_default_falls_back_on_invalid_json() {
         let dir = tempdir().unwrap();
-        let path = config_path_in(dir.path());
+        let path = shortcuts_path_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "{ this is not json").unwrap();
 
@@ -1761,7 +1779,7 @@ mod tests {
     #[test]
     fn load_shortcuts_or_default_uses_defaults_when_file_is_missing() {
         let dir = tempdir().unwrap();
-        let path = config_path_in(dir.path());
+        let path = shortcuts_path_in(dir.path());
         let resolved = load_shortcuts_or_default(&path);
         assert!(resolved.warnings.is_empty());
         assert_eq!(resolved.shortcuts.len(), definitions().len());
@@ -1921,7 +1939,7 @@ mod tests {
     #[test]
     fn write_shortcuts_preserves_unrelated_top_level_config_keys() {
         let dir = tempdir().unwrap();
-        let path = config_path_in(dir.path());
+        let path = shortcuts_path_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
@@ -1955,7 +1973,7 @@ mod tests {
     #[test]
     fn write_shortcuts_rejects_invalid_existing_json_without_clobbering_file() {
         let dir = tempdir().unwrap();
-        let path = config_path_in(dir.path());
+        let path = shortcuts_path_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "{ invalid").unwrap();
 
@@ -2096,7 +2114,7 @@ mod tests {
     #[test]
     fn write_shortcuts_omits_defaults_and_preserves_unrelated_settings() {
         let dir = tempdir().unwrap();
-        let path = config_path_in(dir.path());
+        let path = shortcuts_path_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
@@ -2135,7 +2153,7 @@ mod tests {
     #[test]
     fn write_shortcuts_removes_shortcuts_section_when_all_bindings_match_defaults() {
         let dir = tempdir().unwrap();
-        let path = config_path_in(dir.path());
+        let path = shortcuts_path_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
