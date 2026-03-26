@@ -3507,15 +3507,28 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
     Some(value)
 }
 
-fn extract_osc_payload(command: &str, prefix: &str) -> Option<String> {
-    let (_, rest) = command.split_once(prefix)?;
+fn slice_after_first_match<'a>(source: &'a str, patterns: &[&str]) -> Option<&'a str> {
+    patterns
+        .iter()
+        .filter_map(|pattern| source.find(pattern).map(|index| (index, pattern.len())))
+        .min_by_key(|(index, _)| *index)
+        .map(|(index, len)| &source[index + len..])
+}
+
+fn first_match_index(source: &str, patterns: &[&str]) -> Option<usize> {
+    patterns
+        .iter()
+        .filter_map(|pattern| source.find(pattern))
+        .min()
+}
+
+fn extract_osc_payload(command: &str, prefixes: &[&str]) -> Option<String> {
+    const OSC_TERMINATORS: [&str; 5] = ["\u{7}", "\u{1b}\\", "\\x07", "\\x1b\\", "\\x1b\\\\"];
+
+    let rest = slice_after_first_match(command, prefixes)?;
     let mut payload = rest;
-    if let Some((value, _)) = payload.split_once("\\x07") {
-        payload = value;
-    } else if let Some((value, _)) = payload.split_once("\\x1b\\") {
-        payload = value;
-    } else if let Some((value, _)) = payload.split_once("\\x1b\\\\") {
-        payload = value;
+    if let Some(index) = first_match_index(payload, &OSC_TERMINATORS) {
+        payload = &payload[..index];
     } else if let Some((value, _)) = payload.split_once('\'') {
         payload = value;
     }
@@ -3528,7 +3541,7 @@ fn maybe_emit_osc_notification(
     surface_id: u64,
     command: &str,
 ) {
-    if let Some(body) = extract_osc_payload(command, "\\x1b]9;") {
+    if let Some(body) = extract_osc_payload(command, &["\u{1b}]9;", "\\x1b]9;"]) {
         let _ = state.create_notification(
             String::new(),
             String::new(),
@@ -3539,7 +3552,7 @@ fn maybe_emit_osc_notification(
         return;
     }
 
-    if let Some(title) = extract_osc_payload(command, "\\x1b]99;;") {
+    if let Some(title) = extract_osc_payload(command, &["\u{1b}]99;;", "\\x1b]99;;"]) {
         let _ = state.create_notification(
             title,
             String::new(),
@@ -3550,7 +3563,13 @@ fn maybe_emit_osc_notification(
         return;
     }
 
-    if let Some(title) = extract_osc_payload(command, "\\x1b]99;i=kitty:d=0:p=title;") {
+    if let Some(title) = extract_osc_payload(
+        command,
+        &[
+            "\u{1b}]99;i=kitty:d=0:p=title;",
+            "\\x1b]99;i=kitty:d=0:p=title;",
+        ],
+    ) {
         let entry = state
             .kitty_notification_chunks
             .entry(surface_id)
@@ -3559,7 +3578,10 @@ fn maybe_emit_osc_notification(
         return;
     }
 
-    if let Some(body) = extract_osc_payload(command, "\\x1b]99;i=kitty:p=body;") {
+    if let Some(body) = extract_osc_payload(
+        command,
+        &["\u{1b}]99;i=kitty:p=body;", "\\x1b]99;i=kitty:p=body;"],
+    ) {
         let entry = state
             .kitty_notification_chunks
             .remove(&surface_id)
@@ -6460,6 +6482,29 @@ mod tests {
             workspace_id,
             surface_id,
             "\\x1b]9;Codex turn complete\\x07",
+        );
+
+        assert_eq!(state.notifications.len(), 1);
+        let notification = &state.notifications[0];
+        assert_eq!(notification.title, "");
+        assert_eq!(notification.body, "Codex turn complete");
+        assert_eq!(notification.message, "Codex turn complete");
+        assert_eq!(notification.surface_id, Some(surface_id));
+        assert_eq!(notification.workspace_id, Some(workspace_id));
+        assert!(notification.unread);
+    }
+
+    #[test]
+    fn osc9_control_byte_notifications_become_limux_notifications() {
+        let mut state = ControlState::default();
+        let workspace_id = state.current_workspace_id;
+        let surface_id = state.workspaces[0].windows[0].panes[0].surfaces[0].id;
+
+        maybe_emit_osc_notification(
+            &mut state,
+            workspace_id,
+            surface_id,
+            "\u{1b}]9;Codex turn complete\u{7}",
         );
 
         assert_eq!(state.notifications.len(), 1);
