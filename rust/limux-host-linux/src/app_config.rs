@@ -158,22 +158,17 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
     }
 }
 
-pub fn save(config: &AppConfig) {
+pub fn save(config: &AppConfig) -> Result<(), String> {
     let Some(path) = settings_path() else {
-        eprintln!("limux: config_dir unavailable; cannot save app settings");
-        return;
+        return Err("config_dir unavailable; cannot save app settings".to_string());
     };
 
-    if let Err(err) = save_to_path(&path, config) {
-        eprintln!(
-            "limux: failed to save app config `{}`: {err}",
-            path.display()
-        );
-    }
+    save_to_path(&path, config)
+        .map_err(|err| format!("failed to save app config `{}`: {err}", path.display()))
 }
 
 fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
-    let mut root = read_existing_config_root(path)?;
+    let mut root = read_existing_config_root_for_save(path)?;
 
     root.insert(
         "appearance".to_string(),
@@ -192,18 +187,50 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     write_config_root_atomically(path, &serialized)
 }
 
-fn read_existing_config_root(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+fn read_existing_config_root_for_save(
+    path: &Path,
+) -> Result<serde_json::Map<String, Value>, String> {
     if !path.exists() {
         return Ok(serde_json::Map::new());
     }
 
     let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let root: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
-
-    match root {
-        Value::Object(map) => Ok(map),
-        _ => Err("existing app config root must be a JSON object".to_string()),
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(map)) => Ok(map),
+        Ok(_) => {
+            backup_invalid_existing_config(path)?;
+            Ok(serde_json::Map::new())
+        }
+        Err(err) => {
+            let detail = format!("existing app config is invalid JSON: {err}");
+            backup_invalid_existing_config_with_detail(path, &detail)?;
+            Ok(serde_json::Map::new())
+        }
     }
+}
+
+fn backup_invalid_existing_config(path: &Path) -> Result<(), String> {
+    backup_invalid_existing_config_with_detail(
+        path,
+        "existing app config root must be a JSON object",
+    )
+}
+
+fn backup_invalid_existing_config_with_detail(path: &Path, detail: &str) -> Result<(), String> {
+    let backup_path = invalid_config_backup_path(path);
+    fs::rename(path, &backup_path).map_err(|err| {
+        format!(
+            "{detail}; failed to back up `{}` to `{}`: {err}",
+            path.display(),
+            backup_path.display()
+        )
+    })?;
+    eprintln!(
+        "limux: {detail}; backed up `{}` to `{}` before rewriting settings",
+        path.display(),
+        backup_path.display()
+    );
+    Ok(())
 }
 
 fn write_config_root_atomically(path: &Path, serialized: &str) -> Result<(), String> {
@@ -224,6 +251,14 @@ fn write_config_root_atomically(path: &Path, serialized: &str) -> Result<(), Str
 }
 
 fn temp_config_path(path: &Path) -> std::path::PathBuf {
+    timestamped_sibling_path(path, "tmp")
+}
+
+fn invalid_config_backup_path(path: &Path) -> std::path::PathBuf {
+    timestamped_sibling_path(path, "bak")
+}
+
+fn timestamped_sibling_path(path: &Path, suffix: &str) -> std::path::PathBuf {
     let stem = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -232,8 +267,8 @@ fn temp_config_path(path: &Path) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let temp_name = format!(".{stem}.tmp-{}-{nonce}", std::process::id());
-    path.with_file_name(temp_name)
+    let file_name = format!(".{stem}.{suffix}-{}-{nonce}", std::process::id());
+    path.with_file_name(file_name)
 }
 
 fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
@@ -382,7 +417,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.appearance.color_scheme = ColorScheme::Light;
         config.appearance.ghostty_color_scheme = ColorScheme::Dark;
-        save(&config);
+        save(&config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -429,17 +464,33 @@ mod tests {
     }
 
     #[test]
-    fn save_to_path_rejects_invalid_existing_json_without_clobbering_file() {
+    fn save_to_path_recovers_invalid_existing_json_by_backing_it_up() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, "not json").expect("write invalid config");
 
         let config = AppConfig::default();
-        let err = save_to_path(&path, &config).expect_err("save should fail");
-        assert!(err.contains("expected ident") || err.contains("expected value"));
+        save_to_path(&path, &config).expect("save should recover");
+
+        let raw = fs::read_to_string(&path).expect("read repaired config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse repaired config");
         assert_eq!(
-            fs::read_to_string(&path).expect("read config after failed save"),
+            parsed["appearance"]["color_scheme"],
+            Value::String("system".to_string())
+        );
+
+        let backup = fs::read_dir(path.parent().expect("config dir"))
+            .expect("list config dir")
+            .find_map(|entry| {
+                let entry = entry.expect("dir entry");
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.contains(".settings.json.bak-").then_some(entry.path())
+            })
+            .expect("backup file");
+        assert_eq!(
+            fs::read_to_string(backup).expect("read backup config"),
             "not json"
         );
     }
