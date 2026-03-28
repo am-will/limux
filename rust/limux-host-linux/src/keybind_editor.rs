@@ -20,64 +20,52 @@ pub const KEYBIND_EDITOR_LISTENING_CSS: &str = "limux-keybind-editor-listening";
 
 pub const KEYBIND_EDITOR_CSS: &str = r#"
 .limux-keybind-editor {
-    background: linear-gradient(180deg, rgba(22, 22, 22, 0.98), rgba(16, 16, 16, 0.98));
+    background-color: @window_bg_color;
+    color: @window_fg_color;
     padding: 14px;
 }
 .limux-keybind-header {
     margin-bottom: 8px;
 }
 .limux-keybind-title {
-    color: white;
     font-weight: 700;
-    letter-spacing: 0.04em;
 }
 .limux-keybind-hint {
-    color: rgba(255, 255, 255, 0.62);
     font-size: 12px;
     margin-bottom: 10px;
+    opacity: 0.7;
 }
 .limux-keybind-scroll viewport {
     background: transparent;
 }
 .limux-keybind-row {
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 12px;
     padding: 10px 12px;
     margin-bottom: 8px;
 }
 .limux-keybind-action {
-    color: white;
     font-weight: 600;
 }
 .limux-keybind-default {
-    color: rgba(255, 255, 255, 0.58);
     font-size: 12px;
+    opacity: 0.7;
 }
 .limux-keybind-capture {
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    border-radius: 10px;
-    color: white;
     min-width: 168px;
     padding: 8px 12px;
 }
-.limux-keybind-capture:hover {
-    background: rgba(255, 255, 255, 0.09);
-}
 .limux-keybind-capture-listening {
-    border-color: rgba(111, 211, 255, 0.85);
-    box-shadow: 0 0 0 2px rgba(111, 211, 255, 0.2);
+    border-color: @accent_bg_color;
+    box-shadow: inset 0 0 0 1px @accent_bg_color;
 }
 .limux-keybind-error {
-    color: #ff8a8a;
+    color: @error_color;
     font-size: 12px;
     margin-top: 6px;
 }
 .limux-keybind-row-hint {
-    color: rgba(255, 255, 255, 0.58);
     font-size: 12px;
     margin-top: 6px;
+    opacity: 0.7;
 }
 "#;
 
@@ -134,6 +122,7 @@ pub fn build_keybind_editor(
         let shortcut_id = definition.id;
 
         let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        row.add_css_class("card");
         row.add_css_class("limux-keybind-row");
 
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -159,6 +148,7 @@ pub fn build_keybind_editor(
             .wrap(true)
             .build();
         default_label.add_css_class("limux-keybind-default");
+        default_label.set_opacity(0.7);
 
         meta.append(&action_label);
         meta.append(&default_label);
@@ -185,6 +175,7 @@ pub fn build_keybind_editor(
             .visible(false)
             .build();
         hint_label.add_css_class("limux-keybind-row-hint");
+        hint_label.set_opacity(0.7);
 
         top.append(&meta);
         top.append(&binding_button);

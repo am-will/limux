@@ -2,6 +2,7 @@ mod app_config;
 mod keybind_editor;
 mod layout_state;
 mod pane;
+mod settings_editor;
 mod shortcut_config;
 mod terminal;
 mod window;

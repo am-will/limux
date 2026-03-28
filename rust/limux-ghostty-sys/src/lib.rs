@@ -68,6 +68,8 @@ pub const GHOSTTY_ACTION_SET_TITLE: c_int = 32;
 pub const GHOSTTY_ACTION_PWD: c_int = 34;
 pub const GHOSTTY_ACTION_MOUSE_SHAPE: c_int = 35;
 pub const GHOSTTY_ACTION_COLOR_CHANGE: c_int = 45;
+pub const GHOSTTY_ACTION_RELOAD_CONFIG: c_int = 46;
+pub const GHOSTTY_ACTION_CONFIG_CHANGE: c_int = 47;
 pub const GHOSTTY_ACTION_CLOSE_WINDOW: c_int = 48;
 pub const GHOSTTY_ACTION_RING_BELL: c_int = 49;
 pub const GHOSTTY_ACTION_SHOW_CHILD_EXITED: c_int = 54;
@@ -377,6 +379,7 @@ extern "C" {
     ) -> ghostty_app_t;
     pub fn ghostty_app_free(app: ghostty_app_t);
     pub fn ghostty_app_tick(app: ghostty_app_t);
+    pub fn ghostty_app_update_config(app: ghostty_app_t, config: ghostty_config_t);
     pub fn ghostty_app_set_focus(app: ghostty_app_t, focused: bool);
     pub fn ghostty_app_set_color_scheme(app: ghostty_app_t, scheme: c_int);
 
@@ -408,6 +411,7 @@ extern "C" {
     pub fn ghostty_surface_mouse_pos(surface: ghostty_surface_t, x: f64, y: f64, mods: c_int);
     pub fn ghostty_surface_mouse_scroll(surface: ghostty_surface_t, x: f64, y: f64, mods: c_int);
     pub fn ghostty_surface_request_close(surface: ghostty_surface_t);
+    pub fn ghostty_surface_update_config(surface: ghostty_surface_t, config: ghostty_config_t);
     pub fn ghostty_surface_set_color_scheme(surface: ghostty_surface_t, scheme: c_int);
 
     // Binding actions

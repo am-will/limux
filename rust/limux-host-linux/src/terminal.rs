@@ -10,6 +10,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ unsafe impl Send for GhosttyState {}
 unsafe impl Sync for GhosttyState {}
 
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
+static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -169,6 +171,16 @@ fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
     gl_area.grab_focus();
 }
 
+fn load_ghostty_config() -> ghostty_config_t {
+    unsafe {
+        let config = ghostty_config_new();
+        ghostty_config_load_default_files(config);
+        ghostty_config_load_recursive_files(config);
+        ghostty_config_finalize(config);
+        config
+    }
+}
+
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
 pub fn init_ghostty() {
     GHOSTTY.get_or_init(|| {
@@ -176,13 +188,7 @@ pub fn init_ghostty() {
             ghostty_init(0, ptr::null_mut());
         }
 
-        let config = unsafe {
-            let c = ghostty_config_new();
-            ghostty_config_load_default_files(c);
-            ghostty_config_load_recursive_files(c);
-            ghostty_config_finalize(c);
-            c
-        };
+        let config = load_ghostty_config();
 
         let runtime_config = ghostty_runtime_config_s {
             userdata: ptr::null_mut(),
@@ -224,8 +230,13 @@ fn ghostty_color_scheme_for_dark_mode(dark: bool) -> c_int {
     }
 }
 
+fn current_ghostty_color_scheme() -> c_int {
+    CURRENT_COLOR_SCHEME.load(Ordering::Relaxed)
+}
+
 pub fn sync_color_scheme(dark: bool) {
     let scheme = ghostty_color_scheme_for_dark_mode(dark);
+    CURRENT_COLOR_SCHEME.store(scheme, Ordering::Relaxed);
     let app = ghostty_app();
 
     unsafe {
@@ -254,7 +265,7 @@ unsafe extern "C" fn ghostty_wakeup_cb(_userdata: *mut c_void) {
 }
 
 unsafe extern "C" fn ghostty_action_cb(
-    _app: ghostty_app_t,
+    app: ghostty_app_t,
     target: ghostty_target_s,
     action: ghostty_action_s,
 ) -> bool {
@@ -368,6 +379,25 @@ unsafe extern "C" fn ghostty_action_cb(
                         }
                     });
                 });
+            }
+            true
+        }
+        GHOSTTY_ACTION_RELOAD_CONFIG => {
+            let config = load_ghostty_config();
+            match target.tag {
+                GHOSTTY_TARGET_APP => unsafe {
+                    ghostty_app_update_config(app, config);
+                },
+                GHOSTTY_TARGET_SURFACE => {
+                    let surface = unsafe { target.target.surface };
+                    unsafe {
+                        ghostty_surface_update_config(surface, config);
+                    }
+                }
+                _ => {}
+            }
+            unsafe {
+                ghostty_config_free(config);
             }
             true
         }
@@ -572,9 +602,8 @@ pub struct TerminalCallbacks {
     pub on_open_keybinds: Box<WidgetCallback>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
 pub struct TerminalOptions {
-    pub hover_focus: bool,
+    pub hover_focus: Rc<dyn Fn() -> bool>,
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -701,6 +730,7 @@ pub fn create_terminal(
             }
             unsafe {
                 (*clipboard_context).surface.set(surface);
+                ghostty_surface_set_color_scheme(surface, current_ghostty_color_scheme());
             }
             clipboard_context_cell.set(clipboard_context);
 
@@ -951,7 +981,7 @@ pub fn create_terminal(
         let had_focus = had_focus.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
-            if hover_focus {
+            if (hover_focus)() {
                 // Match common Hyprland/Omarchy-style focus-follows-mouse behavior:
                 // as soon as the pointer enters a terminal, focus it so typing works
                 // immediately without an extra click.
