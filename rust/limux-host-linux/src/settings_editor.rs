@@ -48,11 +48,8 @@ pub fn present_settings_dialog(parent: &impl IsA<gtk::Widget>, input: SettingsEd
     window.present();
 }
 
-fn apply_config_change<F, G>(
-    config: &Rc<RefCell<AppConfig>>,
-    on_changed: &F,
-    update: G,
-) where
+fn apply_config_change<F, G>(config: &Rc<RefCell<AppConfig>>, on_changed: &F, update: G)
+where
     F: Fn(&AppConfig) + ?Sized,
     G: FnOnce(&mut AppConfig),
 {
@@ -228,11 +225,15 @@ mod tests {
     fn apply_config_change_allows_reentrant_config_sync() {
         let config = Rc::new(RefCell::new(AppConfig::default()));
 
-        apply_config_change(&config, &|updated| {
-            config.borrow_mut().clone_from(updated);
-        }, |current| {
-            current.focus.hover_terminal_focus = true;
-        });
+        apply_config_change(
+            &config,
+            &|updated| {
+                config.borrow_mut().clone_from(updated);
+            },
+            |current| {
+                current.focus.hover_terminal_focus = true;
+            },
+        );
 
         assert!(config.borrow().focus.hover_terminal_focus);
     }

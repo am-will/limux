@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -163,16 +164,16 @@ pub fn save(config: &AppConfig) {
         return;
     };
 
-    let mut root = match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|value| match value {
-                Value::Object(map) => Some(map),
-                _ => None,
-            })
-            .unwrap_or_default(),
-        Err(_) => serde_json::Map::new(),
-    };
+    if let Err(err) = save_to_path(&path, config) {
+        eprintln!(
+            "limux: failed to save app config `{}`: {err}",
+            path.display()
+        );
+    }
+}
+
+fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
+    let mut root = read_existing_config_root(path)?;
 
     root.insert(
         "appearance".to_string(),
@@ -188,12 +189,51 @@ pub fn save(config: &AppConfig) {
 
     let serialized =
         serde_json::to_string_pretty(&Value::Object(root)).expect("config should serialize");
-    if let Err(err) = fs::write(&path, format!("{serialized}\n")) {
-        eprintln!(
-            "limux: failed to save app config `{}`: {err}",
-            path.display()
-        );
+    write_config_root_atomically(path, &serialized)
+}
+
+fn read_existing_config_root(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
     }
+
+    let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let root: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+
+    match root {
+        Value::Object(map) => Ok(map),
+        _ => Err("existing app config root must be a JSON object".to_string()),
+    }
+}
+
+fn write_config_root_atomically(path: &Path, serialized: &str) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("config path has no parent directory".to_string());
+    };
+    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+
+    let temp_path = temp_config_path(path);
+    fs::write(&temp_path, format!("{serialized}\n")).map_err(|err| err.to_string())?;
+
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+
+    Ok(())
+}
+
+fn temp_config_path(path: &Path) -> std::path::PathBuf {
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_name = format!(".{stem}.tmp-{}-{nonce}", std::process::id());
+    path.with_file_name(temp_name)
 }
 
 fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
@@ -353,6 +393,54 @@ mod tests {
         assert_eq!(
             parsed["appearance"]["ghostty_color_scheme"],
             Value::String("dark".to_string())
+        );
+    }
+
+    #[test]
+    fn save_preserves_unrelated_top_level_keys() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "custom": {
+    "keep": true
+  },
+  "focus": {
+    "hover_terminal_focus": false
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let mut config = AppConfig::default();
+        config.appearance.color_scheme = ColorScheme::Dark;
+        save_to_path(&path, &config).expect("save config");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(parsed["custom"]["keep"], Value::Bool(true));
+        assert_eq!(
+            parsed["appearance"]["color_scheme"],
+            Value::String("dark".to_string())
+        );
+    }
+
+    #[test]
+    fn save_to_path_rejects_invalid_existing_json_without_clobbering_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, "not json").expect("write invalid config");
+
+        let config = AppConfig::default();
+        let err = save_to_path(&path, &config).expect_err("save should fail");
+        assert!(err.contains("expected ident") || err.contains("expected value"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read config after failed save"),
+            "not json"
         );
     }
 
