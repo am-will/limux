@@ -112,6 +112,7 @@ pub enum TabContentState {
         uri: Option<String>,
     },
     Keybinds {},
+    Settings {},
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]

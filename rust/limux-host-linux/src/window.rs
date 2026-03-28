@@ -3,7 +3,9 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::gdk::prelude::ToplevelExt;
+use gtk::gio;
 use gtk::glib;
+use gtk::glib::variant::ToVariant;
 use gtk4 as gtk;
 use libadwaita as adw;
 
@@ -55,7 +57,8 @@ struct AppState {
     window: adw::ApplicationWindow,
     top_bar: Option<adw::HeaderBar>,
     top_bar_visible: bool,
-    config: Rc<app_config::AppConfig>,
+    config: Rc<RefCell<app_config::AppConfig>>,
+    system_prefers_dark: Rc<Cell<Option<bool>>>,
     workspaces: Vec<Workspace>,
     active_idx: usize,
     shortcuts: Rc<ResolvedShortcutConfig>,
@@ -69,6 +72,9 @@ struct AppState {
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
+    _theme_portal_signal: Option<gio::SignalSubscription>,
+    _theme_gnome_settings: Option<gio::Settings>,
+    _theme_gnome_signal: Option<glib::SignalHandlerId>,
 }
 
 impl AppState {
@@ -98,6 +104,13 @@ struct TabDragWorkspaceSeed {
 
 type State = Rc<RefCell<AppState>>;
 const SPLIT_RATIO_STATE_KEY: &str = "limux-split-ratio-state";
+const PORTAL_DESKTOP_SERVICE: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
+const PORTAL_SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
+const PORTAL_APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
+const PORTAL_COLOR_SCHEME_KEY: &str = "color-scheme";
+const GNOME_INTERFACE_SCHEMA: &str = "org.gnome.desktop.interface";
+const GNOME_COLOR_SCHEME_KEY: &str = "color-scheme";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionSaveRequest {
@@ -486,7 +499,9 @@ fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
 
 const CSS: &str = r#"
 .limux-sidebar {
-    background-color: rgba(25, 25, 25, 1);
+    background-color: @window_bg_color;
+    color: @window_fg_color;
+    border-right: 1px solid alpha(@window_fg_color, 0.08);
 }
 .limux-sidebar-row-box {
     padding: 8px 6px 8px 3px;
@@ -494,14 +509,14 @@ const CSS: &str = r#"
     margin: 2px 3px 2px 1px;
 }
 .limux-ws-name {
-    color: rgba(255, 255, 255, 0.7);
+    color: alpha(@window_fg_color, 0.72);
     font-size: 15px;
 }
 row:selected .limux-ws-name {
-    color: white;
+    color: @window_fg_color;
 }
 .limux-ws-star-btn {
-    color: rgba(255, 255, 255, 0.45);
+    color: alpha(@window_fg_color, 0.45);
     border: none;
     min-height: 0;
     min-width: 0;
@@ -509,13 +524,13 @@ row:selected .limux-ws-name {
     font-size: 22px;
 }
 .limux-ws-star-btn:hover {
-    color: rgba(255, 255, 255, 0.9);
+    color: alpha(@window_fg_color, 0.9);
 }
 row:selected .limux-ws-star-btn {
-    color: rgba(255, 255, 255, 0.85);
+    color: alpha(@window_fg_color, 0.85);
 }
 .limux-ws-star-btn-active {
-    color: #f7c948;
+    color: @accent_bg_color;
 }
 .limux-ws-rename-entry {
     min-height: 0;
@@ -523,7 +538,7 @@ row:selected .limux-ws-star-btn {
     margin: 0;
 }
 .limux-notify-dot {
-    color: #0091FF;
+    color: @accent_bg_color;
     font-size: 10px;
     margin-right: 6px;
 }
@@ -533,48 +548,48 @@ row:selected .limux-ws-star-btn {
     margin-right: 6px;
 }
 .limux-notify-msg {
-    color: rgba(255, 255, 255, 0.35);
+    color: alpha(@window_fg_color, 0.35);
     font-size: 11px;
 }
 .limux-notify-msg-unread {
-    color: rgba(0, 145, 255, 0.8);
+    color: alpha(@accent_bg_color, 0.9);
     font-size: 11px;
 }
 .limux-sidebar-row-unread {
-    background-color: rgba(0, 145, 255, 0.18);
-    border-left: 3px solid #0091FF;
+    background-color: alpha(@accent_bg_color, 0.16);
+    border-left: 3px solid @accent_bg_color;
     border-radius: 6px;
     margin-left: 0;
     margin-right: 0;
 }
 .limux-sidebar-row-unread .limux-ws-name {
-    color: white;
+    color: @window_fg_color;
     font-weight: 700;
 }
 .limux-drop-above .limux-sidebar-row-box {
     border-radius: 0;
-    box-shadow: 0 -2px 0 0 #0091FF;
+    box-shadow: 0 -2px 0 0 @accent_bg_color;
 }
 .limux-drop-below .limux-sidebar-row-box {
     border-radius: 0;
-    box-shadow: 0 2px 0 0 #0091FF;
+    box-shadow: 0 2px 0 0 @accent_bg_color;
 }
 .limux-tab-drop-target {
-    background-color: rgba(0, 145, 255, 0.18);
+    background-color: alpha(@accent_bg_color, 0.18);
     border-radius: 8px;
 }
 .limux-sidebar row:drop(active) {
     box-shadow: none;
 }
 .limux-sidebar-title {
-    color: rgba(255, 255, 255, 0.5);
+    color: alpha(@window_fg_color, 0.55);
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 1px;
 }
 .limux-sidebar-btn {
-    background: rgba(255, 255, 255, 0.08);
-    color: rgba(255, 255, 255, 0.7);
+    background: alpha(@window_fg_color, 0.08);
+    color: alpha(@window_fg_color, 0.7);
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 6px 12px;
@@ -582,39 +597,39 @@ row:selected .limux-ws-star-btn {
     transition: all 200ms ease;
 }
 .limux-sidebar-btn:hover {
-    background: rgba(255, 255, 255, 0.14);
-    color: white;
+    background: alpha(@window_fg_color, 0.14);
+    color: @window_fg_color;
 }
 .limux-sidebar-btn-trash {
-    background: rgba(255, 60, 60, 0.25);
-    color: rgba(255, 80, 80, 1);
-    border: 1px solid rgba(255, 80, 80, 0.5);
+    background: alpha(@error_color, 0.16);
+    color: @error_color;
+    border: 1px solid alpha(@error_color, 0.4);
 }
 .limux-sidebar-btn-trash-hover {
-    background: rgba(255, 60, 60, 0.45);
-    color: rgba(255, 90, 90, 1);
-    border: 1px solid rgba(255, 80, 80, 0.8);
+    background: alpha(@error_color, 0.26);
+    color: @error_color;
+    border: 1px solid alpha(@error_color, 0.7);
 }
 .limux-tab-drag-active {
-    background-color: rgba(0, 145, 255, 0.12);
+    background-color: alpha(@accent_bg_color, 0.12);
     border-width: 1px;
     border-style: dashed;
-    border-color: rgba(0, 145, 255, 0.6);
+    border-color: alpha(@accent_bg_color, 0.6);
     border-radius: 8px;
 }
 .limux-sidebar-btn.limux-tab-drop-target {
-    background-color: rgba(0, 145, 255, 0.28);
-    border-color: rgba(0, 145, 255, 0.9);
+    background-color: alpha(@accent_bg_color, 0.28);
+    border-color: alpha(@accent_bg_color, 0.9);
 }
 .limux-ws-path {
-    color: rgba(255, 255, 255, 0.3);
+    color: alpha(@window_fg_color, 0.3);
     font-size: 12px;
 }
 row:selected .limux-ws-path {
-    color: rgba(255, 255, 255, 0.5);
+    color: alpha(@window_fg_color, 0.5);
 }
 .limux-content {
-    background-color: rgba(23, 23, 23, 1);
+    background-color: @window_bg_color;
 }
 "#;
 
@@ -624,11 +639,17 @@ row:selected .limux-ws-path {
 
 pub fn build_window(app: &adw::Application) {
     let display = gtk::gdk::Display::default().expect("display");
+    let portal_settings_proxy = portal_settings_proxy();
+    let gnome_interface_settings = gnome_interface_settings();
+    let system_prefers_dark = Rc::new(Cell::new(resolve_system_prefers_dark(
+        portal_settings_proxy.as_ref(),
+        gnome_interface_settings.as_ref(),
+    )));
     let loaded_config = app_config::load();
     for warning in &loaded_config.warnings {
         eprintln!("limux: {warning}");
     }
-    let config = Rc::new(loaded_config.config);
+    let config = Rc::new(RefCell::new(loaded_config.config));
 
     let shortcuts = Rc::new(shortcut_config::load_shortcuts_for_display(&display));
     for warning in &shortcuts.warnings {
@@ -638,9 +659,10 @@ pub fn build_window(app: &adw::Application) {
     // Load CSS
     let provider = gtk::CssProvider::new();
     let all_css = format!(
-        "{CSS}\n{}\n{}",
+        "{CSS}\n{}\n{}\n{}",
         pane::PANE_CSS,
-        keybind_editor::KEYBIND_EDITOR_CSS
+        keybind_editor::KEYBIND_EDITOR_CSS,
+        crate::settings_editor::SETTINGS_CSS,
     );
     provider.load_from_data(&all_css);
     gtk::style_context_add_provider_for_display(
@@ -650,10 +672,11 @@ pub fn build_window(app: &adw::Application) {
     );
 
     let style_manager = adw::StyleManager::default();
-    crate::terminal::sync_color_scheme(style_manager.is_dark());
-    style_manager.connect_dark_notify(|style_manager| {
-        crate::terminal::sync_color_scheme(style_manager.is_dark());
-    });
+    apply_appearance(
+        &style_manager,
+        system_prefers_dark.get(),
+        &config.borrow().appearance,
+    );
 
     // Register custom icons — look for icons dir relative to the executable
     let icon_theme = gtk::IconTheme::for_display(&display);
@@ -821,6 +844,7 @@ pub fn build_window(app: &adw::Application) {
         top_bar: header.clone(),
         top_bar_visible: true,
         config,
+        system_prefers_dark: system_prefers_dark.clone(),
         workspaces: Vec::new(),
         active_idx: 0,
         shortcuts,
@@ -834,7 +858,47 @@ pub fn build_window(app: &adw::Application) {
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
+        _theme_portal_signal: None,
+        _theme_gnome_settings: None,
+        _theme_gnome_signal: None,
     }));
+
+    {
+        let state = state.clone();
+        let system_prefers_dark = system_prefers_dark.clone();
+        style_manager.connect_dark_notify(move |style_manager| {
+            sync_ghostty_color_scheme_for_config(
+                style_manager,
+                system_prefers_dark.get(),
+                &state.borrow().config.borrow().appearance,
+            );
+        });
+    }
+
+    let theme_portal_signal = portal_settings_proxy.as_ref().and_then(|proxy| {
+        connect_portal_appearance_watch(
+            proxy,
+            gnome_interface_settings.clone(),
+            state.clone(),
+            style_manager.clone(),
+            system_prefers_dark.clone(),
+        )
+    });
+    let theme_gnome_signal = gnome_interface_settings.as_ref().map(|settings| {
+        connect_gnome_appearance_watch(
+            settings,
+            portal_settings_proxy.clone(),
+            state.clone(),
+            style_manager.clone(),
+            system_prefers_dark.clone(),
+        )
+    });
+    {
+        let mut s = state.borrow_mut();
+        s._theme_portal_signal = theme_portal_signal;
+        s._theme_gnome_settings = gnome_interface_settings.clone();
+        s._theme_gnome_signal = theme_gnome_signal;
+    }
 
     apply_shortcuts_to_application(app, &state.borrow().shortcuts);
 
@@ -1366,6 +1430,218 @@ fn persist_shortcut_binding(
 
     apply_shortcut_config(state, reloaded.clone());
     Ok(reloaded)
+}
+
+fn adw_color_scheme_for(scheme: app_config::ColorScheme) -> adw::ColorScheme {
+    match scheme {
+        app_config::ColorScheme::System => adw::ColorScheme::Default,
+        app_config::ColorScheme::Dark => adw::ColorScheme::ForceDark,
+        app_config::ColorScheme::Light => adw::ColorScheme::ForceLight,
+    }
+}
+
+fn portal_settings_proxy() -> Option<gio::DBusProxy> {
+    gio::DBusProxy::for_bus_sync(
+        gio::BusType::Session,
+        gio::DBusProxyFlags::NONE,
+        None::<&gio::DBusInterfaceInfo>,
+        PORTAL_DESKTOP_SERVICE,
+        PORTAL_DESKTOP_PATH,
+        PORTAL_SETTINGS_INTERFACE,
+        None::<&gio::Cancellable>,
+    )
+    .ok()
+}
+
+fn portal_prefers_dark_from_raw(raw: u32) -> Option<bool> {
+    match raw {
+        1 => Some(true),
+        0 | 2 => Some(false),
+        _ => None,
+    }
+}
+
+fn portal_prefers_dark(proxy: &gio::DBusProxy) -> Option<bool> {
+    let params = (PORTAL_APPEARANCE_NAMESPACE, PORTAL_COLOR_SCHEME_KEY).to_variant();
+    let response = proxy
+        .call_sync(
+            "Read",
+            Some(&params),
+            gio::DBusCallFlags::NONE,
+            -1,
+            None::<&gio::Cancellable>,
+        )
+        .ok()?;
+    let value = response.try_child_get::<glib::Variant>(0).ok().flatten()?;
+    portal_prefers_dark_from_raw(value.try_get::<u32>().ok()?)
+}
+
+fn gnome_interface_settings() -> Option<gio::Settings> {
+    let schema = gio::SettingsSchemaSource::default()?.lookup(GNOME_INTERFACE_SCHEMA, true)?;
+    if !schema.has_key(GNOME_COLOR_SCHEME_KEY) {
+        return None;
+    }
+
+    Some(gio::Settings::new_full(
+        &schema,
+        None::<&gio::SettingsBackend>,
+        None::<&str>,
+    ))
+}
+
+fn gnome_prefers_dark_from_raw(raw: &str) -> Option<bool> {
+    match raw {
+        "prefer-dark" => Some(true),
+        "default" | "prefer-light" => Some(false),
+        _ => None,
+    }
+}
+
+fn gnome_prefers_dark(settings: &gio::Settings) -> Option<bool> {
+    gnome_prefers_dark_from_raw(settings.string(GNOME_COLOR_SCHEME_KEY).as_str())
+}
+
+#[cfg(test)]
+fn gtk_system_prefers_dark_from_raw(raw: Option<i32>) -> Option<bool> {
+    match raw {
+        Some(value) if value == gtk::ffi::GTK_INTERFACE_COLOR_SCHEME_DARK => Some(true),
+        Some(value)
+            if value == gtk::ffi::GTK_INTERFACE_COLOR_SCHEME_LIGHT
+                || value == gtk::ffi::GTK_INTERFACE_COLOR_SCHEME_DEFAULT =>
+        {
+            Some(false)
+        }
+        Some(value) if value == gtk::ffi::GTK_INTERFACE_COLOR_SCHEME_UNSUPPORTED => None,
+        Some(_) => Some(false),
+        None => None,
+    }
+}
+
+fn resolve_system_prefers_dark(
+    portal_settings_proxy: Option<&gio::DBusProxy>,
+    gnome_interface_settings: Option<&gio::Settings>,
+) -> Option<bool> {
+    portal_settings_proxy
+        .and_then(portal_prefers_dark)
+        .or_else(|| gnome_interface_settings.and_then(gnome_prefers_dark))
+}
+
+fn portal_setting_changed_prefers_dark(parameters: &glib::Variant) -> Option<bool> {
+    let (namespace, key, value) = parameters
+        .try_get::<(String, String, glib::Variant)>()
+        .ok()?;
+    if namespace != PORTAL_APPEARANCE_NAMESPACE || key != PORTAL_COLOR_SCHEME_KEY {
+        return None;
+    }
+
+    portal_prefers_dark_from_raw(value.try_get::<u32>().ok()?)
+}
+
+fn sync_system_prefers_dark_change(
+    state: &State,
+    style_manager: &adw::StyleManager,
+    system_prefers_dark: &Cell<Option<bool>>,
+    updated_preference: Option<bool>,
+) {
+    if updated_preference == system_prefers_dark.get() {
+        return;
+    }
+
+    system_prefers_dark.set(updated_preference);
+    sync_ghostty_color_scheme_for_config(
+        style_manager,
+        updated_preference,
+        &state.borrow().config.borrow().appearance,
+    );
+}
+
+fn connect_portal_appearance_watch(
+    proxy: &gio::DBusProxy,
+    gnome_interface_settings: Option<gio::Settings>,
+    state: State,
+    style_manager: adw::StyleManager,
+    system_prefers_dark: Rc<Cell<Option<bool>>>,
+) -> Option<gio::SignalSubscription> {
+    let connection = proxy.connection();
+    let proxy_for_watch = proxy.clone();
+    Some(connection.subscribe_to_signal(
+        Some(PORTAL_DESKTOP_SERVICE),
+        Some(PORTAL_SETTINGS_INTERFACE),
+        Some("SettingChanged"),
+        Some(PORTAL_DESKTOP_PATH),
+        Some(PORTAL_APPEARANCE_NAMESPACE),
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            if portal_setting_changed_prefers_dark(signal.parameters).is_none() {
+                return;
+            }
+
+            let updated_preference = resolve_system_prefers_dark(
+                Some(&proxy_for_watch),
+                gnome_interface_settings.as_ref(),
+            );
+
+            sync_system_prefers_dark_change(
+                &state,
+                &style_manager,
+                system_prefers_dark.as_ref(),
+                updated_preference,
+            );
+        },
+    ))
+}
+
+fn connect_gnome_appearance_watch(
+    settings: &gio::Settings,
+    portal_settings_proxy: Option<gio::DBusProxy>,
+    state: State,
+    style_manager: adw::StyleManager,
+    system_prefers_dark: Rc<Cell<Option<bool>>>,
+) -> glib::SignalHandlerId {
+    settings.connect_changed(Some(GNOME_COLOR_SCHEME_KEY), move |settings, _| {
+        let updated_preference =
+            resolve_system_prefers_dark(portal_settings_proxy.as_ref(), Some(settings));
+        sync_system_prefers_dark_change(
+            &state,
+            &style_manager,
+            system_prefers_dark.as_ref(),
+            updated_preference,
+        );
+    })
+}
+
+fn ghostty_prefers_dark(
+    scheme: app_config::ColorScheme,
+    system_prefers_dark: Option<bool>,
+    fallback_dark: bool,
+) -> bool {
+    match scheme {
+        app_config::ColorScheme::Dark => true,
+        app_config::ColorScheme::Light => false,
+        app_config::ColorScheme::System => system_prefers_dark.unwrap_or(fallback_dark),
+    }
+}
+
+fn sync_ghostty_color_scheme_for_config(
+    style_manager: &adw::StyleManager,
+    system_prefers_dark: Option<bool>,
+    appearance: &app_config::AppearanceConfig,
+) {
+    let dark = ghostty_prefers_dark(
+        appearance.ghostty_color_scheme,
+        system_prefers_dark,
+        style_manager.is_dark(),
+    );
+    crate::terminal::sync_color_scheme(dark);
+}
+
+fn apply_appearance(
+    style_manager: &adw::StyleManager,
+    system_prefers_dark: Option<bool>,
+    appearance: &app_config::AppearanceConfig,
+) {
+    style_manager.set_color_scheme(adw_color_scheme_for(appearance.color_scheme));
+    sync_ghostty_color_scheme_for_config(style_manager, system_prefers_dark, appearance);
 }
 
 fn open_keybind_editor_tab(state: &State, pane_widget: &gtk::Widget) {
@@ -2373,11 +2649,9 @@ fn create_pane_for_workspace(
     let ws_id_pwd = ws_id.to_string();
     let ws_id_empty = ws_id.to_string();
     let state_for_split_with_tab = state.clone();
+    let state_for_config = state.clone();
+    let state_for_config_changed = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
-    let hover_terminal_focus = {
-        let s = state.borrow();
-        s.config.focus.hover_terminal_focus
-    };
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
@@ -2446,7 +2720,6 @@ fn create_pane_for_workspace(
             let state = state.clone();
             move || request_session_save(&state)
         }),
-        hover_terminal_focus,
         on_split_with_tab: Box::new(
             move |source_pane, target_pane, orientation, tab_id, new_pane_first| {
                 handle_split_with_tab(
@@ -2460,6 +2733,20 @@ fn create_pane_for_workspace(
                 );
             },
         ),
+        current_config: Box::new(move || {
+            let s = state_for_config.borrow();
+            s.config.clone()
+        }),
+        on_config_changed: Rc::new(move |updated: &app_config::AppConfig| {
+            let style_manager = adw::StyleManager::default();
+            let system_prefers_dark = {
+                let s = state_for_config_changed.borrow();
+                s.config.borrow_mut().clone_from(updated);
+                s.system_prefers_dark.get()
+            };
+            apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
+            app_config::save(updated);
+        }),
     });
 
     pane::create_pane(
@@ -3319,10 +3606,11 @@ mod tests {
     use std::rc::Rc;
 
     use super::glib;
+    use super::gtk::ffi;
     use super::gtk::gdk;
     use super::{
-        clamp_workspace_insert_index_for_pinning, favorites_prefix_len,
-        next_active_workspace_index, queue_session_save_request,
+        clamp_workspace_insert_index_for_pinning, favorites_prefix_len, ghostty_prefers_dark,
+        gtk_system_prefers_dark_from_raw, next_active_workspace_index, queue_session_save_request,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
         workspace_drop_layout_path, workspace_notification_message, EditableCaptureContext,
@@ -3405,6 +3693,59 @@ mod tests {
         let clamped =
             clamp_workspace_insert_index_for_pinning(&after_removal, true, after_removal.len());
         assert_eq!(clamped, 2);
+    }
+
+    #[test]
+    fn system_prefers_dark_from_raw_maps_known_values() {
+        assert_eq!(
+            gtk_system_prefers_dark_from_raw(Some(ffi::GTK_INTERFACE_COLOR_SCHEME_DARK)),
+            Some(true)
+        );
+        assert_eq!(
+            gtk_system_prefers_dark_from_raw(Some(ffi::GTK_INTERFACE_COLOR_SCHEME_LIGHT)),
+            Some(false)
+        );
+        assert_eq!(
+            gtk_system_prefers_dark_from_raw(Some(ffi::GTK_INTERFACE_COLOR_SCHEME_DEFAULT)),
+            Some(false)
+        );
+        assert_eq!(
+            gtk_system_prefers_dark_from_raw(Some(ffi::GTK_INTERFACE_COLOR_SCHEME_UNSUPPORTED)),
+            None
+        );
+    }
+
+    #[test]
+    fn ghostty_prefers_dark_uses_system_preference_when_requested() {
+        assert!(ghostty_prefers_dark(
+            crate::app_config::ColorScheme::System,
+            Some(true),
+            false
+        ));
+        assert!(!ghostty_prefers_dark(
+            crate::app_config::ColorScheme::System,
+            Some(false),
+            true
+        ));
+        assert!(ghostty_prefers_dark(
+            crate::app_config::ColorScheme::System,
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn ghostty_prefers_dark_honors_explicit_overrides() {
+        assert!(ghostty_prefers_dark(
+            crate::app_config::ColorScheme::Dark,
+            Some(false),
+            false
+        ));
+        assert!(!ghostty_prefers_dark(
+            crate::app_config::ColorScheme::Light,
+            Some(true),
+            true
+        ));
     }
 
     #[test]

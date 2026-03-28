@@ -8,10 +8,45 @@ use crate::shortcut_config;
 
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorScheme {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl ColorScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "system" => Some(Self::System),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub focus: FocusConfig,
+    #[serde(skip)]
+    pub appearance: AppearanceConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppearanceConfig {
+    pub color_scheme: ColorScheme,
+    pub ghostty_color_scheme: ColorScheme,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -97,10 +132,67 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    let appearance = root.get("appearance").and_then(Value::as_object);
+
+    let color_scheme = appearance
+        .and_then(|appearance| appearance.get("color_scheme"))
+        .and_then(Value::as_str)
+        .and_then(ColorScheme::from_str)
+        .unwrap_or_default();
+
+    let ghostty_color_scheme = appearance
+        .and_then(|appearance| appearance.get("ghostty_color_scheme"))
+        .and_then(Value::as_str)
+        .and_then(ColorScheme::from_str)
+        .unwrap_or(color_scheme);
+
     AppConfig {
         focus: FocusConfig {
             hover_terminal_focus,
         },
+        appearance: AppearanceConfig {
+            color_scheme,
+            ghostty_color_scheme,
+        },
+    }
+}
+
+pub fn save(config: &AppConfig) {
+    let Some(path) = settings_path() else {
+        eprintln!("limux: config_dir unavailable; cannot save app settings");
+        return;
+    };
+
+    let mut root = match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|value| match value {
+                Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        Err(_) => serde_json::Map::new(),
+    };
+
+    root.insert(
+        "appearance".to_string(),
+        json!({
+            "color_scheme": config.appearance.color_scheme.as_str(),
+            "ghostty_color_scheme": config.appearance.ghostty_color_scheme.as_str(),
+        }),
+    );
+    root.insert(
+        "focus".to_string(),
+        json!({ "hover_terminal_focus": config.focus.hover_terminal_focus }),
+    );
+
+    let serialized =
+        serde_json::to_string_pretty(&Value::Object(root)).expect("config should serialize");
+    if let Err(err) = fs::write(&path, format!("{serialized}\n")) {
+        eprintln!(
+            "limux: failed to save app config `{}`: {err}",
+            path.display()
+        );
     }
 }
 
@@ -115,6 +207,10 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
 
     fs::create_dir_all(parent)?;
     let default_root = json!({
+        "appearance": {
+            "color_scheme": "system",
+            "ghostty_color_scheme": "system"
+        },
         "focus": {
             "hover_terminal_focus": false
         }
@@ -128,7 +224,32 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    use std::ffi::OsString;
+
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.as_ref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn load_from_path_uses_defaults_when_file_is_missing() {
@@ -157,6 +278,10 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
         assert_eq!(parsed["focus"]["hover_terminal_focus"], Value::Bool(false));
+        assert_eq!(
+            parsed["appearance"]["ghostty_color_scheme"],
+            Value::String("system".to_string())
+        );
     }
 
     #[test]
@@ -179,6 +304,56 @@ mod tests {
 
         assert!(loaded.warnings.is_empty());
         assert!(loaded.config.focus.hover_terminal_focus);
+    }
+
+    #[test]
+    fn load_from_path_defaults_ghostty_scheme_to_gtk_scheme_for_legacy_configs() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "appearance": {
+    "color_scheme": "dark"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.appearance.color_scheme, ColorScheme::Dark);
+        assert_eq!(
+            loaded.config.appearance.ghostty_color_scheme,
+            ColorScheme::Dark
+        );
+    }
+
+    #[test]
+    fn save_writes_gtk_and_ghostty_color_schemes() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        let _env_guard = EnvVarGuard::set("XDG_CONFIG_HOME", dir.path());
+
+        let mut config = AppConfig::default();
+        config.appearance.color_scheme = ColorScheme::Light;
+        config.appearance.ghostty_color_scheme = ColorScheme::Dark;
+        save(&config);
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["appearance"]["color_scheme"],
+            Value::String("light".to_string())
+        );
+        assert_eq!(
+            parsed["appearance"]["ghostty_color_scheme"],
+            Value::String("dark".to_string())
+        );
     }
 
     #[test]
