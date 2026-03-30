@@ -484,7 +484,48 @@ fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
 // CSS
 // ---------------------------------------------------------------------------
 
+const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
+const WORKSPACE_RENAME_ENTRY_CSS_CLASS: &str = "limux-ws-rename-entry";
+const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
+    [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS];
+
 const BASE_CSS: &str = r#"
+:root {
+    --limux-host-entry-bg: rgba(255, 255, 255, 0.98);
+    --limux-host-entry-fg: rgba(15, 23, 42, 0.96);
+    --limux-host-entry-border: rgba(15, 23, 42, 0.16);
+    --limux-host-entry-border-focus: rgba(0, 145, 255, 0.72);
+    --limux-host-entry-placeholder: rgba(15, 23, 42, 0.5);
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --limux-host-entry-bg: rgba(44, 44, 48, 0.98);
+        --limux-host-entry-fg: rgba(255, 255, 255, 0.96);
+        --limux-host-entry-border: rgba(255, 255, 255, 0.14);
+        --limux-host-entry-border-focus: rgba(0, 145, 255, 0.78);
+        --limux-host-entry-placeholder: rgba(255, 255, 255, 0.48);
+    }
+}
+.limux-host-entry {
+    background-color: var(--limux-host-entry-bg);
+    color: var(--limux-host-entry-fg);
+    border: 1px solid var(--limux-host-entry-border);
+    border-radius: 6px;
+    caret-color: currentColor;
+}
+.limux-host-entry:focus-within {
+    border-color: var(--limux-host-entry-border-focus);
+}
+.limux-host-entry text {
+    background-color: transparent;
+    color: var(--limux-host-entry-fg);
+}
+.limux-host-entry text placeholder {
+    color: var(--limux-host-entry-placeholder);
+}
+.limux-host-entry image {
+    color: var(--limux-host-entry-placeholder);
+}
 .limux-sidebar {
     background-color: rgba(25, 25, 25, 1);
 }
@@ -1776,7 +1817,9 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
         .text(&current_name)
         .hexpand(true)
         .build();
-    entry.add_css_class("limux-ws-rename-entry");
+    for css_class in WORKSPACE_RENAME_ENTRY_CSS_CLASSES {
+        entry.add_css_class(css_class);
+    }
 
     label.set_visible(false);
     parent.insert_child_after(&entry, Some(&label));
@@ -3363,7 +3406,9 @@ mod tests {
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
         use_opaque_window_background, workspace_drop_layout_path, workspace_notification_message,
-        EditableCaptureContext, SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource,
+        BASE_CSS, EditableCaptureContext, HOST_ENTRY_CSS_CLASS, SessionSaveAccess,
+        SessionSaveRequest, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES, WorkspaceSeedSource,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -3415,8 +3460,30 @@ mod tests {
     #[test]
     fn build_window_css_uses_resolved_background_opacity() {
         let css = build_window_css(0.42);
+        assert!(css.contains(".limux-host-entry"));
+        assert!(css.contains(".limux-host-entry text"));
+        assert!(css.contains(".limux-host-entry text placeholder"));
         assert!(css.contains(".limux-content"));
         assert!(css.contains("background-color: rgba(23, 23, 23, 0.420);"));
+    }
+
+    #[test]
+    fn base_css_defines_theme_aware_host_entry_styles() {
+        assert!(BASE_CSS.contains(":root"));
+        assert!(BASE_CSS.contains("@media (prefers-color-scheme: dark)"));
+        assert!(BASE_CSS.contains(".limux-host-entry"));
+        assert!(BASE_CSS.contains(".limux-host-entry text"));
+        assert!(BASE_CSS.contains(".limux-host-entry text placeholder"));
+        assert!(BASE_CSS.contains("caret-color: currentColor;"));
+    }
+
+    #[test]
+    fn workspace_rename_entry_uses_shared_host_entry_class() {
+        assert_eq!(
+            WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+            [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS]
+        );
+        assert!(BASE_CSS.contains(".limux-ws-rename-entry"));
     }
 
     #[test]

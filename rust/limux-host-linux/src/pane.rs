@@ -78,6 +78,16 @@ pub enum PaneEmptyReason {
     MovedLastTabOut,
 }
 
+const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
+const TAB_RENAME_ENTRY_CSS_CLASS: &str = "limux-tab-rename-entry";
+const TAB_RENAME_ENTRY_CSS_CLASSES: [&str; 2] = [HOST_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASS];
+const BROWSER_URL_ENTRY_CSS_CLASS: &str = "limux-browser-url-entry";
+const BROWSER_URL_ENTRY_CSS_CLASSES: [&str; 2] =
+    [HOST_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASS];
+const BROWSER_SEARCH_ENTRY_CSS_CLASS: &str = "limux-browser-search-entry";
+const BROWSER_SEARCH_ENTRY_CSS_CLASSES: [&str; 2] =
+    [HOST_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASS];
+
 pub fn is_tab_dragging() -> bool {
     TAB_DRAGGING.with(|value| value.get())
 }
@@ -328,11 +338,15 @@ pub const PANE_CSS: &str = r#"
     margin-right: 2px;
 }
 .limux-tab-rename-entry {
-    background: rgba(255, 255, 255, 0.1);
-    color: white;
-    border: 1px solid rgba(0, 145, 255, 0.5);
-    border-radius: 3px;
     padding: 1px 4px;
+    min-height: 0;
+    font-size: 12px;
+}
+.limux-browser-url-entry {
+    min-height: 0;
+    font-size: 12px;
+}
+.limux-browser-search-entry {
     min-height: 0;
     font-size: 12px;
 }
@@ -1651,7 +1665,9 @@ fn show_rename_dialog(
         .text(&current_name)
         .width_chars(15)
         .build();
-    entry.add_css_class("limux-tab-rename-entry");
+    for css_class in TAB_RENAME_ENTRY_CSS_CLASSES {
+        entry.add_css_class(css_class);
+    }
 
     label.set_visible(false);
     // Insert entry before the close button
@@ -2636,6 +2652,9 @@ fn create_browser_widget(
         .placeholder_text("Enter URL...")
         .hexpand(true)
         .build();
+    for css_class in BROWSER_URL_ENTRY_CSS_CLASSES {
+        url_entry.add_css_class(css_class);
+    }
 
     let back_btn = icon_button("go-previous-symbolic", "Back");
     let fwd_btn = icon_button("go-next-symbolic", "Forward");
@@ -2700,6 +2719,9 @@ fn create_browser_widget(
         .hexpand(true)
         .placeholder_text("Find in page")
         .build();
+    for css_class in BROWSER_SEARCH_ENTRY_CSS_CLASSES {
+        search_entry.add_css_class(css_class);
+    }
     let search_bar = gtk::SearchBar::new();
     search_bar.set_show_close_button(true);
     search_bar.connect_entry(&search_entry);
@@ -2836,6 +2858,9 @@ mod tests {
         classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
         is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
         normalize_reorder_insert_index, pane_action_tooltip, ContentDropZone, TabDragPayload,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
+        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
 
@@ -2875,6 +2900,30 @@ mod tests {
         assert_eq!(
             pane_action_tooltip(&unbound, "Close pane", Some(ShortcutId::CloseFocusedPane)),
             "Close pane"
+        );
+    }
+
+    #[test]
+    fn pane_css_keeps_entry_layout_classes_separate_from_shared_theme() {
+        assert!(PANE_CSS.contains(".limux-tab-rename-entry"));
+        assert!(PANE_CSS.contains(".limux-browser-url-entry"));
+        assert!(PANE_CSS.contains(".limux-browser-search-entry"));
+        assert!(!PANE_CSS.contains("border: 1px solid rgba(0, 145, 255, 0.5);"));
+    }
+
+    #[test]
+    fn pane_entries_use_shared_host_entry_class() {
+        assert_eq!(
+            TAB_RENAME_ENTRY_CSS_CLASSES,
+            [HOST_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASS]
+        );
+        assert_eq!(
+            BROWSER_URL_ENTRY_CSS_CLASSES,
+            [HOST_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASS]
+        );
+        assert_eq!(
+            BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+            [HOST_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASS]
         );
     }
 
