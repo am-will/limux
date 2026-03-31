@@ -616,7 +616,6 @@ pub fn create_terminal(
     search_bar.set_show_close_button(true);
     search_bar.connect_entry(&search_entry);
     search_bar.set_child(Some(&search_entry));
-    search_bar.set_key_capture_widget(Some(&gl_area));
     search_bar.set_valign(gtk::Align::Start);
     search_bar.set_halign(gtk::Align::Fill);
     search_bar.set_margin_top(8);

@@ -2701,7 +2701,6 @@ fn create_browser_widget(
     search_bar.set_show_close_button(true);
     search_bar.connect_entry(&search_entry);
     search_bar.set_child(Some(&search_entry));
-    search_bar.set_key_capture_widget(Some(&webview));
     {
         let search_bar = search_bar.clone();
         let find_controller = find_controller.clone();
