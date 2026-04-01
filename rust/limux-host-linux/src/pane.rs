@@ -1406,6 +1406,19 @@ pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarg
     target
 }
 
+/// Find the first terminal handle in a pane widget (used by control bridge
+/// to send text to a specific workspace).
+pub fn first_terminal_handle(pane_widget: &gtk::Widget) -> Option<terminal::TerminalHandle> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    for entry in &tab_state.tabs {
+        if let TabKind::Terminal { state } = &entry.kind {
+            return Some(state.handle.clone());
+        }
+    }
+    None
+}
+
 fn apply_pin_visuals(tab_button: &gtk::Box, pinned: bool) {
     if let Some(close_widget) = tab_button.last_child() {
         close_widget.set_visible(!pinned);

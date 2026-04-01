@@ -10,6 +10,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config;
+use crate::control_bridge::ControlCommand;
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState,
@@ -1088,6 +1089,21 @@ pub fn build_window(app: &adw::Application) {
     }
 
     apply_loaded_session(&state, layout_state::load_session());
+
+    // Start the control-plane socket server and poll for commands on the GTK
+    // main loop. We use a short interval timer because gtk4-rs 0.11 does not
+    // expose glib::MainContext::channel().
+    let control_rx = crate::control_bridge::start();
+    {
+        let state = state.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            while let Ok(cmd) = control_rx.try_recv() {
+                handle_control_command(&state, cmd);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     window.present();
 }
 
@@ -2752,6 +2768,144 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     };
     add_workspace_from_state(state, &workspace);
     request_session_save(state);
+}
+
+/// Create a workspace without switching focus to it (used by control bridge).
+fn create_workspace_background(state: &State, name: &str, folder_path: &str) {
+    let workspace = WorkspaceState {
+        name: name.to_string(),
+        favorite: false,
+        cwd: Some(folder_path.to_string()),
+        folder_path: Some(folder_path.to_string()),
+        layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
+    };
+    add_workspace_from_state(state, &workspace);
+}
+
+// ---------------------------------------------------------------------------
+// Control-plane command handler
+// ---------------------------------------------------------------------------
+
+fn handle_control_command(state: &State, cmd: ControlCommand) {
+    match cmd {
+        ControlCommand::CreateWorkspace {
+            name,
+            cwd,
+            command,
+            reply,
+        } => {
+            let home = dirs::home_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let folder_path = cwd.as_deref().unwrap_or(&home);
+            let ws_name = name.unwrap_or_else(|| {
+                std::path::Path::new(folder_path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".to_string())
+            });
+
+            let index = state.borrow().workspaces.len();
+            create_workspace_background(state, &ws_name, folder_path);
+
+            // If a command was given, schedule it to be typed into the new
+            // workspace's terminal after the shell has had time to start.
+            if let Some(cmd_text) = command {
+                let state = state.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                    let root = {
+                        let s = state.borrow();
+                        s.workspaces.get(index).map(|ws| ws.root.clone())
+                    };
+                    if let Some(root) = root {
+                        if let Some(handle) = pane::first_terminal_handle(&root) {
+                            handle.send_text(&cmd_text);
+                            handle.send_text("\n");
+                        }
+                    }
+                });
+            }
+
+            let _ = reply.send(serde_json::json!({
+                "workspace_index": index,
+                "name": ws_name,
+            }));
+        }
+
+        ControlCommand::ListWorkspaces { reply } => {
+            let s = state.borrow();
+            let list: Vec<serde_json::Value> = s
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(i, ws)| {
+                    serde_json::json!({
+                        "index": i,
+                        "name": ws.name,
+                        "active": i == s.active_idx,
+                        "cwd": ws.cwd.borrow().clone(),
+                        "folder_path": ws.folder_path,
+                    })
+                })
+                .collect();
+            let _ = reply.send(serde_json::json!({"workspaces": list}));
+        }
+
+        ControlCommand::RenameWorkspace { index, name, reply } => {
+            let ok = {
+                let mut s = state.borrow_mut();
+                if let Some(ws) = s.workspaces.get_mut(index) {
+                    ws.name = name.clone();
+                    ws.name_label.set_label(&name);
+                    true
+                } else {
+                    false
+                }
+            };
+            if ok {
+                request_session_save(state);
+            }
+            let _ = reply.send(serde_json::json!({"ok": ok}));
+        }
+
+        ControlCommand::ActivateWorkspace { index, reply } => {
+            switch_workspace(state, index);
+            let _ = reply.send(serde_json::json!({"ok": true}));
+        }
+
+        ControlCommand::CloseWorkspace { index, reply } => {
+            let id = {
+                let s = state.borrow();
+                s.workspaces.get(index).map(|ws| ws.id.clone())
+            };
+            if let Some(id) = id {
+                close_workspace_by_id(state, &id);
+                let _ = reply.send(serde_json::json!({"ok": true}));
+            } else {
+                let _ = reply.send(serde_json::json!({"ok": false, "error": "not found"}));
+            }
+        }
+
+        ControlCommand::SendText { index, text, reply } => {
+            let root = {
+                let s = state.borrow();
+                s.workspaces.get(index).map(|ws| ws.root.clone())
+            };
+            if let Some(root) = root {
+                if let Some(handle) = pane::first_terminal_handle(&root) {
+                    handle.send_text(&text);
+                    let _ = reply.send(serde_json::json!({"ok": true}));
+                } else {
+                    let _ = reply.send(
+                        serde_json::json!({"ok": false, "error": "no terminal in workspace"}),
+                    );
+                }
+            } else {
+                let _ =
+                    reply.send(serde_json::json!({"ok": false, "error": "workspace not found"}));
+            }
+        }
+    }
 }
 
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
