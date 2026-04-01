@@ -1339,6 +1339,22 @@ fn find_pane_internals(pane_widget: &gtk::Widget) -> Option<Rc<PaneInternals>> {
     }
 }
 
+pub fn is_pane_widget(widget: &gtk::Widget) -> bool {
+    let Some(container) = widget.downcast_ref::<gtk::Box>() else {
+        return false;
+    };
+
+    let mut child = container.first_child();
+    while let Some(current) = child {
+        if current.has_css_class("limux-pane-header") {
+            return true;
+        }
+        child = current.next_sibling();
+    }
+
+    false
+}
+
 pub fn tab_title(pane_widget: &gtk::Widget, tab_id: &str) -> Option<String> {
     let internals = find_pane_internals(pane_widget)?;
     let tab_state = internals.tab_state.borrow();

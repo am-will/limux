@@ -3035,10 +3035,29 @@ fn focus_workspace_entrypoint(root: &gtk::Widget) {
 }
 
 fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
+    if pane::is_pane_widget(widget) {
+        return widget.clone();
+    }
+
     if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
         if let Some(child) = paned.start_child().or_else(|| paned.end_child()) {
             return first_leaf_pane(&child);
         }
+    }
+
+    if let Some(stack) = widget.downcast_ref::<gtk::Stack>() {
+        if let Some(visible) = stack.visible_child() {
+            return first_leaf_pane(&visible);
+        }
+    }
+
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        let candidate = first_leaf_pane(&current);
+        if pane::is_pane_widget(&candidate) {
+            return candidate;
+        }
+        child = current.next_sibling();
     }
 
     widget.clone()
@@ -3343,7 +3362,7 @@ fn find_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
         (ws.id.clone(), ws.root.clone())
     };
 
-    Some((ws_id, root))
+    Some((ws_id, first_leaf_pane(&root)))
 }
 
 fn focused_shortcut_target(state: &State) -> pane::FocusedShortcutTarget {
@@ -3672,7 +3691,6 @@ mod tests {
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
     };
-
     #[derive(Default)]
     struct TestSessionSaveState {
         persistence_suspended: bool,
