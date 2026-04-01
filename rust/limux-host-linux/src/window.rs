@@ -484,7 +484,7 @@ fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
 // CSS
 // ---------------------------------------------------------------------------
 
-const CSS: &str = r#"
+const BASE_CSS: &str = r#"
 .limux-sidebar {
     background-color: rgba(25, 25, 25, 1);
 }
@@ -618,6 +618,8 @@ row:selected .limux-ws-path {
 }
 "#;
 
+const CONTENT_BACKGROUND_RGB: (u8, u8, u8) = (23, 23, 23);
+
 // ---------------------------------------------------------------------------
 // Window construction
 // ---------------------------------------------------------------------------
@@ -629,6 +631,8 @@ pub fn build_window(app: &adw::Application) {
         eprintln!("limux: {warning}");
     }
     let config = Rc::new(loaded_config.config);
+    let background_opacity =
+        sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
 
     let shortcuts = Rc::new(shortcut_config::load_shortcuts_for_display(&display));
     for warning in &shortcuts.warnings {
@@ -638,7 +642,8 @@ pub fn build_window(app: &adw::Application) {
     // Load CSS
     let provider = gtk::CssProvider::new();
     let all_css = format!(
-        "{CSS}\n{}\n{}",
+        "{}\n{}\n{}",
+        build_window_css(background_opacity),
         pane::PANE_CSS,
         keybind_editor::KEYBIND_EDITOR_CSS
     );
@@ -686,6 +691,7 @@ pub fn build_window(app: &adw::Application) {
         .default_width(1400)
         .default_height(900)
         .build();
+    apply_window_background_class(&window, background_opacity);
 
     // On Wayland compositors with xdg-decoration support, the compositor
     // already provides the window chrome, so keep Limux from rendering a
@@ -952,6 +958,34 @@ pub fn build_window(app: &adw::Application) {
 
     apply_loaded_session(&state, layout_state::load_session());
     window.present();
+}
+
+fn build_window_css(background_opacity: f64) -> String {
+    let background_opacity = sanitize_background_opacity(background_opacity);
+    let (r, g, b) = CONTENT_BACKGROUND_RGB;
+    format!(
+        "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
+    )
+}
+
+fn sanitize_background_opacity(background_opacity: f64) -> f64 {
+    if background_opacity.is_finite() {
+        background_opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+fn use_opaque_window_background(background_opacity: f64) -> bool {
+    sanitize_background_opacity(background_opacity) >= 1.0
+}
+
+fn apply_window_background_class(window: &adw::ApplicationWindow, background_opacity: f64) {
+    if use_opaque_window_background(background_opacity) {
+        window.add_css_class("background");
+    } else {
+        window.remove_css_class("background");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3321,10 +3355,13 @@ mod tests {
     use super::glib;
     use super::gtk::gdk;
     use super::{
+        build_window_css,
         clamp_workspace_insert_index_for_pinning, favorites_prefix_len,
         next_active_workspace_index, queue_session_save_request,
+        sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
+        use_opaque_window_background,
         workspace_drop_layout_path, workspace_notification_message, EditableCaptureContext,
         SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource,
     };
@@ -3357,6 +3394,29 @@ mod tests {
     fn favorites_prefix_len_counts_only_leading_favorites() {
         let flags = [true, true, false, true, false];
         assert_eq!(favorites_prefix_len(&flags), 2);
+    }
+
+    #[test]
+    fn sanitize_background_opacity_clamps_invalid_values() {
+        assert_eq!(sanitize_background_opacity(f64::NAN), 1.0);
+        assert_eq!(sanitize_background_opacity(-0.2), 0.0);
+        assert_eq!(sanitize_background_opacity(1.7), 1.0);
+        assert_eq!(sanitize_background_opacity(0.42), 0.42);
+    }
+
+    #[test]
+    fn transparent_window_background_only_applies_below_full_opacity() {
+        assert!(!use_opaque_window_background(0.8));
+        assert!(use_opaque_window_background(1.0));
+        assert!(use_opaque_window_background(5.0));
+        assert!(use_opaque_window_background(f64::NAN));
+    }
+
+    #[test]
+    fn build_window_css_uses_resolved_background_opacity() {
+        let css = build_window_css(0.42);
+        assert!(css.contains(".limux-content"));
+        assert!(css.contains("background-color: rgba(23, 23, 23, 0.420);"));
     }
 
     #[test]

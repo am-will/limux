@@ -369,6 +369,12 @@ extern "C" {
     pub fn ghostty_config_load_default_files(config: ghostty_config_t);
     pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
     pub fn ghostty_config_finalize(config: ghostty_config_t);
+    pub fn ghostty_config_get(
+        config: ghostty_config_t,
+        out: *mut c_void,
+        key: *const c_char,
+        key_len: usize,
+    ) -> bool;
 
     // App
     pub fn ghostty_app_new(
