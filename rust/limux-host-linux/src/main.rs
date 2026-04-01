@@ -4,6 +4,7 @@ mod layout_state;
 mod pane;
 mod settings_editor;
 mod shortcut_config;
+mod split_tree;
 mod terminal;
 mod window;
 
