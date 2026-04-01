@@ -817,6 +817,9 @@ pub fn create_terminal(
     gl_area.set_auto_render(true);
     gl_area.set_focusable(true);
     gl_area.set_can_focus(true);
+    gl_area.connect_map(|gl_area| {
+        gl_area.queue_render();
+    });
 
     let wd = working_directory.map(|s| s.to_string());
     let hover_focus = options.hover_focus;
