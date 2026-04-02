@@ -67,14 +67,19 @@ sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 ### Prerequisites
 
 - Rust toolchain (stable)
+- Zig
 - GTK4, libadwaita, WebKitGTK dev packages
-- Pre-built `libghostty.so` (included in releases, or build from the Ghostty submodule with Zig)
+- Initialized Ghostty submodule
 
 ```bash
 # Install dev dependencies (Ubuntu/Debian)
 sudo apt install libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev pkg-config build-essential
 
-# Build
+# Initialize the Ghostty submodule and build the embedded library
+git submodule update --init --recursive
+(cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast)
+
+# Build limux
 cargo build --release
 
 # Run (point to libghostty.so location)
@@ -88,6 +93,7 @@ LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
 This builds the binary, bundles `libghostty.so`, icons, and an install script into a tarball.
+`package.sh` also rebuilds `libghostty.so` with `ReleaseFast`, so Zig and the initialized Ghostty submodule must be present.
 
 ## Development
 
