@@ -88,6 +88,18 @@ echo "=== Limux Packager ==="
 echo "Version: ${VERSION}"
 echo "Arch:    ${ARCH}"
 
+if ! command -v zig >/dev/null 2>&1; then
+    echo "ERROR: zig not found in PATH."
+    echo "Install Zig, then rerun ./scripts/package.sh"
+    exit 1
+fi
+
+if [ ! -f "${ROOT_DIR}/ghostty/build.zig" ]; then
+    echo "ERROR: Ghostty submodule is missing or uninitialized at ${ROOT_DIR}/ghostty"
+    echo "Run: git submodule update --init --recursive"
+    exit 1
+fi
+
 # Always build libghostty with ReleaseFast to guarantee optimized output.
 # A Debug build (Zig's default) causes ~7x slower terminal IO throughput.
 echo "Building libghostty (ReleaseFast)..."
