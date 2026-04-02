@@ -640,6 +640,45 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
     true
 }
 
+fn normalize_surface_hint(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("surface:")
+        .unwrap_or_else(|| raw.trim())
+}
+
+pub fn terminal_handle_for_surface(
+    pane_widget: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<(String, terminal::TerminalHandle)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    let requested = surface_hint
+        .map(normalize_surface_hint)
+        .filter(|value| !value.is_empty());
+    let active_tab = tab_state.active_tab.as_deref();
+    let mut fallback = None;
+
+    for entry in &tab_state.tabs {
+        let TabKind::Terminal { state } = &entry.kind else {
+            continue;
+        };
+
+        if requested == Some(entry.id.as_str()) {
+            return Some((entry.id.clone(), state.handle.clone()));
+        }
+
+        if active_tab == Some(entry.id.as_str()) {
+            return Some((entry.id.clone(), state.handle.clone()));
+        }
+
+        if fallback.is_none() {
+            fallback = Some((entry.id.clone(), state.handle.clone()));
+        }
+    }
+
+    fallback
+}
+
 // ---------------------------------------------------------------------------
 // Internal tab state
 // ---------------------------------------------------------------------------
