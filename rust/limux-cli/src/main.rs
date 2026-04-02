@@ -696,19 +696,6 @@ async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value
         .call("workspace.select", json!({ "workspace_id": original }))
         .await;
 
-    // Match CLI parity: queued command runs asynchronously and should not block this call.
-    if let Some(command) = command {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-lc").arg(command);
-        if let Some(cwd_value) = cwd.as_ref() {
-            cmd.current_dir(cwd_value);
-        }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _child = cmd.spawn().context("failed to spawn --command process")?;
-    }
-
     Ok(created)
 }
 

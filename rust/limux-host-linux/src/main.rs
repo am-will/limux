@@ -1,4 +1,5 @@
 mod app_config;
+mod control_bridge;
 mod keybind_editor;
 mod layout_state;
 mod pane;

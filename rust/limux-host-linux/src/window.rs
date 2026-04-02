@@ -10,6 +10,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config;
+use crate::control_bridge::{ControlCommand, WorkspaceTarget};
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, WorkspaceState,
@@ -91,6 +92,65 @@ impl AppState {
     }
 }
 
+fn workspace_ref(id: &str) -> String {
+    format!("workspace:{id}")
+}
+
+fn surface_ref(id: &str) -> String {
+    format!("surface:{id}")
+}
+
+fn normalize_workspace_handle(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("workspace:")
+        .unwrap_or_else(|| raw.trim())
+}
+
+fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Option<usize> {
+    match target {
+        WorkspaceTarget::Active => (!state.workspaces.is_empty()).then_some(state.active_idx),
+        WorkspaceTarget::Handle(handle) => {
+            let normalized = normalize_workspace_handle(handle);
+            state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == normalized)
+        }
+        WorkspaceTarget::Name(name) => state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.name == *name),
+        WorkspaceTarget::Index(index) => (*index < state.workspaces.len()).then_some(*index),
+    }
+}
+
+fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> serde_json::Value {
+    let cwd = workspace.cwd.borrow().clone().unwrap_or_default();
+    serde_json::json!({
+        "index": index,
+        "id": workspace.id.as_str(),
+        "ref": workspace_ref(&workspace.id),
+        "workspace_id": workspace.id.as_str(),
+        "workspace_ref": workspace_ref(&workspace.id),
+        "title": workspace.name.as_str(),
+        "name": workspace.name.as_str(),
+        "selected": index == selected_idx,
+        "focused": index == selected_idx,
+        "cwd": cwd,
+    })
+}
+
+fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value> {
+    let workspace = state.workspaces.get(index)?;
+    Some(serde_json::json!({
+        "workspace_id": workspace.id.as_str(),
+        "workspace_ref": workspace_ref(&workspace.id),
+        "workspace": workspace_row(index, state.active_idx, workspace),
+        "title": workspace.name.as_str(),
+        "name": workspace.name.as_str(),
+    }))
+}
+
 #[derive(Clone)]
 struct WorkspaceSeedSource {
     workspace_cwd: Option<String>,
@@ -105,6 +165,9 @@ struct TabDragWorkspaceSeed {
 }
 
 pub(crate) type State = Rc<RefCell<AppState>>;
+thread_local! {
+    static CONTROL_STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+}
 const SPLIT_RATIO_STATE_KEY: &str = "limux-split-ratio-state";
 const PORTAL_DESKTOP_SERVICE: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -868,6 +931,9 @@ pub fn build_window(app: &adw::Application) {
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
     }));
+    CONTROL_STATE.with(|slot| {
+        *slot.borrow_mut() = Some(state.clone());
+    });
 
     {
         let state = state.clone();
@@ -1013,11 +1079,17 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         window.connect_close_request(move |_| {
             save_session_now(&state);
+            CONTROL_STATE.with(|slot| {
+                slot.borrow_mut().take();
+            });
             glib::Propagation::Proceed
         });
     }
 
     apply_loaded_session(&state, layout_state::load_session());
+
+    crate::control_bridge::start(dispatch_control_command);
+
     window.present();
 }
 
@@ -2685,6 +2757,268 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     };
     add_workspace_from_state(state, &workspace);
     request_session_save(state);
+}
+
+fn dispatch_control_command(command: ControlCommand) {
+    CONTROL_STATE.with(|slot| {
+        let state = slot.borrow().clone();
+        if let Some(state) = state {
+            handle_control_command(&state, command);
+        } else {
+            command.respond(Err(crate::control_bridge::BridgeError::internal(
+                "control bridge not initialized",
+            )));
+        }
+    });
+}
+
+fn handle_control_command(state: &State, command: ControlCommand) {
+    match command {
+        ControlCommand::Identify { caller, reply } => {
+            let result = {
+                let app_state = state.borrow();
+                let focused = workspace_payload(&app_state, app_state.active_idx)
+                    .map(|payload| {
+                        serde_json::json!({
+                            "workspace_id": payload["workspace_id"],
+                            "workspace_ref": payload["workspace_ref"],
+                            "title": payload["title"],
+                            "name": payload["name"],
+                        })
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                serde_json::json!({
+                    "name": "limux-control",
+                    "protocol": "v1+v2",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "focused": focused,
+                    "caller": caller.unwrap_or_else(|| focused.clone()),
+                })
+            };
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::CurrentWorkspace { reply } => {
+            let result = {
+                let app_state = state.borrow();
+                workspace_payload(&app_state, app_state.active_idx)
+            };
+            let _ = reply.send(result.ok_or_else(|| {
+                crate::control_bridge::BridgeError::not_found("no active workspace")
+            }));
+        }
+        ControlCommand::ListWorkspaces { reply } => {
+            let workspaces = {
+                let app_state = state.borrow();
+                app_state
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, workspace)| workspace_row(index, app_state.active_idx, workspace))
+                    .collect::<Vec<_>>()
+            };
+            let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
+        }
+        ControlCommand::CreateWorkspace {
+            name,
+            cwd,
+            command,
+            reply,
+        } => {
+            let home = dirs::home_dir()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let folder_path = cwd.as_deref().unwrap_or(&home);
+            let title = name.unwrap_or_else(|| {
+                std::path::Path::new(folder_path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "workspace".to_string())
+            });
+
+            create_workspace_with_folder(state, &title, folder_path);
+
+            let result = {
+                let app_state = state.borrow();
+                workspace_payload(&app_state, app_state.active_idx)
+            };
+
+            if let (Some(command), Some(workspace_id)) = (
+                command,
+                result
+                    .as_ref()
+                    .and_then(|payload| payload["workspace_id"].as_str())
+                    .map(ToOwned::to_owned),
+            ) {
+                let state = state.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                    let target = {
+                        let app_state = state.borrow();
+                        app_state
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == workspace_id)
+                            .and_then(|workspace| {
+                                pane::terminal_handle_for_surface(&workspace.root, None)
+                            })
+                    };
+                    if let Some((_surface_id, handle)) = target {
+                        handle.send_text(&command);
+                        handle.send_text("\n");
+                    }
+                });
+            }
+
+            let _ = reply.send(result.ok_or_else(|| {
+                crate::control_bridge::BridgeError::internal(
+                    "workspace.create did not produce a workspace",
+                )
+            }));
+        }
+        ControlCommand::SelectWorkspace { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let row = {
+                let app_state = state.borrow();
+                app_state.workspaces[index].sidebar_row.clone()
+            };
+            let sidebar_list = state.borrow().sidebar_list.clone();
+            switch_workspace(state, index);
+            sidebar_list.select_row(Some(&row));
+
+            let result = {
+                let app_state = state.borrow();
+                workspace_payload(&app_state, index)
+            };
+            let _ = reply.send(result.ok_or_else(|| {
+                crate::control_bridge::BridgeError::not_found("workspace not found")
+            }));
+        }
+        ControlCommand::RenameWorkspace {
+            target,
+            title,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            {
+                let mut app_state = state.borrow_mut();
+                let workspace = &mut app_state.workspaces[index];
+                workspace.name = title.clone();
+                workspace.name_label.set_label(&title);
+            }
+            request_session_save(state);
+
+            let result = {
+                let app_state = state.borrow();
+                workspace_payload(&app_state, index)
+            };
+            let _ = reply.send(result.ok_or_else(|| {
+                crate::control_bridge::BridgeError::not_found("workspace not found")
+            }));
+        }
+        ControlCommand::CloseWorkspace { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                if app_state.workspaces.len() <= 1 {
+                    None
+                } else {
+                    workspace_index_for_target(&app_state, &target)
+                }
+            };
+
+            let Some(index) = resolved else {
+                let can_close = state.borrow().workspaces.len() > 1;
+                let error = if can_close {
+                    crate::control_bridge::BridgeError::not_found("workspace not found")
+                } else {
+                    crate::control_bridge::BridgeError::conflict("cannot close workspace")
+                };
+                let _ = reply.send(Err(error));
+                return;
+            };
+
+            let closed_workspace = {
+                let app_state = state.borrow();
+                workspace_payload(&app_state, index)
+            };
+            let workspace_id = state.borrow().workspaces[index].id.clone();
+            close_workspace_by_id(state, &workspace_id);
+
+            let _ = reply.send(closed_workspace.ok_or_else(|| {
+                crate::control_bridge::BridgeError::not_found("workspace not found")
+            }));
+        }
+        ControlCommand::SendText {
+            target,
+            surface_hint,
+            text,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let target = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::terminal_handle_for_surface(&workspace.root, surface_hint.as_deref()).map(
+                    |(surface_id, handle)| {
+                        (
+                            serde_json::json!({
+                                "workspace_id": workspace.id.as_str(),
+                                "workspace_ref": workspace_ref(&workspace.id),
+                                "surface_id": surface_id.as_str(),
+                                "surface_ref": surface_ref(&surface_id),
+                            }),
+                            handle,
+                        )
+                    },
+                )
+            };
+
+            let Some((mut payload, handle)) = target else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+
+            handle.send_text(&text);
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = reply.send(Ok(payload));
+        }
+    }
 }
 
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
