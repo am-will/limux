@@ -3757,14 +3757,48 @@ fn dispatch_terminal_command(state: &State, command: ShortcutCommand) -> bool {
         ShortcutCommand::TerminalCopy => target.perform_binding_action("copy_to_clipboard"),
         ShortcutCommand::TerminalPaste => target.perform_binding_action("paste_from_clipboard"),
         ShortcutCommand::TerminalIncreaseFontSize => {
-            target.perform_binding_action("increase_font_size:1")
+            persist_font_size_delta(1.0);
+            broadcast_font_size();
+            true
         }
         ShortcutCommand::TerminalDecreaseFontSize => {
-            target.perform_binding_action("decrease_font_size:1")
+            persist_font_size_delta(-1.0);
+            broadcast_font_size();
+            true
         }
-        ShortcutCommand::TerminalResetFontSize => target.perform_binding_action("reset_font_size"),
+        ShortcutCommand::TerminalResetFontSize => {
+            persist_font_size_reset();
+            crate::terminal::broadcast_binding_action("reset_font_size");
+            true
+        }
         _ => false,
     }
+}
+
+fn persist_font_size_delta(delta: f32) {
+    let current = app_config::load()
+        .config
+        .font_size
+        .unwrap_or_else(crate::terminal::default_font_size);
+    let new_size = (current + delta).clamp(1.0, 255.0);
+    if let Err(err) = app_config::save_font_size(new_size) {
+        eprintln!("limux: {err}");
+    }
+}
+
+fn persist_font_size_reset() {
+    if let Err(err) = app_config::clear_font_size() {
+        eprintln!("limux: {err}");
+    }
+}
+
+fn broadcast_font_size() {
+    let size = app_config::load()
+        .config
+        .font_size
+        .unwrap_or_else(crate::terminal::default_font_size);
+    let action = format!("set_font_size:{size}");
+    crate::terminal::broadcast_binding_action(&action);
 }
 
 fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {

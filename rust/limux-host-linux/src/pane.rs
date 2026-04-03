@@ -1030,7 +1030,10 @@ fn add_terminal_tab_inner(
 
     let term = terminal::create_terminal(
         working_directory,
-        terminal::TerminalOptions { hover_focus },
+        terminal::TerminalOptions {
+            hover_focus,
+            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
+        },
         term_callbacks,
     );
     let widget: gtk::Widget = term.overlay.clone().upcast();

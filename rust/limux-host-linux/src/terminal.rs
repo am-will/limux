@@ -810,6 +810,14 @@ pub struct TerminalCallbacks {
 
 pub struct TerminalOptions {
     pub hover_focus: Rc<dyn Fn() -> bool>,
+    pub saved_font_size: Option<f32>,
+}
+
+/// Default font-size from ghostty config (cached on first access).
+pub(crate) fn default_font_size() -> f32 {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<f32> = OnceLock::new();
+    *SIZE.get_or_init(crate::ghostty_config::read_font_size)
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -833,6 +841,7 @@ pub fn create_terminal(
     });
 
     let wd = working_directory.map(|s| s.to_string());
+    let saved_font_size = options.saved_font_size;
     let hover_focus = options.hover_focus;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
@@ -984,6 +993,18 @@ pub fn create_terminal(
                 ghostty_surface_set_color_scheme(surface, current_ghostty_color_scheme());
             }
             clipboard_context_cell.set(clipboard_context);
+
+            // Apply saved font size (if different from ghostty default)
+            if let Some(size) = saved_font_size {
+                let action = format!("set_font_size:{size}");
+                unsafe {
+                    ghostty_surface_binding_action(
+                        surface,
+                        action.as_ptr() as *const c_char,
+                        action.len(),
+                    );
+                }
+            }
 
             // Set initial size — GLArea gives unscaled CSS pixels,
             // Ghostty handles scaling internally via content_scale.
@@ -1419,6 +1440,22 @@ pub fn create_terminal(
 // ---------------------------------------------------------------------------
 // Context menu
 // ---------------------------------------------------------------------------
+
+/// Send a binding action to every live surface.
+pub(crate) fn broadcast_binding_action(action: &str) {
+    SURFACE_MAP.with(|map| {
+        for &key in map.borrow().keys() {
+            let surface = key as ghostty_surface_t;
+            unsafe {
+                ghostty_surface_binding_action(
+                    surface,
+                    action.as_ptr() as *const c_char,
+                    action.len(),
+                );
+            }
+        }
+    });
+}
 
 fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     if let Some(surface) = surface {
