@@ -385,7 +385,7 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
             let shared_ratio = ratio.clone();
             let applying_for_notify = applying.clone();
             paned.connect_position_notify(move |paned| {
-                if applying_for_notify.get() || !paned.is_mapped() {
+                if applying_for_notify.get() {
                     return;
                 }
                 let allocation = paned.allocation();

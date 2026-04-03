@@ -514,11 +514,6 @@ pub(crate) fn attach_split_position_persistence(state: &State, paned: &gtk::Pane
     update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
     let state = state.clone();
     paned.connect_position_notify(move |paned| {
-        // Skip when the paned is unmapped (workspace hidden) to prevent
-        // stale position events from corrupting the ratio during workspace switches.
-        if !paned.is_mapped() {
-            return;
-        }
         let allocation = paned.allocation();
         let size = if paned.orientation() == gtk::Orientation::Horizontal {
             allocation.width()
