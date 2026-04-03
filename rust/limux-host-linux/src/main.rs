@@ -68,18 +68,56 @@ fn resolve_ghostty_resources_dir(exe_path: &Path) -> Option<PathBuf> {
         .find(|path| is_ghostty_resources_dir(path))
 }
 
-fn set_ghostty_resources_env() {
-    if std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some() {
+fn ghostty_terminfo_dir(resources_dir: &Path) -> Option<PathBuf> {
+    resources_dir.parent().map(|parent| parent.join("terminfo"))
+}
+
+fn set_env_path_if_missing_or_invalid(
+    key: &str,
+    path: Option<PathBuf>,
+    validator: impl Fn(&Path) -> bool,
+) {
+    let has_valid_existing = std::env::var_os(key)
+        .map(PathBuf::from)
+        .is_some_and(|existing| validator(&existing));
+
+    if has_valid_existing {
         return;
     }
 
+    if let Some(path) = path.filter(|candidate| validator(candidate)) {
+        std::env::set_var(key, path);
+    }
+}
+
+fn set_ghostty_runtime_env_for_exe(exe_path: &Path) {
+    let Some(resources_dir) = resolve_ghostty_resources_dir(exe_path) else {
+        return;
+    };
+
+    set_env_path_if_missing_or_invalid(
+        "GHOSTTY_RESOURCES_DIR",
+        Some(resources_dir.clone()),
+        is_ghostty_resources_dir,
+    );
+    set_env_path_if_missing_or_invalid(
+        "TERMINFO",
+        ghostty_terminfo_dir(&resources_dir),
+        has_ghostty_terminfo,
+    );
+    set_env_path_if_missing_or_invalid(
+        "GHOSTTY_SHELL_INTEGRATION_XDG_DIR",
+        Some(resources_dir.join("shell-integration")),
+        |candidate| candidate.is_dir(),
+    );
+}
+
+fn set_ghostty_runtime_env() {
     let Some(exe_path) = std::env::current_exe().ok() else {
         return;
     };
 
-    if let Some(path) = resolve_ghostty_resources_dir(&exe_path) {
-        std::env::set_var("GHOSTTY_RESOURCES_DIR", path);
-    }
+    set_ghostty_runtime_env_for_exe(&exe_path);
 }
 
 fn main() {
@@ -98,7 +136,7 @@ fn main() {
     // Embedded Ghostty needs a resources directory to resolve named themes,
     // terminfo, and shell integration. Prefer Limux-bundled resources but
     // fall back to common system Ghostty install locations.
-    set_ghostty_resources_env();
+    set_ghostty_runtime_env();
 
     // WebKitGTK's bubblewrap sandbox requires unprivileged user namespaces,
     // which may not be available. Disable it to prevent crashes on launch.
@@ -184,6 +222,128 @@ mod tests {
         fs::create_dir_all(&shell_integration_dir).unwrap();
 
         assert!(!is_ghostty_resources_dir(&resources_dir));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derives_terminfo_dir_from_resources_dir() {
+        let resources_dir = PathBuf::from("/usr/share/limux/ghostty");
+        assert_eq!(
+            ghostty_terminfo_dir(&resources_dir),
+            Some(PathBuf::from("/usr/share/limux/terminfo"))
+        );
+    }
+
+    #[test]
+    fn replaces_invalid_inherited_runtime_env_with_resolved_paths() {
+        let root = temp_path("env-override");
+        let exe_dir = root.join("target/release");
+        let resources_dir = root.join("ghostty/zig-out/share/ghostty");
+        let themes_dir = resources_dir.join("themes");
+        let shell_integration_dir = resources_dir.join("shell-integration");
+        let terminfo_dir = root.join("ghostty/zig-out/share/terminfo");
+        let terminfo_file = terminfo_dir.join("x/xterm-ghostty");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::create_dir_all(&themes_dir).unwrap();
+        fs::create_dir_all(&shell_integration_dir).unwrap();
+        fs::create_dir_all(terminfo_file.parent().unwrap()).unwrap();
+        fs::write(&terminfo_file, b"xterm-ghostty").unwrap();
+
+        let old_resources = std::env::var_os("GHOSTTY_RESOURCES_DIR");
+        let old_terminfo = std::env::var_os("TERMINFO");
+        let old_shell_integration = std::env::var_os("GHOSTTY_SHELL_INTEGRATION_XDG_DIR");
+
+        std::env::set_var("GHOSTTY_RESOURCES_DIR", "/app/share/limux/ghostty");
+        std::env::set_var("TERMINFO", "/app/share/limux/terminfo");
+        std::env::set_var(
+            "GHOSTTY_SHELL_INTEGRATION_XDG_DIR",
+            "/app/share/limux/ghostty/shell-integration",
+        );
+
+        let exe = exe_dir.join("limux");
+        set_ghostty_runtime_env_for_exe(&exe);
+
+        assert_eq!(
+            std::env::var_os("GHOSTTY_RESOURCES_DIR"),
+            Some(resources_dir.into_os_string())
+        );
+        assert_eq!(
+            std::env::var_os("TERMINFO"),
+            Some(terminfo_dir.into_os_string())
+        );
+        assert_eq!(
+            std::env::var_os("GHOSTTY_SHELL_INTEGRATION_XDG_DIR"),
+            Some(shell_integration_dir.into_os_string())
+        );
+
+        match old_resources {
+            Some(value) => std::env::set_var("GHOSTTY_RESOURCES_DIR", value),
+            None => std::env::remove_var("GHOSTTY_RESOURCES_DIR"),
+        }
+        match old_terminfo {
+            Some(value) => std::env::set_var("TERMINFO", value),
+            None => std::env::remove_var("TERMINFO"),
+        }
+        match old_shell_integration {
+            Some(value) => std::env::set_var("GHOSTTY_SHELL_INTEGRATION_XDG_DIR", value),
+            None => std::env::remove_var("GHOSTTY_SHELL_INTEGRATION_XDG_DIR"),
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_valid_existing_runtime_env_paths() {
+        let root = temp_path("env-preserve");
+        let exe_dir = root.join("target/release");
+        let resources_dir = root.join("ghostty/zig-out/share/ghostty");
+        let themes_dir = resources_dir.join("themes");
+        let shell_integration_dir = resources_dir.join("shell-integration");
+        let terminfo_dir = root.join("ghostty/zig-out/share/terminfo");
+        let terminfo_file = terminfo_dir.join("x/xterm-ghostty");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::create_dir_all(&themes_dir).unwrap();
+        fs::create_dir_all(&shell_integration_dir).unwrap();
+        fs::create_dir_all(terminfo_file.parent().unwrap()).unwrap();
+        fs::write(&terminfo_file, b"xterm-ghostty").unwrap();
+
+        let old_resources = std::env::var_os("GHOSTTY_RESOURCES_DIR");
+        let old_terminfo = std::env::var_os("TERMINFO");
+        let old_shell_integration = std::env::var_os("GHOSTTY_SHELL_INTEGRATION_XDG_DIR");
+
+        std::env::set_var("GHOSTTY_RESOURCES_DIR", &resources_dir);
+        std::env::set_var("TERMINFO", &terminfo_dir);
+        std::env::set_var("GHOSTTY_SHELL_INTEGRATION_XDG_DIR", &shell_integration_dir);
+
+        let exe = exe_dir.join("limux");
+        set_ghostty_runtime_env_for_exe(&exe);
+
+        assert_eq!(
+            std::env::var_os("GHOSTTY_RESOURCES_DIR"),
+            Some(resources_dir.into_os_string())
+        );
+        assert_eq!(
+            std::env::var_os("TERMINFO"),
+            Some(terminfo_dir.into_os_string())
+        );
+        assert_eq!(
+            std::env::var_os("GHOSTTY_SHELL_INTEGRATION_XDG_DIR"),
+            Some(shell_integration_dir.into_os_string())
+        );
+
+        match old_resources {
+            Some(value) => std::env::set_var("GHOSTTY_RESOURCES_DIR", value),
+            None => std::env::remove_var("GHOSTTY_RESOURCES_DIR"),
+        }
+        match old_terminfo {
+            Some(value) => std::env::set_var("TERMINFO", value),
+            None => std::env::remove_var("TERMINFO"),
+        }
+        match old_shell_integration {
+            Some(value) => std::env::set_var("GHOSTTY_SHELL_INTEGRATION_XDG_DIR", value),
+            None => std::env::remove_var("GHOSTTY_SHELL_INTEGRATION_XDG_DIR"),
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
