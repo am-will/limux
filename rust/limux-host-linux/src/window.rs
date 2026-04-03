@@ -3758,13 +3758,29 @@ fn dispatch_terminal_command(state: &State, command: ShortcutCommand) -> bool {
         ShortcutCommand::TerminalCopy => target.perform_binding_action("copy_to_clipboard"),
         ShortcutCommand::TerminalPaste => target.perform_binding_action("paste_from_clipboard"),
         ShortcutCommand::TerminalIncreaseFontSize => {
-            target.perform_binding_action("increase_font_size:1")
+            let ok = target.perform_binding_action("increase_font_size:1");
+            persist_font_size(&target);
+            ok
         }
         ShortcutCommand::TerminalDecreaseFontSize => {
-            target.perform_binding_action("decrease_font_size:1")
+            let ok = target.perform_binding_action("decrease_font_size:1");
+            persist_font_size(&target);
+            ok
         }
-        ShortcutCommand::TerminalResetFontSize => target.perform_binding_action("reset_font_size"),
+        ShortcutCommand::TerminalResetFontSize => {
+            let ok = target.perform_binding_action("reset_font_size");
+            persist_font_size(&target);
+            ok
+        }
         _ => false,
+    }
+}
+
+fn persist_font_size(terminal: &pane::TerminalShortcutTarget) {
+    if let Some(size) = terminal.font_size() {
+        if let Err(err) = app_config::save_font_size(size) {
+            eprintln!("limux: {err}");
+        }
     }
 }
 
