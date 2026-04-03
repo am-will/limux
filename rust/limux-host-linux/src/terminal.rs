@@ -165,6 +165,11 @@ impl TerminalHandle {
         surface.is_some()
     }
 
+    pub fn font_size(&self) -> Option<f32> {
+        let surface = (*self.surface_cell.borrow())?;
+        Some(unsafe { ghostty_surface_font_size(surface) })
+    }
+
     /// Inject text into the terminal surface for control-socket requests and
     /// drag/drop payloads. Ghostty treats this as pasted text, which matches
     /// the current control protocol semantics.
@@ -810,6 +815,7 @@ pub struct TerminalCallbacks {
 
 pub struct TerminalOptions {
     pub hover_focus: Rc<dyn Fn() -> bool>,
+    pub saved_font_size: Option<f32>,
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -833,6 +839,7 @@ pub fn create_terminal(
     });
 
     let wd = working_directory.map(|s| s.to_string());
+    let saved_font_size = options.saved_font_size;
     let hover_focus = options.hover_focus;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
@@ -965,6 +972,10 @@ pub fn create_terminal(
             let scale = gl_area.scale_factor() as f64;
             config.scale_factor = scale;
             config.context = GHOSTTY_SURFACE_CONTEXT_WINDOW;
+
+            if let Some(size) = saved_font_size {
+                config.font_size = size;
+            }
 
             let c_wd = wd.as_ref().and_then(|s| CString::new(s.as_str()).ok());
             if let Some(ref cwd) = c_wd {

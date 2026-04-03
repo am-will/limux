@@ -36,12 +36,14 @@ impl ColorScheme {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub focus: FocusConfig,
     #[serde(skip)]
     pub appearance: AppearanceConfig,
+    #[serde(skip)]
+    pub font_size: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -56,7 +58,7 @@ pub struct FocusConfig {
     pub hover_terminal_focus: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LoadedAppConfig {
     pub config: AppConfig,
     pub warnings: Vec<String>,
@@ -147,6 +149,12 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(ColorScheme::from_str)
         .unwrap_or(color_scheme);
 
+    let font_size = root
+        .get("font_size")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32)
+        .filter(|&v| v >= 1.0 && v <= 255.0);
+
     AppConfig {
         focus: FocusConfig {
             hover_terminal_focus,
@@ -155,6 +163,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             color_scheme,
             ghostty_color_scheme,
         },
+        font_size,
     }
 }
 
@@ -182,9 +191,31 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         json!({ "hover_terminal_focus": config.focus.hover_terminal_focus }),
     );
 
+    if let Some(size) = config.font_size {
+        root.insert("font_size".to_string(), json!(size));
+    } else {
+        root.remove("font_size");
+    }
+
     let serialized =
         serde_json::to_string_pretty(&Value::Object(root)).expect("config should serialize");
     write_config_root_atomically(path, &serialized)
+}
+
+pub fn save_font_size(font_size: f32) -> Result<(), String> {
+    let Some(path) = settings_path() else {
+        return Err("config_dir unavailable; cannot save font size".to_string());
+    };
+
+    let mut root = read_existing_config_root_for_save(&path)
+        .map_err(|err| format!("failed to save font size to `{}`: {err}", path.display()))?;
+
+    root.insert("font_size".to_string(), json!(font_size));
+
+    let serialized =
+        serde_json::to_string_pretty(&Value::Object(root)).expect("config should serialize");
+    write_config_root_atomically(&path, &serialized)
+        .map_err(|err| format!("failed to save font size to `{}`: {err}", path.display()))
 }
 
 fn read_existing_config_root_for_save(
