@@ -3589,7 +3589,6 @@ fn split_pane(
         options.new_pane_first,
         layout_state::DEFAULT_SPLIT_RATIO,
     );
-
     if options.persist {
         request_session_save(state);
     }

@@ -204,6 +204,7 @@ impl SplitTreeContainer {
         ratio: f64,
     ) {
         self.save_focus();
+        *self.last_focused.borrow_mut() = Some(new_pane.clone());
 
         let shared_ratio = Rc::new(RefCell::new(layout_state::clamp_split_ratio(ratio)));
         let new_node = if new_pane_first {
@@ -299,9 +300,13 @@ impl SplitTreeContainer {
         let widget = build_widget_tree(&tree, &self.state);
         self.bin.append(&widget);
 
-        // Restore focus to the previously focused widget
+        // Newly created panes are tracked as pane containers rather than the
+        // inner terminal/browser widget, so restore through the pane helper
+        // when possible and fall back to plain widget focus otherwise.
         if let Some(focused) = self.last_focused.borrow().as_ref() {
-            focused.grab_focus();
+            if !pane::focus_active_tab_in_pane(focused) {
+                focused.grab_focus();
+            }
         }
     }
 
