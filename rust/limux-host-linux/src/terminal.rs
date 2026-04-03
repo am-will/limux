@@ -1441,6 +1441,22 @@ pub fn create_terminal(
 // Context menu
 // ---------------------------------------------------------------------------
 
+/// Send a binding action to every live surface.
+pub(crate) fn broadcast_binding_action(action: &str) {
+    SURFACE_MAP.with(|map| {
+        for &key in map.borrow().keys() {
+            let surface = key as ghostty_surface_t;
+            unsafe {
+                ghostty_surface_binding_action(
+                    surface,
+                    action.as_ptr() as *const c_char,
+                    action.len(),
+                );
+            }
+        }
+    });
+}
+
 fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     if let Some(surface) = surface {
         unsafe {
