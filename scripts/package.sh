@@ -102,8 +102,10 @@ fi
 
 # Always build libghostty with ReleaseFast to guarantee optimized output.
 # A Debug build (Zig's default) causes ~7x slower terminal IO throughput.
-echo "Building libghostty (ReleaseFast)..."
-(cd "${ROOT_DIR}/ghostty" && zig build -Dapp-runtime=none -Doptimize=ReleaseFast)
+# Use a baseline CPU target so release artifacts don't pick up ISA extensions
+# from the build machine (e.g. AVX-512) and crash with SIGILL on other hosts.
+echo "Building libghostty (ReleaseFast, cpu=baseline)..."
+(cd "${ROOT_DIR}/ghostty" && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline)
 
 if [ ! -f "$GHOSTTY_SO" ]; then
     echo "ERROR: libghostty.so not found at ${GHOSTTY_SO} after build"
