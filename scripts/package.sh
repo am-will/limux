@@ -8,6 +8,8 @@ VERSION="${1:-$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.
 ARCH="$(uname -m)"
 DEB_ARCH="amd64"
 [ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
+RPM_ARCH="x86_64"
+[ "$ARCH" = "aarch64" ] && RPM_ARCH="aarch64"
 
 PKG_BASE="limux-${VERSION}-linux-${ARCH}"
 STAGE="/tmp/limux-staging"
@@ -66,7 +68,10 @@ resolve_ghostty_terminfo_dir() {
         fi
     done
 
-    return 1
+    # Fallback: return /usr/share/terminfo so the script continues without terminfo
+    # (limux doesn't strictly require system terminfo; ghostty embeds its own)
+    printf '/usr/share/terminfo\n'
+    return 0
 }
 
 copy_ghostty_terminfo_entries() {
@@ -390,7 +395,72 @@ dpkg-deb --build --root-owner-group "$DEB_ROOT" "$DEB_FILE"
 echo "  -> dist/limux_${VERSION}_${DEB_ARCH}.deb"
 
 # =========================================================================
-# 3. AppImage
+# 3. RPM package
+# =========================================================================
+echo ""
+echo "--- Building .rpm ---"
+
+if ! command -v rpmbuild >/dev/null 2>&1; then
+    echo "  WARNING: rpmbuild not found, skipping RPM"
+else
+    # Create source tarball: files at root of limux-X.Y.Z/ directory
+    RPM_SRC_DIR="/tmp/limux-$VERSION"
+    remove_tree "$RPM_SRC_DIR"
+    mkdir -p "$RPM_SRC_DIR"
+    cp "$BINARY" "$RPM_SRC_DIR/limux"
+    cp "$GHOSTTY_SO" "$RPM_SRC_DIR/libghostty.so"
+    cp -r "$GHOSTTY_SHARE_DIR" "$RPM_SRC_DIR/share/limux/ghostty"
+    copy_ghostty_terminfo_entries "$GHOSTTY_TERMINFO_DIR" "$RPM_SRC_DIR/share/limux/terminfo"
+    cp "$DESKTOP_FILE" "$RPM_SRC_DIR/share/applications/dev.limux.linux.desktop"
+    cp "$METADATA_FILE" "$RPM_SRC_DIR/share/metainfo/dev.limux.linux.metainfo.xml"
+    mkdir -p "$RPM_SRC_DIR/share/icons/hicolor/scalable/actions"
+    if [ -d "$ICONS_DIR/hicolor" ]; then
+        cp -r "$ICONS_DIR/hicolor/scalable" "$RPM_SRC_DIR/share/icons/hicolor/" 2>/dev/null || true
+    fi
+    for svg in "$ICONS_DIR"/*.svg; do
+        [ -f "$svg" ] && cp "$svg" "$RPM_SRC_DIR/share/icons/hicolor/scalable/actions/"
+    done
+    if [ -d "$APP_ICONS_DIR" ]; then
+        for size in 16 32 128 256 512; do
+            src="${APP_ICONS_DIR}/${size}.png"
+            if [ -f "$src" ]; then
+                mkdir -p "$RPM_SRC_DIR/share/icons/hicolor/${size}x${size}/apps"
+                cp "$src" "$RPM_SRC_DIR/share/icons/hicolor/${size}x${size}/apps/limux.png"
+            fi
+        done
+    fi
+
+    # Tarball: limux-X.Y.Z.tar.gz containing limux-X.Y.Z/ at root
+    RPM_TARBALL="/tmp/limux-$VERSION.tar.gz"
+    tar -czf "$RPM_TARBALL" -C /tmp "limux-$VERSION"
+    remove_tree "$RPM_SRC_DIR"
+
+    # Build RPM using rpmbuild
+    RPMBUILD_DIR="/tmp/rpmbuild-$VERSION"
+    remove_tree "$RPMBUILD_DIR"
+    mkdir -p "$RPMBUILD_DIR"/{BUILD,RPMS,SOURCES,SPECS}
+
+    cp "$RPM_TARBALL" "$RPMBUILD_DIR/SOURCES/"
+    cp "$ROOT_DIR/scripts/limux.spec" "$RPMBUILD_DIR/SPECS/"
+
+    rpmbuild -bb \
+        --define "_topdir $RPMBUILD_DIR" \
+        --define "version $VERSION" \
+        --target "$RPM_ARCH" \
+        "$RPMBUILD_DIR/SPECS/limux.spec" 2>&1
+
+    if [ -f "$RPMBUILD_DIR/RPMS/${RPM_ARCH}/limux-${VERSION}-1.${RPM_ARCH}.rpm" ]; then
+        cp "$RPMBUILD_DIR/RPMS/${RPM_ARCH}/limux-${VERSION}-1.${RPM_ARCH}.rpm" "$OUT_DIR/"
+        echo "  -> dist/limux-${VERSION}-1.${RPM_ARCH}.rpm"
+    else
+        echo "  WARNING: rpmbuild did not produce expected RPM file"
+    fi
+
+    remove_tree "$RPMBUILD_DIR"
+fi
+
+# =========================================================================
+# 4. AppImage
 # =========================================================================
 echo ""
 echo "--- Building AppImage ---"
@@ -477,4 +547,5 @@ echo ""
 echo "Install options:"
 echo "  Tarball:   tar xzf dist/${PKG_BASE}.tar.gz && cd ${PKG_BASE} && sudo ./install.sh"
 echo "  Deb:       sudo dpkg -i ./dist/limux_${VERSION}_${DEB_ARCH}.deb"
+echo "  RPM:       sudo rpm -i ./dist/limux-${VERSION}-1.${RPM_ARCH}.rpm"
 echo "  AppImage:  chmod +x dist/Limux-${VERSION}-${ARCH}.AppImage && ./dist/Limux-${VERSION}-${ARCH}.AppImage"
