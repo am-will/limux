@@ -42,7 +42,7 @@ jobs:
       - name: Build libghostty for embedding
         run: |
           cd ghostty
-          zig build -Dapp-runtime=none -Doptimize=ReleaseFast
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=x86_64_v3
 
       - name: Run repository quality checks
         run: ./scripts/check.sh
