@@ -1,0 +1,153 @@
+name: Build RPM Package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without v prefix)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  rpm:
+    runs-on: opensuse-tumbleweed
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Zig
+        run: |
+          ZIG_VERSION=0.15.2
+          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies
+        run: |
+          sudo zypper install -y --no-confirm \
+           Patterns-devel-base-devel_basis \
+            gtk4-devel \
+            libadwaita-devel \
+            webkit2gtk4-devel \
+            libepoxy-devel \
+            glib2-devel \
+            gobject-introspection-devel \
+            cairo-gobject-devel \
+            pango-devel \
+            gdk-pixbuf2-devel \
+            libsoup-devel \
+            pkg-config \
+            rpm-build \
+            ruby
+
+      - name: Build libghostty for embedding
+        run: |
+          cd ghostty
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast
+
+      - name: Build release binary
+        run: |
+          cargo build --release --manifest-path Cargo.toml
+
+      - name: Create RPM
+        id: rpm
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH="$(uname -m)"
+          RPM_ARCH="x86_64"
+          [ "$ARCH" = "aarch64" ] && RPM_ARCH="aarch64"
+
+          # Create source tarball: limux-X.Y.Z/ at root
+          SRC_DIR="/tmp/limux-$VERSION"
+          rm -rf "$SRC_DIR"
+          mkdir -p "$SRC_DIR"
+          cp target/release/limux "$SRC_DIR/limux"
+          cp ghostty/zig-out/lib/libghostty.so "$SRC_DIR/libghostty.so"
+          mkdir -p "$SRC_DIR/share/limux"
+          cp -r ghostty/zig-out/share/ghostty "$SRC_DIR/share/limux/"
+          mkdir -p "$SRC_DIR/share/limux/terminfo/g" "$SRC_DIR/share/limux/terminfo/x"
+          TERMINFO_SRC="/usr/share/terminfo"
+          if [ -f "${TERMINFO_SRC}/g/ghostty" ]; then
+            cp "${TERMINFO_SRC}/g/ghostty" "$SRC_DIR/share/limux/terminfo/g/"
+          fi
+          if [ -f "${TERMINFO_SRC}/x/xterm-ghostty" ]; then
+            cp "${TERMINFO_SRC}/x/xterm-ghostty" "$SRC_DIR/share/limux/terminfo/x/"
+          fi
+          mkdir -p "$SRC_DIR/share/applications" "$SRC_DIR/share/metainfo"
+          cp rust/limux-host-linux/dev.limux.linux.desktop "$SRC_DIR/share/applications/"
+          cp rust/limux-host-linux/dev.limux.linux.metainfo.xml "$SRC_DIR/share/metainfo/"
+          mkdir -p "$SRC_DIR/share/icons/hicolor/scalable/actions"
+          ICONS_DIR="rust/limux-host-linux/icons"
+          if [ -d "$ICONS_DIR/hicolor" ]; then
+            cp -r "$ICONS_DIR/hicolor/scalable" "$SRC_DIR/share/icons/hicolor/" 2>/dev/null || true
+          fi
+          for svg in "$ICONS_DIR"/*.svg; do
+            [ -f "$svg" ] && cp "$svg" "$SRC_DIR/share/icons/hicolor/scalable/actions/"
+          done
+          APP_ICONS_DIR="$ICONS_DIR/app"
+          if [ -d "$APP_ICONS_DIR" ]; then
+            for size in 16 32 128 256 512; do
+              src="${APP_ICONS_DIR}/${size}.png"
+              if [ -f "$src" ]; then
+                mkdir -p "$SRC_DIR/share/icons/hicolor/${size}x${size}/apps"
+                cp "$src" "$SRC_DIR/share/icons/hicolor/${size}x${size}/apps/limux.png"
+              fi
+            done
+          fi
+
+          # Create tarball
+          tar -czf "/tmp/limux-$VERSION.tar.gz" -C /tmp "limux-$VERSION"
+
+          # Build RPM
+          RPMBUILD_DIR="/tmp/rpmbuild-$VERSION"
+          rm -rf "$RPMBUILD_DIR"
+          mkdir -p "$RPMBUILD_DIR"/{BUILD,RPMS,SOURCES,SPECS}
+          cp "/tmp/limux-$VERSION.tar.gz" "$RPMBUILD_DIR/SOURCES/"
+          sed "s|%{version}|$VERSION|g" scripts/limux.spec > "$RPMBUILD_DIR/SPECS/limux.spec"
+
+          rpmbuild -bb \
+            --define "_topdir $RPMBUILD_DIR" \
+            --define "version $VERSION" \
+            --target "$RPM_ARCH" \
+            "$RPMBUILD_DIR/SPECS/limux.spec" 2>&1
+
+          RPM_OUTPUT="$RPMBUILD_DIR/RPMS/$RPM_ARCH/limux-${VERSION}-1.${RPM_ARCH}.rpm"
+          if [ -f "$RPM_OUTPUT" ]; then
+            echo "rpm_path=$RPM_OUTPUT" >> "$GITHUB_OUTPUT"
+            echo "rpm_arch=$RPM_ARCH" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: rpmbuild failed to create RPM"
+            exit 1
+          fi
+
+      - name: Upload RPM to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.rpm.outputs.rpm_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload RPM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: limux-rpm-${{ steps.version.outputs.version }}
+          path: ${{ steps.rpm.outputs.rpm_path }}
+          retention-days: 30
