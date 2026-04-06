@@ -5,7 +5,7 @@ use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::Dispatcher;
+use crate::{auth, Dispatcher};
 
 pub async fn run_server<P: AsRef<Path>>(socket_path: P, dispatcher: Dispatcher) -> io::Result<()> {
     let socket_path = socket_path.as_ref();
@@ -21,8 +21,26 @@ pub async fn run_server<P: AsRef<Path>>(socket_path: P, dispatcher: Dispatcher) 
 }
 
 pub async fn serve(listener: UnixListener, dispatcher: Dispatcher) -> io::Result<()> {
+    let control_mode = auth::SocketControlMode::from_env();
+    let server_pid = std::process::id();
+
     loop {
         let (stream, _) = listener.accept().await?;
+        let peer = match auth::authenticate_peer(&stream) {
+            Ok(peer) => peer,
+            Err(error) => {
+                eprintln!("limux-control: failed to authenticate client: {error}");
+                continue;
+            }
+        };
+        if !auth::is_authorized(&peer, control_mode, server_pid) {
+            eprintln!(
+                "limux-control: rejected client pid={} uid={} mode={:?}",
+                peer.pid, peer.uid, control_mode
+            );
+            continue;
+        }
+
         let dispatcher = dispatcher.clone();
 
         tokio::spawn(async move {
