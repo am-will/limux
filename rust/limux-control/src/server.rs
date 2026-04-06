@@ -1,12 +1,15 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
 use crate::auth::SocketControlMode;
-use crate::socket_path::{finalize_socket_permissions, prepare_socket_path, SocketMode};
+use crate::request_io::{read_request_frame_async, MAX_CONNECTIONS};
+use crate::socket_path::{bind_tokio_listener, SocketMode};
 use crate::{auth, Dispatcher};
 
 pub async fn run_server<P: AsRef<Path>>(
@@ -16,14 +19,11 @@ pub async fn run_server<P: AsRef<Path>>(
 ) -> io::Result<()> {
     let socket_path = socket_path.as_ref();
     let control_mode = SocketControlMode::from_env();
-    prepare_socket_path(
+    let listener = bind_tokio_listener(
         socket_path,
         socket_mode,
         control_mode.requires_owner_only_socket(),
     )?;
-
-    let listener = UnixListener::bind(socket_path)?;
-    finalize_socket_permissions(socket_path, control_mode.requires_owner_only_socket())?;
     serve_with_mode(listener, dispatcher, control_mode).await
 }
 
@@ -37,8 +37,17 @@ async fn serve_with_mode(
     dispatcher: Dispatcher,
     control_mode: SocketControlMode,
 ) -> io::Result<()> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
     loop {
         let (stream, _) = listener.accept().await?;
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                eprintln!("limux-control: rejecting client, too many active connections");
+                continue;
+            }
+        };
         let peer = match auth::authorize_peer(&stream, control_mode) {
             Ok(peer) => peer,
             Err(error) => {
@@ -49,6 +58,7 @@ async fn serve_with_mode(
         let dispatcher = dispatcher.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = handle_connection(stream, dispatcher).await {
                 eprintln!(
                     "limux-control: connection error for pid={} uid={}: {error}",
@@ -62,17 +72,16 @@ async fn serve_with_mode(
 pub async fn handle_connection(stream: UnixStream, dispatcher: Dispatcher) -> io::Result<()> {
     let (reader_half, mut writer_half) = stream.into_split();
     let mut reader = BufReader::new(reader_half);
-    let mut line = String::new();
+    let mut line_buf = Vec::with_capacity(4096);
 
     loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-
-        if bytes_read == 0 {
+        if !read_request_frame_async(&mut reader, &mut line_buf).await? {
             return Ok(());
         }
 
-        let incoming = line.trim_end_matches(['\n', '\r']);
+        let incoming = std::str::from_utf8(&line_buf)
+            .map(|line| line.trim_end_matches(['\n', '\r']))
+            .unwrap_or("");
         if incoming.is_empty() {
             continue;
         }

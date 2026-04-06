@@ -1,7 +1,9 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -51,9 +53,7 @@ pub fn prepare_socket_path(path: &Path, mode: SocketMode, owner_only: bool) -> i
             fs::set_permissions(parent, PermissionsExt::from_mode(PRIVATE_DIR_MODE))?;
         }
     }
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
+    remove_existing_socket(path)?;
     Ok(())
 }
 
@@ -62,6 +62,28 @@ pub fn finalize_socket_permissions(path: &Path, owner_only: bool) -> io::Result<
         fs::set_permissions(path, PermissionsExt::from_mode(SOCKET_FILE_MODE))?;
     }
     Ok(())
+}
+
+pub fn bind_listener(
+    path: &Path,
+    mode: SocketMode,
+    owner_only: bool,
+) -> io::Result<StdUnixListener> {
+    prepare_socket_path(path, mode, owner_only)?;
+    let listener = StdUnixListener::bind(path)?;
+    finalize_socket_permissions(path, owner_only)?;
+    Ok(listener)
+}
+
+pub fn bind_tokio_listener(
+    path: &Path,
+    mode: SocketMode,
+    owner_only: bool,
+) -> io::Result<tokio::net::UnixListener> {
+    prepare_socket_path(path, mode, owner_only)?;
+    let listener = tokio::net::UnixListener::bind(path)?;
+    finalize_socket_permissions(path, owner_only)?;
+    Ok(listener)
 }
 
 fn default_runtime_socket_path() -> PathBuf {
@@ -89,6 +111,43 @@ fn default_runtime_socket_dir() -> Option<PathBuf> {
 
 fn should_lock_down_parent(path: &Path, mode: SocketMode) -> bool {
     matches!(mode, SocketMode::Runtime) && path.parent() == default_runtime_socket_dir().as_deref()
+}
+
+fn remove_existing_socket(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("refusing to overwrite non-socket path {}", path.display()),
+        ));
+    }
+
+    match StdUnixStream::connect(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("socket already in use at {}", path.display()),
+        )),
+        Err(error) if is_stale_socket_error(&error) => {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("refusing to replace socket at {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn is_stale_socket_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
 }
 
 fn get_env_path(key: &str) -> Option<PathBuf> {
@@ -263,5 +322,39 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn prepare_socket_path_refuses_to_overwrite_non_socket_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let socket_path = temp_dir.path().join("limux.sock");
+        std::fs::write(&socket_path, b"not a socket").expect("write placeholder");
+
+        let error = prepare_socket_path(&socket_path, SocketMode::Runtime, true)
+            .expect_err("non-socket path should fail");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn prepare_socket_path_rejects_live_socket() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let socket_path = temp_dir.path().join("limux.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind listener");
+
+        let error = prepare_socket_path(&socket_path, SocketMode::Runtime, true)
+            .expect_err("live socket should fail");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn prepare_socket_path_removes_stale_socket() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let socket_path = temp_dir.path().join("limux.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind listener");
+        drop(listener);
+
+        prepare_socket_path(&socket_path, SocketMode::Runtime, true)
+            .expect("stale socket should be removed");
+        assert!(!socket_path.exists());
     }
 }

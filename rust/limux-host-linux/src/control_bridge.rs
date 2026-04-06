@@ -1,16 +1,17 @@
 //! Bridge the limux control socket onto the GTK host state.
 
-use std::io::{self, BufRead, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{self, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gtk::glib;
 use gtk4 as gtk;
 use limux_control::auth::{self, SocketControlMode};
-use limux_control::socket_path::{
-    finalize_socket_permissions, prepare_socket_path, resolve_socket_path, SocketMode,
-};
+use limux_control::request_io::{self, read_request_frame};
+use limux_control::socket_path::{bind_listener, resolve_socket_path, SocketMode};
 use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use serde_json::{json, Map, Value};
 
@@ -356,13 +357,21 @@ fn handle_client(
     stream: UnixStream,
     dispatch: &(dyn Fn(ControlCommand) + Send + Sync + 'static),
 ) -> io::Result<()> {
+    stream.set_read_timeout(Some(request_io::CLIENT_IDLE_TIMEOUT))?;
     let reader_stream = stream.try_clone()?;
-    let reader = io::BufReader::new(reader_stream);
+    reader_stream.set_read_timeout(Some(request_io::CLIENT_IDLE_TIMEOUT))?;
+    let mut reader = io::BufReader::new(reader_stream);
     let mut writer = stream;
+    let mut line_buf = Vec::with_capacity(4096);
 
-    for line in reader.lines() {
-        let line = line?;
-        let input = line.trim();
+    loop {
+        if !read_request_frame(&mut reader, &mut line_buf)? {
+            return Ok(());
+        }
+
+        let input = std::str::from_utf8(&line_buf)
+            .map(|line| line.trim_end_matches(['\n', '\r']))
+            .unwrap_or("");
         if input.is_empty() {
             continue;
         }
@@ -374,8 +383,27 @@ fn handle_client(
         writer.write_all(payload.as_bytes())?;
         writer.flush()?;
     }
+}
 
-    Ok(())
+struct ConnectionSlot {
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl ConnectionSlot {
+    fn try_acquire(active_connections: Arc<AtomicUsize>) -> Option<Self> {
+        active_connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < request_io::MAX_CONNECTIONS).then_some(current + 1)
+            })
+            .ok()?;
+        Some(Self { active_connections })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Start the control socket server in a background thread and dispatch each
@@ -391,19 +419,11 @@ pub fn start(dispatch: fn(ControlCommand)) {
         .spawn(move || {
             let path = resolve_socket_path(None, SocketMode::Runtime);
             let control_mode = SocketControlMode::from_env();
-            if let Err(error) = prepare_socket_path(
+            let listener = match bind_listener(
                 &path,
                 SocketMode::Runtime,
                 control_mode.requires_owner_only_socket(),
             ) {
-                eprintln!(
-                    "limux: control socket setup failed ({}): {error}",
-                    path.display()
-                );
-                return;
-            }
-
-            let listener = match UnixListener::bind(&path) {
                 Ok(listener) => listener,
                 Err(error) => {
                     eprintln!(
@@ -413,21 +433,17 @@ pub fn start(dispatch: fn(ControlCommand)) {
                     return;
                 }
             };
-            if let Err(error) =
-                finalize_socket_permissions(&path, control_mode.requires_owner_only_socket())
-            {
-                eprintln!(
-                    "limux: control socket permission setup failed ({}): {error}",
-                    path.display()
-                );
-                return;
-            }
 
             eprintln!("limux: control socket at {}", path.display());
+            let active_connections = Arc::new(AtomicUsize::new(0));
 
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
+                        let Some(slot) = ConnectionSlot::try_acquire(active_connections.clone()) else {
+                            eprintln!("limux: rejecting control client, too many active connections");
+                            continue;
+                        };
                         let peer = match auth::authorize_peer(&stream, control_mode) {
                             Ok(peer) => peer,
                             Err(error) => {
@@ -439,6 +455,7 @@ pub fn start(dispatch: fn(ControlCommand)) {
                         std::thread::Builder::new()
                             .name("limux-ctrl-conn".into())
                             .spawn(move || {
+                                let _slot = slot;
                                 if let Err(error) = handle_client(stream, dispatch.as_ref()) {
                                     eprintln!(
                                         "limux: control connection error for pid={} uid={}: {error}",
