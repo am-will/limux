@@ -1,4 +1,5 @@
 use std::env;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 const LIMUX_SOCKET_ENV: &str = "LIMUX_SOCKET";
@@ -42,12 +43,30 @@ fn default_runtime_socket_path() -> PathBuf {
     match env::var_os("XDG_RUNTIME_DIR") {
         Some(runtime_dir) if !runtime_dir.is_empty() => {
             let mut path = PathBuf::from(runtime_dir);
-            path.push(RUNTIME_SUBDIR);
-            path.push(RUNTIME_SOCKET_NAME);
-            path
+            if runtime_dir_is_secure(&path) {
+                path.push(RUNTIME_SUBDIR);
+                path.push(RUNTIME_SOCKET_NAME);
+                path
+            } else {
+                PathBuf::from(FALLBACK_RUNTIME_SOCKET)
+            }
         }
         _ => PathBuf::from(FALLBACK_RUNTIME_SOCKET),
     }
+}
+
+fn runtime_dir_is_secure(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+
+    metadata.is_dir()
+        && metadata.uid() == unsafe { libc::getuid() }
+        && (metadata.mode() & 0o777) == 0o700
 }
 
 fn get_env_path(key: &str) -> Option<PathBuf> {
@@ -139,6 +158,11 @@ mod tests {
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
         let xdg = TempDir::new().expect("xdg runtime dir temp path");
+        std::fs::set_permissions(
+            xdg.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("set runtime dir perms");
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(xdg.path().to_str().expect("utf8")));
 
         let resolved = resolve_socket_path(None, SocketMode::Runtime);
@@ -157,5 +181,22 @@ mod tests {
 
         let resolved = resolve_socket_path(None, SocketMode::Debug);
         assert_eq!(resolved, PathBuf::from(DEBUG_SOCKET));
+    }
+
+    #[test]
+    fn insecure_runtime_dir_falls_back_to_tmp_socket() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
+        let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+        let xdg = TempDir::new().expect("xdg runtime dir temp path");
+        std::fs::set_permissions(
+            xdg.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("set runtime dir perms");
+        let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(xdg.path().to_str().expect("utf8")));
+
+        let resolved = resolve_socket_path(None, SocketMode::Runtime);
+        assert_eq!(resolved, PathBuf::from(FALLBACK_RUNTIME_SOCKET));
     }
 }
