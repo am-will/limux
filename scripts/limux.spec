@@ -5,7 +5,7 @@ Summary:    GPU-accelerated terminal workspace manager for Linux
 License:    MIT
 URL:        https://github.com/am-will/limux
 Vendor:     Will R <will@limux.dev>
-BuildArch:  x86_64
+ExclusiveArch: x86_64 aarch64
 AutoReq:    yes
 Source0:    limux-%{version}.tar.gz
 
@@ -20,32 +20,9 @@ terminal engine, with split panes, tabbed workspaces, and a built-in browser.
 
 %install
 rm -rf %{buildroot}
-mkdir -p %{buildroot}%{_bindir} %{buildroot}%{_libdir}/limux \
-         %{buildroot}%{_datadir}/limux %{buildroot}%{_datadir}/applications \
-         %{buildroot}%{_datadir}/metainfo %{buildroot}%{_datadir}/icons/hicolor/scalable/actions \
-         %{buildroot}%{_sysconfdir}/ld.so.conf.d
-
-# Binary
-install -Dm755 %{_builddir}/limux-%{version}/limux %{buildroot}%{_bindir}/limux
-
-# Shared library
-install -Dm755 %{_builddir}/limux-%{version}/libghostty.so %{buildroot}%{_libdir}/limux/libghostty.so
-
-# Ghostty resources
-cp -r %{_builddir}/limux-%{version}/share/limux/ghostty %{buildroot}%{_datadir}/limux/
-cp -r %{_builddir}/limux-%{version}/share/limux/terminfo %{buildroot}%{_datadir}/limux/
-
-# Desktop file
-install -Dm644 %{_builddir}/limux-%{version}/share/applications/dev.limux.linux.desktop %{buildroot}%{_datadir}/applications/dev.limux.linux.desktop
-
-# Metainfo
-install -Dm644 %{_builddir}/limux-%{version}/share/metainfo/dev.limux.linux.metainfo.xml %{buildroot}%{_datadir}/metainfo/dev.limux.linux.metainfo.xml
-
-# Icons
-cp -r %{_builddir}/limux-%{version}/share/icons/hicolor %{buildroot}%{_datadir}/icons/
-
-# ldconfig trigger
-echo "%{_libdir}/limux" > %{buildroot}%{_sysconfdir}/ld.so.conf.d/limux.conf
+mkdir -p %{buildroot}
+cp -a %{_builddir}/limux-%{version}/usr %{buildroot}/
+cp -a %{_builddir}/limux-%{version}/etc %{buildroot}/
 
 %post
 ldconfig 2>/dev/null || true
