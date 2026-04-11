@@ -1,3 +1,5 @@
+%global debug_package %{nil}
+
 Name:       limux
 Version:    %{version}
 Release:    1%{?dist}
