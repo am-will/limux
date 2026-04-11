@@ -797,7 +797,7 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 47] = [
         id: ShortcutId::TerminalIncreaseFontSize,
         config_key: "terminal_increase_font_size",
         action_name: "win.terminal-increase-font-size",
-        default_accel: "<Ctrl>plus",
+        default_accel: "<Ctrl>equal",
         label: "Terminal Increase Font Size",
         registers_gtk_accel: false,
         command: ShortcutCommand::TerminalIncreaseFontSize,
