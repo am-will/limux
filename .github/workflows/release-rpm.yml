@@ -45,7 +45,8 @@ jobs:
               zypper refresh
               zypper install -y --no-confirm \
                 binutils \
-                cairo-gobject-devel \
+                blueprint-compiler \
+                cairo-devel \
                 curl \
                 dpkg \
                 gcc \
@@ -59,8 +60,9 @@ jobs:
                 libepoxy-devel \
                 libsoup-devel \
                 make \
+                ncurses-utils \
                 pango-devel \
-                pkg-config \
+                pkgconf-pkg-config \
                 rpm-build \
                 ruby \
                 tar \

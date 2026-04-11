@@ -13,6 +13,7 @@ RPM_ARCH="x86_64"
 
 PKG_BASE="limux-${VERSION}-linux-${ARCH}"
 STAGE="/tmp/limux-staging"
+GHOSTTY_INSTALL_ROOT="/tmp/limux-ghostty-install"
 GHOSTTY_SO="${ROOT_DIR}/ghostty/zig-out/lib/libghostty.so"
 GHOSTTY_SHARE_DIR=""
 GHOSTTY_TERMINFO_DIR=""
@@ -38,6 +39,7 @@ resolve_ghostty_share_dir() {
     local candidate
 
     for candidate in \
+        "${GHOSTTY_INSTALL_ROOT}/usr/share/ghostty" \
         "${ROOT_DIR}/ghostty/zig-out/share/ghostty" \
         "/usr/local/share/ghostty" \
         "/usr/share/ghostty"
@@ -58,6 +60,7 @@ resolve_ghostty_terminfo_dir() {
     parent="$(dirname "$GHOSTTY_SHARE_DIR")"
 
     for candidate in \
+        "${GHOSTTY_INSTALL_ROOT}/usr/share/terminfo" \
         "${parent}/terminfo" \
         "/usr/local/share/terminfo" \
         "/usr/share/terminfo"
@@ -86,6 +89,22 @@ copy_ghostty_terminfo_entries() {
     fi
 }
 
+build_ghostty_resources() {
+    echo "Staging Ghostty resources..."
+    remove_tree "$GHOSTTY_INSTALL_ROOT"
+    mkdir -p "$GHOSTTY_INSTALL_ROOT"
+
+    (
+        cd "${ROOT_DIR}/ghostty"
+        DESTDIR="$GHOSTTY_INSTALL_ROOT" \
+            zig build \
+            --prefix /usr \
+            -Doptimize=ReleaseFast \
+            -Dcpu=baseline \
+            -Demit-docs=false
+    )
+}
+
 echo "=== Limux Packager ==="
 echo "Version: ${VERSION}"
 echo "Arch:    ${ARCH}"
@@ -106,6 +125,7 @@ fi
 # A Debug build (Zig's default) causes ~7x slower terminal IO throughput.
 echo "Building libghostty (ReleaseFast)..."
 (cd "${ROOT_DIR}/ghostty" && zig build -Dapp-runtime=none -Doptimize=ReleaseFast)
+build_ghostty_resources
 
 if [ ! -f "$GHOSTTY_SO" ]; then
     echo "ERROR: libghostty.so not found at ${GHOSTTY_SO} after build"
