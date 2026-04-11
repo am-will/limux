@@ -3757,47 +3757,62 @@ fn dispatch_terminal_command(state: &State, command: ShortcutCommand) -> bool {
         ShortcutCommand::TerminalClearScrollback => target.perform_binding_action("clear_screen"),
         ShortcutCommand::TerminalCopy => target.perform_binding_action("copy_to_clipboard"),
         ShortcutCommand::TerminalPaste => target.perform_binding_action("paste_from_clipboard"),
-        ShortcutCommand::TerminalIncreaseFontSize => {
-            persist_font_size_delta(1.0);
-            broadcast_font_size();
-            true
-        }
-        ShortcutCommand::TerminalDecreaseFontSize => {
-            persist_font_size_delta(-1.0);
-            broadcast_font_size();
-            true
-        }
-        ShortcutCommand::TerminalResetFontSize => {
-            persist_font_size_reset();
-            crate::terminal::broadcast_binding_action("reset_font_size");
-            true
-        }
+        ShortcutCommand::TerminalIncreaseFontSize => persist_font_size_delta(state, 1.0),
+        ShortcutCommand::TerminalDecreaseFontSize => persist_font_size_delta(state, -1.0),
+        ShortcutCommand::TerminalResetFontSize => persist_font_size_reset(state),
         _ => false,
     }
 }
 
-fn persist_font_size_delta(delta: f32) {
-    let current = app_config::load()
-        .config
-        .font_size
-        .unwrap_or_else(crate::terminal::default_font_size);
-    let new_size = (current + delta).clamp(1.0, 255.0);
-    if let Err(err) = app_config::save_font_size(new_size) {
-        eprintln!("limux: {err}");
+fn persist_font_size_delta(state: &State, delta: f32) -> bool {
+    let current = {
+        let s = state.borrow();
+        s.config.borrow().font_size
+    };
+    let new_size = font_size_after_delta(current, crate::terminal::default_font_size(), delta);
+
+    if let Err(err) = persist_font_size(state, Some(new_size)) {
+        show_font_size_save_error(state, err);
+        return false;
     }
+
+    broadcast_font_size(new_size);
+    true
 }
 
-fn persist_font_size_reset() {
-    if let Err(err) = app_config::clear_font_size() {
-        eprintln!("limux: {err}");
+fn persist_font_size_reset(state: &State) -> bool {
+    if let Err(err) = persist_font_size(state, None) {
+        show_font_size_save_error(state, err);
+        return false;
     }
+
+    crate::terminal::broadcast_binding_action("reset_font_size");
+    true
 }
 
-fn broadcast_font_size() {
-    let size = app_config::load()
-        .config
-        .font_size
-        .unwrap_or_else(crate::terminal::default_font_size);
+fn persist_font_size(state: &State, font_size: Option<f32>) -> Result<(), String> {
+    let mut updated = {
+        let s = state.borrow();
+        s.config.borrow().clone()
+    };
+    updated.font_size = font_size;
+    app_config::save(&updated)?;
+
+    state.borrow().config.borrow_mut().font_size = font_size;
+    Ok(())
+}
+
+fn font_size_after_delta(current: Option<f32>, default: f32, delta: f32) -> f32 {
+    (current.unwrap_or(default) + delta).clamp(1.0, 255.0)
+}
+
+fn show_font_size_save_error(state: &State, err: String) {
+    let detail = format!("Failed to save Limux settings: {err}");
+    eprintln!("limux: {detail}");
+    show_runtime_error(state, "Failed to save settings", &detail);
+}
+
+fn broadcast_font_size(size: f32) {
     let action = format!("set_font_size:{size}");
     crate::terminal::broadcast_binding_action(&action);
 }
@@ -4109,6 +4124,17 @@ mod tests {
         assert!(css.contains(".limux-host-entry text placeholder"));
         assert!(css.contains(".limux-content"));
         assert!(css.contains("background-color: rgba(23, 23, 23, 0.420);"));
+    }
+
+    #[test]
+    fn font_size_after_delta_uses_default_when_unset() {
+        assert_eq!(font_size_after_delta(None, 12.0, 1.0), 13.0);
+    }
+
+    #[test]
+    fn font_size_after_delta_clamps_to_supported_range() {
+        assert_eq!(font_size_after_delta(Some(1.0), 12.0, -5.0), 1.0);
+        assert_eq!(font_size_after_delta(Some(255.0), 12.0, 5.0), 255.0);
     }
 
     #[test]
