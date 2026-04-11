@@ -58,14 +58,17 @@ jobs:
                 gtk4-devel \
                 libadwaita-devel \
                 libepoxy-devel \
+                libxml2-tools \
                 libsoup-devel \
                 make \
+                ncurses-devel \
                 ncurses-utils \
                 pango-devel \
                 pkgconf-pkg-config \
                 rpm-build \
                 ruby \
                 tar \
+                gtk4-layer-shell-devel \
                 webkit2gtk4-devel \
                 xz
 

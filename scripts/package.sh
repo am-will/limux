@@ -171,6 +171,7 @@ mkdir -p "$OUT_DIR"
 populate_tree() {
     local dest="$1"
     local prefix="${2:-/usr/local}"
+    local strip_files="${3:-true}"
     local bindir="$dest${prefix}/bin"
     local libdir="$dest${prefix}/lib/limux"
     local ghostty_datadir="$dest${prefix}/share/limux"
@@ -183,12 +184,16 @@ populate_tree() {
 
     # Binary
     cp "$BINARY" "$bindir/limux"
-    strip "$bindir/limux"
+    if [ "$strip_files" = "true" ]; then
+        strip "$bindir/limux"
+    fi
     chmod 755 "$bindir/limux"
 
     # Shared library
     cp "$GHOSTTY_SO" "$libdir/libghostty.so"
-    strip --strip-debug "$libdir/libghostty.so"
+    if [ "$strip_files" = "true" ]; then
+        strip --strip-debug "$libdir/libghostty.so"
+    fi
 
     # Ghostty resources required for named themes and shell integration
     cp -r "$GHOSTTY_SHARE_DIR"/. "$ghostty_resdir"
@@ -223,7 +228,7 @@ build_rpm_source_tree() {
 
     remove_tree "$dest"
     mkdir -p "$dest"
-    populate_tree "$dest" "/usr"
+    populate_tree "$dest" "/usr" "false"
 
     mkdir -p "$dest/etc/ld.so.conf.d"
     echo "/usr/lib/limux" > "$dest/etc/ld.so.conf.d/limux.conf"

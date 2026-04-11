@@ -39,7 +39,7 @@ appstreamcli refresh-cache --force 2>/dev/null || true
 
 %files
 %{_bindir}/limux
-%{_libdir}/limux/libghostty.so
+/usr/lib/limux/libghostty.so
 %{_datadir}/limux/
 %{_datadir}/applications/dev.limux.linux.desktop
 %{_datadir}/metainfo/dev.limux.linux.metainfo.xml
