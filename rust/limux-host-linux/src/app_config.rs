@@ -508,8 +508,10 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
 
-        let mut config = AppConfig::default();
-        config.font_size = Some(16.25);
+        let mut config = AppConfig {
+            font_size: Some(16.25),
+            ..AppConfig::default()
+        };
         save_to_path(&path, &config).expect("save font size");
 
         let raw = fs::read_to_string(&path).expect("read config");
