@@ -189,10 +189,12 @@ impl TabState {
 }
 
 pub fn persistence_dir() -> PathBuf {
-    let base = dirs::data_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join(PERSISTENCE_DIR_NAME)
+    if let Some(data_dir) = dirs::data_dir() {
+        return data_dir.join(PERSISTENCE_DIR_NAME);
+    }
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local/share").join(PERSISTENCE_DIR_NAME)
 }
 
 pub fn canonical_session_path_in(dir: &Path) -> PathBuf {
@@ -444,6 +446,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persistence_dir_falls_back_to_home_local_share_when_data_dir_missing() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", None);
+        let _home = EnvGuard::set("HOME", Some("/tmp/limux-home"));
+
+        assert_eq!(
+            persistence_dir(),
+            PathBuf::from("/tmp/limux-home/.local/share").join(PERSISTENCE_DIR_NAME)
+        );
+    }
     #[test]
     fn load_prefers_canonical_session_over_legacy() {
         let dir = tempdir().expect("tempdir");
