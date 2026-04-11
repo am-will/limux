@@ -3766,7 +3766,8 @@ fn dispatch_terminal_command(state: &State, command: ShortcutCommand) -> bool {
 fn persist_font_size_delta(state: &State, delta: f32) -> bool {
     let current = {
         let s = state.borrow();
-        s.config.borrow().font_size
+        let current = s.config.borrow().font_size;
+        current
     };
     let new_size = font_size_after_delta(current, crate::terminal::default_font_size(), delta);
 
@@ -3792,7 +3793,8 @@ fn persist_font_size_reset(state: &State) -> bool {
 fn persist_font_size(state: &State, font_size: Option<f32>) -> Result<(), String> {
     let mut updated = {
         let s = state.borrow();
-        s.config.borrow().clone()
+        let updated = s.config.borrow().clone();
+        updated
     };
     updated.font_size = font_size;
     app_config::save(&updated)?;
@@ -4060,13 +4062,14 @@ mod tests {
     use super::gtk::gdk;
     use super::{
         build_window_css, clamp_workspace_insert_index_for_pinning, favorites_prefix_len,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, next_active_workspace_index,
-        queue_session_save_request, resolved_system_prefers_dark, sanitize_background_opacity,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
-        use_opaque_window_background, workspace_drop_layout_path, workspace_notification_message,
-        EditableCaptureContext, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        font_size_after_delta, ghostty_prefers_dark, gtk_system_prefers_dark_from_raw,
+        next_active_workspace_index, queue_session_save_request, resolved_system_prefers_dark,
+        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, tab_drag_workspace_seed, use_opaque_window_background,
+        workspace_drop_layout_path, workspace_notification_message, EditableCaptureContext,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource,
+        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
