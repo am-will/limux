@@ -189,13 +189,12 @@ impl TabState {
 }
 
 pub fn persistence_dir() -> PathBuf {
-    let base = dirs::data_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    if base.ends_with(".local/share") {
-        return base.join(PERSISTENCE_DIR_NAME);
+    if let Some(data_dir) = dirs::data_dir() {
+        return data_dir.join(PERSISTENCE_DIR_NAME);
     }
-    base.join(".local/share").join(PERSISTENCE_DIR_NAME)
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local/share").join(PERSISTENCE_DIR_NAME)
 }
 
 pub fn canonical_session_path_in(dir: &Path) -> PathBuf {
@@ -405,8 +404,59 @@ fn default_tab_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let old = std::env::var_os(key);
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn persistence_dir_uses_xdg_data_home_directly() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", Some("/tmp/limux-xdg-data"));
+        let _home = EnvGuard::set("HOME", Some("/tmp/limux-home"));
+
+        assert_eq!(
+            persistence_dir(),
+            PathBuf::from("/tmp/limux-xdg-data").join(PERSISTENCE_DIR_NAME)
+        );
+    }
+
+    #[test]
+    fn persistence_dir_falls_back_to_home_local_share_when_data_dir_missing() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", None);
+        let _home = EnvGuard::set("HOME", Some("/tmp/limux-home"));
+
+        assert_eq!(
+            persistence_dir(),
+            PathBuf::from("/tmp/limux-home/.local/share").join(PERSISTENCE_DIR_NAME)
+        );
+    }
     #[test]
     fn load_prefers_canonical_session_over_legacy() {
         let dir = tempdir().expect("tempdir");
