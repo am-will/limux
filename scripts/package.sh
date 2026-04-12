@@ -15,6 +15,7 @@ PKG_BASE="limux-${VERSION}-linux-${ARCH}"
 STAGE="/tmp/limux-staging"
 GHOSTTY_INSTALL_ROOT="/tmp/limux-ghostty-install"
 GHOSTTY_SO="${ROOT_DIR}/ghostty/zig-out/lib/libghostty.so"
+MAX_GLIBC_VERSION="${LIMUX_MAX_GLIBC:-2.39}"
 GHOSTTY_SHARE_DIR=""
 GHOSTTY_TERMINFO_DIR=""
 ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons"
@@ -33,6 +34,47 @@ remove_tree() {
     find "$path" -depth -mindepth 1 ! -type d -exec rm -f {} +
     find "$path" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
     rmdir "$path" 2>/dev/null || true
+}
+
+version_gt() {
+    local left="$1"
+    local right="$2"
+    [ "$left" != "$right" ] && [ "$(printf '%s\n%s\n' "$left" "$right" | sort -V | tail -n1)" = "$left" ]
+}
+
+glibc_requirement_for() {
+    local path="$1"
+
+    if ! command -v objdump >/dev/null 2>&1; then
+        return 0
+    fi
+
+    objdump -T "$path" 2>/dev/null \
+        | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+        | sed 's/^GLIBC_//' \
+        | sort -Vu \
+        | tail -n1
+}
+
+assert_glibc_compatibility() {
+    local path="$1"
+    local label="$2"
+    local required_glibc
+
+    required_glibc="$(glibc_requirement_for "$path")"
+    if [ -z "$required_glibc" ]; then
+        echo "WARNING: unable to determine GLIBC requirement for ${label}"
+        return 0
+    fi
+
+    if version_gt "$required_glibc" "$MAX_GLIBC_VERSION"; then
+        echo "ERROR: ${label} requires GLIBC_${required_glibc}, which exceeds the supported release baseline GLIBC_${MAX_GLIBC_VERSION}."
+        echo "Build release artifacts inside Ubuntu 24.04 or another environment pinned to GLIBC_${MAX_GLIBC_VERSION} or older."
+        echo "Override the baseline intentionally with LIMUX_MAX_GLIBC=<version> if you are targeting a newer distro on purpose."
+        exit 1
+    fi
+
+    echo "Verified ${label} GLIBC requirement: GLIBC_${required_glibc} (target max GLIBC_${MAX_GLIBC_VERSION})"
 }
 
 resolve_ghostty_share_dir() {
@@ -108,6 +150,7 @@ build_ghostty_resources() {
 echo "=== Limux Packager ==="
 echo "Version: ${VERSION}"
 echo "Arch:    ${ARCH}"
+echo "GLIBC:   <= ${MAX_GLIBC_VERSION}"
 
 if ! command -v zig >/dev/null 2>&1; then
     echo "ERROR: zig not found in PATH."
@@ -160,6 +203,9 @@ if [ ! -f "$BINARY" ]; then
     echo "ERROR: Binary not found at ${BINARY}"
     exit 1
 fi
+
+assert_glibc_compatibility "$GHOSTTY_SO" "libghostty.so"
+assert_glibc_compatibility "$BINARY" "limux"
 
 # Clean staging and output
 remove_tree "$STAGE"
