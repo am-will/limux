@@ -122,9 +122,10 @@ if [ ! -f "${ROOT_DIR}/ghostty/build.zig" ]; then
 fi
 
 # Always build libghostty with ReleaseFast to guarantee optimized output.
-# A Debug build (Zig's default) causes ~7x slower terminal IO throughput.
-echo "Building libghostty (ReleaseFast)..."
-(cd "${ROOT_DIR}/ghostty" && zig build -Dapp-runtime=none -Doptimize=ReleaseFast)
+# Pinning cpu=baseline keeps the shipped library portable across x86_64 CPUs
+# that do not expose the builder's ISA extensions, such as AVX-512.
+echo "Building libghostty (ReleaseFast, cpu=baseline)..."
+(cd "${ROOT_DIR}/ghostty" && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline)
 build_ghostty_resources
 
 if [ ! -f "$GHOSTTY_SO" ]; then
