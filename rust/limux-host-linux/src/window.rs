@@ -461,37 +461,56 @@ fn build_workspace_root(
     (root, container)
 }
 
-pub(crate) fn apply_split_ratio_after_layout(
+fn apply_ratio_value(
     paned: &gtk::Paned,
     orientation: gtk::Orientation,
     ratio: f64,
-) {
+    applying: &Rc<Cell<bool>>,
+) -> bool {
     let ratio = layout_state::clamp_split_ratio(ratio);
-    let apply_ratio = move |paned: &gtk::Paned| {
-        let allocation = paned.allocation();
-        let size = if orientation == gtk::Orientation::Horizontal {
-            allocation.width()
-        } else {
-            allocation.height()
-        };
-        if size <= 0 {
-            return false;
-        }
-        paned.set_position(layout_state::split_position_from_ratio(ratio, size));
-        update_split_ratio_state(paned, ratio);
-        true
+    let allocation = paned.allocation();
+    let size = if orientation == gtk::Orientation::Horizontal {
+        allocation.width()
+    } else {
+        allocation.height()
     };
+    if size <= 0 {
+        return false;
+    }
+    applying.set(true);
+    paned.set_position(layout_state::split_position_from_ratio(ratio, size));
+    update_split_ratio_state(paned, ratio);
+    applying.set(false);
+    true
+}
+
+pub(crate) fn apply_split_ratio_after_layout(
+    paned: &gtk::Paned,
+    orientation: gtk::Orientation,
+    ratio_cell: Rc<RefCell<f64>>,
+    applying: Rc<Cell<bool>>,
+) {
+    // Capture the ratio by value for the initial idle callback so that early
+    // position_notify events (which may corrupt the cell) don't affect it.
+    let initial_ratio = *ratio_cell.borrow();
 
     let paned_for_idle = paned.clone();
+    let applying_for_idle = applying.clone();
     glib::idle_add_local_once(move || {
-        let _ = apply_ratio(&paned_for_idle);
+        apply_ratio_value(
+            &paned_for_idle,
+            orientation,
+            initial_ratio,
+            &applying_for_idle,
+        );
     });
 
     let paned_for_map = paned.clone();
-    // Hidden workspaces may not have a real allocation during initial restore, so retry when the
-    // split is actually mapped instead of collapsing the divider to an arbitrary fallback pixel.
+    // Re-apply the current data model ratio on every map event (workspace switches).
+    // Reads from the cell so drag-adjusted ratios are restored correctly.
     paned.connect_map(move |_| {
-        let _ = apply_ratio(&paned_for_map);
+        let ratio = *ratio_cell.borrow();
+        apply_ratio_value(&paned_for_map, orientation, ratio, &applying);
     });
 }
 
