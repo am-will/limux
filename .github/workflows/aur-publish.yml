@@ -9,19 +9,22 @@ on:
         description: "Version to publish (without v prefix)"
         required: true
 
+# Only run on upstream — secrets are not available on forks
+run-name: "Publish ${{ inputs.version || github.ref_name }} to AUR"
+
 permissions:
   contents: read
 
 jobs:
-  aur-publish:
+  resolve-version:
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
 
-      - name: Extract version
-        id: version
+    steps:
+      - name: Resolve version
+        id: resolve
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
@@ -29,24 +32,88 @@ jobs:
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Generate AUR PKGBUILD
+  validate-src:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm zig rust git gtk4 libadwaita webkitgtk-6.0 ghostty
+
+      - name: Validate PKGBUILD template
+        run: |
+          sed "s/@@VERSION@@/$VERSION/" PKGBUILD-source.template > /tmp/PKGBUILD
+          source /tmp/PKGBUILD
+          echo "PKGBUILD parsed OK: $pkgname $pkgver"
+
+      - name: Build
+        run: |
+          cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast && cd ..
+          cargo build --release
+
+      - name: Verify build outputs
+        run: |
+          test -f target/release/limux
+          test -f ghostty/zig-out/lib/libghostty.so
+          test -d /usr/share/ghostty
+
+  validate-bin:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+
+    outputs:
+      sha256: ${{ steps.validate.outputs.sha256 }}
+
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+
+    steps:
+      - name: Download and validate tarball
+        id: validate
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
           TARBALL_URL="https://github.com/am-will/limux/releases/download/v${VERSION}/limux-${VERSION}-linux-x86_64.tar.gz"
+          curl -fL --retry 5 --retry-delay 10 "$TARBALL_URL" -o /tmp/limux.tar.gz
 
-          for i in 1 2 3 4 5; do
-            curl -fL "$TARBALL_URL" -o /tmp/limux.tar.gz && break
-            echo "Attempt $i failed, retrying in 30s..."
-            sleep 30
-          done
-          SHA256=$(sha256sum /tmp/limux.tar.gz | awk '{print $1}')
+          cd /tmp && tar xzf limux.tar.gz
+          DIR="limux-${VERSION}-linux-x86_64"
+          test -f "$DIR/limux"
+          test -f "$DIR/lib/libghostty.so"
+          test -f "$DIR/share/applications/dev.limux.linux.desktop"
+          test -d "$DIR/share/limux/ghostty"
 
+          echo "sha256=$(sha256sum /tmp/limux.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+  publish-bin:
+    if: github.repository == 'am-will/limux'
+    needs: [resolve-version, validate-bin]
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Generate PKGBUILD
+        run: |
           sed -e "s/@@VERSION@@/$VERSION/" \
-              -e "s/@@SHA256@@/$SHA256/" \
+              -e "s/@@SHA256@@/${{ needs.validate-bin.outputs.sha256 }}/" \
               PKGBUILD.template > PKGBUILD
 
-      - name: Publish to AUR
+      - name: Publish limux-bin to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
         with:
           pkgname: limux-bin
@@ -54,5 +121,32 @@ jobs:
           commit_username: "limux-aurbot"
           commit_email: limux-aurbot@users.noreply.aur.archlinux.org
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "chore: bump to ${{ steps.version.outputs.version }}"
+          commit_message: "Update to ${{ env.VERSION }}"
+          force_push: true
+
+  publish-src:
+    if: github.repository == 'am-will/limux'
+    needs: [resolve-version, validate-src]
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Generate PKGBUILD
+        run: |
+          sed "s/@@VERSION@@/$VERSION/" PKGBUILD-source.template > PKGBUILD
+
+      - name: Publish limux to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: limux
+          pkgbuild: PKGBUILD
+          commit_username: "limux-aurbot"
+          commit_email: limux-aurbot@users.noreply.aur.archlinux.org
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ env.VERSION }}"
           force_push: true

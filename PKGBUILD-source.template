@@ -1,0 +1,67 @@
+# Maintainer: Anton Barchukov <anton@barchukov.com>
+pkgname=limux
+pkgver=@@VERSION@@
+pkgrel=1
+pkgdesc="GPU-accelerated terminal workspace manager for Linux, powered by Ghostty's rendering engine (cmux port)"
+arch=('x86_64')
+url="https://github.com/am-will/limux"
+license=('MIT')
+depends=('gtk4' 'libadwaita' 'webkitgtk-6.0')
+makedepends=('zig' 'cargo' 'git' 'ghostty' 'patchelf')
+conflicts=('limux-bin' 'limux-bin-debug')
+source=("$pkgname-$pkgver::git+https://github.com/am-will/limux.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    git submodule update --init --recursive
+    cd ghostty
+    git submodule update --init --recursive
+    zig build -Dapp-runtime=none -Doptimize=ReleaseFast
+    cd ..
+    # Build glad as a shared lib — libghostty.so needs these symbols at runtime
+    # but cargo's --gc-sections discards them from the static link.
+    gcc -shared -fPIC -o libglad.so \
+        ghostty/vendor/glad/src/gl.c \
+        -Ighostty/vendor/glad/include
+
+    cargo build --release
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    # Binary — patch in libglad.so dependency so libghostty.so can find glad symbols
+    install -Dm755 target/release/limux "$pkgdir/usr/bin/limux"
+    patchelf --add-needed libglad.so "$pkgdir/usr/bin/limux"
+
+    # Shared libraries
+    install -Dm644 ghostty/zig-out/lib/libghostty.so "$pkgdir/usr/lib/limux/libghostty.so"
+    install -Dm644 libglad.so "$pkgdir/usr/lib/limux/libglad.so"
+
+    # ld.so.conf.d entry so the linker finds libghostty.so
+    install -Dm644 /dev/stdin "$pkgdir/etc/ld.so.conf.d/limux.conf" <<< "/usr/lib/limux"
+
+    # Desktop file and AppStream metadata
+    install -Dm644 rust/limux-host-linux/dev.limux.linux.desktop "$pkgdir/usr/share/applications/dev.limux.linux.desktop"
+    install -Dm644 rust/limux-host-linux/dev.limux.linux.metainfo.xml "$pkgdir/usr/share/metainfo/dev.limux.linux.metainfo.xml"
+
+    # App icons
+    for size in 16 32 128 256 512; do
+        install -Dm644 "rust/limux-host-linux/icons/app/${size}.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/limux.png"
+    done
+
+    # Action icons (SVGs)
+    install -dm755 "$pkgdir/usr/share/icons/hicolor/scalable/actions"
+    install -Dm644 rust/limux-host-linux/icons/*.svg -t "$pkgdir/usr/share/icons/hicolor/scalable/actions/"
+
+    # Ghostty resources (themes, shell integration) from system ghostty package
+    install -dm755 "$pkgdir/usr/share/limux"
+    cp -r /usr/share/ghostty "$pkgdir/usr/share/limux/ghostty"
+
+    # Terminfo entries from system ghostty-terminfo package
+    install -dm755 "$pkgdir/usr/share/limux/terminfo/g" "$pkgdir/usr/share/limux/terminfo/x"
+    [ -f /usr/share/terminfo/g/ghostty ] && install -Dm644 /usr/share/terminfo/g/ghostty "$pkgdir/usr/share/limux/terminfo/g/ghostty"
+    [ -f /usr/share/terminfo/x/xterm-ghostty ] && install -Dm644 /usr/share/terminfo/x/xterm-ghostty "$pkgdir/usr/share/limux/terminfo/x/xterm-ghostty"
+}
