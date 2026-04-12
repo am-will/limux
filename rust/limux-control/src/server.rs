@@ -5,29 +5,55 @@ use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::Dispatcher;
+use crate::auth::SocketControlMode;
+use crate::socket_path::{finalize_socket_permissions, prepare_socket_path, SocketMode};
+use crate::{auth, Dispatcher};
 
-pub async fn run_server<P: AsRef<Path>>(socket_path: P, dispatcher: Dispatcher) -> io::Result<()> {
+pub async fn run_server<P: AsRef<Path>>(
+    socket_path: P,
+    socket_mode: SocketMode,
+    dispatcher: Dispatcher,
+) -> io::Result<()> {
     let socket_path = socket_path.as_ref();
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let control_mode = SocketControlMode::from_env();
+    prepare_socket_path(
+        socket_path,
+        socket_mode,
+        control_mode.requires_owner_only_socket(),
+    )?;
 
     let listener = UnixListener::bind(socket_path)?;
-    serve(listener, dispatcher).await
+    finalize_socket_permissions(socket_path, control_mode.requires_owner_only_socket())?;
+    serve_with_mode(listener, dispatcher, control_mode).await
 }
 
 pub async fn serve(listener: UnixListener, dispatcher: Dispatcher) -> io::Result<()> {
+    let control_mode = SocketControlMode::from_env();
+    serve_with_mode(listener, dispatcher, control_mode).await
+}
+
+async fn serve_with_mode(
+    listener: UnixListener,
+    dispatcher: Dispatcher,
+    control_mode: SocketControlMode,
+) -> io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
+        let peer = match auth::authorize_peer(&stream, control_mode) {
+            Ok(peer) => peer,
+            Err(error) => {
+                eprintln!("limux-control: rejected client: {error}");
+                continue;
+            }
+        };
         let dispatcher = dispatcher.clone();
 
         tokio::spawn(async move {
             if let Err(error) = handle_connection(stream, dispatcher).await {
-                eprintln!("connection error: {error}");
+                eprintln!(
+                    "limux-control: connection error for pid={} uid={}: {error}",
+                    peer.pid, peer.uid
+                );
             }
         });
     }

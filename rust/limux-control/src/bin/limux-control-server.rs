@@ -33,7 +33,8 @@ impl From<CliSocketMode> for SocketMode {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let socket = resolve_socket_path(args.socket, args.socket_mode.into());
+    let socket_mode: SocketMode = args.socket_mode.into();
+    let socket = resolve_socket_path(args.socket, socket_mode);
     if std::env::var("LIMUX_DEBUG_LOG")
         .ok()
         .as_deref()
@@ -53,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let dispatcher = limux_control::Dispatcher::new();
-    limux_control::server::run_server(&socket, dispatcher).await?;
+    limux_control::server::run_server(&socket, socket_mode, dispatcher).await?;
     Ok(())
 }
 
