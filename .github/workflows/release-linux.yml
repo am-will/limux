@@ -55,7 +55,6 @@ jobs:
             libadwaita-1-dev \
             libepoxy-dev \
             libgtk-4-dev \
-            libgtk4-layer-shell-dev \
             libwebkitgtk-6.0-dev \
             pkg-config
 

@@ -68,8 +68,7 @@ jobs:
                 rpm-build \
                 ruby \
                 tar \
-                gtk4-layer-shell-devel \
-                webkit2gtk4-devel \
+                pkgconfig(webkitgtk-6.0) \
                 xz
 
               ZIG_VERSION=0.15.2
