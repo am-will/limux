@@ -690,6 +690,40 @@ enum TabKind {
     Keybinds,
 }
 
+enum TabFocusTarget {
+    Terminal(terminal::TerminalHandle),
+    Browser(BrowserHandles),
+    Widget(gtk::Widget),
+}
+
+impl TabFocusTarget {
+    fn from_entry(entry: &TabEntry) -> Self {
+        match &entry.kind {
+            TabKind::Terminal { state } => Self::Terminal(state.handle.clone()),
+            TabKind::Browser { state } => Self::Browser(state.handles.clone()),
+            TabKind::Keybinds => Self::Widget(entry.content.clone()),
+        }
+    }
+
+    fn focus(self) {
+        match self {
+            Self::Terminal(handle) => {
+                handle.focus_surface();
+            }
+            Self::Browser(handles) => {
+                handles.focus_content();
+            }
+            Self::Widget(widget) => {
+                if widget.is_focus() || widget.can_focus() {
+                    widget.grab_focus();
+                } else {
+                    widget.child_focus(gtk::DirectionType::TabForward);
+                }
+            }
+        }
+    }
+}
+
 struct TabEntry {
     id: String,
     tab_button: gtk::Box,
@@ -1090,7 +1124,7 @@ fn add_terminal_tab_inner(
         &internals.tab_state,
         &tab_id,
     );
-    term.overlay.grab_focus();
+    term.handle.focus_surface();
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
@@ -2306,9 +2340,6 @@ fn activate_tab(
     tab_id: &str,
 ) {
     let mut ts = tab_state.borrow_mut();
-    if ts.active_tab.as_deref() == Some(tab_id) {
-        return;
-    }
     ts.active_tab = Some(tab_id.to_string());
 
     // Update visual state on all tabs
@@ -2324,17 +2355,20 @@ fn activate_tab(
         content_stack.set_visible_child_name(tab_id);
     }
 
-    // Focus the content — only grab focus on directly focusable widgets (terminals).
-    // For containers (browser vbox), focus the first focusable child instead.
-    if let Some(entry) = ts.tabs.iter().find(|e| e.id == tab_id) {
-        let content = entry.content.clone();
-        drop(ts);
-        if content.is_focus() || content.can_focus() {
-            content.grab_focus();
-        } else {
-            // Try to find a focusable child (e.g., the WebView inside a Box)
-            content.child_focus(gtk::DirectionType::TabForward);
-        }
+    let focus_target = ts
+        .tabs
+        .iter()
+        .find(|entry| entry.id == tab_id)
+        .map(TabFocusTarget::from_entry);
+    drop(ts);
+
+    if let Some(target) = focus_target {
+        // Mouse-initiated tab switches can leave focus on the click target if we
+        // refocus synchronously. Deferring to the next idle tick makes the newly
+        // active surface or webview the final focus owner.
+        glib::idle_add_local_once(move || {
+            target.focus();
+        });
     }
 }
 
@@ -2455,6 +2489,16 @@ impl BrowserShortcutTarget {
 impl BrowserHandles {
     fn is_find_active(&self) -> bool {
         self.search_bar.is_search_mode()
+    }
+
+    fn focus_content(&self) -> bool {
+        if self.is_find_active() {
+            self.search_entry.grab_focus();
+            self.search_entry.select_region(0, -1);
+        } else {
+            self.webview.grab_focus();
+        }
+        true
     }
 
     fn is_page_editable(&self) -> bool {
@@ -2582,6 +2626,10 @@ impl BrowserHandles {
 #[cfg(not(feature = "webkit"))]
 impl BrowserHandles {
     fn is_find_active(&self) -> bool {
+        false
+    }
+
+    fn focus_content(&self) -> bool {
         false
     }
 

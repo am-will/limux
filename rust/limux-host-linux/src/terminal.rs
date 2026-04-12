@@ -159,6 +159,11 @@ impl TerminalHandle {
         *self.callbacks.borrow_mut() = callbacks;
     }
 
+    pub fn focus_surface(&self) -> bool {
+        self.gl_area.grab_focus();
+        true
+    }
+
     pub fn perform_binding_action(&self, action: &str) -> bool {
         let surface = *self.surface_cell.borrow();
         surface_action(surface, action);
