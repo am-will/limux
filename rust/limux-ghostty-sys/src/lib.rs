@@ -62,6 +62,7 @@ pub const GHOSTTY_ACTION_NEW_WINDOW: c_int = 1;
 pub const GHOSTTY_ACTION_NEW_TAB: c_int = 2;
 pub const GHOSTTY_ACTION_CLOSE_TAB: c_int = 3;
 pub const GHOSTTY_ACTION_NEW_SPLIT: c_int = 4;
+pub const GHOSTTY_ACTION_SCROLLBAR: c_int = 26;
 pub const GHOSTTY_ACTION_RENDER: c_int = 27;
 pub const GHOSTTY_ACTION_DESKTOP_NOTIFICATION: c_int = 31;
 pub const GHOSTTY_ACTION_SET_TITLE: c_int = 32;
@@ -293,11 +294,20 @@ pub struct ghostty_action_s {
 // Must be exactly 24 bytes to match the C union.
 #[repr(C)]
 pub union ghostty_action_u {
+    pub scrollbar: ghostty_action_scrollbar_s,
     pub desktop_notification: ghostty_action_desktop_notification_s,
     pub set_title: ghostty_action_set_title_s,
     pub pwd: ghostty_action_pwd_s,
     pub child_exited: ghostty_surface_message_childexited_s,
     _padding: [u8; 24],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_action_scrollbar_s {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
 }
 
 #[repr(C)]
@@ -368,15 +378,15 @@ extern "C" {
     // Config
     pub fn ghostty_config_new() -> ghostty_config_t;
     pub fn ghostty_config_free(config: ghostty_config_t);
-    pub fn ghostty_config_load_default_files(config: ghostty_config_t);
-    pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
-    pub fn ghostty_config_finalize(config: ghostty_config_t);
     pub fn ghostty_config_get(
         config: ghostty_config_t,
         out: *mut c_void,
         key: *const c_char,
         key_len: usize,
     ) -> bool;
+    pub fn ghostty_config_load_default_files(config: ghostty_config_t);
+    pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
+    pub fn ghostty_config_finalize(config: ghostty_config_t);
 
     // App
     pub fn ghostty_app_new(
