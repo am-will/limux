@@ -378,15 +378,15 @@ extern "C" {
     // Config
     pub fn ghostty_config_new() -> ghostty_config_t;
     pub fn ghostty_config_free(config: ghostty_config_t);
-    pub fn ghostty_config_load_default_files(config: ghostty_config_t);
-    pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
-    pub fn ghostty_config_finalize(config: ghostty_config_t);
     pub fn ghostty_config_get(
         config: ghostty_config_t,
         out: *mut c_void,
         key: *const c_char,
         key_len: usize,
     ) -> bool;
+    pub fn ghostty_config_load_default_files(config: ghostty_config_t);
+    pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
+    pub fn ghostty_config_finalize(config: ghostty_config_t);
 
     // App
     pub fn ghostty_app_new(
