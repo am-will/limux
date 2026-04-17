@@ -18,7 +18,6 @@ use webkit6::prelude::*;
 use crate::app_config::AppConfig;
 use crate::keybind_editor;
 use crate::layout_state::{PaneState, TabContentState, TabState as SavedTabState};
-use crate::settings_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 use crate::terminal::{self, TerminalCallbacks};
 
@@ -167,7 +166,6 @@ type PaneShortcutCaptureCallback =
     dyn Fn(ShortcutId, Option<NormalizedShortcut>) -> Result<ResolvedShortcutConfig, String>;
 type PaneSplitWithTabCallback = dyn Fn(&gtk::Widget, &gtk::Widget, gtk::Orientation, String, bool);
 type PaneConfigCallback = dyn Fn() -> Rc<RefCell<AppConfig>>;
-type PaneConfigChangedCallback = dyn Fn(&AppConfig, &AppConfig);
 
 pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
@@ -183,7 +181,6 @@ pub struct PaneCallbacks {
     pub on_state_changed: Box<PaneSignalCallback>,
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
     pub current_config: Box<PaneConfigCallback>,
-    pub on_config_changed: Rc<PaneConfigChangedCallback>,
 }
 
 #[derive(Clone)]
@@ -286,24 +283,25 @@ pub const PANE_CSS: &str = r#"
 .limux-tab-close {
     background: none;
     border: none;
-    border-radius: 3px;
-    padding: 1px;
+    border-radius: 6px;
+    padding: 2px;
     min-height: 0;
     min-width: 0;
+    margin: 0 0 0 4px;
     color: alpha(@window_fg_color, 0.28);
-    margin-left: 4px;
 }
 .limux-tab-close:hover {
     color: alpha(@window_fg_color, 0.8);
-    background: alpha(@window_fg_color, 0.1);
+    background: alpha(@window_fg_color, 0.08);
 }
 .limux-pane-action {
     background: none;
     border: none;
-    border-radius: 4px;
-    padding: 4px 5px;
+    border-radius: 6px;
+    padding: 4px;
     min-height: 0;
     min-width: 0;
+    margin: 0 1px;
     color: alpha(@window_fg_color, 0.4);
 }
 .limux-pane-action:hover {
@@ -391,23 +389,44 @@ pub fn create_pane(
         .vexpand(true)
         .build();
 
-    // The single header line: tabs (left) + action icons (right)
+    // The single header line: [leading slot] tabs (left) + action icons (right)
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
         .build();
     header.add_css_class("limux-pane-header");
 
+    // Empty leading slot at the very start of the header — window.rs can
+    // stash the dock toggle here when the top bar is hidden and the sidebar
+    // is collapsed. Hidden by default (no children = no width).
+    let leading_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .build();
+    leading_box.add_css_class("limux-pane-leading");
+    header.append(&leading_box);
+
     let tab_overlay = gtk::Overlay::new();
     tab_overlay.add_css_class("limux-tab-overlay");
     tab_overlay.set_hexpand(true);
 
+    // tab_strip holds the actual tab buttons (natural width). A WindowHandle
+    // sibling to its right soaks up the remaining space and drags the window
+    // when clicked, so the empty area after the last tab is also draggable.
     let tab_strip = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .build();
+    let tab_drag_filler = gtk::WindowHandle::new();
+    tab_drag_filler.set_hexpand(true);
+    let tab_strip_wrapper = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
         .hexpand(true)
         .build();
-    tab_overlay.set_child(Some(&tab_strip));
+    tab_strip_wrapper.append(&tab_strip);
+    tab_strip_wrapper.append(&tab_drag_filler);
+    tab_overlay.set_child(Some(&tab_strip_wrapper));
 
     let drop_indicator = gtk::Box::new(gtk::Orientation::Vertical, 0);
     drop_indicator.add_css_class("limux-tab-drop-indicator");
@@ -460,7 +479,6 @@ pub fn create_pane(
         "limux-split-vertical-symbolic",
         &pane_action_tooltip(&shortcuts, "Split down", Some(ShortcutId::SplitDown)),
     );
-    let settings_btn = icon_button("emblem-system-symbolic", "Settings");
     let close_btn = icon_button(
         "window-close-symbolic",
         &pane_action_tooltip(&shortcuts, "Close pane", Some(ShortcutId::CloseFocusedPane)),
@@ -470,7 +488,6 @@ pub fn create_pane(
     actions.append(&new_browser_btn);
     actions.append(&split_h_btn);
     actions.append(&split_v_btn);
-    actions.append(&settings_btn);
     actions.append(&close_btn);
 
     header.append(&tab_overlay);
@@ -496,6 +513,7 @@ pub fn create_pane(
         drop_indicator: drop_indicator.clone(),
         content_drop_overlay: content_drop_overlay.clone(),
         pane_outer: outer.clone(),
+        leading_box: leading_box.clone(),
         callbacks: callbacks.clone(),
         working_directory: ws_wd.clone(),
         workspace_dragging: workspace_dragging.clone(),
@@ -546,21 +564,6 @@ pub fn create_pane(
             (cb.on_close_pane)(&pw.clone().upcast());
         });
     }
-    {
-        let internals = internals.clone();
-        settings_btn.connect_clicked(move |_| {
-            settings_editor::present_settings_dialog(
-                &internals.pane_outer,
-                settings_editor::SettingsEditorInput {
-                    config: (internals.callbacks.current_config)(),
-                    shortcuts: (internals.callbacks.current_shortcuts)(),
-                    on_capture: internals.callbacks.on_capture_shortcut.clone(),
-                    on_config_changed: internals.callbacks.on_config_changed.clone(),
-                },
-            );
-        });
-    }
-
     install_tab_strip_drop_target(&tab_overlay, &internals);
     install_content_drop_target(&internals);
 
@@ -748,6 +751,7 @@ pub struct PaneInternals {
     drop_indicator: gtk::Box,
     content_drop_overlay: gtk::Box,
     pane_outer: gtk::Box,
+    leading_box: gtk::Box,
     callbacks: Rc<PaneCallbacks>,
     working_directory: Rc<std::cell::RefCell<Option<String>>>,
     workspace_dragging: Rc<Cell<bool>>,
@@ -776,6 +780,7 @@ fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
         .icon_name(icon_name)
         .tooltip_text(tooltip)
         .has_frame(false)
+        .valign(gtk::Align::Center)
         .build();
     btn.add_css_class("limux-pane-action");
     btn
@@ -1415,6 +1420,13 @@ fn find_pane_internals(pane_widget: &gtk::Widget) -> Option<Rc<PaneInternals>> {
     }
 }
 
+/// Returns the leading slot (at the very start of the pane header) so the
+/// outer app can place widgets there (e.g. a dock toggle). The box stays
+/// empty by default.
+pub fn pane_leading_box(pane_widget: &gtk::Widget) -> Option<gtk::Box> {
+    find_pane_internals(pane_widget).map(|internals| internals.leading_box.clone())
+}
+
 pub fn is_pane_widget(widget: &gtk::Widget) -> bool {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return false;
@@ -1424,6 +1436,15 @@ pub fn is_pane_widget(widget: &gtk::Widget) -> bool {
     while let Some(current) = child {
         if current.has_css_class("limux-pane-header") {
             return true;
+        }
+        // The header can be wrapped in a WindowHandle (used so empty space in
+        // the header drags the window); look through it for the real header.
+        if let Some(handle) = current.downcast_ref::<gtk::WindowHandle>() {
+            if let Some(inner) = handle.child() {
+                if inner.has_css_class("limux-pane-header") {
+                    return true;
+                }
+            }
         }
         child = current.next_sibling();
     }
@@ -1560,6 +1581,7 @@ fn build_tab_button_from_label(
     let close_btn = gtk::Button::builder()
         .icon_name("window-close-symbolic")
         .has_frame(false)
+        .valign(gtk::Align::Center)
         .build();
     close_btn.add_css_class("limux-tab-close");
 
@@ -1607,6 +1629,31 @@ fn build_tab_button_from_label(
         });
     }
     tab_btn.add_controller(right_click);
+
+    // Middle-click to close the tab.
+    let middle_click = gtk::GestureClick::new();
+    middle_click.set_button(2);
+    {
+        let tab_id = tab_id.to_string();
+        let tab_strip = internals.tab_strip.clone();
+        let content_stack = internals.content_stack.clone();
+        let tab_state = internals.tab_state.clone();
+        let callbacks = internals.callbacks.clone();
+        let pane_outer = internals.pane_outer.clone();
+        middle_click.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            remove_tab(
+                &tab_strip,
+                &content_stack,
+                &tab_state,
+                &tab_id,
+                &callbacks,
+                &pane_outer,
+                PaneEmptyReason::ClosedLastTab,
+            );
+        });
+    }
+    tab_btn.add_controller(middle_click);
 
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);

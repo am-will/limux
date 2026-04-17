@@ -36,12 +36,38 @@ impl ColorScheme {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowControlsSide {
+    Left,
+    #[default]
+    Right,
+}
+
+impl WindowControlsSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub focus: FocusConfig,
     #[serde(skip)]
     pub appearance: AppearanceConfig,
+    #[serde(skip)]
+    pub interface: InterfaceConfig,
     #[serde(skip)]
     pub font_size: Option<f32>,
 }
@@ -50,6 +76,23 @@ pub struct AppConfig {
 pub struct AppearanceConfig {
     pub color_scheme: ColorScheme,
     pub ghostty_color_scheme: ColorScheme,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceConfig {
+    pub window_controls_side: WindowControlsSide,
+    pub show_top_bar: bool,
+    pub show_workspace_indicators: bool,
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self {
+            window_controls_side: WindowControlsSide::default(),
+            show_top_bar: true,
+            show_workspace_indicators: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -155,6 +198,24 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .map(|v| v as f32)
         .filter(|v| (1.0..=255.0).contains(v));
 
+    let interface_obj = root.get("interface").and_then(Value::as_object);
+
+    let window_controls_side = interface_obj
+        .and_then(|interface| interface.get("window_controls_side"))
+        .and_then(Value::as_str)
+        .and_then(WindowControlsSide::from_str)
+        .unwrap_or_default();
+
+    let show_top_bar = interface_obj
+        .and_then(|interface| interface.get("show_top_bar"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let show_workspace_indicators = interface_obj
+        .and_then(|interface| interface.get("show_workspace_indicators"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
     AppConfig {
         focus: FocusConfig {
             hover_terminal_focus,
@@ -162,6 +223,11 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         appearance: AppearanceConfig {
             color_scheme,
             ghostty_color_scheme,
+        },
+        interface: InterfaceConfig {
+            window_controls_side,
+            show_top_bar,
+            show_workspace_indicators,
         },
         font_size,
     }
@@ -189,6 +255,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     root.insert(
         "focus".to_string(),
         json!({ "hover_terminal_focus": config.focus.hover_terminal_focus }),
+    );
+    root.insert(
+        "interface".to_string(),
+        json!({
+            "window_controls_side": config.interface.window_controls_side.as_str(),
+            "show_top_bar": config.interface.show_top_bar,
+            "show_workspace_indicators": config.interface.show_workspace_indicators,
+        }),
     );
 
     if let Some(size) = config.font_size {

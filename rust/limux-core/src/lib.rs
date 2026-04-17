@@ -2689,37 +2689,21 @@ impl ControlState {
                 }
                 true
             }
-            "down" | "ctrl+n" | "ctrl+j" => {
-                if palette_visible {
-                    self.command_palette_move_selection(window_id, 1);
-                    true
-                } else {
-                    false
-                }
+            "down" | "ctrl+n" | "ctrl+j" if palette_visible => {
+                self.command_palette_move_selection(window_id, 1);
+                true
             }
-            "up" | "ctrl+p" | "ctrl+k" => {
-                if palette_visible {
-                    self.command_palette_move_selection(window_id, -1);
-                    true
-                } else {
-                    false
-                }
+            "up" | "ctrl+p" | "ctrl+k" if palette_visible => {
+                self.command_palette_move_selection(window_id, -1);
+                true
             }
-            "cmd+a" => {
-                if palette_visible {
-                    self.command_palette_select_all(window_id);
-                    true
-                } else {
-                    false
-                }
+            "cmd+a" if palette_visible => {
+                self.command_palette_select_all(window_id);
+                true
             }
-            "enter" => {
-                if palette_visible {
-                    self.command_palette_enter(window_id);
-                    true
-                } else {
-                    false
-                }
+            "enter" if palette_visible => {
+                self.command_palette_enter(window_id);
+                true
             }
             _ => false,
         }

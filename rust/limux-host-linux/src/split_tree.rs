@@ -374,6 +374,13 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .orientation(*orientation)
                 .hexpand(true)
                 .vexpand(true)
+                // Allow either child to be shrunk below its minimum size so
+                // the saved split ratio (e.g. 50/50) is honored even when one
+                // pane has wider tabs than the other. Without this, gtk::Paned
+                // clamps the position to respect the larger pane's minimum
+                // width, producing visibly uneven splits.
+                .shrink_start_child(true)
+                .shrink_end_child(true)
                 .build();
 
             let ratio_val = *ratio.borrow();
@@ -386,25 +393,73 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
             // position, corrupting the stored ratio.
             let applying = Rc::new(Cell::new(false));
 
-            // Wire resize drags back to the shared ratio cell in the data model.
+            // Track the width we last saw, so position_notify can distinguish
+            // user drags (width unchanged → recompute ratio) from width-driven
+            // auto-adjust (width changed → preserve ratio by re-applying
+            // position = ratio * new_width). Without this, opening the
+            // sidebar (which shrinks the inner paned's width) silently skews
+            // the saved ratio because GtkPaned's position is absolute pixels.
+            let last_size = Rc::new(Cell::new(0i32));
             let shared_ratio = ratio.clone();
             let applying_for_notify = applying.clone();
+            let last_size_for_notify = last_size.clone();
             paned.connect_position_notify(move |paned| {
                 if applying_for_notify.get() {
                     return;
                 }
-                let allocation = paned.allocation();
                 let size = if paned.orientation() == gtk::Orientation::Horizontal {
-                    allocation.width()
+                    paned.width()
                 } else {
-                    allocation.height()
+                    paned.height()
                 };
+                if size <= 0 {
+                    return;
+                }
+                if last_size_for_notify.get() != size {
+                    // Width changed — this position-notify is an auto-adjust,
+                    // not a user drag. Don't update the ratio.
+                    last_size_for_notify.set(size);
+                    return;
+                }
                 let new_ratio = layout_state::snapshot_split_ratio(
                     paned.position(),
                     size,
                     Some(*shared_ratio.borrow()),
                 );
                 *shared_ratio.borrow_mut() = layout_state::clamp_split_ratio(new_ratio);
+            });
+
+            // Re-apply position = ratio * size whenever the paned's actual
+            // size changes (sidebar toggles, window resizes). GtkWidget's
+            // `width`/`height` properties don't reliably emit notify across
+            // GTK 4.x versions, so we poll via a per-frame tick callback
+            // (intentional: O(1) integer comparison per frame; always returns
+            // Continue so the paned stays reactive for its entire lifetime).
+            let paned_for_resize = paned.clone();
+            let shared_ratio_for_resize = ratio.clone();
+            let applying_for_resize = applying.clone();
+            let last_size_for_resize = last_size.clone();
+            let resize_orientation = *orientation;
+            paned.add_tick_callback(move |paned, _| {
+                let size = if resize_orientation == gtk::Orientation::Horizontal {
+                    paned.width()
+                } else {
+                    paned.height()
+                };
+                if size <= 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                if last_size_for_resize.get() != size {
+                    last_size_for_resize.set(size);
+                    let ratio = *shared_ratio_for_resize.borrow();
+                    crate::window::apply_ratio_value(
+                        &paned_for_resize,
+                        resize_orientation,
+                        ratio,
+                        &applying_for_resize,
+                    );
+                }
+                glib::ControlFlow::Continue
             });
 
             let left_widget = build_widget_tree(left, state);

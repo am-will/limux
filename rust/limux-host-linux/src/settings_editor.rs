@@ -5,7 +5,7 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::app_config::{AppConfig, ColorScheme};
+use crate::app_config::{AppConfig, ColorScheme, WindowControlsSide};
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
@@ -167,6 +167,49 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     hover_row.set_activatable_widget(Some(&hover_switch));
     group.add(&hover_row);
 
+    let top_bar_row = adw::ActionRow::builder()
+        .title("Top bar")
+        .subtitle("Show a top bar with workspace indicators. When off, the dock toggle, settings, new workspace, and window controls move into the sidebar header (or the leading pane when the sidebar is collapsed).")
+        .build();
+    top_bar_row.set_title_lines(1);
+    top_bar_row.set_subtitle_lines(4);
+    let top_bar_switch = gtk::Switch::new();
+    top_bar_switch.set_active(input.config.borrow().interface.show_top_bar);
+    top_bar_switch.set_valign(gtk::Align::Center);
+    top_bar_row.add_suffix(&top_bar_switch);
+    top_bar_row.set_activatable_widget(Some(&top_bar_switch));
+    group.add(&top_bar_row);
+
+    let indicators_row = adw::ActionRow::builder()
+        .title("Workspace indicators on the top bar")
+        .subtitle("Show a clickable pill for each workspace in the top bar")
+        .build();
+    indicators_row.set_title_lines(1);
+    indicators_row.set_subtitle_lines(2);
+    let indicators_switch = gtk::Switch::new();
+    indicators_switch.set_active(input.config.borrow().interface.show_workspace_indicators);
+    indicators_switch.set_valign(gtk::Align::Center);
+    indicators_row.add_suffix(&indicators_switch);
+    indicators_row.set_activatable_widget(Some(&indicators_switch));
+    group.add(&indicators_row);
+
+    let controls_row = adw::ActionRow::builder()
+        .title("Window controls side")
+        .subtitle("Place close, minimize, and maximize on the left or right of the top bar (or of the sidebar header when the top bar is off)")
+        .build();
+    controls_row.set_title_lines(1);
+    controls_row.set_subtitle_lines(3);
+    let controls_dropdown = gtk::DropDown::from_strings(&["Left", "Right"]);
+    let initial_side = input.config.borrow().interface.window_controls_side;
+    controls_dropdown.set_selected(match initial_side {
+        WindowControlsSide::Left => 0,
+        WindowControlsSide::Right => 1,
+    });
+    controls_dropdown.set_valign(gtk::Align::Center);
+    controls_row.add_suffix(&controls_dropdown);
+    controls_row.set_activatable_widget(Some(&controls_dropdown));
+    group.add(&controls_row);
+
     page.add(&group);
 
     {
@@ -204,6 +247,39 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             let hover_terminal_focus = switch.is_active();
             apply_config_change(&config, &*on_changed, move |c| {
                 c.focus.hover_terminal_focus = hover_terminal_focus;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        top_bar_switch.connect_active_notify(move |switch| {
+            let show_top_bar = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_top_bar = show_top_bar;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        indicators_switch.connect_active_notify(move |switch| {
+            let show_workspace_indicators = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_workspace_indicators = show_workspace_indicators;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        controls_dropdown.connect_selected_notify(move |dropdown| {
+            let side = match dropdown.selected() {
+                0 => WindowControlsSide::Left,
+                _ => WindowControlsSide::Right,
+            };
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.window_controls_side = side;
             });
         });
     }
