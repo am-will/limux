@@ -67,7 +67,8 @@ pub(crate) struct AppState {
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
-    paned: gtk::Paned,
+    sidebar_shell: gtk::Box,
+    sidebar_handle: gtk::Box,
     new_ws_btn: gtk::Button,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
@@ -326,25 +327,24 @@ fn restore_active_workspace(state: &State, index: usize) {
 }
 
 fn apply_sidebar_state_immediately(state: &State, sidebar_state: &layout_state::SidebarState) {
-    let (paned, sidebar, width) = {
+    let (sidebar_shell, sidebar_handle, width) = {
         let mut s = state.borrow_mut();
         s.sidebar_expanded_width = sidebar_state.width.max(SIDEBAR_WIDTH);
-        let sidebar = match s.paned.start_child() {
-            Some(sidebar) => sidebar,
-            None => return,
-        };
-        (s.paned.clone(), sidebar, s.sidebar_expanded_width)
+        (
+            s.sidebar_shell.clone(),
+            s.sidebar_handle.clone(),
+            s.sidebar_expanded_width,
+        )
     };
 
-    if sidebar_state.visible {
-        sidebar.set_visible(true);
-        paned.set_position(width);
-    } else {
-        // Apply restored sidebar visibility directly; using the animated toggle path during
-        // startup would create flicker and extra persistence churn while restore is suspended.
-        sidebar.set_visible(false);
-        paned.set_position(0);
-    }
+    // Apply restored sidebar visibility directly; using the animated toggle path during
+    // startup would create flicker and extra persistence churn while restore is suspended.
+    set_sidebar_state_widgets(
+        &sidebar_shell,
+        &sidebar_handle,
+        if sidebar_state.visible { width } else { 0 },
+        sidebar_state.visible,
+    );
 }
 
 fn apply_top_bar_state_immediately(state: &State, visible: bool) {
@@ -356,7 +356,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
     let s = state.borrow();
     let sidebar_visible = sidebar_is_visible(&s);
     let sidebar_width = if sidebar_visible {
-        s.paned.position()
+        sidebar_width(&s.sidebar_shell)
     } else {
         s.sidebar_expanded_width
     }
@@ -395,11 +395,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
 }
 
 fn sidebar_is_visible(state: &AppState) -> bool {
-    state
-        .paned
-        .start_child()
-        .map(|sidebar| sidebar.is_visible() && state.paned.position() > 10)
-        .unwrap_or(false)
+    state.sidebar_shell.is_visible() && sidebar_width(&state.sidebar_shell) > 10
 }
 
 fn begin_window_move_from_widget(
@@ -542,6 +538,9 @@ const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASS: &str = "limux-ws-rename-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS];
+const SIDEBAR_HANDLE_CSS_CLASS: &str = "limux-sidebar-handle";
+const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
+const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
 
 const BASE_CSS: &str = r#"
 :root {
@@ -712,6 +711,13 @@ row:selected .limux-ws-path {
 }
 .limux-content {
     background-color: @window_bg_color;
+}
+.limux-sidebar-handle {
+    min-width: 3px;
+    background-color: alpha(@window_fg_color, 0.08);
+}
+.limux-sidebar-handle:hover {
+    background-color: alpha(@accent_bg_color, 0.45);
 }
 "#;
 
@@ -901,29 +907,19 @@ pub fn build_window(app: &adw::Application) {
     let sidebar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
-        .width_request(220)
         .build();
     sidebar.add_css_class("limux-sidebar");
     sidebar.append(&sidebar_title);
     sidebar.append(&sidebar_scroll);
     sidebar.append(&new_ws_btn);
 
-    let main_paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .position(220)
-        .resize_start_child(false)
-        .resize_end_child(true)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
-        .start_child(&sidebar)
-        .end_child(&stack)
-        .build();
+    let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if let Some(ref header) = header {
         vbox.append(header);
     }
-    vbox.append(&main_paned);
+    vbox.append(&main_split);
     window.set_content(Some(&vbox));
 
     let state: State = Rc::new(RefCell::new(AppState {
@@ -938,7 +934,8 @@ pub fn build_window(app: &adw::Application) {
         shortcuts,
         stack: stack.clone(),
         sidebar_list: sidebar_list.clone(),
-        paned: main_paned.clone(),
+        sidebar_shell: sidebar_shell.clone(),
+        sidebar_handle: sidebar_handle.clone(),
         new_ws_btn: new_ws_btn.clone(),
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
@@ -953,6 +950,8 @@ pub fn build_window(app: &adw::Application) {
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
+
+    install_sidebar_resize(&state, &main_split, &sidebar, &sidebar_shell);
 
     {
         let state = state.clone();
@@ -994,24 +993,6 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         window.connect_fullscreened_notify(move |_| {
             sync_top_bar_visibility(&state);
-        });
-    }
-
-    {
-        let state = state.clone();
-        main_paned.connect_position_notify(move |paned| {
-            let position = paned.position();
-            let should_save = if position > 10 {
-                let mut s = state.borrow_mut();
-                let changed = s.sidebar_expanded_width != position;
-                s.sidebar_expanded_width = position;
-                changed
-            } else {
-                false
-            };
-            if should_save {
-                request_session_save(&state);
-            }
         });
     }
 
@@ -1118,6 +1099,121 @@ fn build_window_css(background_opacity: f64) -> String {
     format!(
         "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
     )
+}
+
+fn build_sidebar_split(sidebar: &gtk::Box, stack: &gtk::Stack) -> (gtk::Box, gtk::Box, gtk::Box) {
+    let sidebar_shell = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(false)
+        .vexpand(true)
+        .build();
+    sidebar_shell.append(sidebar);
+    set_sidebar_width(&sidebar_shell, SIDEBAR_WIDTH);
+
+    let sidebar_handle = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(SIDEBAR_RESIZE_HANDLE_WIDTH_PX)
+        .hexpand(false)
+        .vexpand(true)
+        .build();
+    sidebar_handle.add_css_class(SIDEBAR_HANDLE_CSS_CLASS);
+    sidebar_handle.set_cursor_from_name(Some(SIDEBAR_HANDLE_CURSOR_NAME));
+
+    let main_split = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    main_split.append(&sidebar_shell);
+    main_split.append(&sidebar_handle);
+    main_split.append(stack);
+
+    (main_split, sidebar_shell, sidebar_handle)
+}
+
+fn install_sidebar_resize(
+    state: &State,
+    main_split: &gtk::Box,
+    sidebar: &gtk::Box,
+    sidebar_shell: &gtk::Box,
+) {
+    let resizing_sidebar = Rc::new(Cell::new(false));
+    let drag_origin = Rc::new(Cell::new(SIDEBAR_WIDTH));
+    let drag = gtk::GestureDrag::new();
+
+    {
+        let drag_origin = drag_origin.clone();
+        let sidebar = sidebar.clone();
+        let sidebar_shell = sidebar_shell.clone();
+        let resizing_sidebar = resizing_sidebar.clone();
+        drag.connect_drag_begin(move |gesture, x, _| {
+            let current_width = sidebar_width(&sidebar_shell);
+            let handle_start = current_width as f64;
+            let handle_end = handle_start + SIDEBAR_RESIZE_HANDLE_WIDTH_PX as f64;
+            if x < handle_start || x > handle_end {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            resizing_sidebar.set(true);
+            drag_origin.set(current_width.max(sidebar_min_width(&sidebar)));
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+    }
+
+    {
+        let drag_origin = drag_origin.clone();
+        let sidebar = sidebar.clone();
+        let sidebar_shell = sidebar_shell.clone();
+        let resizing_sidebar = resizing_sidebar.clone();
+        let state = state.clone();
+        drag.connect_drag_update(move |_, offset_x, _| {
+            if !resizing_sidebar.get() {
+                return;
+            }
+            let min_width = sidebar_min_width(&sidebar);
+            let width = (drag_origin.get() as f64 + offset_x).round() as i32;
+            let width = width.max(min_width);
+            set_sidebar_width(&sidebar_shell, width);
+            state.borrow_mut().sidebar_expanded_width = width;
+        });
+    }
+
+    {
+        let sidebar_shell = sidebar_shell.clone();
+        let resizing_sidebar = resizing_sidebar.clone();
+        let state = state.clone();
+        drag.connect_drag_end(move |_, _, _| {
+            resizing_sidebar.set(false);
+            state.borrow_mut().sidebar_expanded_width = sidebar_width(&sidebar_shell);
+            request_session_save(&state);
+        });
+    }
+
+    main_split.add_controller(drag);
+}
+
+fn set_sidebar_width(sidebar_shell: &gtk::Box, width: i32) {
+    sidebar_shell.set_width_request(width.max(0));
+}
+
+fn set_sidebar_state_widgets(
+    sidebar_shell: &gtk::Box,
+    sidebar_handle: &gtk::Box,
+    width: i32,
+    visible: bool,
+) {
+    set_sidebar_width(sidebar_shell, width);
+    sidebar_shell.set_visible(visible);
+    sidebar_handle.set_visible(visible);
+}
+
+fn sidebar_width(sidebar_shell: &gtk::Box) -> i32 {
+    sidebar_shell.width_request().max(0)
+}
+
+fn sidebar_min_width(sidebar: &gtk::Box) -> i32 {
+    let (minimum, _, _, _) = sidebar.measure(gtk::Orientation::Horizontal, -1);
+    minimum.max(1)
 }
 
 fn sanitize_background_opacity(background_opacity: f64) -> f64 {
@@ -3453,12 +3549,9 @@ fn toggle_fullscreen(state: &State) {
 }
 
 fn toggle_sidebar(state: &State) {
-    let (paned, sidebar, current, is_visible, target_width, prior_animation, epoch) = {
+    let (sidebar_shell, sidebar_handle, current, is_visible, target_width, prior_animation, epoch) = {
         let mut s = state.borrow_mut();
-        let Some(sidebar) = s.paned.start_child() else {
-            return;
-        };
-        let current = s.paned.position();
+        let current = sidebar_width(&s.sidebar_shell);
         let is_visible = current > 10; // treat < 10px as collapsed
         if is_visible {
             s.sidebar_expanded_width = current;
@@ -3467,8 +3560,8 @@ fn toggle_sidebar(state: &State) {
         let prior_animation = s.sidebar_animation.take();
         s.sidebar_animation_epoch = s.sidebar_animation_epoch.wrapping_add(1);
         (
-            s.paned.clone(),
-            sidebar,
+            s.sidebar_shell.clone(),
+            s.sidebar_handle.clone(),
             current,
             is_visible,
             target_width,
@@ -3484,13 +3577,13 @@ fn toggle_sidebar(state: &State) {
     if is_visible {
         // Collapse: animate position to 0, then hide sidebar.
         let target = adw::CallbackAnimationTarget::new({
-            let p = paned.clone();
+            let sidebar_shell = sidebar_shell.clone();
             move |value| {
-                p.set_position(value as i32);
+                set_sidebar_width(&sidebar_shell, value as i32);
             }
         });
         let animation = adw::TimedAnimation::builder()
-            .widget(&paned)
+            .widget(&sidebar_shell)
             .value_from(current as f64)
             .value_to(0.0)
             .duration(200)
@@ -3509,7 +3602,7 @@ fn toggle_sidebar(state: &State) {
                 }
             };
             if is_current {
-                sidebar.set_visible(false);
+                set_sidebar_state_widgets(&sidebar_shell, &sidebar_handle, 0, false);
                 request_session_save(&state_for_done);
             }
         });
@@ -3517,16 +3610,15 @@ fn toggle_sidebar(state: &State) {
         animation.play();
     } else {
         // Expand: make sidebar visible, then animate position from 0 to remembered width.
-        sidebar.set_visible(true);
-        paned.set_position(0);
+        set_sidebar_state_widgets(&sidebar_shell, &sidebar_handle, 0, true);
         let target = adw::CallbackAnimationTarget::new({
-            let p = paned.clone();
+            let sidebar_shell = sidebar_shell.clone();
             move |value| {
-                p.set_position(value as i32);
+                set_sidebar_width(&sidebar_shell, value as i32);
             }
         });
         let animation = adw::TimedAnimation::builder()
-            .widget(&paned)
+            .widget(&sidebar_shell)
             .value_from(0.0)
             .value_to(target_width as f64)
             .duration(200)
