@@ -21,18 +21,23 @@ Ghostty config is not involved. Ghostty still owns terminal behavior once Limux 
 Limux reads shortcuts from:
 
 ```text
-~/.config/limux/config.json
+~/.config/limux/shortcuts.json
 ```
 
-That path comes from `dirs::config_dir()/limux/config.json`.
+That path comes from `dirs::config_dir()/limux/shortcuts.json`.
 
 If the file is missing, Limux uses built-in defaults.
+
+Older Limux builds stored shortcut overrides under the top-level `shortcuts`
+key in `~/.config/limux/config.json`. On startup, if `shortcuts.json` does not
+exist, Limux migrates that legacy `shortcuts` object into `shortcuts.json` and
+leaves `config.json` untouched.
 
 ## Important Runtime Behavior
 
 - Shortcuts are loaded at startup.
 - When you change them through the terminal `Keybinds` editor, Limux writes the config, reloads it, and applies the new bindings immediately in the running app.
-- If you edit `~/.config/limux/config.json` by hand outside the app, restart Limux to pick up those changes.
+- If you edit `~/.config/limux/shortcuts.json` by hand outside the app, restart Limux to pick up those changes.
 - If the config file is invalid or unreadable, Limux falls back to defaults and prints a warning to stderr.
 - If two active shortcuts resolve to the same binding, Limux rejects the override set and falls back to defaults.
 - Unknown shortcut IDs are ignored with a warning.
@@ -239,7 +244,7 @@ cargo run -p limux-host-linux --features webkit --bin limux
 Remove or move the config file out of the way:
 
 ```bash
-trash ~/.config/limux/config.json
+trash ~/.config/limux/shortcuts.json
 ```
 
 Launch Limux and verify:
@@ -352,7 +357,7 @@ Launch Limux, open terminal `Keybinds`, click the `Split Right` binding, and pre
 Verify:
 
 - the `Split Right` row updates to `Ctrl+H`
-- `~/.config/limux/config.json` contains the `split_right` override
+- `~/.config/limux/shortcuts.json` contains the `split_right` override
 - `Ctrl+H` splits right immediately without restarting Limux
 - `Ctrl+D` no longer splits right
 - the pane header split-right tooltip now shows `Ctrl+H`
