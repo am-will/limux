@@ -121,6 +121,20 @@ fn set_ghostty_runtime_env() {
     set_ghostty_runtime_env_for_exe(&exe_path);
 }
 
+fn gtk_runtime_version() -> (u32, u32, u32) {
+    unsafe {
+        (
+            gtk4::ffi::gtk_get_major_version(),
+            gtk4::ffi::gtk_get_minor_version(),
+            gtk4::ffi::gtk_get_micro_version(),
+        )
+    }
+}
+
+fn gtk_runtime_at_least(major: u32, minor: u32, micro: u32) -> bool {
+    gtk_runtime_version() >= (major, minor, micro)
+}
+
 fn main() {
     // Handle --version flag
     if std::env::args().any(|a| a == "--version" || a == "-v") {
@@ -128,11 +142,17 @@ fn main() {
         return;
     }
 
-    // Ghostty requires desktop OpenGL, not GLES. Must disable GLES before
-    // GTK initializes, otherwise GDK may select a GLES context.
-    // This matches what Ghostty's own GTK apprt does in setGtkEnv().
-    append_env("GDK_DISABLE", "gles-api,vulkan");
-    append_env("GDK_DEBUG", "gl-disable-gles,vulkan-disable");
+    // Ghostty requires desktop OpenGL, not GLES. Must set the GTK renderer
+    // environment before GTK initializes, and the exact knobs differ by GTK
+    // runtime version. Match Ghostty's GTK logic closely here so modern GTK
+    // doesn't warn about removed GDK_DEBUG values.
+    if gtk_runtime_at_least(4, 16, 0) {
+        append_env("GDK_DISABLE", "gles-api,vulkan");
+    } else if gtk_runtime_at_least(4, 14, 0) {
+        append_env("GDK_DEBUG", "gl-disable-gles,vulkan-disable");
+    } else {
+        append_env("GDK_DEBUG", "vulkan-disable");
+    }
 
     // Embedded Ghostty needs a resources directory to resolve named themes,
     // terminfo, and shell integration. Prefer Limux-bundled resources but

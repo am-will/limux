@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   packages:
+    name: Build tarball, deb, and AppImage on Ubuntu 24.04
     runs-on: ubuntu-24.04
 
     steps:
@@ -32,11 +33,9 @@ jobs:
           fi
 
       - name: Install Zig
-        run: |
-          ZIG_VERSION=0.15.2
-          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
 
       - name: Install stable Rust
         run: |
@@ -70,6 +69,16 @@ jobs:
           meson install -C /tmp/blueprint-compiler/_build
           echo "/tmp/blueprint-prefix/bin" >> "$GITHUB_PATH"
 
+      - name: Verify release glibc floor
+        run: |
+          set -euo pipefail
+          expected="2.39"
+          actual="$(ldd --version | sed -n '1s/.* //p')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Linux release packages must be built on the Ubuntu 24.04 GLIBC_${expected} floor, got GLIBC_${actual}."
+            exit 1
+          fi
+
       - name: Install appimagetool
         run: |
           curl -L \
@@ -84,9 +93,10 @@ jobs:
         run: ./scripts/package.sh "${{ steps.version.outputs.version }}"
 
       - name: Upload packages to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
           files: |
             dist/*
         env:

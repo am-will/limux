@@ -1,0 +1,69 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CLAUDE_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks claude session-start || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Claude session restore",
+            "timeout": 5
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CLAUDE_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks claude prompt-submit || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Claude session restore",
+            "timeout": 5
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CLAUDE_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks claude stop || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Claude session restore",
+            "timeout": 5
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CLAUDE_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks claude stop || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Claude session restore",
+            "timeout": 5
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CLAUDE_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks claude session-end || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Claude session restore",
+            "timeout": 5
+          }
+        ],
+        "matcher": "*"
+      }
+    ]
+  }
+}

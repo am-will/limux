@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use limux_ghostty_sys::*;
 
+use crate::shortcut_config::NormalizedShortcut;
+
 // ---------------------------------------------------------------------------
 // Global Ghostty app singleton
 // ---------------------------------------------------------------------------
@@ -177,12 +179,51 @@ impl TerminalHandle {
     /// Inject text into the terminal surface for control-socket requests and
     /// drag/drop payloads. Ghostty treats this as pasted text, which matches
     /// the current control protocol semantics.
-    pub fn send_text(&self, text: &str) {
-        if let Some(surface) = *self.surface_cell.borrow() {
-            unsafe {
-                ghostty_surface_text(surface, text.as_ptr() as *const c_char, text.len());
-            }
+    pub fn send_text(&self, text: &str) -> bool {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return false;
+        };
+
+        unsafe {
+            ghostty_surface_text(surface, text.as_ptr() as *const c_char, text.len());
         }
+        true
+    }
+
+    pub fn send_key(&self, key: &str) -> bool {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return false;
+        };
+
+        let Ok(binding) = NormalizedShortcut::parse(key) else {
+            return false;
+        };
+        let Some((keyval, modifier)) = gtk::accelerator_parse(binding.to_config_accel()) else {
+            return false;
+        };
+
+        let press = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            Some(self.gl_area.upcast_ref()),
+            None,
+            keyval,
+            0,
+            modifier,
+        );
+        let release = translate_key_event(
+            GHOSTTY_ACTION_RELEASE,
+            Some(self.gl_area.upcast_ref()),
+            None,
+            keyval,
+            0,
+            modifier,
+        );
+
+        unsafe {
+            ghostty_surface_key(surface, press);
+            ghostty_surface_key(surface, release);
+        }
+        true
     }
 
     pub fn show_find(&self) -> bool {
@@ -862,6 +903,26 @@ pub struct TerminalCallbacks {
 pub struct TerminalOptions {
     pub hover_focus: Rc<dyn Fn() -> bool>,
     pub saved_font_size: Option<f32>,
+    pub startup_command: Option<String>,
+    /// Extra environment variables to expose to the spawned shell
+    /// (e.g. `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, `LIMUX_PANE_ID`, `LIMUX_SOCKET`).
+    ///
+    /// These are resolved at pane-creation time so scripts running inside the
+    /// terminal can discover their own workspace/surface/pane without having
+    /// to call `limux identify` first. This is the foundation for the cmux
+    /// agent-to-agent communication workflow.
+    pub extra_env: Vec<(String, String)>,
+}
+
+impl Default for TerminalOptions {
+    fn default() -> Self {
+        Self {
+            hover_focus: Rc::new(|| false),
+            saved_font_size: None,
+            startup_command: None,
+            extra_env: Vec::new(),
+        }
+    }
 }
 
 /// Default font-size from ghostty config (cached on first access).
@@ -893,7 +954,9 @@ pub fn create_terminal(
 
     let wd = working_directory.map(|s| s.to_string());
     let saved_font_size = options.saved_font_size;
+    let startup_command = options.startup_command;
     let hover_focus = options.hover_focus;
+    let extra_env = options.extra_env;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
@@ -1020,6 +1083,7 @@ pub fn create_terminal(
         let had_focus = had_focus.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
         let scrollbar_syncing = scrollbar_syncing.clone();
+        let extra_env = extra_env.clone();
         gl_area.connect_realize(move |gl_area| {
             gl_area.make_current();
             if let Some(err) = gl_area.error() {
@@ -1056,6 +1120,40 @@ pub fn create_terminal(
             let c_wd = wd.as_ref().and_then(|s| CString::new(s.as_str()).ok());
             if let Some(ref cwd) = c_wd {
                 config.working_directory = cwd.as_ptr();
+            }
+
+            // Build env_vars array for the spawned shell. Keep the CStrings
+            // and the ghostty_env_var_s array alive until after
+            // ghostty_surface_new returns — Ghostty dupes the strings into
+            // its own arena (see ghostty/src/apprt/embedded.zig:573), so we
+            // only need the pointers valid across that single call.
+            let mut env_cstrings: Vec<(CString, CString)> = Vec::with_capacity(extra_env.len());
+            for (k, v) in extra_env.iter() {
+                if let (Ok(k_c), Ok(v_c)) = (CString::new(k.as_str()), CString::new(v.as_str())) {
+                    env_cstrings.push((k_c, v_c));
+                }
+            }
+            let mut env_vars_raw: Vec<ghostty_env_var_s> = env_cstrings
+                .iter()
+                .map(|(k, v)| ghostty_env_var_s {
+                    key: k.as_ptr(),
+                    value: v.as_ptr(),
+                })
+                .collect();
+            if !env_vars_raw.is_empty() {
+                config.env_vars = env_vars_raw.as_mut_ptr();
+                config.env_var_count = env_vars_raw.len();
+            }
+
+            let c_startup_command = startup_command
+                .as_ref()
+                .and_then(|command| CString::new(command.as_str()).ok());
+            if let Some(ref command) = c_startup_command {
+                config.command = command.as_ptr();
+                eprintln!(
+                    "limux: starting restored terminal command={}",
+                    command.to_string_lossy()
+                );
             }
 
             let surface = unsafe { ghostty_surface_new(app, &config) };

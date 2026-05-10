@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,8 @@ pub struct AppSessionState {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct WorkspaceState {
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub favorite: bool,
@@ -84,6 +88,8 @@ pub enum SplitOrientation {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct PaneState {
     #[serde(default)]
+    pub pane_id: Option<u32>,
+    #[serde(default)]
     pub active_tab_id: Option<String>,
     #[serde(default)]
     pub tabs: Vec<TabState>,
@@ -100,12 +106,90 @@ pub struct TabState {
     pub content: TabContentState,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestorableAgentKind {
+    Claude,
+    Codex,
+    OpenCode,
+    Gemini,
+}
+
+impl RestorableAgentKind {
+    pub fn resume_command(
+        self,
+        session_id: &str,
+        launch_command: Option<&AgentLaunchCommandState>,
+        cwd: Option<&str>,
+    ) -> Option<String> {
+        build_resume_command(self, session_id, launch_command, cwd)
+    }
+
+    fn fallback_executable(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    fn store_name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct AgentLaunchCommandState {
+    pub executable: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub captured_at: Option<f64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct RestorableAgentState {
+    pub kind: RestorableAgentKind,
+    pub session_id: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub launch_command: Option<AgentLaunchCommandState>,
+    #[serde(default)]
+    pub restore_on_startup: bool,
+}
+
+impl RestorableAgentState {
+    pub fn resume_command(&self) -> Option<String> {
+        if !self.restore_on_startup {
+            return None;
+        }
+        self.kind.resume_command(
+            &self.session_id,
+            self.launch_command.as_ref(),
+            self.cwd.as_deref(),
+        )
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "tab_kind", rename_all = "snake_case")]
 pub enum TabContentState {
     Terminal {
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        agent: Option<RestorableAgentState>,
     },
     Browser {
         #[serde(default)]
@@ -150,6 +234,7 @@ impl PaneState {
     pub fn fallback(working_directory: Option<&str>) -> Self {
         let tab = TabState::terminal(default_tab_id("terminal"), working_directory);
         Self {
+            pane_id: None,
             active_tab_id: Some(tab.id.clone()),
             tabs: vec![tab],
         }
@@ -158,6 +243,7 @@ impl PaneState {
     pub fn browser_only(uri: Option<&str>) -> Self {
         let tab = TabState::browser(default_tab_id("browser"), uri);
         Self {
+            pane_id: None,
             active_tab_id: Some(tab.id.clone()),
             tabs: vec![tab],
         }
@@ -172,6 +258,7 @@ impl TabState {
             pinned: false,
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
+                agent: None,
             },
         }
     }
@@ -346,6 +433,7 @@ impl AppSessionState {
                     .or(workspace.cwd.as_deref());
                 let tab = TabState::terminal(default_tab_id("legacy-terminal"), working_directory);
                 WorkspaceState {
+                    id: None,
                     name: workspace.name,
                     favorite: workspace.favorite,
                     cwd: workspace.cwd,
@@ -354,6 +442,7 @@ impl AppSessionState {
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
                         active_tab_id: Some(tab.id.clone()),
+                        pane_id: None,
                         tabs: vec![tab],
                     }),
                 }
@@ -364,6 +453,192 @@ impl AppSessionState {
             ..Self::default()
         })
     }
+}
+
+#[derive(serde::Deserialize)]
+struct HookSessionRecord {
+    session_id: String,
+    workspace_id: String,
+    surface_id: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    launch_command: Option<AgentLaunchCommandState>,
+    updated_at: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct HookSessionFile {
+    #[serde(default)]
+    sessions: BTreeMap<String, HookSessionRecord>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RestorableAgentIndex {
+    by_surface: HashMap<(String, String), (RestorableAgentState, f64)>,
+    by_any_workspace_surface: HashMap<String, (RestorableAgentState, f64)>,
+    by_tab_id: HashMap<String, (RestorableAgentState, f64)>,
+}
+
+impl RestorableAgentIndex {
+    pub fn load() -> Self {
+        Self::load_from_dir(&agent_hook_state_dir())
+    }
+
+    pub fn load_from_dir(dir: &Path) -> Self {
+        let mut index = Self::default();
+        for (kind, file_name) in [
+            (RestorableAgentKind::Claude, "claude-hook-sessions.json"),
+            (RestorableAgentKind::Codex, "codex-hook-sessions.json"),
+            (RestorableAgentKind::OpenCode, "opencode-hook-sessions.json"),
+            (RestorableAgentKind::Gemini, "gemini-hook-sessions.json"),
+        ] {
+            let path = dir.join(file_name);
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(file) = serde_json::from_str::<HookSessionFile>(&raw) else {
+                continue;
+            };
+            for record in file.sessions.values() {
+                let Some(session_id) = normalized_str(&record.session_id) else {
+                    continue;
+                };
+                let Some(workspace_id) = normalized_str(&record.workspace_id) else {
+                    continue;
+                };
+                let Some(surface_id) = normalized_str(&record.surface_id) else {
+                    continue;
+                };
+                let tab_id = surface_id
+                    .rsplit_once(':')
+                    .map(|(_, tab_id)| tab_id.to_string());
+                let key = (workspace_id, surface_id);
+                if index
+                    .by_surface
+                    .get(&key)
+                    .is_some_and(|(_, updated_at)| *updated_at > record.updated_at)
+                {
+                    continue;
+                }
+                index.by_surface.insert(
+                    key.clone(),
+                    (
+                        RestorableAgentState {
+                            kind,
+                            session_id: session_id.clone(),
+                            cwd: record.cwd.clone(),
+                            launch_command: record.launch_command.clone(),
+                            restore_on_startup: true,
+                        },
+                        record.updated_at,
+                    ),
+                );
+                let latest_for_surface = index
+                    .by_any_workspace_surface
+                    .get(&key.1)
+                    .is_some_and(|(_, updated_at)| *updated_at > record.updated_at);
+                if !latest_for_surface {
+                    index.by_any_workspace_surface.insert(
+                        key.1,
+                        (
+                            RestorableAgentState {
+                                kind,
+                                session_id: session_id.clone(),
+                                cwd: record.cwd.clone(),
+                                launch_command: record.launch_command.clone(),
+                                restore_on_startup: true,
+                            },
+                            record.updated_at,
+                        ),
+                    );
+                }
+                if let Some(tab_id) = tab_id {
+                    let latest_for_tab = index
+                        .by_tab_id
+                        .get(&tab_id)
+                        .is_some_and(|(_, updated_at)| *updated_at > record.updated_at);
+                    if !latest_for_tab {
+                        index.by_tab_id.insert(
+                            tab_id,
+                            (
+                                RestorableAgentState {
+                                    kind,
+                                    session_id: session_id.clone(),
+                                    cwd: record.cwd.clone(),
+                                    launch_command: record.launch_command.clone(),
+                                    restore_on_startup: true,
+                                },
+                                record.updated_at,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    pub fn agent_for_surface(
+        &self,
+        workspace_id: &str,
+        pane_id: Option<u32>,
+        tab_id: &str,
+    ) -> Option<RestorableAgentState> {
+        let surface_id = pane_id.map(|pane_id| format!("{pane_id}:{tab_id}"));
+        surface_id
+            .as_ref()
+            .and_then(|surface_id| {
+                self.by_surface
+                    .get(&(workspace_id.to_string(), surface_id.clone()))
+                    .or_else(|| self.by_any_workspace_surface.get(surface_id))
+            })
+            .or_else(|| self.by_tab_id.get(tab_id))
+            .map(|(agent, _)| agent.clone())
+    }
+}
+
+pub fn attach_restorable_agents_to_layout(
+    layout: &mut LayoutNodeState,
+    workspace_id: &str,
+    index: &RestorableAgentIndex,
+) {
+    match layout {
+        LayoutNodeState::Pane(pane) => {
+            for tab in &mut pane.tabs {
+                if let TabContentState::Terminal { agent, .. } = &mut tab.content {
+                    if agent
+                        .as_ref()
+                        .is_some_and(|agent| !agent.restore_on_startup)
+                    {
+                        continue;
+                    }
+                    if let Some(restored_agent) =
+                        index.agent_for_surface(workspace_id, pane.pane_id, &tab.id)
+                    {
+                        *agent = Some(restored_agent);
+                    }
+                }
+            }
+        }
+        LayoutNodeState::Split(split) => {
+            attach_restorable_agents_to_layout(&mut split.start, workspace_id, index);
+            attach_restorable_agents_to_layout(&mut split.end, workspace_id, index);
+        }
+    }
+}
+
+fn agent_hook_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LIMUX_AGENT_HOOK_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = dirs::state_dir() {
+        return dir.join(PERSISTENCE_DIR_NAME);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/state")
+        .join(PERSISTENCE_DIR_NAME)
 }
 
 fn temp_session_path(path: &Path) -> PathBuf {
@@ -399,6 +674,207 @@ fn default_split_ratio() -> f64 {
 
 fn default_tab_id(prefix: &str) -> String {
     format!("{prefix}-0")
+}
+
+fn build_resume_command(
+    kind: RestorableAgentKind,
+    session_id: &str,
+    launch: Option<&AgentLaunchCommandState>,
+    cwd: Option<&str>,
+) -> Option<String> {
+    let session_id = normalized_str(session_id)?;
+    let fallback = kind.fallback_executable().to_string();
+    let args = launch
+        .map(|launch| launch.arguments.clone())
+        .filter(|args| !args.is_empty())
+        .unwrap_or_else(|| vec![fallback.clone()]);
+    let sanitized = sanitize_launch_arguments(kind, &args);
+    let executable = launch
+        .and_then(|launch| normalized_str(&launch.executable))
+        .or_else(|| sanitized.first().cloned())
+        .unwrap_or(fallback);
+    let preserved_tail = sanitized
+        .get(1..)
+        .map(|tail| tail.to_vec())
+        .unwrap_or_default();
+
+    let mut parts = vec![executable];
+    match kind {
+        RestorableAgentKind::Codex => {
+            parts.push("resume".to_string());
+            parts.extend(preserved_tail);
+            parts.push(session_id.clone());
+        }
+        RestorableAgentKind::OpenCode => {
+            parts.push("--session".to_string());
+            parts.push(session_id.clone());
+            parts.extend(preserved_tail);
+        }
+        RestorableAgentKind::Claude | RestorableAgentKind::Gemini => {
+            parts.push("--resume".to_string());
+            parts.push(session_id.clone());
+            parts.extend(preserved_tail);
+        }
+    }
+
+    let command = parts
+        .iter()
+        .map(|part| shell_single_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cwd = cwd.and_then(normalized_str).or_else(|| {
+        launch
+            .and_then(|launch| launch.cwd.as_deref())
+            .and_then(normalized_str)
+    });
+    let run_command = match cwd {
+        Some(cwd) => format!("cd {} && {command}", shell_single_quote(&cwd)),
+        None => command,
+    };
+    Some(wrap_restored_agent_command(kind, &session_id, &run_command))
+}
+
+fn wrap_restored_agent_command(
+    kind: RestorableAgentKind,
+    session_id: &str,
+    run_command: &str,
+) -> String {
+    let payload = format!(
+        "{{\"session_id\":{},\"hook_event_name\":\"Cleanup\"}}",
+        serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".to_string())
+    );
+    let cleanup = format!(
+        "printf %s {} | {} --json hooks {} cleanup >/dev/null 2>&1 || true",
+        shell_single_quote(&payload),
+        shell_single_quote(&limux_cli_executable()),
+        kind.store_name()
+    );
+    format!("{run_command}; limux_agent_status=$?; {cleanup}; exec \"${{SHELL:-/bin/sh}}\" -l")
+}
+
+fn limux_cli_executable() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            let candidate = path.with_file_name("limux-cli");
+            candidate.exists().then_some(candidate)
+        })
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "limux-cli".to_string())
+}
+
+fn sanitize_launch_arguments(kind: RestorableAgentKind, arguments: &[String]) -> Vec<String> {
+    if arguments.is_empty() {
+        return vec![kind.fallback_executable().to_string()];
+    }
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let arg = &arguments[index];
+        if index == 0 {
+            result.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if is_resume_selector(kind, arg) || option_takes_secret_value(arg) {
+            index += 1;
+            if index < arguments.len() && !arguments[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        if option_is_secret_assignment(arg) {
+            index += 1;
+            continue;
+        }
+        if option_takes_safe_value(arg) {
+            result.push(arg.clone());
+            if index + 1 < arguments.len() {
+                result.push(arguments[index + 1].clone());
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if option_is_safe_flag_or_assignment(arg) {
+            result.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    result
+}
+
+fn is_resume_selector(kind: RestorableAgentKind, arg: &str) -> bool {
+    match kind {
+        RestorableAgentKind::Codex => {
+            arg == "resume" || arg == "--resume" || arg.starts_with("--resume=")
+        }
+        RestorableAgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
+        RestorableAgentKind::Claude | RestorableAgentKind::Gemini => {
+            arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
+        }
+    }
+}
+
+fn option_takes_secret_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--api-key" | "--apikey" | "--token" | "--auth-token" | "--password"
+    )
+}
+
+fn option_is_secret_assignment(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    lower.starts_with("--api-key=")
+        || lower.starts_with("--apikey=")
+        || lower.starts_with("--token=")
+        || lower.starts_with("--auth-token=")
+        || lower.starts_with("--password=")
+}
+
+fn option_takes_safe_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--model"
+            | "-m"
+            | "--config"
+            | "-c"
+            | "--profile"
+            | "--sandbox"
+            | "--approval-policy"
+            | "--cwd"
+            | "--cd"
+            | "--working-directory"
+    )
+}
+
+fn option_is_safe_flag_or_assignment(arg: &str) -> bool {
+    if matches!(
+        arg,
+        "--dangerously-bypass-approvals-and-sandbox" | "--dangerously-skip-permissions"
+    ) {
+        return true;
+    }
+    let Some((name, _)) = arg.split_once('=') else {
+        return false;
+    };
+    option_takes_safe_value(name)
+}
+
+fn normalized_str(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -465,6 +941,7 @@ mod tests {
 
         let canonical = AppSessionState {
             workspaces: vec![WorkspaceState {
+                id: Some("11111111-1111-4111-8111-111111111111".to_string()),
                 name: "canonical".to_string(),
                 favorite: true,
                 cwd: Some("/canonical".to_string()),
@@ -520,7 +997,7 @@ mod tests {
         };
         assert_eq!(pane.tabs.len(), 1);
         match &pane.tabs[0].content {
-            TabContentState::Terminal { cwd } => {
+            TabContentState::Terminal { cwd, .. } => {
                 assert_eq!(cwd.as_deref(), Some("/tmp/project"));
             }
             other => panic!("expected terminal tab, got {other:?}"),
@@ -565,6 +1042,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let state = AppSessionState {
             workspaces: vec![WorkspaceState {
+                id: Some("22222222-2222-4222-8222-222222222222".to_string()),
                 name: "workspace".to_string(),
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
@@ -580,12 +1058,337 @@ mod tests {
         let decoded: AppSessionState =
             serde_json::from_str(&raw).expect("decode canonical session");
         assert_eq!(decoded.version, SESSION_VERSION);
+        assert_eq!(
+            decoded.workspaces[0].id.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
         assert_eq!(decoded.workspaces[0].name, "workspace");
+    }
+
+    #[test]
+    fn workspace_id_defaults_for_legacy_session_json() {
+        let raw = r#"{
+            "version": 1,
+            "workspaces": [{
+                "name": "legacy-shape",
+                "favorite": false,
+                "layout": {
+                    "kind": "pane",
+                    "active_tab_id": "terminal-0",
+                    "tabs": [{
+                        "id": "terminal-0",
+                        "tab_kind": "terminal",
+                        "cwd": "/tmp/project"
+                    }]
+                }
+            }]
+        }"#;
+
+        let decoded: AppSessionState = serde_json::from_str(raw).expect("decode legacy shape");
+        assert_eq!(decoded.workspaces[0].id, None);
+    }
+
+    #[test]
+    fn hook_index_attaches_agent_to_matching_workspace_surface() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            r#"{
+                "version": 1,
+                "sessions": {
+                    "session-a": {
+                        "session_id": "session-a",
+                        "workspace_id": "workspace-a",
+                        "surface_id": "42:tab-a",
+                        "cwd": "/tmp/project",
+                        "pid": 1,
+                        "launch_command": {
+                            "executable": "codex",
+                            "arguments": ["codex"],
+                            "cwd": "/tmp/project",
+                            "environment": {},
+                            "captured_at": 10.0
+                        },
+                        "updated_at": 10.0
+                    }
+                }
+            }"#,
+        )
+        .expect("write hook state");
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(42),
+            active_tab_id: Some("tab-a".to_string()),
+            tabs: vec![TabState::terminal("tab-a", Some("/tmp/project"))],
+        });
+
+        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        match &pane.tabs[0].content {
+            TabContentState::Terminal { agent, .. } => {
+                let agent = agent.as_ref().expect("agent metadata");
+                assert_eq!(agent.kind, RestorableAgentKind::Codex);
+                assert_eq!(agent.session_id, "session-a");
+                let command = agent.resume_command().expect("resume command");
+                assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'session-a'"));
+                assert!(command.contains("hooks codex cleanup"));
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_index_falls_back_to_surface_when_workspace_id_drifted() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            r#"{
+                "version": 1,
+                "sessions": {
+                    "session-a": {
+                        "session_id": "session-a",
+                        "workspace_id": "old-workspace",
+                        "surface_id": "42:tab-a",
+                        "cwd": "/tmp/project",
+                        "pid": 1,
+                        "launch_command": {
+                            "executable": "codex",
+                            "arguments": ["codex"],
+                            "cwd": "/tmp/project",
+                            "environment": {},
+                            "captured_at": 10.0
+                        },
+                        "updated_at": 10.0
+                    }
+                }
+            }"#,
+        )
+        .expect("write hook state");
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+
+        let agent = index
+            .agent_for_surface("new-workspace", Some(42), "tab-a")
+            .expect("agent by surface fallback");
+        assert_eq!(agent.kind, RestorableAgentKind::Codex);
+        assert_eq!(agent.session_id, "session-a");
+    }
+
+    #[test]
+    fn hook_index_falls_back_to_tab_id_when_pane_id_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            r#"{
+                "version": 1,
+                "sessions": {
+                    "session-a": {
+                        "session_id": "session-a",
+                        "workspace_id": "old-workspace",
+                        "surface_id": "42:tab-a",
+                        "cwd": "/tmp/project",
+                        "pid": 1,
+                        "launch_command": {
+                            "executable": "codex",
+                            "arguments": ["codex"],
+                            "cwd": "/tmp/project",
+                            "environment": {},
+                            "captured_at": 10.0
+                        },
+                        "updated_at": 10.0
+                    }
+                }
+            }"#,
+        )
+        .expect("write hook state");
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+
+        let agent = index
+            .agent_for_surface("new-workspace", None, "tab-a")
+            .expect("agent by tab id fallback");
+        assert_eq!(agent.kind, RestorableAgentKind::Codex);
+        assert_eq!(agent.session_id, "session-a");
+    }
+
+    #[test]
+    fn hook_merge_preserves_persisted_agent_when_index_misses() {
+        let index = RestorableAgentIndex::default();
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(42),
+            active_tab_id: Some("tab-a".to_string()),
+            tabs: vec![TabState {
+                id: "tab-a".to_string(),
+                custom_name: None,
+                pinned: false,
+                content: TabContentState::Terminal {
+                    cwd: Some("/tmp/project".to_string()),
+                    agent: Some(RestorableAgentState {
+                        kind: RestorableAgentKind::Codex,
+                        session_id: "persisted-session".to_string(),
+                        cwd: Some("/tmp/project".to_string()),
+                        launch_command: None,
+                        restore_on_startup: true,
+                    }),
+                },
+            }],
+        });
+
+        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        match &pane.tabs[0].content {
+            TabContentState::Terminal { agent, .. } => {
+                assert_eq!(
+                    agent.as_ref().map(|agent| agent.session_id.as_str()),
+                    Some("persisted-session")
+                );
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_merge_recovers_agent_without_workspace_or_pane_id() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            r#"{
+                "version": 1,
+                "sessions": {
+                    "session-a": {
+                        "session_id": "session-a",
+                        "workspace_id": "old-workspace",
+                        "surface_id": "42:tab-a",
+                        "cwd": "/tmp/project",
+                        "pid": 1,
+                        "launch_command": {
+                            "executable": "codex",
+                            "arguments": ["codex"],
+                            "cwd": "/tmp/project",
+                            "environment": {},
+                            "captured_at": 10.0
+                        },
+                        "updated_at": 10.0
+                    }
+                }
+            }"#,
+        )
+        .expect("write hook state");
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: None,
+            active_tab_id: Some("tab-a".to_string()),
+            tabs: vec![TabState::terminal("tab-a", Some("/tmp/project"))],
+        });
+
+        attach_restorable_agents_to_layout(&mut layout, "", &index);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        match &pane.tabs[0].content {
+            TabContentState::Terminal { agent, .. } => {
+                assert_eq!(
+                    agent.as_ref().map(|agent| agent.session_id.as_str()),
+                    Some("session-a")
+                );
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_tab_state_round_trips_restorable_agent_metadata() {
+        let tab = TabState {
+            id: "tab-a".to_string(),
+            custom_name: None,
+            pinned: false,
+            content: TabContentState::Terminal {
+                cwd: Some("/tmp/project".to_string()),
+                agent: Some(RestorableAgentState {
+                    kind: RestorableAgentKind::Codex,
+                    session_id: "sess-123".to_string(),
+                    cwd: Some("/tmp/project".to_string()),
+                    launch_command: Some(AgentLaunchCommandState {
+                        executable: "codex".to_string(),
+                        arguments: vec![
+                            "codex".to_string(),
+                            "--model".to_string(),
+                            "gpt-5.5".to_string(),
+                        ],
+                        cwd: Some("/tmp/project".to_string()),
+                        environment: Default::default(),
+                        captured_at: Some(12.0),
+                    }),
+                    restore_on_startup: true,
+                }),
+            },
+        };
+
+        let raw = serde_json::to_string(&tab).expect("encode tab");
+        let decoded: TabState = serde_json::from_str(&raw).expect("decode tab");
+
+        match decoded.content {
+            TabContentState::Terminal { agent, .. } => {
+                let agent = agent.expect("agent metadata");
+                assert_eq!(agent.kind, RestorableAgentKind::Codex);
+                assert_eq!(agent.session_id, "sess-123");
+                assert_eq!(
+                    agent
+                        .launch_command
+                        .expect("launch command")
+                        .arguments
+                        .as_slice(),
+                    ["codex", "--model", "gpt-5.5"]
+                );
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restorable_agent_resume_command_runs_from_cwd() {
+        let agent = RestorableAgentState {
+            kind: RestorableAgentKind::Codex,
+            session_id: "sess-123".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            launch_command: Some(AgentLaunchCommandState {
+                executable: "codex".to_string(),
+                arguments: vec!["codex".to_string()],
+                cwd: Some("/tmp/project".to_string()),
+                environment: Default::default(),
+                captured_at: Some(12.0),
+            }),
+            restore_on_startup: true,
+        };
+
+        let command = agent.resume_command().expect("resume command");
+        assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'sess-123'"));
+        assert!(command.contains("hooks codex cleanup"));
+        assert!(command.contains("exec \"${SHELL:-/bin/sh}\" -l"));
+    }
+
+    #[test]
+    fn legacy_restorable_agent_without_restore_marker_does_not_resume() {
+        let agent = RestorableAgentState {
+            kind: RestorableAgentKind::Codex,
+            session_id: "old-stale-session".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            launch_command: None,
+            restore_on_startup: false,
+        };
+
+        assert_eq!(agent.resume_command(), None);
     }
 
     #[test]
     fn normalize_layout_falls_back_to_first_tab_when_active_tab_is_stale() {
         let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: None,
             active_tab_id: Some("missing".to_string()),
             tabs: vec![TabState {
                 id: "browser-1".to_string(),
@@ -608,6 +1411,7 @@ mod tests {
     #[test]
     fn normalize_layout_rebuilds_empty_pane_from_working_directory() {
         let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: None,
             active_tab_id: None,
             tabs: Vec::new(),
         });
@@ -619,7 +1423,7 @@ mod tests {
         };
         assert_eq!(pane.tabs.len(), 1);
         match &pane.tabs[0].content {
-            TabContentState::Terminal { cwd } => {
+            TabContentState::Terminal { cwd, .. } => {
                 assert_eq!(cwd.as_deref(), Some("/tmp/project"));
             }
             other => panic!("expected terminal fallback, got {other:?}"),
@@ -645,11 +1449,13 @@ mod tests {
         let state = AppSessionState {
             top_bar_visible: false,
             workspaces: vec![WorkspaceState {
+                id: Some("33333333-3333-4333-8333-333333333333".to_string()),
                 name: "workspace".to_string(),
                 favorite: false,
                 cwd: None,
                 folder_path: None,
                 layout: LayoutNodeState::Pane(PaneState {
+                    pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),
                     tabs: vec![TabState {
                         id: "keybinds-1".to_string(),

@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_GEMINI_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks gemini session-start || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Gemini session restore",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_GEMINI_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks gemini prompt-submit || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Gemini session restore",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_GEMINI_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks gemini stop || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Gemini session restore",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_GEMINI_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks gemini session-end || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Gemini session restore",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

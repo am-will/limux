@@ -70,7 +70,7 @@ assert_glibc_compatibility() {
 
     if version_gt "$required_glibc" "$MAX_GLIBC_VERSION"; then
         echo "ERROR: ${label} requires GLIBC_${required_glibc}, which exceeds the supported release baseline GLIBC_${MAX_GLIBC_VERSION}."
-        echo "Build release artifacts inside Ubuntu 24.04 or another environment pinned to GLIBC_${MAX_GLIBC_VERSION} or older."
+        echo "Build release artifacts inside an environment pinned to GLIBC_${MAX_GLIBC_VERSION}."
         echo "Override the baseline intentionally with LIMUX_MAX_GLIBC=<version> if you are targeting a newer distro on purpose."
         exit 1
     fi

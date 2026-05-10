@@ -10,7 +10,10 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config;
-use crate::control_bridge::{ControlCommand, WorkspaceTarget};
+use crate::control_bridge::{
+    BridgeError, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType,
+    WorkspaceTarget,
+};
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, WorkspaceState,
@@ -20,6 +23,9 @@ use crate::shortcut_config::{
     self, EditableCapturePolicy, ResolvedShortcutConfig, ShortcutCommand, ShortcutId,
 };
 use crate::split_tree::{self, SplitTreeContainer};
+
+const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
+const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
 
 // ---------------------------------------------------------------------------
 // State
@@ -96,14 +102,98 @@ fn workspace_ref(id: &str) -> String {
     format!("workspace:{id}")
 }
 
+fn pane_ref(id: u32) -> String {
+    format!("pane:{id}")
+}
+
 fn surface_ref(id: &str) -> String {
     format!("surface:{id}")
+}
+
+fn pane_create_response_payload(
+    workspace_id: &str,
+    workspace_name: &str,
+    surface: pane::SurfaceSummary,
+) -> serde_json::Value {
+    let surface_id = surface.surface_id;
+    serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "workspace": {
+            "id": workspace_id,
+            "ref": workspace_ref(workspace_id),
+            "workspace_id": workspace_id,
+            "workspace_ref": workspace_ref(workspace_id),
+            "title": workspace_name,
+            "name": workspace_name,
+        },
+        "title": workspace_name,
+        "name": workspace_name,
+        "pane_id": surface.pane_id.to_string(),
+        "pane_ref": pane_ref(surface.pane_id),
+        "surface_id": surface_id.clone(),
+        "surface_ref": surface_ref(&surface_id),
+        "surface_title": surface.title,
+        "surface_type": surface.kind,
+        "ok": true,
+    })
+}
+
+fn send_pane_create_response_after_command(
+    pane_widget: gtk::Widget,
+    surface_id: String,
+    command: String,
+    response: serde_json::Value,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+) {
+    let mut attempts = 0;
+    let mut reply = Some(reply);
+    let command = format!("{command}\n");
+
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(PANE_CREATE_COMMAND_READY_INTERVAL_MS),
+        move || {
+            attempts += 1;
+
+            if let Some((matched_surface_id, handle)) =
+                pane::exact_terminal_handle_for_surface(&pane_widget, &surface_id)
+            {
+                if matched_surface_id == surface_id && handle.send_text(&command) {
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(Ok(response.clone()));
+                    }
+                    return glib::ControlFlow::Break;
+                }
+            }
+
+            if attempts >= PANE_CREATE_COMMAND_READY_ATTEMPTS {
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(Err(BridgeError::internal(format!(
+                        "pane.create command target surface {surface_id} never became writable"
+                    ))));
+                }
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        },
+    );
 }
 
 fn normalize_workspace_handle(raw: &str) -> &str {
     raw.trim()
         .strip_prefix("workspace:")
         .unwrap_or_else(|| raw.trim())
+}
+
+fn normalize_pane_handle(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("pane:")
+        .unwrap_or_else(|| raw.trim())
+}
+
+fn parse_pane_handle(raw: &str) -> Option<u32> {
+    normalize_pane_handle(raw).parse::<u32>().ok()
 }
 
 fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Option<usize> {
@@ -149,6 +239,372 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
     }))
+}
+
+fn focused_surface_payload(state: &State) -> Option<serde_json::Value> {
+    let (workspace_id, workspace_name, pane_widget) = {
+        let app_state = state.borrow();
+        let workspace = app_state.active_workspace()?;
+        let pane_widget = find_focused_pane(state).map(|(_, pane_widget)| pane_widget)?;
+        (workspace.id.clone(), workspace.name.clone(), pane_widget)
+    };
+    let surface = pane::active_surface_summary(&pane_widget)?;
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "workspace_id".to_string(),
+        serde_json::Value::String(workspace_id.clone()),
+    );
+    payload.insert(
+        "workspace_ref".to_string(),
+        serde_json::Value::String(workspace_ref(&workspace_id)),
+    );
+    payload.insert(
+        "title".to_string(),
+        serde_json::Value::String(workspace_name.clone()),
+    );
+    payload.insert(
+        "name".to_string(),
+        serde_json::Value::String(workspace_name),
+    );
+    payload.insert(
+        "pane_id".to_string(),
+        serde_json::Value::String(surface.pane_id.to_string()),
+    );
+    payload.insert(
+        "pane_ref".to_string(),
+        serde_json::Value::String(pane_ref(surface.pane_id)),
+    );
+    payload.insert(
+        "surface_id".to_string(),
+        serde_json::Value::String(surface.surface_id.clone()),
+    );
+    payload.insert(
+        "surface_ref".to_string(),
+        serde_json::Value::String(surface_ref(&surface.surface_id)),
+    );
+    if !surface.title.is_empty() {
+        payload.insert(
+            "surface_title".to_string(),
+            serde_json::Value::String(surface.title),
+        );
+    }
+    payload.insert(
+        "surface_type".to_string(),
+        serde_json::Value::String(surface.kind),
+    );
+    if let Some(cwd) = surface.cwd.filter(|cwd| !cwd.is_empty()) {
+        payload.insert("cwd".to_string(), serde_json::Value::String(cwd));
+    }
+    if let Some(uri) = surface.uri.filter(|uri| !uri.is_empty()) {
+        payload.insert("uri".to_string(), serde_json::Value::String(uri));
+    }
+    Some(serde_json::Value::Object(payload))
+}
+
+fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>, Option<String>) {
+    let is_active = {
+        let app_state = state.borrow();
+        app_state
+            .active_workspace()
+            .map(|workspace| workspace.id == workspace_id)
+            .unwrap_or(false)
+    };
+    if !is_active {
+        return (None, None);
+    }
+
+    let Some((_focused_workspace_id, pane_widget)) = find_focused_pane(state) else {
+        return (None, None);
+    };
+    let Some(surface) = pane::active_surface_summary(&pane_widget) else {
+        return (None, None);
+    };
+    (Some(surface.pane_id), Some(surface.surface_id))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PaneCreateDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl PaneCreateDirection {
+    #[allow(dead_code)]
+    pub(crate) fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
+}
+
+impl From<BridgePaneCreateDirection> for PaneCreateDirection {
+    fn from(direction: BridgePaneCreateDirection) -> Self {
+        match direction {
+            BridgePaneCreateDirection::Left => Self::Left,
+            BridgePaneCreateDirection::Right => Self::Right,
+            BridgePaneCreateDirection::Up => Self::Up,
+            BridgePaneCreateDirection::Down => Self::Down,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PaneCreateSplitPlacement {
+    pub(crate) orientation: gtk::Orientation,
+    pub(crate) new_pane_first: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PaneCreateTargetError {
+    WorkspaceNotFound,
+    InvalidSurfaceId(String),
+    InvalidPaneId(u32),
+    NoPanes,
+}
+
+#[allow(dead_code)]
+pub(crate) struct ResolvedPaneCreateTarget {
+    pub(crate) workspace_id: String,
+    pub(crate) pane_id: u32,
+    pub(crate) pane_widget: gtk::Widget,
+    pub(crate) placement: PaneCreateSplitPlacement,
+}
+
+fn pane_create_split_placement(direction: PaneCreateDirection) -> PaneCreateSplitPlacement {
+    match direction {
+        PaneCreateDirection::Left => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Horizontal,
+            new_pane_first: true,
+        },
+        PaneCreateDirection::Right => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Horizontal,
+            new_pane_first: false,
+        },
+        PaneCreateDirection::Up => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Vertical,
+            new_pane_first: true,
+        },
+        PaneCreateDirection::Down => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Vertical,
+            new_pane_first: false,
+        },
+    }
+}
+
+fn normalize_surface_handle(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("surface:")
+        .unwrap_or_else(|| raw.trim())
+}
+
+fn resolve_pane_create_source_id(
+    surface_id: Option<&str>,
+    pane_id: Option<u32>,
+    focused_pane_id: Option<u32>,
+    target_workspace_is_active: bool,
+    pane_ids: &[u32],
+    surface_to_pane: &[(&str, u32)],
+) -> Result<u32, PaneCreateTargetError> {
+    if pane_ids.is_empty() {
+        return Err(PaneCreateTargetError::NoPanes);
+    }
+
+    if let Some(surface_id) = surface_id {
+        let requested = normalize_surface_handle(surface_id);
+        return surface_to_pane
+            .iter()
+            .find(|(known_surface_id, _)| *known_surface_id == requested)
+            .map(|(_, pane_id)| *pane_id)
+            .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
+    }
+
+    if let Some(pane_id) = pane_id {
+        if pane_ids.contains(&pane_id) {
+            return Ok(pane_id);
+        }
+        return Err(PaneCreateTargetError::InvalidPaneId(pane_id));
+    }
+
+    if target_workspace_is_active {
+        if let Some(focused_pane_id) = focused_pane_id {
+            if pane_ids.contains(&focused_pane_id) {
+                return Ok(focused_pane_id);
+            }
+        }
+    }
+
+    pane_ids
+        .first()
+        .copied()
+        .ok_or(PaneCreateTargetError::NoPanes)
+}
+
+fn pane_create_target_error(error: PaneCreateTargetError) -> BridgeError {
+    match error {
+        PaneCreateTargetError::WorkspaceNotFound => BridgeError::not_found("workspace not found"),
+        PaneCreateTargetError::InvalidSurfaceId(_) => BridgeError::not_found("surface not found"),
+        PaneCreateTargetError::InvalidPaneId(_) => BridgeError::not_found("pane not found"),
+        PaneCreateTargetError::NoPanes => BridgeError::not_found("pane not found"),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_pane_create_target(
+    state: &State,
+    target: &WorkspaceTarget,
+    surface_id: Option<&str>,
+    pane_id: Option<u32>,
+    direction: PaneCreateDirection,
+) -> Result<ResolvedPaneCreateTarget, PaneCreateTargetError> {
+    let (workspace_id, workspace_root, target_workspace_is_active) = {
+        let app_state = state.borrow();
+        let workspace_index = workspace_index_for_target(&app_state, target)
+            .ok_or(PaneCreateTargetError::WorkspaceNotFound)?;
+        let workspace = &app_state.workspaces[workspace_index];
+        (
+            workspace.id.clone(),
+            workspace.root.clone(),
+            workspace_index == app_state.active_idx,
+        )
+    };
+
+    let pane_summaries = pane::pane_summaries_for_root(&workspace_root);
+    let pane_ids = pane_summaries
+        .iter()
+        .map(|summary| summary.pane_id)
+        .collect::<Vec<_>>();
+    let surface_summaries = pane::surface_summaries_for_root(&workspace_root);
+    let surface_to_pane = surface_summaries
+        .iter()
+        .map(|surface| (surface.surface_id.as_str(), surface.pane_id))
+        .collect::<Vec<_>>();
+    let focused_pane_id = target_workspace_is_active
+        .then(|| focused_ids_for_workspace(state, &workspace_id).0)
+        .flatten();
+
+    let pane_id = resolve_pane_create_source_id(
+        surface_id,
+        pane_id,
+        focused_pane_id,
+        target_workspace_is_active,
+        &pane_ids,
+        &surface_to_pane,
+    )?;
+    let pane_widget = pane::pane_widget_for_root(&workspace_root, pane_id)
+        .ok_or(PaneCreateTargetError::InvalidPaneId(pane_id))?;
+
+    Ok(ResolvedPaneCreateTarget {
+        workspace_id,
+        pane_id,
+        pane_widget,
+        placement: pane_create_split_placement(direction),
+    })
+}
+
+fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value {
+    let (focused_pane_id, _) = focused_ids_for_workspace(state, &workspace.id);
+    let panes = pane::pane_summaries_for_root(&workspace.root)
+        .into_iter()
+        .enumerate()
+        .map(|(index, pane)| {
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "pane_id".to_string(),
+                serde_json::Value::String(pane.pane_id.to_string()),
+            );
+            row.insert(
+                "pane_ref".to_string(),
+                serde_json::Value::String(pane_ref(pane.pane_id)),
+            );
+            row.insert("index".to_string(), serde_json::json!(index));
+            row.insert(
+                "surface_count".to_string(),
+                serde_json::json!(pane.surface_count),
+            );
+            let focused = focused_pane_id == Some(pane.pane_id);
+            row.insert("focused".to_string(), serde_json::Value::Bool(focused));
+            row.insert("selected".to_string(), serde_json::Value::Bool(focused));
+            if let Some(surface_id) = pane.active_surface_id {
+                row.insert(
+                    "surface_id".to_string(),
+                    serde_json::Value::String(surface_id.clone()),
+                );
+                row.insert(
+                    "surface_ref".to_string(),
+                    serde_json::Value::String(surface_ref(&surface_id)),
+                );
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "panes": panes })
+}
+
+fn surface_list_payload(
+    state: &State,
+    workspace: &Workspace,
+    pane_filter: Option<u32>,
+) -> serde_json::Value {
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+    let surfaces = pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .filter(|surface| pane_filter.is_none_or(|pane_id| surface.pane_id == pane_id))
+        .enumerate()
+        .map(|(index, surface)| {
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "surface_id".to_string(),
+                serde_json::Value::String(surface.surface_id.clone()),
+            );
+            row.insert(
+                "surface_ref".to_string(),
+                serde_json::Value::String(surface_ref(&surface.surface_id)),
+            );
+            row.insert(
+                "pane_id".to_string(),
+                serde_json::Value::String(surface.pane_id.to_string()),
+            );
+            row.insert(
+                "pane_ref".to_string(),
+                serde_json::Value::String(pane_ref(surface.pane_id)),
+            );
+            row.insert("index".to_string(), serde_json::json!(index));
+            row.insert(
+                "title".to_string(),
+                serde_json::Value::String(surface.title.clone()),
+            );
+            row.insert(
+                "type".to_string(),
+                serde_json::Value::String(surface.kind.clone()),
+            );
+            row.insert(
+                "selected".to_string(),
+                serde_json::Value::Bool(surface.selected),
+            );
+            row.insert(
+                "focused".to_string(),
+                serde_json::Value::Bool(
+                    focused_surface_id.as_deref() == Some(surface.surface_id.as_str()),
+                ),
+            );
+            if let Some(cwd) = surface.cwd.filter(|cwd| !cwd.is_empty()) {
+                row.insert("cwd".to_string(), serde_json::Value::String(cwd));
+            }
+            if let Some(uri) = surface.uri.filter(|uri| !uri.is_empty()) {
+                row.insert("uri".to_string(), serde_json::Value::String(uri));
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "surfaces": surfaces })
 }
 
 #[derive(Clone)]
@@ -283,13 +739,21 @@ fn suspend_persistence(state: &State, suspended: bool) {
     state.borrow_mut().persistence_suspended = suspended;
 }
 
-fn apply_loaded_session(state: &State, loaded: LoadedSession) {
+fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     suspend_persistence(state, true);
 
     apply_top_bar_state_immediately(state, loaded.state.top_bar_visible);
 
     let restored_any = !loaded.state.workspaces.is_empty();
     if restored_any {
+        let restorable_agents = layout_state::RestorableAgentIndex::load();
+        for workspace in &mut loaded.state.workspaces {
+            layout_state::attach_restorable_agents_to_layout(
+                &mut workspace.layout,
+                workspace.id.as_deref().unwrap_or(""),
+                &restorable_agents,
+            );
+        }
         for workspace in &loaded.state.workspaces {
             add_workspace_from_state(state, workspace);
         }
@@ -354,6 +818,7 @@ fn apply_top_bar_state_immediately(state: &State, visible: bool) {
 
 fn snapshot_session_state(state: &State) -> AppSessionState {
     let s = state.borrow();
+    let restorable_agents = layout_state::RestorableAgentIndex::load();
     let sidebar_visible = sidebar_is_visible(&s);
     let sidebar_width = if sidebar_visible {
         s.paned.position()
@@ -369,15 +834,22 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             let cwd = workspace.cwd.borrow().clone();
             let folder_path = workspace.folder_path.clone();
             let working_directory = folder_path.clone().or(cwd.clone());
+            let mut layout = workspace
+                .split_container
+                .tree()
+                .snapshot(working_directory.as_deref());
+            layout_state::attach_restorable_agents_to_layout(
+                &mut layout,
+                &workspace.id,
+                &restorable_agents,
+            );
             WorkspaceState {
+                id: Some(workspace.id.clone()),
                 name: workspace.name.clone(),
                 favorite: workspace.favorite,
                 cwd,
                 folder_path,
-                layout: workspace
-                    .split_container
-                    .tree()
-                    .snapshot(working_directory.as_deref()),
+                layout,
             }
         })
         .collect();
@@ -2719,19 +3191,74 @@ fn install_workspace_row_interactions(
     }
 }
 
-#[allow(deprecated)]
 fn add_workspace(state: &State, _working_directory: Option<&str>) {
-    // Open a folder chooser dialog (using FileChooserDialog to avoid portal crashes)
-    let window: Option<gtk::Window> = {
-        let s = state.borrow();
-        s.stack
-            .root()
-            .and_then(|r| r.downcast::<gtk::Window>().ok())
+    let window = active_window(state);
+    let dialog = gtk::FileDialog::builder()
+        .title("Open Folder as Workspace")
+        .accept_label("Open")
+        .modal(true)
+        .build();
+
+    if let Some(home) = dirs::home_dir() {
+        let home_file = gtk::gio::File::for_path(&home);
+        dialog.set_initial_folder(Some(&home_file));
+    }
+
+    let state_for_native = state.clone();
+    let window_for_native = window.clone();
+    dialog.select_folder(
+        window.as_ref(),
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(file) => {
+                create_workspace_from_file(&state_for_native, &file);
+            }
+            Err(err) if is_workspace_picker_cancel(&err) => {}
+            Err(err) => {
+                eprintln!(
+                    "limux: native workspace folder picker failed ({err}); falling back to legacy chooser"
+                );
+                show_legacy_workspace_folder_dialog(
+                    &state_for_native,
+                    window_for_native.as_ref(),
+                );
+            }
+        },
+    );
+}
+
+fn active_window(state: &State) -> Option<gtk::Window> {
+    let s = state.borrow();
+    s.stack
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok())
+}
+
+fn create_workspace_from_file(state: &State, file: &gio::File) {
+    let Some(path) = file.path() else {
+        return;
     };
 
+    let path_str = path.to_string_lossy().to_string();
+    let folder_name = path
+        .file_name()
+        .map(|segment| segment.to_string_lossy().to_string())
+        .unwrap_or_else(|| path_str.clone());
+    create_workspace_with_folder(state, &folder_name, &path_str);
+}
+
+fn is_workspace_picker_cancel(err: &glib::Error) -> bool {
+    matches!(
+        err.kind::<gtk::DialogError>(),
+        Some(gtk::DialogError::Cancelled | gtk::DialogError::Dismissed)
+    )
+}
+
+#[allow(deprecated)]
+fn show_legacy_workspace_folder_dialog(state: &State, window: Option<&gtk::Window>) {
     let dialog = gtk::FileChooserDialog::new(
         Some("Open Folder as Workspace"),
-        window.as_ref(),
+        window,
         gtk::FileChooserAction::SelectFolder,
         &[
             ("Cancel", gtk::ResponseType::Cancel),
@@ -2740,7 +3267,6 @@ fn add_workspace(state: &State, _working_directory: Option<&str>) {
     );
     dialog.set_modal(true);
 
-    // Start in the home directory
     if let Some(home) = dirs::home_dir() {
         let home_file = gtk::gio::File::for_path(&home);
         let _ = dialog.set_current_folder(Some(&home_file));
@@ -2750,14 +3276,7 @@ fn add_workspace(state: &State, _working_directory: Option<&str>) {
     dialog.connect_response(move |dlg, response| {
         if response == gtk::ResponseType::Accept {
             if let Some(file) = dlg.file() {
-                if let Some(path) = file.path() {
-                    let path_str = path.to_string_lossy().to_string();
-                    let folder_name = path
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path_str.clone());
-                    create_workspace_with_folder(&state, &folder_name, &path_str);
-                }
+                create_workspace_from_file(&state, &file);
             }
         }
         dlg.close();
@@ -2768,6 +3287,7 @@ fn add_workspace(state: &State, _working_directory: Option<&str>) {
 
 fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     let workspace = WorkspaceState {
+        id: None,
         name: name.to_string(),
         favorite: false,
         cwd: Some(folder_path.to_string()),
@@ -2795,17 +3315,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
     match command {
         ControlCommand::Identify { caller, reply } => {
             let result = {
-                let app_state = state.borrow();
-                let focused = workspace_payload(&app_state, app_state.active_idx)
-                    .map(|payload| {
-                        serde_json::json!({
-                            "workspace_id": payload["workspace_id"],
-                            "workspace_ref": payload["workspace_ref"],
-                            "title": payload["title"],
-                            "name": payload["name"],
-                        })
-                    })
-                    .unwrap_or(serde_json::Value::Null);
+                let focused = focused_surface_payload(state).unwrap_or(serde_json::Value::Null);
                 serde_json::json!({
                     "name": "limux-control",
                     "protocol": "v1+v2",
@@ -2836,6 +3346,174 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
+        }
+        ControlCommand::ListPanes { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                pane_list_payload(state, &app_state.workspaces[index])
+            };
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::ListPaneSurfaces {
+            target,
+            pane_id,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let pane_filter = pane_id
+                .as_deref()
+                .and_then(parse_pane_handle)
+                .or_else(|| pane_id.as_deref().and_then(|raw| raw.parse::<u32>().ok()));
+            if pane_id.is_some() && pane_filter.is_none() {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.surfaces requires a valid pane_id",
+                )));
+                return;
+            }
+
+            let result = {
+                let app_state = state.borrow();
+                surface_list_payload(state, &app_state.workspaces[index], pane_filter)
+            };
+
+            if pane_id.is_some()
+                && result["surfaces"]
+                    .as_array()
+                    .is_some_and(|surfaces| surfaces.is_empty())
+            {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane not found",
+                )));
+                return;
+            }
+
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::CreatePane { request, reply } => {
+            if !matches!(request.pane_type, PaneCreateType::Terminal) {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.create live GTK bridge supports type=terminal only",
+                )));
+                return;
+            }
+
+            let source_pane_id = request
+                .source_pane_id
+                .as_deref()
+                .and_then(parse_pane_handle);
+            if request.source_pane_id.is_some() && source_pane_id.is_none() {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.create requires a valid pane_id",
+                )));
+                return;
+            }
+
+            let direction = PaneCreateDirection::from(request.direction);
+            let resolved = match resolve_pane_create_target(
+                state,
+                &request.target,
+                request.source_surface_id.as_deref(),
+                source_pane_id,
+                direction,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = reply.send(Err(pane_create_target_error(error)));
+                    return;
+                }
+            };
+
+            let workspace_name = {
+                let app_state = state.borrow();
+                app_state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == resolved.workspace_id)
+                    .map(|workspace| workspace.name.clone())
+            };
+            let Some(workspace_name) = workspace_name else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let new_pane = split_pane(
+                state,
+                &resolved.workspace_id,
+                &resolved.pane_widget,
+                resolved.placement.orientation,
+                SplitPaneOptions {
+                    initial_state: None,
+                    skip_default_tab: false,
+                    new_pane_first: resolved.placement.new_pane_first,
+                    persist: true,
+                },
+            );
+
+            let Some(surface) = pane::active_surface_summary(&new_pane) else {
+                let _ = reply.send(Err(BridgeError::internal(
+                    "pane.create did not produce a terminal surface",
+                )));
+                return;
+            };
+
+            let surface_id = surface.surface_id.clone();
+            let response =
+                pane_create_response_payload(&resolved.workspace_id, &workspace_name, surface);
+
+            if let Some(command) = request.command {
+                send_pane_create_response_after_command(
+                    new_pane.upcast(),
+                    surface_id,
+                    command,
+                    response,
+                    reply,
+                );
+                return;
+            }
+
+            let _ = reply.send(Ok(response));
+        }
+        ControlCommand::ListSurfaces { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                surface_list_payload(state, &app_state.workspaces[index], None)
+            };
+            let _ = reply.send(Ok(result));
         }
         ControlCommand::CreateWorkspace {
             name,
@@ -3009,7 +3687,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let target = {
                 let app_state = state.borrow();
                 let workspace = &app_state.workspaces[index];
-                pane::terminal_handle_for_surface(&workspace.root, surface_hint.as_deref()).map(
+                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
                     |(surface_id, handle)| {
                         (
                             serde_json::json!({
@@ -3037,6 +3715,104 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(Ok(payload));
         }
+        ControlCommand::SendKey {
+            target,
+            surface_hint,
+            key,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let target = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
+                    |(surface_id, handle)| {
+                        (
+                            serde_json::json!({
+                                "workspace_id": workspace.id.as_str(),
+                                "workspace_ref": workspace_ref(&workspace.id),
+                                "surface_id": surface_id.as_str(),
+                                "surface_ref": surface_ref(&surface_id),
+                            }),
+                            handle,
+                        )
+                    },
+                )
+            };
+
+            let Some((mut payload, handle)) = target else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+
+            if !handle.send_key(&key) {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "unsupported key",
+                )));
+                return;
+            }
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::CreateNotification {
+            target,
+            title,
+            subtitle,
+            body,
+            reply,
+        } => {
+            // Resolve the workspace target. `WorkspaceTarget::Active` maps to
+            // the currently-focused workspace via workspace_index_for_target.
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let ws_id = state.borrow().workspaces[index].id.clone();
+
+            // Build the sidebar message: title becomes the bold prefix,
+            // subtitle + body are joined with " — " for the body text.
+            let combined_body = match (subtitle.is_empty(), body.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => body.clone(),
+                (false, true) => subtitle.clone(),
+                (false, false) => format!("{subtitle} — {body}"),
+            };
+            let message = workspace_notification_message(&title, &combined_body);
+            mark_workspace_unread_with_message(state, &ws_id, &message);
+
+            let payload = serde_json::json!({
+                "ok": true,
+                "workspace_id": ws_id,
+                "workspace_ref": workspace_ref(&ws_id),
+                "title": title,
+                "subtitle": subtitle,
+                "body": body,
+            });
+            let _ = reply.send(Ok(payload));
+        }
     }
 }
 
@@ -3049,7 +3825,12 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         let s = state.borrow();
         (s.stack.clone(), s.sidebar_list.clone())
     };
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = workspace
+        .id
+        .as_deref()
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let stack_name = format!("ws-{id}");
     let working_dir = workspace
         .folder_path
@@ -3122,6 +3903,7 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_config = state.clone();
     let state_for_config_changed = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
+    let ws_id_for_env = ws_id.to_string();
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
@@ -3234,6 +4016,7 @@ pub(crate) fn create_pane_for_workspace(
                 }
             },
         ),
+        workspace_for_pane: Box::new(move |_pane_widget| Some(ws_id_for_env.clone())),
     });
 
     pane::create_pane(
@@ -4244,14 +5027,16 @@ mod tests {
     use super::{
         build_window_css, clamp_workspace_insert_index_for_pinning, directional_neighbor_score,
         favorites_prefix_len, font_size_after_delta, ghostty_prefers_dark,
-        gtk_system_prefers_dark_from_raw, next_active_workspace_index, queue_session_save_request,
-        resolved_system_prefers_dark, sanitize_background_opacity,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
-        use_opaque_window_background, workspace_drop_layout_path, workspace_notification_message,
-        Direction, EditableCaptureContext, NeighborScore, PaneBounds, PortalColorSchemePreference,
-        SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        gtk_system_prefers_dark_from_raw, next_active_workspace_index, pane_create_split_placement,
+        queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
+        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, tab_drag_workspace_seed, use_opaque_window_background,
+        workspace_drop_layout_path, workspace_notification_message, Direction,
+        EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
+        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -4374,6 +5159,96 @@ mod tests {
         assert_eq!(left_score.overlap, 0);
         assert_eq!(right_score.overlap, 100);
         assert!(right_score.has_overlap);
+    }
+
+    #[test]
+    fn pane_create_split_placement_maps_direction_to_orientation_and_order() {
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Left),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Horizontal,
+                new_pane_first: true,
+            }
+        );
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Right),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Horizontal,
+                new_pane_first: false,
+            }
+        );
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Up),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Vertical,
+                new_pane_first: true,
+            }
+        );
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Down),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Vertical,
+                new_pane_first: false,
+            }
+        );
+    }
+
+    #[test]
+    fn pane_create_source_prefers_surface_then_pane_then_active_focus_then_first_leaf() {
+        let panes = [10, 20, 30];
+        let surfaces = [("10:aaa", 10), ("20:bbb", 20)];
+
+        assert_eq!(
+            resolve_pane_create_source_id(
+                Some("surface:20:bbb"),
+                Some(10),
+                Some(30),
+                true,
+                &panes,
+                &surfaces,
+            ),
+            Ok(20)
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, Some(10), Some(30), true, &panes, &surfaces),
+            Ok(10)
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, None, Some(30), true, &panes, &surfaces),
+            Ok(30)
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, None, Some(30), false, &panes, &surfaces),
+            Ok(10)
+        );
+    }
+
+    #[test]
+    fn pane_create_source_reports_invalid_surface_pane_and_empty_workspace() {
+        let panes = [10, 20];
+        let surfaces = [("10:aaa", 10)];
+
+        assert_eq!(
+            resolve_pane_create_source_id(
+                Some("missing"),
+                Some(10),
+                Some(20),
+                true,
+                &panes,
+                &surfaces,
+            ),
+            Err(PaneCreateTargetError::InvalidSurfaceId(
+                "missing".to_string()
+            ))
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, Some(99), Some(20), true, &panes, &surfaces),
+            Err(PaneCreateTargetError::InvalidPaneId(99))
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, None, None, true, &[], &[]),
+            Err(PaneCreateTargetError::NoPanes)
+        );
     }
 
     #[test]

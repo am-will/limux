@@ -14,13 +14,18 @@ permissions:
 
 jobs:
   rpm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
 
       - name: Determine version
         id: version
@@ -31,66 +36,43 @@ jobs:
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build packages in openSUSE Tumbleweed container
+      - name: Install stable Rust
         run: |
-          set -euo pipefail
-          docker run --rm \
-            -e LIMUX_VERSION="${{ steps.version.outputs.version }}" \
-            -v "$GITHUB_WORKSPACE:/workspace" \
-            -w /workspace \
-            opensuse/tumbleweed:latest \
-            bash -lc '
-              set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
-              zypper refresh
-              zypper install -y --no-confirm \
-                binutils \
-                cairo-devel \
-                curl \
-                dpkg \
-                gcc \
-                gcc-c++ \
-                gettext-tools \
-                gdk-pixbuf-devel \
-                git \
-                glib2-devel \
-                gobject-introspection-devel \
-                gzip \
-                gtk4-devel \
-                libadwaita-devel \
-                libepoxy-devel \
-                libxml2-tools \
-                libsoup-devel \
-                make \
-                meson \
-                ncurses-devel \
-                ncurses-utils \
-                ninja \
-                pango-devel \
-                pkgconf-pkg-config \
-                python3-gobject \
-                rpm-build \
-                ruby \
-                tar \
-                "pkgconfig(webkitgtk-6.0)" \
-                xz
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            appstream \
+            binutils \
+            build-essential \
+            desktop-file-utils \
+            gettext \
+            libadwaita-1-dev \
+            libepoxy-dev \
+            libgtk-4-dev \
+            libxml2-utils \
+            libwebkitgtk-6.0-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            python3-gi \
+            rpm
 
-              ZIG_VERSION=0.15.2
-              curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-              tar -xf /tmp/zig.tar.xz -C /tmp
-              export PATH="/tmp/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
+      - name: Install current blueprint-compiler
+        run: |
+          BLUEPRINT_VERSION=v0.20.4
+          git clone --depth 1 --branch "${BLUEPRINT_VERSION}" https://github.com/GNOME/blueprint-compiler.git /tmp/blueprint-compiler
+          meson setup /tmp/blueprint-compiler/_build /tmp/blueprint-compiler --prefix /tmp/blueprint-prefix
+          meson install -C /tmp/blueprint-compiler/_build
+          echo "/tmp/blueprint-prefix/bin" >> "$GITHUB_PATH"
 
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-              . "$HOME/.cargo/env"
-
-              BLUEPRINT_VERSION=v0.20.4
-              git clone --depth 1 --branch "$BLUEPRINT_VERSION" https://github.com/GNOME/blueprint-compiler.git /tmp/blueprint-compiler
-              meson setup /tmp/blueprint-compiler/_build /tmp/blueprint-compiler --prefix /tmp/blueprint-prefix
-              meson install -C /tmp/blueprint-compiler/_build
-              export PATH="/tmp/blueprint-prefix/bin:$PATH"
-
-              ./scripts/package.sh "$LIMUX_VERSION"
-            '
+      - name: Build RPM package
+        env:
+          LIMUX_MAX_GLIBC: "2.39"
+        run: ./scripts/package.sh "${{ steps.version.outputs.version }}"
 
       - name: Resolve RPM path
         id: rpm
@@ -106,9 +88,10 @@ jobs:
           echo "rpm_arch=$RPM_ARCH" >> "$GITHUB_OUTPUT"
 
       - name: Upload RPM to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
           files: ${{ steps.rpm.outputs.rpm_path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -8,7 +8,12 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+dirs = "6"
 limux-control = { path = "../limux-control" }
 limux-protocol = { path = "../limux-protocol" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

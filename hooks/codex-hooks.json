@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CODEX_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks codex session-start || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Codex session restore",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CODEX_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks codex prompt-submit || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Codex session restore",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${LIMUX_CODEX_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks codex stop || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "statusMessage": "Limux Codex session restore",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

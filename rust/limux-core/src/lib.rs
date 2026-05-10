@@ -2689,37 +2689,21 @@ impl ControlState {
                 }
                 true
             }
-            "down" | "ctrl+n" | "ctrl+j" => {
-                if palette_visible {
-                    self.command_palette_move_selection(window_id, 1);
-                    true
-                } else {
-                    false
-                }
+            "down" | "ctrl+n" | "ctrl+j" if palette_visible => {
+                self.command_palette_move_selection(window_id, 1);
+                true
             }
-            "up" | "ctrl+p" | "ctrl+k" => {
-                if palette_visible {
-                    self.command_palette_move_selection(window_id, -1);
-                    true
-                } else {
-                    false
-                }
+            "up" | "ctrl+p" | "ctrl+k" if palette_visible => {
+                self.command_palette_move_selection(window_id, -1);
+                true
             }
-            "cmd+a" => {
-                if palette_visible {
-                    self.command_palette_select_all(window_id);
-                    true
-                } else {
-                    false
-                }
+            "cmd+a" if palette_visible => {
+                self.command_palette_select_all(window_id);
+                true
             }
-            "enter" => {
-                if palette_visible {
-                    self.command_palette_enter(window_id);
-                    true
-                } else {
-                    false
-                }
+            "enter" if palette_visible => {
+                self.command_palette_enter(window_id);
+                true
             }
             _ => false,
         }
@@ -2895,6 +2879,47 @@ fn optional_string_param(
 fn required_string_param(params: &Map<String, Value>, key: &str) -> Result<String, CommandError> {
     optional_string_param(params, key)?.ok_or_else(|| {
         CommandError::invalid_params(format!("{key} is required and must be a string"))
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PaneCreateContract {
+    workspace_id: Option<u64>,
+    source_pane_id: Option<u64>,
+    source_surface_id: Option<u64>,
+    direction: String,
+    pane_type: String,
+    url: Option<String>,
+    command: Option<String>,
+}
+
+fn parse_pane_create_contract(
+    params: &Map<String, Value>,
+) -> Result<PaneCreateContract, CommandError> {
+    let direction =
+        optional_string_param(params, "direction")?.unwrap_or_else(|| "right".to_string());
+    if !matches!(direction.as_str(), "left" | "right" | "up" | "down") {
+        return Err(CommandError::invalid_params(
+            "pane.create direction must be one of left|right|up|down",
+        ));
+    }
+
+    let pane_type =
+        optional_string_param(params, "type")?.unwrap_or_else(|| "terminal".to_string());
+    if !matches!(pane_type.as_str(), "terminal" | "browser") {
+        return Err(CommandError::invalid_params(
+            "pane.create type must be one of terminal|browser",
+        ));
+    }
+
+    Ok(PaneCreateContract {
+        workspace_id: optional_u64_param_any(params, &["workspace_id"])?,
+        source_pane_id: optional_u64_param_any(params, &["pane_id"])?,
+        source_surface_id: optional_u64_param_any(params, &["surface_id"])?,
+        direction,
+        pane_type,
+        url: optional_string_param(params, "url")?,
+        command: optional_string_param(params, "command")?,
     })
 }
 
@@ -5137,25 +5162,43 @@ fn handle_command(
         }
         "pane.create" => {
             let params = params_object(params)?;
+            let contract = parse_pane_create_contract(params)?;
             let title = optional_string_param(params, "surface_title")?;
-            let pane_type =
-                optional_string_param(params, "type")?.unwrap_or_else(|| "terminal".to_string());
-            let url = optional_string_param(params, "url")?;
-            let pane = state
-                .create_pane(title)
-                .ok_or_else(|| CommandError::not_found("no active window"))?;
-            let surface_id = pane.current_surface_id.unwrap_or_default();
-            if pane_type == "browser" {
-                state.browser_register_surface(surface_id);
-                state.browser_navigate(url.unwrap_or_else(|| "about:blank".to_string()));
-            }
-            Ok(json!({
-                "pane_id": encode_handle_id(pane.id),
-                "pane_ref": pane_ref(pane.id),
-                "surface_id": encode_handle_id(surface_id),
-                "surface_ref": surface_ref(surface_id),
-                "pane": pane
-            }))
+
+            // The standalone dispatcher accepts the live-host self-split
+            // contract for compatibility, but only the GTK host can honor
+            // source pane targeting, directional placement, or terminal command
+            // injection. Core still creates a pane in the selected workspace
+            // and preserves the shared response fields.
+            let _host_only_fields = (
+                contract.source_pane_id,
+                contract.source_surface_id,
+                contract.direction.clone(),
+                contract.command.clone(),
+            );
+
+            with_workspace_scope(state, contract.workspace_id, |scoped| {
+                let pane = scoped
+                    .create_pane(title)
+                    .ok_or_else(|| CommandError::not_found("no active window"))?;
+                let surface_id = pane.current_surface_id.unwrap_or_default();
+                if contract.pane_type == "browser" {
+                    scoped.browser_register_surface(surface_id);
+                    scoped.browser_navigate(
+                        contract
+                            .url
+                            .clone()
+                            .unwrap_or_else(|| "about:blank".to_string()),
+                    );
+                }
+                Ok(json!({
+                    "pane_id": encode_handle_id(pane.id),
+                    "pane_ref": pane_ref(pane.id),
+                    "surface_id": encode_handle_id(surface_id),
+                    "surface_ref": surface_ref(surface_id),
+                    "pane": pane
+                }))
+            })
         }
         "pane.focus" => {
             let params = params_object(params)?;
@@ -6853,6 +6896,62 @@ mod tests {
             source_url.result.expect("source browser url")["url"],
             "https://cmux.dev/docs"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_pane_create_rejects_invalid_contract_values() {
+        let dispatcher = Dispatcher::new();
+
+        let bad_direction = dispatcher
+            .dispatch(request("pane.create", json!({ "direction": "diagonal" })))
+            .await;
+        let error = bad_direction.error.expect("direction error");
+        assert_eq!(error.code, -32602);
+
+        let bad_type = dispatcher
+            .dispatch(request("pane.create", json!({ "type": "webview" })))
+            .await;
+        let error = bad_type.error.expect("type error");
+        assert_eq!(error.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_pane_create_accepts_self_split_contract_refs() {
+        let dispatcher = Dispatcher::new();
+
+        let current = dispatcher
+            .dispatch(request("system.identify", json!({})))
+            .await
+            .result
+            .expect("identify result");
+        let workspace_ref = current["workspace_ref"].clone();
+        let pane_ref = current["pane_ref"].clone();
+        let surface_ref = current["surface_ref"].clone();
+
+        let created = dispatcher
+            .dispatch(request(
+                "pane.create",
+                json!({
+                    "workspace_id": workspace_ref,
+                    "pane_id": pane_ref,
+                    "surface_id": surface_ref,
+                    "direction": "up",
+                    "type": "terminal",
+                    "command": "printf core-contract\\n"
+                }),
+            ))
+            .await;
+        let result = created.result.expect("pane.create result");
+        assert!(result["pane_id"].as_str().is_some());
+        assert!(result["pane_ref"]
+            .as_str()
+            .expect("pane ref")
+            .starts_with("pane:"));
+        assert!(result["surface_id"].as_str().is_some());
+        assert!(result["surface_ref"]
+            .as_str()
+            .expect("surface ref")
+            .starts_with("surface:"));
     }
 
     #[tokio::test]

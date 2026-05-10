@@ -23,14 +23,19 @@ Download the latest release from [GitHub Releases](https://github.com/am-will/li
 
 **Debian/Ubuntu (.deb)** — recommended:
 ```bash
-sudo dpkg -i ./limux_0.1.13_amd64.deb
+sudo dpkg -i ./limux_0.1.14_amd64.deb
 ```
 
-**AppImage** — portable, no install needed:
+**AppImage** — portable across Ubuntu 24.04-era desktops and newer, no install needed:
 ```bash
-chmod +x Limux-0.1.13-x86_64.AppImage
-./Limux-0.1.13-x86_64.AppImage
+chmod +x Limux-0.1.14-x86_64.AppImage
+./Limux-0.1.14-x86_64.AppImage
 ```
+
+Release AppImages are built and checked on the Ubuntu 24.04 `GLIBC_2.39`
+floor. Limux still uses the host GTK4, libadwaita, and WebKitGTK runtime
+libraries, so older distributions may need the `.deb`, tarball, or a source
+build with matching system packages instead.
 
 **Tarball** — manual install:
 ```bash
@@ -104,6 +109,60 @@ Run the canonical local quality gate before committing:
 ```
 
 Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
+
+## Agent integrations
+
+Limux ships first-class hooks for coding agents (Codex, Claude Code, and
+Gemini CLI). Every terminal limux spawns auto-exports
+`LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /
+`LIMUX_TAB_ID` / `LIMUX_SOCKET`, so the CLI auto-targets the right place
+with no flags needed from inside the agent's own terminal.
+
+```bash
+# Fire a libadwaita toast + sidebar unread badge from any agent
+limux notify --subtitle "needs review" --body "blocked on auth choice" "Input needed"
+
+# Install Limux session-restore hooks for supported agents
+limux hooks setup
+
+# Drop-in hook handlers translate hook JSON on stdin into notify/session state
+echo '{"event":"stop"}' | limux claude-hook --event stop
+echo '{"event":"finished"}' | limux gemini-hook --event finished
+
+# Spin up a multi-agent collaboration team — one workspace per agent,
+# launches each agent's CLI, and writes AGENTS.md describing the
+# <agent-msg> XML protocol so peers can talk to each other:
+limux agent-team --agents codex,claude --cwd "$PWD"
+# → Codex and Claude can now do:
+#   limux send --workspace claude $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
+
+# Or split the current agent's pane and launch another terminal agent.
+# Inside Limux, workspace/surface/pane default from LIMUX_*:
+limux new-pane --direction right --command claude
+# Live GTK self-spawn currently supports terminal panes only.
+
+# Explicit source targets are also accepted and serialized unchanged:
+limux new-pane --workspace "$LIMUX_WORKSPACE_ID" --surface "$LIMUX_SURFACE_ID" \
+  --pane "$LIMUX_PANE_ID" --direction down --command "codex"
+
+# Keep both agents in the same workspace on separate splits/tabs:
+limux identify --json
+limux list-panels --workspace "$LIMUX_WORKSPACE_ID"
+limux send --workspace "$LIMUX_WORKSPACE_ID" --surface "<peer-surface-id>" \
+  $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
+```
+
+See the auto-generated `AGENTS.md` (written into the shared cwd) for
+the full protocol spec, peer table, and editable Policies section.
+
+Checked-in hook templates live in [`hooks/`](hooks/). They mirror
+`limux hooks setup` for Codex, Claude Code, and Gemini CLI; OpenCode is
+omitted until its hook integration is ready.
+
+Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
+and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build
+loop, crate map, and the `feat/cmux-parity` roadmap tracked in
+[`docs/cmux-parity-plan.md`](docs/cmux-parity-plan.md).
 
 ## Keyboard shortcuts
 

@@ -17,7 +17,9 @@ use webkit6::prelude::*;
 
 use crate::app_config::AppConfig;
 use crate::keybind_editor;
-use crate::layout_state::{PaneState, TabContentState, TabState as SavedTabState};
+use crate::layout_state::{
+    PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
+};
 use crate::settings_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 use crate::terminal::{self, TerminalCallbacks};
@@ -168,6 +170,10 @@ type PaneShortcutCaptureCallback =
 type PaneSplitWithTabCallback = dyn Fn(&gtk::Widget, &gtk::Widget, gtk::Orientation, String, bool);
 type PaneConfigCallback = dyn Fn() -> Rc<RefCell<AppConfig>>;
 type PaneConfigChangedCallback = dyn Fn(&AppConfig, &AppConfig);
+/// Returns the workspace id that owns a given pane widget, or `None` if the
+/// pane is not yet attached to a workspace. Used to stamp `LIMUX_WORKSPACE_ID`
+/// onto every terminal spawned inside the pane.
+type PaneWorkspaceLookupCallback = dyn Fn(&gtk::Widget) -> Option<String>;
 
 pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
@@ -184,6 +190,9 @@ pub struct PaneCallbacks {
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
     pub current_config: Box<PaneConfigCallback>,
     pub on_config_changed: Rc<PaneConfigChangedCallback>,
+    /// Resolve the workspace id for a given pane widget. May be `None` while
+    /// the pane is still being constructed; callers treat that as "unknown".
+    pub workspace_for_pane: Box<PaneWorkspaceLookupCallback>,
 }
 
 #[derive(Clone)]
@@ -646,11 +655,21 @@ fn normalize_surface_hint(raw: &str) -> &str {
         .unwrap_or_else(|| raw.trim())
 }
 
+fn composite_surface_id(pane_id: u32, tab_id: &str) -> String {
+    format!("{pane_id}:{tab_id}")
+}
+
+fn surface_hint_matches(surface_id: &str, tab_id: &str, surface_hint: &str) -> bool {
+    let requested = normalize_surface_hint(surface_hint);
+    !requested.is_empty() && (requested == tab_id || requested == surface_id)
+}
+
 pub fn terminal_handle_for_surface(
     pane_widget: &gtk::Widget,
     surface_hint: Option<&str>,
 ) -> Option<(String, terminal::TerminalHandle)> {
     let internals = find_pane_internals(pane_widget)?;
+    let pane_id = internals.pane_id;
     let tab_state = internals.tab_state.borrow();
     let requested = surface_hint
         .map(normalize_surface_hint)
@@ -663,20 +682,44 @@ pub fn terminal_handle_for_surface(
             continue;
         };
 
-        if requested == Some(entry.id.as_str()) {
-            return Some((entry.id.clone(), state.handle.clone()));
+        let full_surface_id = composite_surface_id(pane_id, &entry.id);
+
+        if requested.is_some_and(|value| value == entry.id || value == full_surface_id) {
+            return Some((full_surface_id, state.handle.clone()));
         }
 
         if active_tab == Some(entry.id.as_str()) {
-            return Some((entry.id.clone(), state.handle.clone()));
+            return Some((full_surface_id, state.handle.clone()));
         }
 
         if fallback.is_none() {
-            fallback = Some((entry.id.clone(), state.handle.clone()));
+            fallback = Some((full_surface_id, state.handle.clone()));
         }
     }
 
     fallback
+}
+
+pub fn exact_terminal_handle_for_surface(
+    pane_widget: &gtk::Widget,
+    surface_hint: &str,
+) -> Option<(String, terminal::TerminalHandle)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let pane_id = internals.pane_id;
+    let tab_state = internals.tab_state.borrow();
+
+    for entry in &tab_state.tabs {
+        let TabKind::Terminal { state } = &entry.kind else {
+            continue;
+        };
+
+        let full_surface_id = composite_surface_id(pane_id, &entry.id);
+        if surface_hint_matches(&full_surface_id, &entry.id, surface_hint) {
+            return Some((full_surface_id, state.handle.clone()));
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +870,7 @@ struct TerminalTabOptions<'a> {
     custom_name: Option<&'a str>,
     pinned: bool,
     cwd: Option<&'a str>,
+    agent: Option<RestorableAgentState>,
 }
 
 struct BrowserTabOptions<'a> {
@@ -860,7 +904,7 @@ fn restore_tabs_from_state(
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
-            TabContentState::Terminal { cwd } => add_terminal_tab_inner(
+            TabContentState::Terminal { cwd, agent } => add_terminal_tab_inner(
                 internals,
                 cwd.as_deref().or(working_directory),
                 Some(TerminalTabOptions {
@@ -868,6 +912,7 @@ fn restore_tabs_from_state(
                     custom_name: saved_tab.custom_name.as_deref(),
                     pinned: saved_tab.pinned,
                     cwd: cwd.as_deref().or(working_directory),
+                    agent: agent.clone(),
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
@@ -1062,11 +1107,45 @@ fn add_terminal_tab_inner(
         })
     };
 
+    // Build the env the spawned shell will see. Encodes this terminal's
+    // identity so CLI calls (e.g. `limux identify`, `limux send`) auto-target
+    // the current surface without flags. Mirrors cmux's env auto-wiring.
+    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+    let workspace_id_for_env = (internals.callbacks.workspace_for_pane)(&pane_widget);
+    let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    if let Some(ws) = workspace_id_for_env {
+        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws));
+    }
+    extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env));
+    extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
+    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
+    if let Some(sock) = limux_control::socket_path::resolve_socket_path(
+        None,
+        limux_control::socket_path::SocketMode::Runtime,
+    )
+    .to_str()
+    {
+        extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
+    }
+    let startup_command = options
+        .as_ref()
+        .and_then(|value| value.agent.as_ref())
+        .and_then(|agent| agent.resume_command());
+    if let Some(command) = startup_command.as_deref() {
+        eprintln!(
+            "limux: restoring agent terminal surface={}:{} command={}",
+            internals.pane_id, tab_id, command
+        );
+    }
+
     let term = terminal::create_terminal(
         working_directory,
         terminal::TerminalOptions {
             hover_focus,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
+            startup_command,
+            extra_env,
         },
         term_callbacks,
     );
@@ -1386,6 +1465,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
             let content = match &entry.kind {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
+                    agent: None,
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
@@ -1401,6 +1481,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
         })
         .collect();
     Some(PaneState {
+        pane_id: Some(internals.pane_id),
         active_tab_id: ts.active_tab.clone(),
         tabs,
     })
@@ -1446,6 +1527,175 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
         TabKind::Terminal { state } => state.cwd.borrow().clone(),
         TabKind::Browser { .. } | TabKind::Keybinds => None,
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneSummary {
+    pub pane_id: u32,
+    pub surface_count: usize,
+    pub active_surface_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceSummary {
+    pub pane_id: u32,
+    pub surface_id: String,
+    pub title: String,
+    pub kind: String,
+    pub selected: bool,
+    pub cwd: Option<String>,
+    pub uri: Option<String>,
+}
+
+fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
+    let mut panes = PANE_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .values()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|internals| internals.pane_outer.is_ancestor(root))
+            .collect::<Vec<_>>()
+    });
+    panes.sort_by_key(|internals| internals.pane_id);
+    panes
+}
+
+pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
+    pane_internals_for_root(root)
+        .into_iter()
+        .map(|internals| {
+            let pane_id = internals.pane_id;
+            let tab_state = internals.tab_state.borrow();
+            let active_surface_id = tab_state
+                .active_tab
+                .as_deref()
+                .map(|tab_id| composite_surface_id(pane_id, tab_id))
+                .or_else(|| {
+                    tab_state
+                        .tabs
+                        .first()
+                        .map(|entry| composite_surface_id(pane_id, &entry.id))
+                });
+            PaneSummary {
+                pane_id,
+                surface_count: tab_state.tabs.len(),
+                active_surface_id,
+            }
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+pub(crate) fn pane_widget_for_root(root: &gtk::Widget, pane_id: u32) -> Option<gtk::Widget> {
+    pane_internals_for_root(root)
+        .into_iter()
+        .find(|internals| internals.pane_id == pane_id)
+        .map(|internals| internals.pane_outer.clone().upcast())
+}
+
+pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
+    let mut surfaces = Vec::new();
+
+    for internals in pane_internals_for_root(root) {
+        let pane_id = internals.pane_id;
+        let tab_state = internals.tab_state.borrow();
+        let active_tab = tab_state.active_tab.as_deref();
+        for entry in &tab_state.tabs {
+            let selected = active_tab
+                .map(|current| current == entry.id)
+                .unwrap_or_else(|| {
+                    tab_state
+                        .tabs
+                        .first()
+                        .is_some_and(|first| first.id == entry.id)
+                });
+            let (kind, cwd, uri) = match &entry.kind {
+                TabKind::Terminal { state } => {
+                    ("terminal".to_string(), state.cwd.borrow().clone(), None)
+                }
+                TabKind::Browser { state } => {
+                    ("browser".to_string(), None, state.uri.borrow().clone())
+                }
+                TabKind::Keybinds => ("keybinds".to_string(), None, None),
+            };
+            surfaces.push(SurfaceSummary {
+                pane_id,
+                surface_id: composite_surface_id(pane_id, &entry.id),
+                title: entry.title_label.label().to_string(),
+                kind,
+                selected,
+                cwd,
+                uri,
+            });
+        }
+    }
+
+    surfaces.sort_by(|left, right| {
+        left.pane_id
+            .cmp(&right.pane_id)
+            .then_with(|| right.selected.cmp(&left.selected))
+            .then_with(|| left.surface_id.cmp(&right.surface_id))
+    });
+    surfaces
+}
+
+pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    let pane_id = internals.pane_id;
+    let tab_state = internals.tab_state.borrow();
+    let active_id = tab_state
+        .active_tab
+        .clone()
+        .or_else(|| tab_state.tabs.first().map(|entry| entry.id.clone()))?;
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == active_id)?;
+    let (kind, cwd, uri) = match &entry.kind {
+        TabKind::Terminal { state } => ("terminal".to_string(), state.cwd.borrow().clone(), None),
+        TabKind::Browser { state } => ("browser".to_string(), None, state.uri.borrow().clone()),
+        TabKind::Keybinds => ("keybinds".to_string(), None, None),
+    };
+    Some(SurfaceSummary {
+        pane_id,
+        surface_id: composite_surface_id(pane_id, &entry.id),
+        title: entry.title_label.label().to_string(),
+        kind,
+        selected: true,
+        cwd,
+        uri,
+    })
+}
+
+pub fn terminal_handle_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<(String, terminal::TerminalHandle)> {
+    let requested = surface_hint
+        .map(normalize_surface_hint)
+        .filter(|value| !value.is_empty());
+
+    if let Some(requested) = requested {
+        for internals in pane_internals_for_root(root) {
+            let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+            if let Some((surface_id, handle)) =
+                terminal_handle_for_surface(&pane_widget, Some(requested))
+            {
+                if surface_id == requested
+                    || surface_id
+                        .strip_prefix("surface:")
+                        .is_some_and(|value| value == requested)
+                {
+                    return Some((surface_id, handle));
+                }
+            }
+        }
+        return None;
+    }
+
+    pane_internals_for_root(root)
+        .into_iter()
+        .find_map(|internals| {
+            let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+            terminal_handle_for_surface(&pane_widget, None)
+        })
 }
 
 pub fn move_tab_to_pane(
@@ -2997,8 +3247,8 @@ mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
         is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, ContentDropZone, TabDragPayload,
-        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches, ContentDropZone,
+        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -3065,6 +3315,18 @@ mod tests {
             BROWSER_SEARCH_ENTRY_CSS_CLASSES,
             [HOST_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASS]
         );
+    }
+
+    #[test]
+    fn surface_hint_matches_only_exact_surface_or_tab_id() {
+        assert!(surface_hint_matches(
+            "42:tab-a",
+            "tab-a",
+            "surface:42:tab-a"
+        ));
+        assert!(surface_hint_matches("42:tab-a", "tab-a", "tab-a"));
+        assert!(!surface_hint_matches("42:tab-a", "tab-a", "42:tab-b"));
+        assert!(!surface_hint_matches("42:tab-a", "tab-a", ""));
     }
 
     #[test]
