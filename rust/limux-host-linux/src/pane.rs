@@ -1182,11 +1182,77 @@ fn make_terminal_callbacks(
     }
 }
 
+fn is_safe_browser_url(url: &str) -> bool {
+    // Minimal allow-list of URI schemes that may be handed to the system
+    // browser on Ctrl+click. The threat model is hostile terminal output:
+    // anything that ends up in a pane's scrollback can craft an OSC 8
+    // hyperlink, and clicking it must not lead to code execution.
+    //
+    // Why only http/https/mailto?
+    // - `javascript:`, `vbscript:`, `data:` are classic XSS sinks (Gitea
+    //   blocks these unconditionally — github.com/go-gitea/gitea#25960).
+    // - `file://` directly opens local files via the registered handler;
+    //   a hostile `cat` of a crafted .desktop file would be RCE.
+    // - `ftp://`, `ftps://`, `smb://`, `nfs://`, `dav://`, `sftp://` all
+    //   auto-mount via gvfs and can execute binaries on the mounted share
+    //   (positive.security/blog/url-open-rce).
+    // - Custom schemes (`vscode://`, `slack://`, `obsidian://`, ...) have
+    //   historically had RCE CVEs in their handlers; we don't second-guess
+    //   that surface area here.
+    //
+    // RFC 3986 §3.1: scheme matching is case-insensitive.
+    let Some(colon) = url.find(':') else {
+        return false;
+    };
+    let scheme = url[..colon].to_ascii_lowercase();
+    let rest = &url[colon..];
+    match scheme.as_str() {
+        "https" | "http" => rest.starts_with("://"),
+        "mailto" => rest.starts_with(':'),
+        _ => false,
+    }
+}
+
 fn open_url_in_external_browser(url: &str) {
-    if let Err(err) =
-        gtk::gio::AppInfo::launch_default_for_uri(url, None::<&gtk::gio::AppLaunchContext>)
+    if !is_safe_browser_url(url) {
+        eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
+        return;
+    }
+
+    // Use the GDK display's launch context so GIO emits an xdg-activation
+    // token. Without it, the target app (e.g. Firefox) receives the URL but
+    // Wayland refuses to let it raise its window — Konsole works because KIO
+    // wires the token in the same way.
+    if let Some(display) = gtk::gdk::Display::default() {
+        let context = display.app_launch_context();
+        match gtk::gio::AppInfo::launch_default_for_uri(url, Some(&context)) {
+            Ok(_) => return,
+            Err(err) => {
+                eprintln!("limux: gio launch failed, falling back to xdg-open: {err}");
+            }
+        }
+    }
+
+    // Fallback: spawn xdg-open. Loses activation but at least delivers the URL
+    // in AppImage / sandboxed contexts where the bundled GIO can't dispatch.
+    // Reap the child in a detached thread — xdg-open exits as soon as it
+    // hands the URL off to the registered handler, and a dropped Child would
+    // otherwise linger as a <defunct> entry until the host process exits.
+    match std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
     {
-        eprintln!("limux: failed to open URL in external browser: {err}");
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(err) => {
+            eprintln!("limux: failed to spawn xdg-open for {url}: {err}");
+        }
     }
 }
 
@@ -3421,11 +3487,12 @@ fn create_browser_widget(
 mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
-        is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches, ContentDropZone,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
-        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
-        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
+        is_localhost_input, is_safe_browser_url, next_active_after_tab_removal,
+        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
+        surface_hint_matches, ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
+        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
+        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
+        TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
@@ -3713,6 +3780,76 @@ mod tests {
 
         for (input, expected) in cases {
             assert_eq!(normalize_browser_entry_input(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn is_safe_browser_url_accepts_navigable_schemes() {
+        // Web + email only — see the rationale on `is_safe_browser_url`.
+        for url in [
+            "https://example.com",
+            "https://example.com/path?x=1&y=2",
+            "http://example.com",
+            "http://localhost:8080/foo",
+            "mailto:user@example.com",
+            "mailto:user@example.com?subject=hi",
+        ] {
+            assert!(is_safe_browser_url(url), "should accept {url}");
+        }
+    }
+
+    #[test]
+    fn is_safe_browser_url_is_scheme_case_insensitive() {
+        // RFC 3986 §3.1: scheme matching is case-insensitive. OSC 8 hyperlinks
+        // sometimes preserve the original case from upstream sources, so we
+        // must not reject syntactically valid uppercase/mixed-case schemes.
+        for url in [
+            "HTTPS://example.com",
+            "Https://example.com",
+            "HTTP://example.com",
+            "MAILTO:user@example.com",
+        ] {
+            assert!(is_safe_browser_url(url), "should accept {url}");
+        }
+    }
+
+    #[test]
+    fn is_safe_browser_url_rejects_unsupported_or_dangerous_schemes() {
+        // Threat model: hostile terminal output can craft any OSC 8 hyperlink.
+        // The schemes below are either classic XSS sinks (`javascript:`,
+        // `data:`, `vbscript:`), gvfs auto-mount + exec vectors
+        // (`smb:`, `nfs:`, `dav:`, `davs:`, `sftp:`, `ftp:`, `ftps:`), local
+        // RCE via the file handler (`file:`), or app-specific URIs whose
+        // handlers have a history of RCE CVEs (`vscode:`, `slack:`, etc.).
+        // Leading whitespace and bare paths are also rejected as malformed.
+        for url in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+            "File:///home/manu/notes.md",
+            "ftp://ftp.example.com/pub/file",
+            "ftps://ftp.example.com/pub/file",
+            "smb://server/share",
+            "nfs://server/export",
+            "dav://server/path",
+            "davs://server/path",
+            "sftp://user@host/path",
+            "ssh://user@host",
+            "magnet:?xt=urn:btih:abc",
+            "chrome://settings",
+            "about:blank",
+            "vscode://file/path",
+            "slack://open?team=T",
+            "  https://example.com",
+            "/etc/passwd",
+            "example.com",
+            "",
+            "https:",
+            "http:/example.com",
+        ] {
+            assert!(!is_safe_browser_url(url), "should reject {url:?}");
         }
     }
 }

@@ -52,6 +52,12 @@ pub struct TerminalIdentity {
     pub surface_id: String,
 }
 
+/// Vertical pixel gap between the cursor and the bottom edge of the hover
+/// URL preview popover. Roughly the height of a large accessibility cursor
+/// so the popover stays visible even when the user has a >32 px pointer
+/// skin enabled.
+const LINK_PREVIEW_CURSOR_Y_GAP: i32 = 14;
+
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
     gl_area: gtk::GLArea,
@@ -67,6 +73,12 @@ struct SurfaceEntry {
     on_close: Option<Box<VoidCallback>>,
     open_url_external: Rc<Cell<bool>>,
     clipboard_context: *mut ClipboardContext,
+    // Hover URL preview for OSC 8 hyperlinks. The popover is a child of
+    // `gl_area` so it inherits libadwaita's popover styling — matching the
+    // right-click context menu by construction.
+    link_popover: gtk::Popover,
+    link_label: gtk::Label,
+    cursor_pos: Rc<Cell<(f64, f64)>>,
 }
 
 struct ClipboardContext {
@@ -767,6 +779,51 @@ unsafe extern "C" fn ghostty_action_cb(
             }
             true
         }
+        GHOSTTY_ACTION_MOUSE_OVER_LINK => {
+            // Ghostty emits this when the cursor enters / leaves a hyperlink
+            // region (only while the link is in its "clickable" state — i.e.
+            // Ctrl held). Show the target URL in a libadwaita popover so the
+            // user can see where an OSC 8 labelled link actually points
+            // before they click — defence against deceptive link-masking.
+            if target.tag == GHOSTTY_TARGET_SURFACE {
+                let surface_key = unsafe { target.target.surface } as usize;
+                let payload = unsafe { action.action.mouse_over_link };
+                let url = if payload.url.is_null() || payload.len == 0 {
+                    None
+                } else {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(payload.url.cast::<u8>(), payload.len)
+                    };
+                    Some(String::from_utf8_lossy(bytes).to_string())
+                };
+                SURFACE_MAP.with(|map| {
+                    if let Some(entry) = map.borrow().get(&surface_key) {
+                        match url {
+                            Some(url) => {
+                                entry.link_label.set_text(&url);
+                                let (x, y) = entry.cursor_pos.get();
+                                // GTK default: PositionType::Top centers the
+                                // popover horizontally on the rectangle and
+                                // anchors its bottom edge to the rectangle's
+                                // top edge. The Y-gap keeps the popover clear
+                                // of large accessibility cursor skins.
+                                entry.link_popover.set_pointing_to(Some(
+                                    &gtk::gdk::Rectangle::new(
+                                        x as i32,
+                                        (y as i32).saturating_sub(LINK_PREVIEW_CURSOR_Y_GAP),
+                                        1,
+                                        1,
+                                    ),
+                                ));
+                                entry.link_popover.popup();
+                            }
+                            None => entry.link_popover.popdown(),
+                        }
+                    }
+                });
+            }
+            true
+        }
         GHOSTTY_ACTION_OPEN_URL => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
@@ -1146,6 +1203,20 @@ pub fn create_terminal(
     let open_url_external = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
+    let cursor_pos: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+
+    // Popover used by the OSC 8 hover preview. Built via the same helpers
+    // as the right-click context menu so the look matches by construction.
+    let link_label = gtk::Label::new(None);
+    link_label.set_selectable(false);
+    let link_inner = build_popover_inner_box();
+    link_inner.append(&link_label);
+    let link_popover = build_floating_popover(&gl_area, &link_inner);
+    link_popover.set_autohide(false);
+    // Above the cursor by default, web-browser style. GTK auto-flips to
+    // Bottom if there isn't enough room above the pointing rectangle.
+    link_popover.set_position(gtk::PositionType::Top);
+    link_popover.set_can_focus(false);
 
     // Create overlay early so closures can capture it for toast notifications
     let overlay = gtk::Overlay::new();
@@ -1272,6 +1343,9 @@ pub fn create_terminal(
         let overlay_for_map = overlay.clone();
         let scrollbar_for_map = scrollbar.clone();
         let scrollbar_adjustment_for_map = scrollbar_adjustment.clone();
+        let link_popover_for_map = link_popover.clone();
+        let link_label_for_map = link_label.clone();
+        let cursor_pos_for_map = cursor_pos.clone();
         let surface_cell = surface_cell.clone();
         let callbacks = callbacks.clone();
         let had_focus = had_focus.clone();
@@ -1443,6 +1517,9 @@ pub fn create_terminal(
                         })),
                         open_url_external: open_url_external_for_map.clone(),
                         clipboard_context,
+                        link_popover: link_popover_for_map.clone(),
+                        link_label: link_label_for_map.clone(),
+                        cursor_pos: cursor_pos_for_map.clone(),
                     },
                 );
             });
@@ -1682,6 +1759,9 @@ pub fn create_terminal(
         let surface_cell_for_enter = surface_cell.clone();
         let gl_for_focus = gl_area.clone();
         let had_focus = had_focus.clone();
+        let cursor_pos_enter = cursor_pos.clone();
+        let cursor_pos_motion = cursor_pos.clone();
+        let link_popover_motion = link_popover.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
             if (hover_focus)() {
@@ -1691,6 +1771,7 @@ pub fn create_terminal(
                 request_terminal_focus(&gl_for_focus, &had_focus);
             }
 
+            cursor_pos_enter.set((x, y));
             if let Some(surface) = *surface_cell_for_enter.borrow() {
                 let mods = translate_mouse_mods(ctrl.current_event_state());
                 unsafe { ghostty_surface_mouse_pos(surface, x, y, mods) };
@@ -1698,6 +1779,18 @@ pub fn create_terminal(
         });
         let surface_cell = surface_cell.clone();
         motion.connect_motion(move |ctrl, x, y| {
+            cursor_pos_motion.set((x, y));
+            // Keep the URL preview tracking the cursor while it stays inside
+            // a clickable link region (Ghostty only emits MOUSE_OVER_LINK
+            // on enter/leave, not on every motion).
+            if link_popover_motion.is_visible() {
+                link_popover_motion.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                    x as i32,
+                    (y as i32).saturating_sub(LINK_PREVIEW_CURSOR_Y_GAP),
+                    1,
+                    1,
+                )));
+            }
             if let Some(surface) = *surface_cell.borrow() {
                 let mods = translate_mouse_mods(ctrl.current_event_state());
                 unsafe { ghostty_surface_mouse_pos(surface, x, y, mods) };
@@ -1859,6 +1952,33 @@ fn copy_text_to_clipboards(text: &str) {
     }
 }
 
+/// Build a libadwaita-styled floating popover (no arrow), parented to
+/// `parent`. Shared by the right-click context menu and the OSC 8 hover
+/// URL preview so they look identical by construction. The caller is
+/// responsible for `set_pointing_to` and `popup`/`popdown`.
+fn build_floating_popover(
+    parent: &impl IsA<gtk::Widget>,
+    child: &impl IsA<gtk::Widget>,
+) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(child));
+    popover.set_has_arrow(false);
+    popover.set_parent(parent);
+    popover
+}
+
+/// 4 px box wrapper that matches the inner margin used by the right-click
+/// context menu items. Reused for the hover preview so both popovers have
+/// the same visual breathing room around their content.
+fn build_popover_inner_box() -> gtk::Box {
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    menu_box.set_margin_top(4);
+    menu_box.set_margin_bottom(4);
+    menu_box.set_margin_start(4);
+    menu_box.set_margin_end(4);
+    menu_box
+}
+
 fn show_terminal_context_menu(
     gl_area: &gtk::GLArea,
     overlay: &gtk::Overlay,
@@ -1867,11 +1987,7 @@ fn show_terminal_context_menu(
     x: f64,
     y: f64,
 ) {
-    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    menu_box.set_margin_top(4);
-    menu_box.set_margin_bottom(4);
-    menu_box.set_margin_start(4);
-    menu_box.set_margin_end(4);
+    let menu_box = build_popover_inner_box();
 
     let has_selection = surface
         .map(|s| unsafe { ghostty_surface_has_selection(s) })
@@ -1946,10 +2062,7 @@ fn show_terminal_context_menu(
         menu_box.append(&btn);
     }
 
-    let popover = gtk::Popover::new();
-    popover.set_child(Some(&menu_box));
-    popover.set_parent(gl_area);
-    popover.set_has_arrow(false);
+    let popover = build_floating_popover(gl_area, &menu_box);
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
 
     // Wire up each button

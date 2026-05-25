@@ -77,6 +77,7 @@ pub const GHOSTTY_ACTION_DESKTOP_NOTIFICATION: c_int = 31;
 pub const GHOSTTY_ACTION_SET_TITLE: c_int = 32;
 pub const GHOSTTY_ACTION_PWD: c_int = 34;
 pub const GHOSTTY_ACTION_MOUSE_SHAPE: c_int = 35;
+pub const GHOSTTY_ACTION_MOUSE_OVER_LINK: c_int = 37;
 pub const GHOSTTY_ACTION_COLOR_CHANGE: c_int = 45;
 pub const GHOSTTY_ACTION_RELOAD_CONFIG: c_int = 46;
 pub const GHOSTTY_ACTION_CONFIG_CHANGE: c_int = 47;
@@ -326,6 +327,7 @@ pub union ghostty_action_u {
     pub set_title: ghostty_action_set_title_s,
     pub pwd: ghostty_action_pwd_s,
     pub open_url: ghostty_action_open_url_s,
+    pub mouse_over_link: ghostty_action_mouse_over_link_s,
     pub child_exited: ghostty_surface_message_childexited_s,
     _padding: [u8; 24],
 }
@@ -361,6 +363,13 @@ pub struct ghostty_action_pwd_s {
 #[derive(Clone, Copy)]
 pub struct ghostty_action_open_url_s {
     pub kind: c_int,
+    pub url: *const c_char,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_action_mouse_over_link_s {
     pub url: *const c_char,
     pub len: usize,
 }
