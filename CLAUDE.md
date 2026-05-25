@@ -71,6 +71,15 @@ rg -n "PaneCallbacks \{"                           rust/limux-host-linux/src/win
   `ghostty_surface_new` call.
 - **Vendored `ghostty/` is read-only.** Work through the C API in
   `ghostty/include/ghostty.h`.
+- **AppImage must ship the gdk-pixbuf SVG loader.** Limux's toolbar
+  uses `-symbolic` SVG icons; without `libpixbufloader-svg.so` and
+  its `librsvg-2.so.2` closure inside the AppImage's `usr/lib/`,
+  GTK falls back to the broken-image glyph on hosts that don't have
+  the loader installed system-wide (Fedora 44+, minimal containers).
+  The bundling logic lives in `scripts/package.sh` and is guarded by
+  `assert_pixbuf_svg_loader_bundle`; gate releases on
+  `LIMUX_REQUIRE_SVG_LOADER=1` to make a missing loader a hard
+  failure.
 - **Clippy is a hard gate** (`-D warnings`). Fix lints, don't suppress.
 - **Don't commit** `target/` or other build artifacts.
 

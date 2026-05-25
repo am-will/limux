@@ -53,7 +53,9 @@ jobs:
             gettext \
             libadwaita-1-dev \
             libepoxy-dev \
+            libgdk-pixbuf2.0-bin \
             libgtk-4-dev \
+            librsvg2-common \
             libxml2-utils \
             libwebkitgtk-6.0-dev \
             meson \
@@ -90,6 +92,7 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           LIMUX_MAX_GLIBC: "2.39"
+          LIMUX_REQUIRE_SVG_LOADER: "1"
         run: ./scripts/package.sh "${{ steps.version.outputs.version }}"
 
       - name: Upload packages to release

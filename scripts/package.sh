@@ -103,6 +103,30 @@ assert_no_legacy_host_entrypoint() {
     fi
 }
 
+assert_pixbuf_svg_loader_bundle() {
+    local appdir="$1"
+    local loader_dir_rel="$2"
+    local cache_dir_rel="$3"
+
+    if ! ls "${appdir}/${loader_dir_rel}/"libpixbufloader[-_]svg.so >/dev/null 2>&1; then
+        echo "ERROR: AppImage is missing libpixbufloader-svg.so under ${loader_dir_rel}/"
+        exit 1
+    fi
+    if [ ! -f "${appdir}/usr/lib/librsvg-2.so.2" ]; then
+        echo "ERROR: AppImage is missing librsvg-2.so.2 (loader closure copy failed?)"
+        exit 1
+    fi
+    if [ ! -s "${appdir}/${cache_dir_rel}/loaders.cache.template" ]; then
+        echo "ERROR: AppImage is missing loaders.cache.template under ${cache_dir_rel}/"
+        exit 1
+    fi
+    if ! grep -q "@LOADER_DIR@" "${appdir}/${cache_dir_rel}/loaders.cache.template"; then
+        echo "ERROR: loaders.cache.template missing @LOADER_DIR@ placeholder — AppRun substitution will fail"
+        exit 1
+    fi
+    echo "Verified bundled SVG pixbuf loader, librsvg-2.so.2, and loaders.cache.template"
+}
+
 install_desktop_file() {
     local src="$1"
     local dest="$2"
@@ -764,6 +788,109 @@ if [ -f "$APP_ICONS_DIR/256.png" ]; then
     cp "$APP_ICONS_DIR/256.png" "$APPDIR/.DirIcon"
 fi
 
+# Bundle gdk-pixbuf SVG loader + librsvg closure. Without these, symbolic SVG
+# icons (the pane action toolbar) fail to render on hosts that don't ship
+# rsvg-pixbuf-loader — e.g. Fedora 44+, which dropped the package — because
+# the AppImage's bundled libgdk_pixbuf has no loader to delegate to.
+# See https://github.com/am-will/limux/issues/80
+PIXBUF_LOADER_DIR_REL="usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+PIXBUF_CACHE_DIR_REL="usr/lib/gdk-pixbuf-2.0/2.10.0"
+PIXBUF_SVG_LOADER=""
+
+# Map `uname -m` to the Debian multiarch tuple. dpkg-architecture is the
+# authoritative source on Debian/Ubuntu; the case statement is a fallback for
+# hosts without dpkg (Fedora, Arch, …) where the multiarch path is unused
+# anyway. Also covers /usr/lib/gdk-pixbuf-2.0/... (no arch infix) used by Arch.
+PIXBUF_MULTIARCH=""
+if command -v dpkg-architecture >/dev/null 2>&1; then
+    PIXBUF_MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+fi
+if [ -z "$PIXBUF_MULTIARCH" ]; then
+    case "$(uname -m)" in
+        x86_64) PIXBUF_MULTIARCH="x86_64-linux-gnu" ;;
+        aarch64) PIXBUF_MULTIARCH="aarch64-linux-gnu" ;;
+        i386|i486|i586|i686) PIXBUF_MULTIARCH="i386-linux-gnu" ;;
+        armv7l|armv7) PIXBUF_MULTIARCH="arm-linux-gnueabihf" ;;
+        armv6l) PIXBUF_MULTIARCH="arm-linux-gnueabi" ;;
+        *) PIXBUF_MULTIARCH="$(uname -m)-linux-gnu" ;;
+    esac
+fi
+
+for candidate in \
+    /usr/lib/${PIXBUF_MULTIARCH}/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so \
+    /usr/lib/${PIXBUF_MULTIARCH}/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so \
+    /usr/lib64/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so \
+    /usr/lib64/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so \
+    /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so \
+    /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so
+do
+    if [ -f "$candidate" ]; then
+        PIXBUF_SVG_LOADER="$candidate"
+        break
+    fi
+done
+
+if [ -n "$PIXBUF_SVG_LOADER" ]; then
+    mkdir -p "$APPDIR/$PIXBUF_LOADER_DIR_REL"
+    cp "$PIXBUF_SVG_LOADER" "$APPDIR/$PIXBUF_LOADER_DIR_REL/"
+
+    # Drag in librsvg-2 and its closure — the loader dlopens it at runtime.
+    copy_appimage_library_closure "$APPDIR/usr/lib" "$PIXBUF_SVG_LOADER"
+
+    # Generate a relocatable loaders.cache template. AppRun substitutes
+    # @LOADER_DIR@ with the live mount path at runtime. Use a tab delimiter
+    # for sed since neither the AppDir path nor "@LOADER_DIR@" can contain
+    # a literal tab.
+    # Debian/Ubuntu ship `gdk-pixbuf-query-loaders` under the multiarch lib
+    # dir, not in $PATH — check there before falling back to PATH.
+    QUERY_LOADERS=""
+    for candidate in \
+        /usr/lib/${PIXBUF_MULTIARCH}/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders \
+        /usr/lib64/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders \
+        /usr/lib/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders
+    do
+        if [ -x "$candidate" ]; then
+            QUERY_LOADERS="$candidate"
+            break
+        fi
+    done
+    if [ -z "$QUERY_LOADERS" ]; then
+        if command -v gdk-pixbuf-query-loaders >/dev/null 2>&1; then
+            QUERY_LOADERS=gdk-pixbuf-query-loaders
+        elif command -v gdk-pixbuf-query-loaders-64 >/dev/null 2>&1; then
+            QUERY_LOADERS=gdk-pixbuf-query-loaders-64
+        fi
+    fi
+
+    if [ -n "$QUERY_LOADERS" ]; then
+        GDK_PIXBUF_MODULEDIR="$APPDIR/$PIXBUF_LOADER_DIR_REL" "$QUERY_LOADERS" \
+            | sed -e $'s\t'"$APPDIR/$PIXBUF_LOADER_DIR_REL"$'\t@LOADER_DIR@\tg' \
+            > "$APPDIR/$PIXBUF_CACHE_DIR_REL/loaders.cache.template"
+    else
+        echo "WARNING: gdk-pixbuf-query-loaders not found; AppImage SVG loader not registered."
+        echo "         Install libgdk-pixbuf2.0-bin (Debian/Ubuntu) or gdk-pixbuf2-modules (Fedora)."
+        echo "         AppImage will ship without SVG symbolic icons working on hosts without rsvg-pixbuf-loader."
+        if [ "${LIMUX_REQUIRE_SVG_LOADER:-}" = "1" ]; then
+            exit 1
+        fi
+    fi
+
+    # Smoke check: assert the loader bundle is wired correctly (skipped if
+    # the query step warned and continued without producing the template).
+    if [ -s "$APPDIR/$PIXBUF_CACHE_DIR_REL/loaders.cache.template" ]; then
+        assert_pixbuf_svg_loader_bundle "$APPDIR" "$PIXBUF_LOADER_DIR_REL" "$PIXBUF_CACHE_DIR_REL"
+    fi
+else
+    echo "WARNING: libpixbufloader-svg.so not found on build host."
+    echo "         Install rsvg-pixbuf-loader (Fedora), librsvg2-common (Debian/Ubuntu),"
+    echo "         or librsvg (Arch) to bundle the loader. AppImage will ship without"
+    echo "         SVG symbolic icons working on hosts that don't ship the loader (e.g. Fedora 44+)."
+    echo "         Set LIMUX_REQUIRE_SVG_LOADER=1 to make this a hard error (used by official CI)."
+    if [ "${LIMUX_REQUIRE_SVG_LOADER:-}" = "1" ]; then
+        exit 1
+    fi
+fi
+
 # AppRun entry point — sets up library path and launches the binary
 cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
 #!/bin/bash
@@ -771,6 +898,28 @@ HERE="$(dirname "$(readlink -f "$0")")"
 cd "$HERE"
 export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/share}"
+
+# Activate bundled gdk-pixbuf SVG loader by materializing loaders.cache with
+# the current mount path. Written to $XDG_CACHE_HOME so it works on a
+# read-only FUSE-mounted AppImage. See packaging step that bundles the loader.
+# Only export GDK_PIXBUF_MODULE_FILE if mkdir and sed both succeed — otherwise
+# pointing at a missing/stale cache silently breaks SVG rendering.
+PIXBUF_DIR="${HERE}/usr/lib/gdk-pixbuf-2.0/2.10.0"
+if [ -f "${PIXBUF_DIR}/loaders.cache.template" ] && [ -d "${PIXBUF_DIR}/loaders" ]; then
+    LIMUX_CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}"
+    LIMUX_CACHE="${LIMUX_CACHE_BASE}/limux"
+    PIXBUF_CACHE="${LIMUX_CACHE}/pixbuf-loaders.cache.$$"
+    if [ -n "${LIMUX_CACHE_BASE}" ] \
+       && mkdir -p "$LIMUX_CACHE" 2>/dev/null \
+       && sed -e $'s\t@LOADER_DIR@\t'"${PIXBUF_DIR}/loaders"$'\tg' \
+              "${PIXBUF_DIR}/loaders.cache.template" > "${PIXBUF_CACHE}" 2>/dev/null \
+       && [ -s "${PIXBUF_CACHE}" ]; then
+        export GDK_PIXBUF_MODULE_FILE="${PIXBUF_CACHE}"
+    fi
+    unset LIMUX_CACHE_BASE LIMUX_CACHE PIXBUF_CACHE
+fi
+unset PIXBUF_DIR
+
 export WEBKIT_EXEC_PATH="${HERE}/usr/lib/webkitgtk-6.0"
 export WEBKIT_INJECTED_BUNDLE_PATH="${HERE}/usr/lib/webkitgtk-6.0/injected-bundle"
 exec "${HERE}/usr/bin/limux" "$@"

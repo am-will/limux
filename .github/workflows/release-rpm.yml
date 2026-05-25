@@ -52,7 +52,9 @@ jobs:
             gettext \
             libadwaita-1-dev \
             libepoxy-dev \
+            libgdk-pixbuf2.0-bin \
             libgtk-4-dev \
+            librsvg2-common \
             libxml2-utils \
             libwebkitgtk-6.0-dev \
             meson \
@@ -72,6 +74,7 @@ jobs:
       - name: Build RPM package
         env:
           LIMUX_MAX_GLIBC: "2.39"
+          LIMUX_REQUIRE_SVG_LOADER: "1"
         run: ./scripts/package.sh "${{ steps.version.outputs.version }}"
 
       - name: Resolve RPM path
