@@ -412,15 +412,35 @@ fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
     gl_area.grab_focus();
 }
 
+/// Convert a logical (CSS) pixel dimension to the physical-pixel
+/// dimension Ghostty's renderer expects, given GTK4's integer scale
+/// factor.
+///
+/// GTK4 allocates the GLArea's backing FBO at `logical * scale_factor()`
+/// physical pixels. On Wayland fractional-scale outputs (1.25, 1.5, …)
+/// the compositor then downscales that integer-scaled buffer to the
+/// fractional surface size via `wp-fractional-scale-v1`. Ghostty's
+/// renderer takes `set_size` as the physical-pixel canvas and
+/// `set_content_scale` as the HiDPI font/cell-metrics density —
+/// passing logical pixels here would leave Ghostty drawing into the
+/// bottom-left sub-rectangle of an oversized FBO (the
+/// "fractional-scale console renders black/clipped" symptom).
+pub fn physical_size_for_scale(logical: u32, scale: u32) -> u32 {
+    logical * scale
+}
+
 fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
     let alloc = gl_area.allocation();
-    let w = alloc.width() as u32;
-    let h = alloc.height() as u32;
-    if w > 0 && h > 0 {
-        let scale = gl_area.scale_factor() as f64;
+    let logical_w = alloc.width() as u32;
+    let logical_h = alloc.height() as u32;
+    if logical_w > 0 && logical_h > 0 {
+        let scale = gl_area.scale_factor() as u32;
+        let phys_w = physical_size_for_scale(logical_w, scale);
+        let phys_h = physical_size_for_scale(logical_h, scale);
+        let scale_f = scale as f64;
         unsafe {
-            ghostty_surface_set_content_scale(surface, scale, scale);
-            ghostty_surface_set_size(surface, w, h);
+            ghostty_surface_set_content_scale(surface, scale_f, scale_f);
+            ghostty_surface_set_size(surface, phys_w, phys_h);
         }
     }
     unsafe { ghostty_surface_refresh(surface) };
@@ -1311,8 +1331,7 @@ pub fn create_terminal(
             };
             config.userdata = clipboard_context.cast();
 
-            let scale = gl_area.scale_factor() as f64;
-            config.scale_factor = scale;
+            config.scale_factor = gl_area.scale_factor() as f64;
             config.context = GHOSTTY_SURFACE_CONTEXT_WINDOW;
 
             let c_wd = wd.as_ref().and_then(|s| CString::new(s.as_str()).ok());
@@ -1380,12 +1399,10 @@ pub fn create_terminal(
                 }
             }
 
-            // Set initial size — GLArea gives unscaled CSS pixels,
-            // Ghostty handles scaling internally via content_scale.
+            // Set initial size in physical pixels (logical × scale_factor).
+            // See refresh_surface_display for the rationale.
             let alloc = gl_area.allocation();
-            let w = alloc.width() as u32;
-            let h = alloc.height() as u32;
-            if w > 0 && h > 0 {
+            if alloc.width() > 0 && alloc.height() > 0 {
                 refresh_surface_display(surface, gl_area);
             }
 
@@ -2278,6 +2295,26 @@ fn translate_mouse_mods(state: gtk::gdk::ModifierType) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the GTK4 ↔ Ghostty pixel contract: the ghostty surface
+    /// canvas is sized in physical pixels (`logical × scale_factor`),
+    /// not logical CSS pixels. Regression-tests against the bug
+    /// fixed by issue #82 where logical pixels reached `set_size`
+    /// and the terminal rendered into a sub-rectangle of an
+    /// oversized FBO on Wayland fractional-scale outputs.
+    #[test]
+    fn physical_size_matches_logical_times_scale_factor() {
+        // Integer scales the compositor actually exposes to GTK4.
+        assert_eq!(physical_size_for_scale(1280, 1), 1280);
+        assert_eq!(physical_size_for_scale(1280, 2), 2560);
+        assert_eq!(physical_size_for_scale(720, 3), 2160);
+
+        // Edge cases: a zero dimension stays zero (refresh_surface_display
+        // gates on width/height > 0 before calling, but the helper itself
+        // must remain a pure multiplication).
+        assert_eq!(physical_size_for_scale(0, 2), 0);
+        assert_eq!(physical_size_for_scale(640, 0), 0);
+    }
 
     #[test]
     fn maps_dark_mode_to_ghostty_color_scheme() {

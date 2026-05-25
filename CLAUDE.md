@@ -71,6 +71,14 @@ rg -n "PaneCallbacks \{"                           rust/limux-host-linux/src/win
   `ghostty_surface_new` call.
 - **Vendored `ghostty/` is read-only.** Work through the C API in
   `ghostty/include/ghostty.h`.
+- **Logical vs physical pixels at the GTK ↔ Ghostty boundary.**
+  GTK4's `scale_factor()` is an *integer*; on Wayland fractional-
+  scale outputs (1.25, 1.5, …) the compositor downscales an
+  integer-scaled FBO via `wp-fractional-scale-v1`. Ghostty's
+  `ghostty_surface_set_size` expects **physical** pixels
+  (`logical × scale_factor`), not logical CSS pixels. Passing logical
+  pixels leaves the terminal drawing into a sub-rectangle of an
+  oversized FBO — see `physical_size_for_scale` in `terminal.rs`.
 - **Clippy is a hard gate** (`-D warnings`). Fix lints, don't suppress.
 - **Don't commit** `target/` or other build artifacts.
 
