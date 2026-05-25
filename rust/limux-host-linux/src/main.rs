@@ -127,6 +127,23 @@ fn sanitize_terminal_child_env() {
     std::env::remove_var("NO_COLOR");
 }
 
+fn set_env_if_missing(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
+}
+
+fn set_webkit_runtime_env() {
+    // WebKitGTK's DMABUF/GBM renderer can fail on restricted DRM devices,
+    // especially NVIDIA ARM desktops, leaving browser panes blank.
+    set_env_if_missing("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    set_env_if_missing("WEBKIT_WEBGL_DISABLE_GBM", "1");
+
+    // WebKitGTK's bubblewrap sandbox requires unprivileged user namespaces,
+    // which may not be available. Disable it to prevent crashes on launch.
+    set_env_if_missing("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+}
+
 fn gtk_runtime_version() -> (u32, u32, u32) {
     unsafe {
         (
@@ -166,11 +183,7 @@ fn main() {
     set_ghostty_runtime_env();
     sanitize_terminal_child_env();
 
-    // WebKitGTK's bubblewrap sandbox requires unprivileged user namespaces,
-    // which may not be available. Disable it to prevent crashes on launch.
-    if std::env::var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_err() {
-        std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
-    }
+    set_webkit_runtime_env();
 
     // Initialize Ghostty before GTK app starts
     terminal::init_ghostty();

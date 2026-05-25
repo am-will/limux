@@ -1376,12 +1376,12 @@ pub fn build_window(app: &adw::Application) {
         &config.borrow().appearance,
     );
 
-    // Register custom icons — look for icons dir relative to the executable
+    // Register custom icons. Installed packages provide `limux` in the hicolor
+    // app theme; development runs also expose source-tree PNGs under `icons/app`.
     let icon_theme = gtk::IconTheme::for_display(&display);
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    // Try several possible icon locations
     for path in [
         exe_dir
             .as_ref()
@@ -1391,6 +1391,10 @@ pub fn build_window(app: &adw::Application) {
             env!("CARGO_MANIFEST_DIR"),
             "/icons"
         ))),
+        Some(std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/icons/app"
+        ))),
     ]
     .iter()
     .flatten()
@@ -1399,11 +1403,13 @@ pub fn build_window(app: &adw::Application) {
             icon_theme.add_search_path(path);
         }
     }
+    gtk::Window::set_default_icon_name("limux");
 
     let title = format!("Limux v{}", crate::VERSION);
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title(&title)
+        .icon_name("limux")
         .default_width(1400)
         .default_height(900)
         .build();

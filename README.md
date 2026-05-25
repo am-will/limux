@@ -23,13 +23,17 @@ Download the latest release from [GitHub Releases](https://github.com/am-will/li
 
 **Debian/Ubuntu (.deb)** — recommended:
 ```bash
-sudo dpkg -i ./limux_0.1.19_amd64.deb
+sudo dpkg -i ./limux_0.1.19_amd64.deb   # Intel/AMD
+sudo dpkg -i ./limux_0.1.19_arm64.deb   # Ubuntu ARM64/aarch64
 ```
 
 **AppImage** — portable across Ubuntu 24.04-era desktops and newer, no install needed:
 ```bash
 chmod +x Limux-0.1.19-x86_64.AppImage
 ./Limux-0.1.19-x86_64.AppImage
+
+chmod +x Limux-0.1.19-aarch64.AppImage  # Ubuntu ARM64/aarch64
+./Limux-0.1.19-aarch64.AppImage
 ```
 
 Release AppImages are built and checked on the Ubuntu 24.04 `GLIBC_2.39`
@@ -39,8 +43,9 @@ build with matching system packages instead.
 
 **Tarball** — manual install:
 ```bash
-tar xzf limux-*-linux-x86_64.tar.gz
-cd limux-*-linux-x86_64
+tar xzf limux-*-linux-x86_64.tar.gz     # Intel/AMD
+tar xzf limux-*-linux-aarch64.tar.gz    # Ubuntu ARM64/aarch64
+cd limux-*-linux-*
 sudo ./install.sh
 ```
 
@@ -91,6 +96,10 @@ cargo build --release
 LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
+Ubuntu ARM64/aarch64 uses the same source build steps and system packages.
+Release packaging maps `aarch64`/`arm64` hosts to `limux_*_arm64.deb`,
+`limux-*-linux-aarch64.tar.gz`, and `Limux-*-aarch64.AppImage`.
+
 ### Package a release tarball
 
 ```bash
@@ -98,7 +107,7 @@ LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
 This builds the binary, bundles `libghostty.so`, icons, and an install script into a tarball.
-`package.sh` also rebuilds `libghostty.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig and the initialized Ghostty submodule must be present.
+`package.sh` also rebuilds `libghostty.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig and the initialized Ghostty submodule must be present. Run it on the target architecture, or set `LIMUX_ARCH=x86_64`/`LIMUX_ARCH=aarch64` only when your build toolchain is already targeting that architecture.
 
 ## Development
 

@@ -5,11 +5,23 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Read version from workspace Cargo.toml (single source of truth)
 VERSION="${1:-$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')}"
-ARCH="$(uname -m)"
-DEB_ARCH="amd64"
-[ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
-RPM_ARCH="x86_64"
-[ "$ARCH" = "aarch64" ] && RPM_ARCH="aarch64"
+HOST_ARCH="${LIMUX_ARCH:-$(uname -m)}"
+case "$HOST_ARCH" in
+    x86_64|amd64)
+        ARCH="x86_64"
+        DEB_ARCH="amd64"
+        RPM_ARCH="x86_64"
+        ;;
+    aarch64|arm64)
+        ARCH="aarch64"
+        DEB_ARCH="arm64"
+        RPM_ARCH="aarch64"
+        ;;
+    *)
+        echo "ERROR: unsupported architecture '${HOST_ARCH}'. Supported architectures: x86_64, aarch64."
+        exit 1
+        ;;
+esac
 
 PKG_BASE="limux-${VERSION}-linux-${ARCH}"
 STAGE="/tmp/limux-staging"
@@ -172,6 +184,11 @@ copy_ghostty_terminfo_entries() {
 . "${ROOT_DIR}/scripts/appimage-webkit.sh"
 
 configure_ghostty_build_args() {
+    if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists fontconfig; then
+        echo "fontconfig not available via pkg-config; building Ghostty with bundled fontconfig."
+        GHOSTTY_ZIG_ARGS+=(-fno-sys=fontconfig)
+    fi
+
     if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists gtk4-layer-shell-0; then
         echo "gtk4-layer-shell not available via pkg-config; building Ghostty with bundled gtk4-layer-shell."
         GHOSTTY_ZIG_ARGS+=(-fno-sys=gtk4-layer-shell)
@@ -217,8 +234,8 @@ if [ ! -f "${ROOT_DIR}/ghostty/build.zig" ]; then
 fi
 
 # Always build libghostty with ReleaseFast to guarantee optimized output.
-# Pinning cpu=baseline keeps the shipped library portable across x86_64 CPUs
-# that do not expose the builder's ISA extensions, such as AVX-512.
+# Pinning cpu=baseline keeps the shipped library portable across machines
+# that do not expose the builder's architecture-specific ISA extensions.
 configure_ghostty_build_args
 echo "Building libghostty (ReleaseFast, cpu=baseline)..."
 (cd "${ROOT_DIR}/ghostty" && zig build -Dapp-runtime=none "${GHOSTTY_ZIG_ARGS[@]}")
