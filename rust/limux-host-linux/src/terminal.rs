@@ -16,6 +16,46 @@ use std::time::Duration;
 
 use limux_ghostty_sys::*;
 
+pub const TERMINAL_CSS: &str = r#"
+scrollbar.overlay-scrollbar {
+    min-width: 3px;
+    background: transparent;
+    border: none;
+    opacity: 1;
+    transition: opacity 200ms ease-out;
+}
+scrollbar.overlay-scrollbar.overlay-scrollbar-hidden {
+    opacity: 0;
+}
+scrollbar.overlay-scrollbar range,
+scrollbar.overlay-scrollbar trough {
+    background: transparent;
+    border: none;
+    margin: 0;
+    padding: 0;
+}
+scrollbar.overlay-scrollbar trough {
+    transition: background 150ms ease-out;
+}
+scrollbar.overlay-scrollbar:hover trough {
+    background: alpha(@window_fg_color, 0.06);
+}
+scrollbar.overlay-scrollbar slider {
+    background-color: alpha(@window_fg_color, 0.3);
+    background-clip: padding-box;
+    border: 3px solid transparent;
+    min-width: 3px;
+    margin: 2px 0;
+    border-radius: 10px;
+    transition: min-width 150ms ease-out, border-width 150ms ease-out, background-color 150ms ease-out;
+}
+scrollbar.overlay-scrollbar:hover slider {
+    background-color: alpha(@window_fg_color, 0.5);
+    min-width: 8px;
+    border-width: 1px;
+}
+"#;
+
 use crate::shortcut_config::NormalizedShortcut;
 
 // ---------------------------------------------------------------------------
@@ -59,6 +99,8 @@ struct SurfaceEntry {
     scrollbar: gtk::Scrollbar,
     scrollbar_adjustment: gtk::Adjustment,
     scrollbar_syncing: Rc<Cell<bool>>,
+    scrollbar_hide_timer: Option<glib::SourceId>,
+    scrollbar_hide_gen: u64,
     on_title_changed: Option<Box<TitleChangedCallback>>,
     on_pwd_changed: Option<Box<PwdChangedCallback>>,
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
@@ -67,6 +109,35 @@ struct SurfaceEntry {
     on_close: Option<Box<VoidCallback>>,
     open_url_external: Rc<Cell<bool>>,
     clipboard_context: *mut ClipboardContext,
+}
+
+const SCROLLBAR_FADE_DELAY_MS: u64 = 1500;
+
+fn schedule_scrollbar_hide(surface_key: usize) {
+    SURFACE_MAP.with(|map| {
+        let mut locked = map.borrow_mut();
+        let Some(entry) = locked.get_mut(&surface_key) else {
+            return;
+        };
+        entry.scrollbar_hide_gen += 1;
+        let gen = entry.scrollbar_hide_gen;
+        let key = surface_key;
+        entry.scrollbar_hide_timer = Some(glib::timeout_add_local(
+            Duration::from_millis(SCROLLBAR_FADE_DELAY_MS),
+            move || {
+                SURFACE_MAP.with(|m| {
+                    let mut l = m.borrow_mut();
+                    if let Some(e) = l.get_mut(&key) {
+                        if e.scrollbar_hide_gen == gen {
+                            e.scrollbar.add_css_class("overlay-scrollbar-hidden");
+                            e.scrollbar_hide_timer = None;
+                        }
+                    }
+                });
+                glib::ControlFlow::Break
+            },
+        ));
+    });
 }
 
 struct ClipboardContext {
@@ -663,25 +734,37 @@ unsafe extern "C" fn ghostty_action_cb(
         GHOSTTY_ACTION_SCROLLBAR => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
-                let scrollbar = unsafe { action.action.scrollbar };
-                SURFACE_MAP.with(|map| {
-                    if let Some(entry) = map.borrow().get(&surface_key) {
-                        entry.scrollbar_syncing.set(true);
-                        entry.scrollbar_adjustment.configure(
-                            scrollbar.offset as f64,
-                            0.0,
-                            scrollbar.total as f64,
-                            1.0,
-                            scrollbar.len as f64,
-                            scrollbar.len as f64,
-                        );
-                        entry.scrollbar_syncing.set(false);
-                        entry.scrollbar.set_visible(
-                            CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed)
-                                && scrollbar.total > scrollbar.len,
-                        );
+                let sc = unsafe { action.action.scrollbar };
+                let needs_hide_timer = SURFACE_MAP.with(|map| {
+                    let mut locked = map.borrow_mut();
+                    let Some(entry) = locked.get_mut(&surface_key) else {
+                        return false;
+                    };
+                    entry.scrollbar_syncing.set(true);
+                    entry.scrollbar_adjustment.configure(
+                        sc.offset as f64,
+                        0.0,
+                        sc.total as f64,
+                        1.0,
+                        sc.len as f64,
+                        sc.len as f64,
+                    );
+                    entry.scrollbar_syncing.set(false);
+
+                    let enabled = CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed);
+                    let has_content = sc.total > sc.len;
+                    if enabled && has_content {
+                        entry.scrollbar.remove_css_class("overlay-scrollbar-hidden");
+                        true
+                    } else {
+                        entry.scrollbar_hide_timer = None;
+                        entry.scrollbar.add_css_class("overlay-scrollbar-hidden");
+                        false
                     }
                 });
+                if needs_hide_timer {
+                    schedule_scrollbar_hide(surface_key);
+                }
             }
             true
         }
@@ -1155,14 +1238,18 @@ pub fn create_terminal(
 
     let scrollbar_adjustment = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scrollbar_adjustment));
-    scrollbar.set_visible(false);
+    scrollbar.set_visible(true);
     scrollbar.set_vexpand(true);
+    scrollbar.set_halign(gtk::Align::End);
+    scrollbar.set_valign(gtk::Align::Fill);
+    scrollbar.add_css_class("overlay-scrollbar");
+    scrollbar.add_css_class("overlay-scrollbar-hidden");
+    overlay.add_overlay(&scrollbar);
 
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
     root.append(&overlay);
-    root.append(&scrollbar);
 
     let search_entry = gtk::SearchEntry::builder()
         .hexpand(true)
@@ -1264,6 +1351,35 @@ pub fn create_terminal(
             let row = adj.value().round() as usize;
             surface_action(*surface_cell.borrow(), &format!("scroll_to_row:{row}"));
         });
+    }
+    {
+        let surface_cell = surface_cell.clone();
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_enter(move |_, _x, _y| {
+            let surface_key = surface_cell.borrow().map(|s| s as usize);
+            if let Some(key) = surface_key {
+                SURFACE_MAP.with(|map| {
+                    let mut locked = map.borrow_mut();
+                    if let Some(entry) = locked.get_mut(&key) {
+                        entry.scrollbar_hide_timer = None;
+                        entry.scrollbar_hide_gen += 1;
+                        entry.scrollbar.remove_css_class("overlay-scrollbar-hidden");
+                    }
+                });
+            }
+        });
+        scrollbar.add_controller(motion);
+    }
+    {
+        let surface_cell = surface_cell.clone();
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_leave(move |_| {
+            let surface_key = surface_cell.borrow().map(|s| s as usize);
+            if let Some(key) = surface_key {
+                schedule_scrollbar_hide(key);
+            }
+        });
+        scrollbar.add_controller(motion);
     }
 
     // On realize: create the Ghostty surface
@@ -1399,6 +1515,8 @@ pub fn create_terminal(
                         scrollbar: scrollbar_for_map.clone(),
                         scrollbar_adjustment: scrollbar_adjustment_for_map.clone(),
                         scrollbar_syncing: scrollbar_syncing.clone(),
+                        scrollbar_hide_timer: None,
+                        scrollbar_hide_gen: 0,
                         on_title_changed: Some(Box::new({
                             let cb = callbacks.clone();
                             move |title| {

@@ -1356,11 +1356,12 @@ pub fn build_window(app: &adw::Application) {
     // Load CSS
     let provider = gtk::CssProvider::new();
     let all_css = format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         build_window_css(background_opacity),
         pane::PANE_CSS,
         keybind_editor::KEYBIND_EDITOR_CSS,
         crate::settings_editor::SETTINGS_CSS,
+        crate::terminal::TERMINAL_CSS,
     );
     provider.load_from_data(&all_css);
     gtk::style_context_add_provider_for_display(
