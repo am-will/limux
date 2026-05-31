@@ -697,6 +697,16 @@ pub fn refresh_terminal_displays_in_root(root: &gtk::Widget) {
     }
 }
 
+pub fn set_terminals_split_state(root: &gtk::Widget, is_split: bool) {
+    for internals in pane_internals_for_root(root) {
+        for entry in &internals.tab_state.borrow().tabs {
+            if let TabKind::Terminal { state } = &entry.kind {
+                state.handle.set_split_state(is_split);
+            }
+        }
+    }
+}
+
 pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
     let Some(internals) = find_pane_internals(pane_widget) else {
         return false;

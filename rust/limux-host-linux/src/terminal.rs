@@ -25,6 +25,8 @@ use crate::shortcut_config::NormalizedShortcut;
 struct GhosttyState {
     app: ghostty_app_t,
     background_opacity: f64,
+    background_color: (u8, u8, u8),
+    unfocused_split_opacity: f64,
 }
 
 // Safety: ghostty_app_t is thread-safe for the operations we perform
@@ -170,6 +172,9 @@ pub struct TerminalHandle {
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     callbacks: Rc<RefCell<TerminalCallbacks>>,
+    had_focus: Rc<Cell<bool>>,
+    unfocused_revealer: gtk::Revealer,
+    is_split: Rc<Cell<bool>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,6 +390,13 @@ impl TerminalHandle {
         unsafe { ghostty_surface_free_text(surface, &mut text) };
         selection
     }
+
+    /// Set whether the terminal is part of a split layout.
+    /// When unfocused and split, a semi-transparent overlay dims the surface.
+    pub fn set_split_state(&self, split: bool) {
+        self.is_split.set(split);
+        update_unfocused_split(&self.unfocused_revealer, self.had_focus.get(), split);
+    }
 }
 
 fn empty_ghostty_text() -> ghostty_text_s {
@@ -517,6 +529,8 @@ pub fn init_ghostty() {
 
         let config = load_ghostty_config();
         let background_opacity = load_background_opacity(config);
+        let background_color = load_background_color(config);
+        let unfocused_split_opacity = load_unfocused_split_opacity(config);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
 
         let runtime_config = ghostty_runtime_config_s {
@@ -546,6 +560,8 @@ pub fn init_ghostty() {
         GhosttyState {
             app,
             background_opacity,
+            background_color,
+            unfocused_split_opacity,
         }
     });
 }
@@ -560,6 +576,22 @@ pub fn ghostty_background_opacity() -> f64 {
         .get()
         .map(|state| state.background_opacity)
         .unwrap_or(1.0)
+}
+
+pub fn ghostty_background_color() -> (u8, u8, u8) {
+    init_ghostty();
+    GHOSTTY
+        .get()
+        .map(|state| state.background_color)
+        .unwrap_or((0, 0, 0))
+}
+
+pub fn ghostty_unfocused_split_opacity() -> f64 {
+    init_ghostty();
+    GHOSTTY
+        .get()
+        .map(|state| state.unfocused_split_opacity)
+        .unwrap_or(0.7)
 }
 
 fn load_background_opacity(config: ghostty_config_t) -> f64 {
@@ -578,6 +610,42 @@ fn load_background_opacity(config: ghostty_config_t) -> f64 {
         opacity.clamp(0.0, 1.0)
     } else {
         1.0
+    }
+}
+
+fn load_background_color(config: ghostty_config_t) -> (u8, u8, u8) {
+    let mut color = ghostty_config_color_s { r: 0, g: 0, b: 0 };
+    let key = b"background";
+    let loaded = unsafe {
+        ghostty_config_get(
+            config,
+            (&mut color as *mut ghostty_config_color_s).cast::<c_void>(),
+            key.as_ptr().cast::<c_char>(),
+            key.len(),
+        )
+    };
+    if loaded {
+        (color.r, color.g, color.b)
+    } else {
+        (0, 0, 0)
+    }
+}
+
+fn load_unfocused_split_opacity(config: ghostty_config_t) -> f64 {
+    let mut opacity = 0.7_f64;
+    let key = b"unfocused-split-opacity";
+    let loaded = unsafe {
+        ghostty_config_get(
+            config,
+            (&mut opacity as *mut f64).cast::<c_void>(),
+            key.as_ptr().cast::<c_char>(),
+            key.len(),
+        )
+    };
+    if loaded && opacity.is_finite() {
+        opacity.clamp(0.15, 1.0)
+    } else {
+        0.7
     }
 }
 
@@ -1179,6 +1247,23 @@ pub fn create_terminal(
     search_bar.set_margin_end(8);
     overlay.add_overlay(&search_bar);
 
+    // Unfocused split dimming overlay (Revealer + styled Box).
+    // Mirrors Ghostty's surface.blp Revealer + DrawingArea approach:
+    // visible when the surface is unfocused AND part of a split.
+    let is_split = Rc::new(Cell::new(false));
+    let unfocused_revealer = gtk::Revealer::new();
+    unfocused_revealer.set_transition_duration(0);
+    unfocused_revealer.set_can_focus(false);
+    unfocused_revealer.set_can_target(false);
+    unfocused_revealer.set_halign(gtk::Align::Fill);
+    unfocused_revealer.set_valign(gtk::Align::Fill);
+    let unfocused_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    unfocused_box.set_hexpand(true);
+    unfocused_box.set_vexpand(true);
+    unfocused_box.add_css_class("unfocused-split");
+    unfocused_revealer.set_child(Some(&unfocused_box));
+    overlay.add_overlay(&unfocused_revealer);
+
     let im_context = gtk::IMMulticontext::new();
     im_context.set_client_widget(Some(&gl_area));
     im_context.set_use_preedit(true);
@@ -1190,6 +1275,9 @@ pub fn create_terminal(
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),
+        had_focus: had_focus.clone(),
+        unfocused_revealer: unfocused_revealer.clone(),
+        is_split: is_split.clone(),
     };
 
     {
@@ -1730,21 +1818,35 @@ pub fn create_terminal(
         let had_focus_leave = had_focus.clone();
         let im_context_enter = im_context.clone();
         let im_context_leave = im_context.clone();
+        let unfocused_revealer_enter = unfocused_revealer.clone();
+        let unfocused_revealer_leave = unfocused_revealer.clone();
         let focus_ctrl = gtk::EventControllerFocus::new();
         let sc = surface_cell.clone();
+        let is_split_enter = is_split.clone();
         focus_ctrl.connect_enter(move |_| {
             had_focus_enter.set(true);
             im_context_enter.focus_in();
             if let Some(surface) = *sc.borrow() {
                 unsafe { ghostty_surface_set_focus(surface, true) };
             }
+            update_unfocused_split(
+                &unfocused_revealer_enter,
+                true,
+                is_split_enter.get(),
+            );
         });
+        let is_split_leave = is_split.clone();
         focus_ctrl.connect_leave(move |_| {
             had_focus_leave.set(false);
             im_context_leave.focus_out();
             if let Some(surface) = *surface_cell.borrow() {
                 unsafe { ghostty_surface_set_focus(surface, false) };
             }
+            update_unfocused_split(
+                &unfocused_revealer_leave,
+                false,
+                is_split_leave.get(),
+            );
         });
         gl_area.add_controller(focus_ctrl);
     }
@@ -2159,6 +2261,10 @@ fn fallback_unshifted_codepoint(keyval: gtk::gdk::Key) -> u32 {
 }
 
 /// Show a brief "Copied to clipboard" toast at the bottom of the terminal.
+fn update_unfocused_split(revealer: &gtk::Revealer, had_focus: bool, is_split: bool) {
+    revealer.set_reveal_child(!had_focus && is_split);
+}
+
 fn show_clipboard_toast(overlay: &gtk::Overlay) {
     let toast = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     toast.set_halign(gtk::Align::Center);

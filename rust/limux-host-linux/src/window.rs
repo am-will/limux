@@ -1706,8 +1706,19 @@ pub fn build_window(app: &adw::Application) {
 fn build_window_css(background_opacity: f64) -> String {
     let background_opacity = sanitize_background_opacity(background_opacity);
     let (r, g, b) = CONTENT_BACKGROUND_RGB;
+
+    let (bg_r, bg_g, bg_b) = crate::terminal::ghostty_background_color();
+    let unfocused_opacity = 1.0 - crate::terminal::ghostty_unfocused_split_opacity();
+
     format!(
-        "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
+        "{BASE_CSS}\n\
+         .limux-content {{\n\
+         \x20   background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n\
+         }}\n\
+         .unfocused-split {{\n\
+         \x20   opacity: {unfocused_opacity:.2};\n\
+         \x20   background-color: rgb({bg_r}, {bg_g}, {bg_b});\n\
+         }}\n"
     )
 }
 
