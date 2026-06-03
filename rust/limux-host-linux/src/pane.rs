@@ -2163,7 +2163,7 @@ fn show_rename_dialog(
     entry.grab_focus();
     entry.select_region(0, -1);
 
-    // On activate (Enter) or focus-out, commit rename
+    // On activate (Enter) or blur, commit rename.
     let lbl = label.clone();
     let state = tab_state.clone();
     let tid = tab_id.to_string();
@@ -2208,15 +2208,18 @@ fn show_rename_dialog(
     }
     {
         let do_rename = do_rename.clone();
-        let focus_controller = gtk::EventControllerFocus::new();
-        focus_controller.connect_leave(move |ctrl| {
-            if let Some(widget) = ctrl.widget() {
-                if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                    do_rename(entry);
-                }
+        entry.connect_notify_local(Some("has-focus"), move |entry, _| {
+            if entry.has_focus() {
+                return;
             }
+            let do_rename = do_rename.clone();
+            let entry = entry.clone();
+            glib::idle_add_local_once(move || {
+                if !entry.has_focus() {
+                    do_rename(&entry);
+                }
+            });
         });
-        entry.add_controller(focus_controller);
     }
 }
 
