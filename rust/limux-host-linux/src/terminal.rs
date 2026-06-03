@@ -52,6 +52,19 @@ pub struct TerminalIdentity {
     pub surface_id: String,
 }
 
+pub(crate) struct HoverFocusGuard;
+
+impl Drop for HoverFocusGuard {
+    fn drop(&mut self) {
+        HOVER_FOCUS_SUPPRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn suspend_hover_focus() -> HoverFocusGuard {
+    HOVER_FOCUS_SUPPRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    HoverFocusGuard
+}
+
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
     gl_area: gtk::GLArea,
@@ -160,6 +173,7 @@ impl TerminalImeState {
 }
 
 thread_local! {
+    static HOVER_FOCUS_SUPPRESS_DEPTH: Cell<usize> = const { Cell::new(0) };
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
 }
 
@@ -1684,7 +1698,7 @@ pub fn create_terminal(
         let had_focus = had_focus.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
-            if (hover_focus)() {
+            if HOVER_FOCUS_SUPPRESS_DEPTH.with(|depth| depth.get() == 0) && (hover_focus)() {
                 // Match common Hyprland/Omarchy-style focus-follows-mouse behavior:
                 // as soon as the pointer enters a terminal, focus it so typing works
                 // immediately without an extra click.

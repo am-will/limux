@@ -2054,8 +2054,9 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         let menu_ref = menu.clone();
         let callbacks = context.callbacks.clone();
         rename_btn.connect_clicked(move |_| {
+            let hover_focus_guard = terminal::suspend_hover_focus();
             menu_ref.popdown();
-            show_rename_dialog(&lbl, &state, &tid, &callbacks);
+            show_rename_dialog(&lbl, &state, &tid, &callbacks, hover_focus_guard);
         });
     }
 
@@ -2138,6 +2139,7 @@ fn show_rename_dialog(
     tab_state: &Rc<RefCell<TabState>>,
     tab_id: &str,
     callbacks: &Rc<PaneCallbacks>,
+    hover_focus_guard: terminal::HoverFocusGuard,
 ) {
     let current_name = label.label().to_string();
 
@@ -2168,6 +2170,7 @@ fn show_rename_dialog(
     let parent_for_cleanup = parent.clone();
 
     let commit = Rc::new(std::cell::Cell::new(false));
+    let hover_focus_guard = Rc::new(RefCell::new(Some(hover_focus_guard)));
 
     let do_rename = {
         let commit = commit.clone();
@@ -2176,6 +2179,7 @@ fn show_rename_dialog(
         let tid = tid.clone();
         let parent = parent_for_cleanup.clone();
         let callbacks = callbacks.clone();
+        let hover_focus_guard = hover_focus_guard.clone();
         move |entry: &gtk::Entry| {
             if commit.get() {
                 return;
@@ -2191,6 +2195,7 @@ fn show_rename_dialog(
             }
             lbl.set_visible(true);
             parent.remove(entry);
+            hover_focus_guard.borrow_mut().take();
             (callbacks.on_state_changed)();
         }
     };
