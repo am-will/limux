@@ -5260,66 +5260,53 @@ fn dispatch_terminal_command(state: &State, command: ShortcutCommand) -> bool {
         ShortcutCommand::TerminalClearScrollback => target.perform_binding_action("clear_screen"),
         ShortcutCommand::TerminalCopy => target.perform_binding_action("copy_to_clipboard"),
         ShortcutCommand::TerminalPaste => target.perform_binding_action("paste_from_clipboard"),
-        ShortcutCommand::TerminalIncreaseFontSize => persist_font_size_delta(state, 1.0),
-        ShortcutCommand::TerminalDecreaseFontSize => persist_font_size_delta(state, -1.0),
-        ShortcutCommand::TerminalResetFontSize => persist_font_size_reset(state),
+        ShortcutCommand::TerminalIncreaseFontSize => adjust_terminal_font_size(state, &target, 1.0),
+        ShortcutCommand::TerminalDecreaseFontSize => {
+            adjust_terminal_font_size(state, &target, -1.0)
+        }
+        ShortcutCommand::TerminalResetFontSize => reset_terminal_font_size(state, &target),
         _ => false,
     }
 }
 
-fn persist_font_size_delta(state: &State, delta: f32) -> bool {
-    let current = {
-        let s = state.borrow();
-        let current = s.config.borrow().font_size;
-        current
-    };
-    let new_size = font_size_after_delta(current, crate::terminal::default_font_size(), delta);
-
-    if let Err(err) = persist_font_size(state, Some(new_size)) {
-        show_font_size_save_error(state, err);
-        return false;
-    }
-
-    broadcast_font_size(new_size);
-    true
+fn terminal_default_font_size(state: &State) -> f32 {
+    terminal_default_font_size_override(state).unwrap_or_else(crate::terminal::default_font_size)
 }
 
-fn persist_font_size_reset(state: &State) -> bool {
-    if let Err(err) = persist_font_size(state, None) {
-        show_font_size_save_error(state, err);
-        return false;
-    }
-
-    crate::terminal::broadcast_binding_action("reset_font_size");
-    true
+fn terminal_default_font_size_override(state: &State) -> Option<f32> {
+    let config = {
+        let s = state.borrow();
+        s.config.clone()
+    };
+    let configured = config.borrow().font_size;
+    configured
+        .filter(|size| size.is_finite())
+        .map(|size| size.clamp(1.0, 255.0))
 }
 
-fn persist_font_size(state: &State, font_size: Option<f32>) -> Result<(), String> {
-    let mut updated = {
-        let s = state.borrow();
-        let updated = s.config.borrow().clone();
-        updated
-    };
-    updated.font_size = font_size;
-    app_config::save(&updated)?;
+fn adjust_terminal_font_size(
+    state: &State,
+    target: &pane::TerminalShortcutTarget,
+    delta: f32,
+) -> bool {
+    let new_size = font_size_after_delta(
+        target.font_size_override(),
+        terminal_default_font_size(state),
+        delta,
+    );
+    target.set_font_size_override(new_size)
+}
 
-    state.borrow().config.borrow_mut().font_size = font_size;
-    Ok(())
+fn reset_terminal_font_size(state: &State, target: &pane::TerminalShortcutTarget) -> bool {
+    target.reset_font_size_override(terminal_default_font_size_override(state))
 }
 
 fn font_size_after_delta(current: Option<f32>, default: f32, delta: f32) -> f32 {
-    (current.unwrap_or(default) + delta).clamp(1.0, 255.0)
-}
-
-fn show_font_size_save_error(state: &State, err: String) {
-    let detail = format!("Failed to save Limux settings: {err}");
-    eprintln!("limux: {detail}");
-    show_runtime_error(state, "Failed to save settings", &detail);
-}
-
-fn broadcast_font_size(size: f32) {
-    let action = format!("set_font_size:{size}");
-    crate::terminal::broadcast_binding_action(&action);
+    let base = current
+        .filter(|size| size.is_finite())
+        .unwrap_or(default)
+        .clamp(1.0, 255.0);
+    (base + delta).clamp(1.0, 255.0)
 }
 
 fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
