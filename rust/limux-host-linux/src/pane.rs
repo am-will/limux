@@ -230,17 +230,54 @@ pub struct PaneCallbacks {
 #[derive(Clone)]
 struct TerminalTabState {
     cwd: Rc<RefCell<Option<String>>>,
+    font_size: Rc<RefCell<Option<f32>>>,
     handle: terminal::TerminalHandle,
 }
 
 #[derive(Clone)]
 pub struct TerminalShortcutTarget {
     handle: terminal::TerminalHandle,
+    font_size: Rc<RefCell<Option<f32>>>,
+    callbacks: Rc<PaneCallbacks>,
 }
 
 impl TerminalShortcutTarget {
     pub fn perform_binding_action(&self, action: &str) -> bool {
         self.handle.perform_binding_action(action)
+    }
+
+    pub fn font_size_override(&self) -> Option<f32> {
+        *self.font_size.borrow()
+    }
+
+    pub fn set_font_size_override(&self, size: f32) -> bool {
+        if !size.is_finite() {
+            return false;
+        }
+
+        let size = size.clamp(1.0, 255.0);
+        let action = format!("set_font_size:{size}");
+        if !self.handle.perform_binding_action(&action) {
+            return false;
+        }
+
+        *self.font_size.borrow_mut() = Some(size);
+        (self.callbacks.on_state_changed)();
+        true
+    }
+
+    pub fn reset_font_size_override(&self, default_size: Option<f32>) -> bool {
+        let action = match default_size.filter(|size| size.is_finite()) {
+            Some(size) => format!("set_font_size:{}", size.clamp(1.0, 255.0)),
+            None => "reset_font_size".to_string(),
+        };
+        if !self.handle.perform_binding_action(&action) {
+            return false;
+        }
+
+        *self.font_size.borrow_mut() = None;
+        (self.callbacks.on_state_changed)();
+        true
     }
 
     pub fn show_find(&self) -> bool {
@@ -943,6 +980,7 @@ struct TerminalTabOptions<'a> {
     pinned: bool,
     cwd: Option<&'a str>,
     agent: Option<RestorableAgentState>,
+    font_size: Option<f32>,
 }
 
 struct BrowserTabOptions<'a> {
@@ -976,7 +1014,11 @@ fn restore_tabs_from_state(
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
-            TabContentState::Terminal { cwd, agent } => add_terminal_tab_inner(
+            TabContentState::Terminal {
+                cwd,
+                agent,
+                font_size,
+            } => add_terminal_tab_inner(
                 internals,
                 cwd.as_deref().or(working_directory),
                 Some(TerminalTabOptions {
@@ -985,6 +1027,7 @@ fn restore_tabs_from_state(
                     pinned: saved_tab.pinned,
                     cwd: cwd.as_deref().or(working_directory),
                     agent: agent.clone(),
+                    font_size: *font_size,
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
@@ -1207,6 +1250,13 @@ fn add_terminal_tab_inner(
             .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
             .or_else(|| working_directory.map(|cwd| cwd.to_string())),
     ));
+    let term_font_size = Rc::new(RefCell::new(
+        options
+            .as_ref()
+            .and_then(|value| value.font_size)
+            .filter(|size| size.is_finite())
+            .map(|size| size.clamp(1.0, 255.0)),
+    ));
     let term_callbacks = make_terminal_callbacks(internals, &tab_id, &title_label, &term_cwd);
     let hover_focus = {
         let callbacks = internals.callbacks.clone();
@@ -1249,11 +1299,19 @@ fn add_terminal_tab_inner(
         );
     }
 
+    let saved_font_size = *term_font_size.borrow();
+    let saved_font_size = saved_font_size.or_else(|| {
+        let config = (internals.callbacks.current_config)();
+        let configured = config.borrow().font_size;
+        configured
+            .filter(|size| size.is_finite())
+            .map(|size| size.clamp(1.0, 255.0))
+    });
     let term = terminal::create_terminal(
         working_directory,
         terminal::TerminalOptions {
             hover_focus,
-            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
+            saved_font_size,
             startup_command,
             extra_env,
         },
@@ -1276,6 +1334,7 @@ fn add_terminal_tab_inner(
             kind: TabKind::Terminal {
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
+                    font_size: term_font_size.clone(),
                     handle: term.handle.clone(),
                 },
             },
@@ -1576,6 +1635,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
                     agent: None,
+                    font_size: *state.font_size.borrow(),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
@@ -1839,6 +1899,8 @@ pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarg
                 ..
             }) => FocusedShortcutTarget::Terminal(TerminalShortcutTarget {
                 handle: state.handle.clone(),
+                font_size: state.font_size.clone(),
+                callbacks: internals.callbacks.clone(),
             }),
             Some(TabEntry {
                 kind: TabKind::Browser { state },

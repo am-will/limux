@@ -191,6 +191,8 @@ pub enum TabContentState {
         cwd: Option<String>,
         #[serde(default)]
         agent: Option<RestorableAgentState>,
+        #[serde(default)]
+        font_size: Option<f32>,
     },
     Browser {
         #[serde(default)]
@@ -260,6 +262,7 @@ impl TabState {
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
                 agent: None,
+                font_size: None,
             },
         }
     }
@@ -1379,6 +1382,7 @@ mod tests {
                         launch_command: None,
                         restore_on_startup: true,
                     }),
+                    font_size: None,
                 },
             }],
         });
@@ -1474,6 +1478,7 @@ mod tests {
                     }),
                     restore_on_startup: true,
                 }),
+                font_size: None,
             },
         };
 
@@ -1493,6 +1498,52 @@ mod tests {
                         .as_slice(),
                     ["codex", "--model", "gpt-5.5"]
                 );
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_tab_state_round_trips_font_size_override() {
+        let tab = TabState {
+            id: "tab-a".to_string(),
+            custom_name: None,
+            pinned: false,
+            content: TabContentState::Terminal {
+                cwd: Some("/tmp/project".to_string()),
+                agent: None,
+                font_size: Some(17.5),
+            },
+        };
+
+        let raw = serde_json::to_string(&tab).expect("encode tab");
+        let decoded: TabState = serde_json::from_str(&raw).expect("decode tab");
+
+        match decoded.content {
+            TabContentState::Terminal { font_size, .. } => {
+                assert_eq!(font_size, Some(17.5));
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_tab_state_defaults_missing_font_size_override() {
+        let decoded: TabState = serde_json::from_str(
+            r#"{
+                "id": "tab-a",
+                "custom_name": null,
+                "pinned": false,
+                "tab_kind": "terminal",
+                "cwd": "/tmp/project",
+                "agent": null
+            }"#,
+        )
+        .expect("decode legacy tab");
+
+        match decoded.content {
+            TabContentState::Terminal { font_size, .. } => {
+                assert_eq!(font_size, None);
             }
             other => panic!("expected terminal tab, got {other:?}"),
         }
