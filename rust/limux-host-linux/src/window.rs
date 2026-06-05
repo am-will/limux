@@ -2640,6 +2640,9 @@ fn handle_config_change(
     let style_manager = adw::StyleManager::default();
     let system_prefers_dark = state.borrow().system_prefers_dark.get();
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
+    if updated.appearance.ui_scale != previous.appearance.ui_scale {
+        reload_app_css(state, updated);
+    }
     if previous.interface.window_controls_side != updated.interface.window_controls_side
         || previous.interface.show_top_bar != updated.interface.show_top_bar
         || previous.interface.show_workspace_indicators
@@ -2650,6 +2653,9 @@ fn handle_config_change(
     if let Err(err) = app_config::save(updated) {
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
+        if updated.appearance.ui_scale != previous.appearance.ui_scale {
+            reload_app_css(state, previous);
+        }
         apply_top_bar_mode(state);
 
         let detail = format!("Failed to save Limux settings: {err}");
@@ -3237,28 +3243,47 @@ fn active_workspace_leading_pane(state: &State) -> Option<gtk::Widget> {
 /// Reparent the dock toggle, + button, and window-controls into the top bar
 /// or the sidebar header (or, in the top-bar-off + sidebar-closed case, park
 /// the dock toggle on the active workspace's leading pane).
+/// The top-bar widgets resolved from `AppState`, after confirming the optional
+/// ones exist. Grouped so the per-layout helpers take a single ref instead of a
+/// dozen individual widget arguments.
+struct TopBarWidgets {
+    handle: gtk::WindowHandle,
+    content: gtk::Box,
+    dock: gtk::Button,
+    settings: gtk::Button,
+    new_ws: gtk::Button,
+    minimize: gtk::Button,
+    maximize: gtk::Button,
+    close: gtk::Button,
+    indicator_box: gtk::Box,
+    sidebar_header: gtk::Box,
+    sidebar_header_handle: gtk::WindowHandle,
+    sidebar_drag_area: gtk::Box,
+}
+
 fn apply_top_bar_mode(state: &State) {
-    let (
-        top_bar_handle,
-        top_bar_content_box,
-        dock_toggle,
-        settings_btn,
-        new_ws_btn,
-        minimize,
-        maximize,
-        close,
-        indicator_box,
-        sidebar_header,
-        sidebar_header_handle,
-        sidebar_drag_area,
-        show_top_bar,
-        controls_side,
-        show_workspace_indicators,
-        sidebar_visible_now,
-    ) = {
+    apply_top_bar_mode_impl(state, true);
+}
+
+/// Lays out the dock toggle / settings / new-workspace / window controls into
+/// the top bar, the sidebar header, or the leading pane depending on config and
+/// sidebar visibility. `allow_retry` guards a single idle re-run used by the
+/// collapsed-sidebar layout when the leading pane is momentarily missing during
+/// a workspace rebuild; the retry runs with `false` so it can never loop.
+fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
+    let (show_top_bar, controls_side, show_workspace_indicators, sidebar_visible_now, widgets) = {
         let s = state.borrow();
         let config = s.config.borrow();
-        (
+        let (
+            Some(handle),
+            Some(content),
+            Some(dock),
+            Some(settings),
+            Some(new_ws),
+            Some(minimize),
+            Some(maximize),
+            Some(close),
+        ) = (
             s.top_bar.clone(),
             s.top_bar_content.clone(),
             s.top_bar_sidebar_toggle.clone(),
@@ -3267,10 +3292,25 @@ fn apply_top_bar_mode(state: &State) {
             s.top_bar_minimize_btn.clone(),
             s.top_bar_maximize_btn.clone(),
             s.top_bar_close_btn.clone(),
-            s.indicator_box.clone(),
-            s.sidebar_header.clone(),
-            s.sidebar_header_handle.clone(),
-            s.sidebar_drag_area.clone(),
+        )
+        else {
+            return;
+        };
+        let widgets = TopBarWidgets {
+            handle,
+            content,
+            dock,
+            settings,
+            new_ws,
+            minimize,
+            maximize,
+            close,
+            indicator_box: s.indicator_box.clone(),
+            sidebar_header: s.sidebar_header.clone(),
+            sidebar_header_handle: s.sidebar_header_handle.clone(),
+            sidebar_drag_area: s.sidebar_drag_area.clone(),
+        };
+        (
             // The persisted setting AND the transient keyboard toggle must
             // both be on for the top bar layout to apply.
             config.interface.show_top_bar && s.top_bar_visible,
@@ -3280,47 +3320,25 @@ fn apply_top_bar_mode(state: &State) {
             // stale during animations or startup; we don't want to misclassify
             // a set_visible(true) sidebar as closed.
             s.sidebar_box.is_visible(),
+            widgets,
         )
-    };
-
-    let (
-        Some(handle),
-        Some(content),
-        Some(dock),
-        Some(settings),
-        Some(new_ws),
-        Some(mi),
-        Some(ma),
-        Some(cl),
-    ) = (
-        top_bar_handle,
-        top_bar_content_box,
-        dock_toggle,
-        settings_btn,
-        new_ws_btn,
-        minimize,
-        maximize,
-        close,
-    )
-    else {
-        return;
     };
 
     // Detach the mobile widgets from wherever they're parented now — this
     // covers the case where a widget lives in the top bar, the sidebar
     // header, or a pane's leading_box from a previous arrangement.
-    detach(&dock);
-    detach(&settings);
-    detach(&new_ws);
-    detach(&mi);
-    detach(&ma);
-    detach(&cl);
-    detach(&indicator_box);
+    detach(&widgets.dock);
+    detach(&widgets.settings);
+    detach(&widgets.new_ws);
+    detach(&widgets.minimize);
+    detach(&widgets.maximize);
+    detach(&widgets.close);
+    detach(&widgets.indicator_box);
 
     // Clear the alt sidebar header from previous arrangements (removes the
     // leftover hexpand spacer child).
-    while let Some(child) = sidebar_header.first_child() {
-        sidebar_header.remove(&child);
+    while let Some(child) = widgets.sidebar_header.first_child() {
+        widgets.sidebar_header.remove(&child);
     }
 
     // Workspace indicator pills are only shown when the user opts in.
@@ -3335,80 +3353,104 @@ fn apply_top_bar_mode(state: &State) {
     }
 
     if show_top_bar {
-        // Classic layout: put everything back into the top bar, in order
-        // dock | settings | new_ws | indicator_box | [controls at side]
-        content.append(&dock);
-        content.append(&settings);
-        content.append(&new_ws);
-        content.append(&indicator_box);
-
-        match controls_side {
-            app_config::WindowControlsSide::Left => {
-                cl.insert_before(&content, content.first_child().as_ref());
-                mi.insert_after(&content, Some(&cl));
-                ma.insert_after(&content, Some(&mi));
-            }
-            app_config::WindowControlsSide::Right => {
-                content.append(&mi);
-                content.append(&ma);
-                content.append(&cl);
-            }
-        }
-
-        handle.set_visible(true);
-        sidebar_header_handle.set_visible(false);
-        // Top bar already handles window drag — hide the 8px drag strip above
-        // the workspace list so the first row sits flush with the sidebar top,
-        // matching the sidebar-header mode's spacing.
-        sidebar_drag_area.set_visible(false);
+        layout_top_bar_visible(&widgets, controls_side);
         return;
     }
 
     // Top bar hidden. Hide the whole top-bar widget.
-    handle.set_visible(false);
+    widgets.handle.set_visible(false);
 
     if sidebar_visible_now {
-        // Sidebar open: left group + expanding spacer + right group, so the
-        // window controls sit at one end and the app buttons at the other.
-        let spacer = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .hexpand(true)
-            .build();
-
-        match controls_side {
-            app_config::WindowControlsSide::Left => {
-                // close | min | max || spacer || dock | settings | + (new_ws)
-                sidebar_header.append(&cl);
-                sidebar_header.append(&mi);
-                sidebar_header.append(&ma);
-                sidebar_header.append(&spacer);
-                sidebar_header.append(&dock);
-                sidebar_header.append(&settings);
-                sidebar_header.append(&new_ws);
-            }
-            app_config::WindowControlsSide::Right => {
-                // dock | settings | + || spacer || min | max | close
-                sidebar_header.append(&dock);
-                sidebar_header.append(&settings);
-                sidebar_header.append(&new_ws);
-                sidebar_header.append(&spacer);
-                sidebar_header.append(&mi);
-                sidebar_header.append(&ma);
-                sidebar_header.append(&cl);
-            }
-        }
-        sidebar_header_handle.set_visible(true);
-        // Sidebar header replaces the drag strip above it visually, so hide
-        // the 8px drag spacer to match the pane header height exactly.
-        sidebar_drag_area.set_visible(false);
+        layout_sidebar_header(&widgets, controls_side);
     } else {
-        // Sidebar collapsed: dock toggle goes on the leading pane, all other
-        // controls stay detached (not visible anywhere).
-        sidebar_header_handle.set_visible(false);
-        sidebar_drag_area.set_visible(true);
-        if let Some(pane) = active_workspace_leading_pane(state) {
-            if let Some(leading) = pane::pane_leading_box(&pane) {
-                leading.append(&dock);
+        layout_collapsed_dock(state, &widgets, allow_retry);
+    }
+}
+
+/// Classic layout: everything back in the top bar, controls at the chosen side.
+fn layout_top_bar_visible(w: &TopBarWidgets, controls_side: app_config::WindowControlsSide) {
+    // dock | settings | new_ws | indicator_box | [controls at side]
+    w.content.append(&w.dock);
+    w.content.append(&w.settings);
+    w.content.append(&w.new_ws);
+    w.content.append(&w.indicator_box);
+
+    match controls_side {
+        app_config::WindowControlsSide::Left => {
+            w.close
+                .insert_before(&w.content, w.content.first_child().as_ref());
+            w.minimize.insert_after(&w.content, Some(&w.close));
+            w.maximize.insert_after(&w.content, Some(&w.minimize));
+        }
+        app_config::WindowControlsSide::Right => {
+            w.content.append(&w.minimize);
+            w.content.append(&w.maximize);
+            w.content.append(&w.close);
+        }
+    }
+
+    w.handle.set_visible(true);
+    w.sidebar_header_handle.set_visible(false);
+    // Top bar already handles window drag — hide the 8px drag strip above
+    // the workspace list so the first row sits flush with the sidebar top,
+    // matching the sidebar-header mode's spacing.
+    w.sidebar_drag_area.set_visible(false);
+}
+
+/// Top bar hidden, sidebar open: left group + expanding spacer + right group,
+/// so the window controls sit at one end and the app buttons at the other.
+fn layout_sidebar_header(w: &TopBarWidgets, controls_side: app_config::WindowControlsSide) {
+    let spacer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .hexpand(true)
+        .build();
+
+    match controls_side {
+        app_config::WindowControlsSide::Left => {
+            // close | min | max || spacer || dock | settings | + (new_ws)
+            w.sidebar_header.append(&w.close);
+            w.sidebar_header.append(&w.minimize);
+            w.sidebar_header.append(&w.maximize);
+            w.sidebar_header.append(&spacer);
+            w.sidebar_header.append(&w.dock);
+            w.sidebar_header.append(&w.settings);
+            w.sidebar_header.append(&w.new_ws);
+        }
+        app_config::WindowControlsSide::Right => {
+            // dock | settings | + || spacer || min | max | close
+            w.sidebar_header.append(&w.dock);
+            w.sidebar_header.append(&w.settings);
+            w.sidebar_header.append(&w.new_ws);
+            w.sidebar_header.append(&spacer);
+            w.sidebar_header.append(&w.minimize);
+            w.sidebar_header.append(&w.maximize);
+            w.sidebar_header.append(&w.close);
+        }
+    }
+    w.sidebar_header_handle.set_visible(true);
+    // Sidebar header replaces the drag strip above it visually, so hide
+    // the 8px drag spacer to match the pane header height exactly.
+    w.sidebar_drag_area.set_visible(false);
+}
+
+/// Top bar hidden, sidebar collapsed: the dock toggle parks on the leading
+/// pane, all other controls stay detached. The leading pane can be momentarily
+/// absent while the workspace widget tree rebuilds; in that case retry once on
+/// idle so the dock toggle doesn't briefly vanish during transient cycles.
+fn layout_collapsed_dock(state: &State, w: &TopBarWidgets, allow_retry: bool) {
+    w.sidebar_header_handle.set_visible(false);
+    w.sidebar_drag_area.set_visible(true);
+
+    let leading_box =
+        active_workspace_leading_pane(state).and_then(|pane| pane::pane_leading_box(&pane));
+    match leading_box {
+        Some(leading) => leading.append(&w.dock),
+        None => {
+            if allow_retry {
+                let state = state.clone();
+                glib::idle_add_local_once(move || {
+                    apply_top_bar_mode_impl(&state, false);
+                });
             }
         }
     }
@@ -5597,51 +5639,6 @@ pub(crate) fn create_pane_for_workspace(
             let s = state_for_config.borrow();
             s.config.clone()
         }),
-        on_config_changed: Rc::new(
-            move |previous: &app_config::AppConfig, updated: &app_config::AppConfig| {
-                let style_manager = adw::StyleManager::default();
-                let system_prefers_dark =
-                    state_for_config_changed.borrow().system_prefers_dark.get();
-                apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
-                if updated.appearance.ui_scale != previous.appearance.ui_scale {
-                    reload_app_css(&state_for_config_changed, updated);
-                }
-                if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path
-                {
-                    sync_workspace_path_visibility(
-                        &state_for_config_changed,
-                        updated.appearance.show_workspace_path,
-                    );
-                }
-                if let Err(err) = app_config::save(updated) {
-                    state_for_config_changed
-                        .borrow()
-                        .config
-                        .borrow_mut()
-                        .clone_from(previous);
-                    apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
-                    if updated.appearance.ui_scale != previous.appearance.ui_scale {
-                        reload_app_css(&state_for_config_changed, previous);
-                    }
-                    if updated.appearance.show_workspace_path
-                        != previous.appearance.show_workspace_path
-                    {
-                        sync_workspace_path_visibility(
-                            &state_for_config_changed,
-                            previous.appearance.show_workspace_path,
-                        );
-                    }
-
-                    let detail = format!("Failed to save Limux settings: {err}");
-                    eprintln!("limux: {detail}");
-                    show_runtime_error(
-                        &state_for_config_changed,
-                        "Failed to save settings",
-                        &detail,
-                    );
-                }
-            },
-        ),
         workspace_for_pane: Box::new(move |_pane_widget| Some(ws_id_for_env.clone())),
     });
 

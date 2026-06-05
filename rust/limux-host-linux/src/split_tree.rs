@@ -547,6 +547,17 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                     return glib::ControlFlow::Continue;
                 }
                 if last_size_for_resize.get() != size {
+                    // Debug-only jitter probe: each line is one ratio re-apply.
+                    // Rapid repeated lines on a stable layout signal the size is
+                    // oscillating (worth watching as split trees get deep). Costs
+                    // nothing in release builds.
+                    #[cfg(debug_assertions)]
+                    {
+                        let previous = last_size_for_resize.get();
+                        eprintln!(
+                            "limux: split-ratio tick reapply ({resize_orientation:?}) size {previous} -> {size}"
+                        );
+                    }
                     last_size_for_resize.set(size);
                     let ratio = *shared_ratio_for_resize.borrow();
                     crate::window::apply_ratio_value(
