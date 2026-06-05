@@ -414,12 +414,16 @@ fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
 
 fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
     let alloc = gl_area.allocation();
-    let w = alloc.width() as u32;
-    let h = alloc.height() as u32;
+    let scale = gl_area.scale_factor();
+    // ghostty_surface_set_size expects PHYSICAL pixels (the GL framebuffer size).
+    // gl_area.allocation() returns LOGICAL CSS pixels; multiply by the integer
+    // scale factor to get the physical pixel dimensions that match the GL viewport.
+    let w = (alloc.width() * scale) as u32;
+    let h = (alloc.height() * scale) as u32;
     if w > 0 && h > 0 {
-        let scale = gl_area.scale_factor() as f64;
+        let scale_f64 = scale as f64;
         unsafe {
-            ghostty_surface_set_content_scale(surface, scale, scale);
+            ghostty_surface_set_content_scale(surface, scale_f64, scale_f64);
             ghostty_surface_set_size(surface, w, h);
         }
     }
