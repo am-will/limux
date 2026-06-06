@@ -112,8 +112,8 @@ Repository maintainability rules live in [`docs/maintainability.md`](docs/mainta
 
 ## Agent integrations
 
-Limux ships first-class hooks for coding agents (Codex, Claude Code, and
-Gemini CLI). Every terminal limux spawns auto-exports
+Limux ships first-class hooks for coding agents (Codex, Claude Code, Gemini
+CLI, and Pi). Every terminal limux spawns auto-exports
 `LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /
 `LIMUX_TAB_ID` / `LIMUX_SOCKET`, so the CLI auto-targets the right place
 with no flags needed from inside the agent's own terminal.
@@ -128,6 +128,7 @@ limux hooks setup
 # Drop-in hook handlers translate hook JSON on stdin into notify/session state
 echo '{"event":"stop"}' | limux claude-hook --event stop
 echo '{"event":"finished"}' | limux gemini-hook --event finished
+echo '{"event":"stop"}' | limux pi-hook --event stop
 
 # Spin up a multi-agent collaboration team — one workspace per agent,
 # launches each agent's CLI, and writes AGENTS.md describing the
@@ -155,9 +156,10 @@ limux send --workspace "$LIMUX_WORKSPACE_ID" --surface "<peer-surface-id>" \
 See the auto-generated `AGENTS.md` (written into the shared cwd) for
 the full protocol spec, peer table, and editable Policies section.
 
-Checked-in hook templates live in [`hooks/`](hooks/). They mirror
-`limux hooks setup` for Codex, Claude Code, and Gemini CLI; OpenCode is
-omitted until its hook integration is ready.
+Checked-in JSON hook templates live in [`hooks/`](hooks/). They mirror
+`limux hooks setup` for Codex, Claude Code, and Gemini CLI. Pi is installed as
+a generated extension under `~/.pi/agent/extensions/`; OpenCode is omitted
+from default setup until its hook integration is ready.
 
 Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
 and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build

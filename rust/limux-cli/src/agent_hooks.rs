@@ -14,6 +14,7 @@ pub(crate) enum AgentKind {
     Codex,
     OpenCode,
     Gemini,
+    Pi,
 }
 
 impl AgentKind {
@@ -23,6 +24,7 @@ impl AgentKind {
             "codex" => Some(Self::Codex),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "gemini" => Some(Self::Gemini),
+            "pi" | "pi-coding-agent" | "pi-coding" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -33,6 +35,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
+            Self::Pi => "pi",
         }
     }
 
@@ -42,6 +45,7 @@ impl AgentKind {
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini",
+            Self::Pi => "Pi",
         }
     }
 
@@ -51,6 +55,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
+            Self::Pi => "pi",
         }
     }
 }
@@ -278,6 +283,11 @@ pub(crate) fn build_resume_command(
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
+        AgentKind::Pi => {
+            parts.push("--session".to_string());
+            parts.push(session_id);
+            parts.extend(preserved_tail);
+        }
     }
 
     let command = parts
@@ -368,6 +378,12 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::Claude | AgentKind::Gemini => {
             arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
         }
+        AgentKind::Pi => {
+            arg == "--session"
+                || arg.starts_with("--session=")
+                || arg == "--continue"
+                || arg == "-c"
+        }
     }
 }
 
@@ -448,6 +464,8 @@ fn selected_environment() -> BTreeMap<String, String> {
         "CLAUDE_CONFIG_DIR",
         "OPENCODE_CONFIG_DIR",
         "GEMINI_CONFIG_DIR",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL",
