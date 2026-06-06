@@ -412,15 +412,29 @@ fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
     gl_area.grab_focus();
 }
 
-fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+/// Convert a GLArea's logical (CSS-pixel) allocation to physical (device) pixels.
+fn gl_area_device_size(gl_area: &gtk::GLArea) -> (u32, u32) {
     let alloc = gl_area.allocation();
-    let w = alloc.width() as u32;
-    let h = alloc.height() as u32;
-    if w > 0 && h > 0 {
+    let scale = gl_area.scale_factor() as f64;
+    let w = (alloc.width() as f64 * scale).round() as u32;
+    let h = (alloc.height() as f64 * scale).round() as u32;
+    (w, h)
+}
+
+/// Push the current content scale and physical size into Ghostty.
+/// `device_width` and `device_height` must be in physical (device) pixels,
+/// not CSS/logical pixels.
+fn refresh_surface_display(
+    surface: ghostty_surface_t,
+    gl_area: &gtk::GLArea,
+    device_width: u32,
+    device_height: u32,
+) {
+    if device_width > 0 && device_height > 0 {
         let scale = gl_area.scale_factor() as f64;
         unsafe {
             ghostty_surface_set_content_scale(surface, scale, scale);
-            ghostty_surface_set_size(surface, w, h);
+            ghostty_surface_set_size(surface, device_width, device_height);
         }
     }
     unsafe { ghostty_surface_refresh(surface) };
@@ -434,7 +448,8 @@ fn refresh_realized_surface_display(surface: ghostty_surface_t, gl_area: &gtk::G
             unsafe { ghostty_surface_display_realized(surface) };
         }
     }
-    refresh_surface_display(surface, gl_area);
+    let (w, h) = gl_area_device_size(gl_area);
+    refresh_surface_display(surface, gl_area, w, h);
 }
 
 fn clear_ghostty_preedit(surface: ghostty_surface_t) {
@@ -1380,13 +1395,11 @@ pub fn create_terminal(
                 }
             }
 
-            // Set initial size — GLArea gives unscaled CSS pixels,
-            // Ghostty handles scaling internally via content_scale.
-            let alloc = gl_area.allocation();
-            let w = alloc.width() as u32;
-            let h = alloc.height() as u32;
+            // Set initial size — GLArea allocation is CSS (logical) pixels,
+            // but ghostty_surface_set_size expects physical (device) pixels.
+            let (w, h) = gl_area_device_size(gl_area);
             if w > 0 && h > 0 {
-                refresh_surface_display(surface, gl_area);
+                refresh_surface_display(surface, gl_area, w, h);
             }
 
             let surface_key = surface as usize;
@@ -1483,7 +1496,8 @@ pub fn create_terminal(
                 let w = width as u32;
                 let h = height as u32;
                 if w > 0 && h > 0 {
-                    refresh_surface_display(surface, gl_area);
+                    // GLArea::resize passes physical (device) pixels directly.
+                    refresh_surface_display(surface, gl_area, w, h);
                 }
             }
 
@@ -1492,6 +1506,28 @@ pub fn create_terminal(
                 glib::idle_add_local_once(move || {
                     gl_for_focus.grab_focus();
                 });
+            }
+        });
+    }
+
+    // On scale-factor change: update Ghostty's content scale and size.
+    // GTK4 usually emits resize when the backing surface resizes, but
+    // fractional-scale transitions can leave the allocation unchanged
+    // while the device-pixel size changes, so we refresh explicitly here.
+    {
+        let surface_cell = surface_cell.clone();
+        let last_device_size: Rc<Cell<Option<(u32, u32)>>> = Rc::new(Cell::new(None));
+        gl_area.connect_scale_factor_notify(move |gl_area| {
+            if let Some(surface) = *surface_cell.borrow() {
+                let (w, h) = gl_area_device_size(gl_area);
+                if w > 0 && h > 0 {
+                    let size = (w, h);
+                    if last_device_size.get() == Some(size) {
+                        return;
+                    }
+                    last_device_size.set(Some(size));
+                    refresh_surface_display(surface, gl_area, w, h);
+                }
             }
         });
     }
