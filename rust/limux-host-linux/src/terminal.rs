@@ -416,8 +416,8 @@ fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
 fn gl_area_device_size(gl_area: &gtk::GLArea) -> (u32, u32) {
     let alloc = gl_area.allocation();
     let scale = gl_area.scale_factor() as f64;
-    let w = (alloc.width() as f64 * scale).round() as u32;
-    let h = (alloc.height() as f64 * scale).round() as u32;
+    let w = (alloc.width() as f64 * scale).round().max(0.0) as u32;
+    let h = (alloc.height() as f64 * scale).round().max(0.0) as u32;
     (w, h)
 }
 

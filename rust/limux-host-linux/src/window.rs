@@ -5098,10 +5098,6 @@ fn split_pane(
     Some(new_pane.upcast())
 }
 
-fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
-    remove_pane_internal(state, ws_id, pane_widget, true);
-}
-
 fn remove_pane_internal(state: &State, ws_id: &str, pane_widget: &gtk::Widget, persist: bool) {
     let container = {
         let s = state.borrow();
@@ -5386,15 +5382,19 @@ fn cycle_focused_pane_tab(state: &State, delta: i32) {
 }
 
 fn close_focused_tab(state: &State) {
-    if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
-        let parent = pane_widget.parent();
-        // If this is the only pane (parent is Stack), don't close — keep workspace alive
-        if let Some(ref p) = parent {
-            if p.downcast_ref::<gtk::Stack>().is_some() {
-                return;
-            }
+    let Some((_ws_id, pane_widget)) = find_focused_pane(state) else {
+        return;
+    };
+    // If this is the only pane in the workspace, keep it alive when it has
+    // a single tab — mirroring the original guard that prevented removing the
+    // last pane and tearing down the workspace.
+    if let Some(ref p) = pane_widget.parent() {
+        if p.downcast_ref::<gtk::Stack>().is_some() && pane::tab_count_in_pane(&pane_widget) <= 1 {
+            return;
         }
-        remove_pane(state, &ws_id, &pane_widget);
+    }
+    if let Some(tab_id) = pane::active_tab_in_pane(&pane_widget) {
+        pane::close_tab_in_pane(&pane_widget, &tab_id);
     }
 }
 

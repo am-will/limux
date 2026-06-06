@@ -687,6 +687,46 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
     true
 }
 
+/// Returns the active tab id in the given pane, if any.
+pub fn active_tab_in_pane(pane_widget: &gtk::Widget) -> Option<String> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    tab_state.active_tab.clone()
+}
+
+/// Returns the number of tabs in the given pane.
+pub fn tab_count_in_pane(pane_widget: &gtk::Widget) -> usize {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return 0;
+    };
+    let count = internals.tab_state.borrow().tabs.len();
+    count
+}
+
+/// Closes the tab with the given id in the pane. If the tab is pinned, it is ignored.
+pub fn close_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return;
+    };
+    let is_pinned = internals
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .any(|entry| entry.id == tab_id && entry.pinned);
+    if !is_pinned {
+        remove_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            tab_id,
+            &internals.callbacks,
+            &internals.pane_outer,
+            PaneEmptyReason::ClosedLastTab,
+        );
+    }
+}
+
 pub fn refresh_terminal_displays_in_root(root: &gtk::Widget) {
     for internals in pane_internals_for_root(root) {
         for entry in &internals.tab_state.borrow().tabs {
