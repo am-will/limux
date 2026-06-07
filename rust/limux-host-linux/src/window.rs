@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -30,6 +32,8 @@ const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
 const APP_ICON_FOR_DARK_OS: &str = "limux-os-dark";
 const APP_ICON_FOR_LIGHT_OS: &str = "limux-os-light";
+const APP_ICON_LAUNCHER_NAME: &str = "limux";
+const APP_ICON_SIZES: &[u16] = &[16, 32, 128, 256, 512];
 
 // ---------------------------------------------------------------------------
 // State
@@ -2804,6 +2808,92 @@ fn sync_app_icon_for_system_theme(
     let icon_name = app_icon_name_for_system_theme(system_prefers_dark, fallback_dark);
     gtk::Window::set_default_icon_name(icon_name);
     window.set_icon_name(Some(icon_name));
+    if let Err(err) = sync_launcher_icon_for_system_theme(icon_name) {
+        eprintln!("limux: failed to sync launcher icon: {err}");
+    }
+}
+
+fn sync_launcher_icon_for_system_theme(icon_name: &str) -> Result<(), String> {
+    let user_data_dir =
+        dirs::data_dir().ok_or_else(|| "could not resolve user data directory".to_string())?;
+    let source_roots = launcher_icon_source_roots(&user_data_dir);
+    let mut changed = false;
+    let mut copied = 0usize;
+
+    for size in APP_ICON_SIZES {
+        let Some(source) = source_roots
+            .iter()
+            .map(|root| launcher_icon_path(root, *size, icon_name))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        let dest = launcher_icon_path(&user_data_dir, *size, APP_ICON_LAUNCHER_NAME);
+        if copy_icon_if_changed(&source, &dest)? {
+            changed = true;
+        }
+        copied += 1;
+    }
+
+    if copied == 0 {
+        return Err(format!("no installed {icon_name} app icon variants found"));
+    }
+
+    if changed {
+        refresh_user_icon_cache(&user_data_dir);
+    }
+
+    Ok(())
+}
+
+fn launcher_icon_source_roots(user_data_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![user_data_dir.to_path_buf()];
+
+    let xdg_data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
+    roots.extend(std::env::split_paths(&xdg_data_dirs));
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    roots.into_iter().fold(Vec::new(), |mut unique, root| {
+        if !unique.contains(&root) {
+            unique.push(root);
+        }
+        unique
+    })
+}
+
+fn launcher_icon_path(root: &Path, size: u16, icon_name: &str) -> PathBuf {
+    root.join("icons")
+        .join("hicolor")
+        .join(format!("{size}x{size}"))
+        .join("apps")
+        .join(format!("{icon_name}.png"))
+}
+
+fn copy_icon_if_changed(source: &Path, dest: &Path) -> Result<bool, String> {
+    let source_bytes =
+        fs::read(source).map_err(|err| format!("failed to read {}: {err}", source.display()))?;
+    if fs::read(dest).is_ok_and(|dest_bytes| dest_bytes == source_bytes) {
+        return Ok(false);
+    }
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    fs::write(dest, source_bytes)
+        .map_err(|err| format!("failed to write {}: {err}", dest.display()))?;
+    Ok(true)
+}
+
+fn refresh_user_icon_cache(user_data_dir: &Path) {
+    let hicolor_dir = user_data_dir.join("icons/hicolor");
+    let _ = ProcessCommand::new("gtk-update-icon-cache")
+        .args(["-f", "-t"])
+        .arg(hicolor_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn apply_appearance(
@@ -5911,13 +6001,13 @@ mod tests {
     use super::ToVariant;
     use super::{
         app_icon_name_for_system_theme, build_window_css, clamp_workspace_insert_index_for_pinning,
-        desktop_notification_action_from_signal, desktop_notification_actions,
-        desktop_notification_activation_token_from_signal,
+        copy_icon_if_changed, desktop_notification_action_from_signal,
+        desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, next_active_workspace_index,
-        pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
-        resolved_system_prefers_dark, sanitize_background_opacity,
+        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, launcher_icon_path,
+        next_active_workspace_index, pane_create_split_placement, queue_session_save_request,
+        resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
@@ -5925,8 +6015,9 @@ mod tests {
         workspace_folder_path_from_input, workspace_notification_message, Direction,
         EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
         PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        WorkspaceSeedSource, APP_ICON_FOR_DARK_OS, APP_ICON_FOR_LIGHT_OS, BASE_CSS,
-        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        WorkspaceSeedSource, APP_ICON_FOR_DARK_OS, APP_ICON_FOR_LIGHT_OS, APP_ICON_LAUNCHER_NAME,
+        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -6333,6 +6424,33 @@ mod tests {
             app_icon_name_for_system_theme(None, false),
             APP_ICON_FOR_LIGHT_OS
         );
+    }
+
+    #[test]
+    fn launcher_icon_path_targets_hicolor_app_icon() {
+        assert_eq!(
+            launcher_icon_path(
+                std::path::Path::new("/home/tester/.local/share"),
+                512,
+                APP_ICON_LAUNCHER_NAME
+            ),
+            std::path::PathBuf::from(
+                "/home/tester/.local/share/icons/hicolor/512x512/apps/limux.png"
+            )
+        );
+    }
+
+    #[test]
+    fn copy_icon_if_changed_replaces_stale_launcher_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.png");
+        let dest = dir.path().join("nested/dest.png");
+        std::fs::write(&source, b"white-icon").unwrap();
+        std::fs::write(&dest, b"black-icon").unwrap_err();
+
+        assert!(copy_icon_if_changed(&source, &dest).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"white-icon");
+        assert!(!copy_icon_if_changed(&source, &dest).unwrap());
     }
 
     #[test]
