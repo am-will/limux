@@ -1409,6 +1409,9 @@ pub fn build_window(app: &adw::Application) {
     let initial_app_icon_name =
         app_icon_name_for_system_theme(system_prefers_dark.get(), style_manager.is_dark());
     gtk::Window::set_default_icon_name(initial_app_icon_name);
+    if let Err(err) = sync_launcher_icon_for_system_theme(initial_app_icon_name) {
+        eprintln!("limux: failed to sync launcher icon: {err}");
+    }
 
     let title = format!("Limux v{}", crate::VERSION);
     let window = adw::ApplicationWindow::builder()
