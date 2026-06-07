@@ -1412,6 +1412,9 @@ pub fn build_window(app: &adw::Application) {
     if let Err(err) = sync_launcher_icon_for_system_theme(initial_app_icon_name) {
         eprintln!("limux: failed to sync launcher icon: {err}");
     }
+    if let Err(err) = sync_desktop_entry_icon_for_system_theme(initial_app_icon_name) {
+        eprintln!("limux: failed to sync desktop entry icon: {err}");
+    }
 
     let title = format!("Limux v{}", crate::VERSION);
     let window = adw::ApplicationWindow::builder()
@@ -2814,6 +2817,9 @@ fn sync_app_icon_for_system_theme(
     if let Err(err) = sync_launcher_icon_for_system_theme(icon_name) {
         eprintln!("limux: failed to sync launcher icon: {err}");
     }
+    if let Err(err) = sync_desktop_entry_icon_for_system_theme(icon_name) {
+        eprintln!("limux: failed to sync desktop entry icon: {err}");
+    }
 }
 
 fn sync_launcher_icon_for_system_theme(icon_name: &str) -> Result<(), String> {
@@ -2894,6 +2900,86 @@ fn refresh_user_icon_cache(user_data_dir: &Path) {
     let _ = ProcessCommand::new("gtk-update-icon-cache")
         .args(["-f", "-t"])
         .arg(hicolor_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn sync_desktop_entry_icon_for_system_theme(icon_name: &str) -> Result<(), String> {
+    let user_data_dir =
+        dirs::data_dir().ok_or_else(|| "could not resolve user data directory".to_string())?;
+    let desktop_file_name = format!("{}.desktop", crate::APP_ID);
+    let dest = user_data_dir.join("applications").join(&desktop_file_name);
+    let source = desktop_entry_source_candidates(&user_data_dir, &desktop_file_name)
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("{desktop_file_name} was not found"))?;
+    let contents = fs::read_to_string(&source)
+        .map_err(|err| format!("failed to read {}: {err}", source.display()))?;
+    let updated = desktop_entry_with_icon(&contents, icon_name);
+
+    if fs::read_to_string(&dest).is_ok_and(|existing| existing == updated) {
+        return Ok(());
+    }
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    fs::write(&dest, updated)
+        .map_err(|err| format!("failed to write {}: {err}", dest.display()))?;
+    refresh_user_desktop_database(&user_data_dir);
+    Ok(())
+}
+
+fn desktop_entry_source_candidates(user_data_dir: &Path, desktop_file_name: &str) -> Vec<PathBuf> {
+    let mut roots = vec![user_data_dir.to_path_buf()];
+
+    let xdg_data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
+    roots.extend(std::env::split_paths(&xdg_data_dirs));
+
+    let mut candidates = roots
+        .into_iter()
+        .map(|root| root.join("applications").join(desktop_file_name))
+        .collect::<Vec<_>>();
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(desktop_file_name));
+
+    candidates.into_iter().fold(Vec::new(), |mut unique, path| {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+        unique
+    })
+}
+
+fn desktop_entry_with_icon(contents: &str, icon_name: &str) -> String {
+    let mut replaced = false;
+    let mut updated = contents
+        .lines()
+        .map(|line| {
+            if !replaced && line.starts_with("Icon=") {
+                replaced = true;
+                format!("Icon={icon_name}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !replaced {
+        updated.push(format!("Icon={icon_name}"));
+    }
+
+    let mut output = updated.join("\n");
+    output.push('\n');
+    output
+}
+
+fn refresh_user_desktop_database(user_data_dir: &Path) {
+    let applications_dir = user_data_dir.join("applications");
+    let _ = ProcessCommand::new("update-desktop-database")
+        .arg(applications_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -6004,8 +6090,9 @@ mod tests {
     use super::ToVariant;
     use super::{
         app_icon_name_for_system_theme, build_window_css, clamp_workspace_insert_index_for_pinning,
-        copy_icon_if_changed, desktop_notification_action_from_signal,
-        desktop_notification_actions, desktop_notification_activation_token_from_signal,
+        copy_icon_if_changed, desktop_entry_source_candidates, desktop_entry_with_icon,
+        desktop_notification_action_from_signal, desktop_notification_actions,
+        desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, launcher_icon_path,
@@ -6454,6 +6541,34 @@ mod tests {
         assert!(copy_icon_if_changed(&source, &dest).unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), b"white-icon");
         assert!(!copy_icon_if_changed(&source, &dest).unwrap());
+    }
+
+    #[test]
+    fn desktop_entry_with_icon_replaces_first_icon_line() {
+        let updated = desktop_entry_with_icon(
+            "[Desktop Entry]\nName=Limux\nIcon=limux\nType=Application\n",
+            APP_ICON_FOR_DARK_OS,
+        );
+
+        assert_eq!(
+            updated,
+            "[Desktop Entry]\nName=Limux\nIcon=limux-os-dark\nType=Application\n"
+        );
+    }
+
+    #[test]
+    fn desktop_entry_source_candidates_include_user_and_dev_paths() {
+        let candidates = desktop_entry_source_candidates(
+            std::path::Path::new("/home/tester/.local/share"),
+            "dev.limux.linux.desktop",
+        );
+
+        assert!(candidates.contains(&std::path::PathBuf::from(
+            "/home/tester/.local/share/applications/dev.limux.linux.desktop"
+        )));
+        assert!(candidates.contains(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dev.limux.linux.desktop")
+        ));
     }
 
     #[test]
