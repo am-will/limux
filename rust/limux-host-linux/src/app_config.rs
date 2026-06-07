@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MIN_FONT_SIZE: f32 = 8.0;
+const MAX_FONT_SIZE: f32 = 255.0;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,6 +50,8 @@ pub struct AppConfig {
     pub notifications: NotificationConfig,
     #[serde(skip)]
     pub font_size: Option<f32>,
+    #[serde(skip)]
+    pub ui_font_sizes: BTreeMap<String, f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -254,7 +260,24 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .get("font_size")
         .and_then(Value::as_f64)
         .map(|v| v as f32)
-        .filter(|v| (1.0..=255.0).contains(v));
+        .filter(|v| (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(v));
+
+    let ui_font_sizes = root
+        .get("ui_font_sizes")
+        .and_then(Value::as_object)
+        .map(|sizes| {
+            sizes
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_f64()
+                        .map(|v| v as f32)
+                        .filter(|v| (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(v))
+                        .map(|v| (key.clone(), v))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     AppConfig {
         focus: FocusConfig {
@@ -269,6 +292,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             sound: notification_sound,
         },
         font_size,
+        ui_font_sizes,
     }
 }
 
@@ -307,6 +331,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         root.insert("font_size".to_string(), json!(size));
     } else {
         root.remove("font_size");
+    }
+
+    if config.ui_font_sizes.is_empty() {
+        root.remove("ui_font_sizes");
+    } else {
+        root.insert("ui_font_sizes".to_string(), json!(config.ui_font_sizes));
     }
 
     let serialized =
@@ -568,6 +598,25 @@ mod tests {
     }
 
     #[test]
+    fn load_from_path_rejects_too_small_font_sizes() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "font_size": 7.5
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert_eq!(loaded.config.font_size, None);
+    }
+
+    #[test]
     fn load_from_path_reads_notification_preferences() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
@@ -645,6 +694,59 @@ mod tests {
             parsed["appearance"]["color_scheme"],
             Value::String("dark".to_string())
         );
+    }
+
+    #[test]
+    fn load_from_path_reads_ui_font_sizes_when_valid() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "ui_font_sizes": {
+    "sidebar_workspace_name": 16.5,
+    "too_small": 7.5,
+    "invalid": 999
+  }
+}"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+        assert_eq!(
+            loaded.config.ui_font_sizes.get("sidebar_workspace_name"),
+            Some(&16.5)
+        );
+        assert!(!loaded.config.ui_font_sizes.contains_key("too_small"));
+        assert!(!loaded.config.ui_font_sizes.contains_key("invalid"));
+    }
+
+    #[test]
+    fn save_to_path_writes_and_clears_ui_font_sizes() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+
+        let mut config = AppConfig::default();
+        config
+            .ui_font_sizes
+            .insert("sidebar_workspace_name".to_string(), 16.5);
+        save_to_path(&path, &config).expect("save ui font sizes");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["ui_font_sizes"]["sidebar_workspace_name"],
+            json!(16.5)
+        );
+
+        config.ui_font_sizes.clear();
+        save_to_path(&path, &config).expect("clear ui font sizes");
+
+        let raw = fs::read_to_string(&path).expect("read cleared config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse cleared config");
+        assert!(parsed.get("ui_font_sizes").is_none());
     }
 
     #[test]

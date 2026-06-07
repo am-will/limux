@@ -31,3 +31,14 @@ That script is the source of truth for the repository quality gate and currently
 - Keep pure logic separate from GTK widget wiring where possible.
 - Move test modules out of large production files when they obscure the main codepath.
 - Treat clippy findings as maintainability work, not optional cleanup.
+
+## GTK UI Styling
+
+- Sidebar workspace rows intentionally override the theme-provided
+  `.navigation-sidebar > row` horizontal padding and margins so selected and
+  unread row backgrounds span the full sidebar width.
+- Keep the sidebar unread indicator as an inset `box-shadow`, not a border,
+  so marking a workspace unread does not change row width or text alignment.
+- When changing sidebar row CSS in `rust/limux-host-linux/src/window.rs`, keep
+  the row-inset and unread-width regression tests updated with the intended
+  visual contract.

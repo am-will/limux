@@ -109,6 +109,35 @@ pub enum PaneEmptyReason {
     MovedLastTabOut,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneNotificationKind {
+    Attention,
+    Finished,
+}
+
+impl PaneNotificationKind {
+    fn tab_css_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-tab-notify-attention",
+            Self::Finished => "limux-tab-notify-finished",
+        }
+    }
+
+    fn pane_css_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-pane-notify-attention",
+            Self::Finished => "limux-pane-notify-finished",
+        }
+    }
+
+    fn tab_status_css_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-tab-status-attention",
+            Self::Finished => "limux-tab-status-finished",
+        }
+    }
+}
+
 const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
 const TAB_RENAME_ENTRY_CSS_CLASS: &str = "limux-tab-rename-entry";
 const TAB_RENAME_ENTRY_CSS_CLASSES: [&str; 2] = [HOST_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASS];
@@ -324,6 +353,29 @@ pub const PANE_CSS: &str = r#"
     color: @window_fg_color;
     background: alpha(@window_fg_color, 0.08);
 }
+.limux-tab-unread {
+    color: @window_fg_color;
+    font-weight: 600;
+}
+.limux-tab-status {
+    font-size: 10px;
+    min-width: 10px;
+    margin-right: 3px;
+}
+.limux-tab-status-attention {
+    color: @accent_color;
+}
+.limux-tab-status-finished {
+    color: rgb(46, 194, 126);
+}
+.limux-tab-notify-attention {
+    background: alpha(@accent_bg_color, 0.16);
+    box-shadow: inset 0 -2px 0 0 @accent_bg_color;
+}
+.limux-tab-notify-finished {
+    background: rgba(46, 194, 126, 0.14);
+    box-shadow: inset 0 -2px 0 0 rgb(46, 194, 126);
+}
 .limux-tab-close {
     background: none;
     border: none;
@@ -417,6 +469,12 @@ pub const PANE_CSS: &str = r#"
 }
 .limux-drop-preview-center {
     background: alpha(@accent_bg_color, 0.14);
+}
+.limux-pane-notify-attention {
+    box-shadow: inset 0 0 0 2px @accent_bg_color;
+}
+.limux-pane-notify-finished {
+    box-shadow: inset 0 0 0 2px rgb(46, 194, 126);
 }
 "#;
 
@@ -718,6 +776,27 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
         &internals.tab_state,
         tab_id,
     );
+    true
+}
+
+pub fn mark_tab_notification(
+    pane_widget: &gtk::Widget,
+    tab_id: &str,
+    kind: PaneNotificationKind,
+) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let tab_state = internals.tab_state.borrow();
+    let Some(entry) = tab_state.tabs.iter().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+    clear_tab_notification_classes(&entry.tab_button);
+    entry.tab_button.add_css_class("limux-tab-unread");
+    entry.tab_button.add_css_class(kind.tab_css_class());
+    mark_tab_status_icon(&entry.tab_button, kind);
+    refresh_pane_notification_ring_for_tabs(&internals.pane_outer, &tab_state.tabs);
     true
 }
 
@@ -1917,6 +1996,13 @@ fn build_tab_button_from_label(
     pin_icon.set_visible(false);
     pin_icon.set_can_target(false);
 
+    let status_icon = gtk::Label::builder()
+        .label("\u{25CF}")
+        .visible(false)
+        .build();
+    status_icon.add_css_class("limux-tab-status");
+    status_icon.set_can_target(false);
+
     let close_btn = gtk::Button::builder()
         .icon_name("window-close-symbolic")
         .has_frame(false)
@@ -1926,6 +2012,7 @@ fn build_tab_button_from_label(
     let inner_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     inner_box.set_can_target(false);
     inner_box.append(&pin_icon);
+    inner_box.append(&status_icon);
     inner_box.append(label);
 
     let tab_btn = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1941,7 +2028,11 @@ fn build_tab_button_from_label(
         let content_stack = internals.content_stack.clone();
         let tab_state = internals.tab_state.clone();
         let callbacks = internals.callbacks.clone();
+        let tab_button = tab_btn.clone();
         click.connect_pressed(move |_, _, _, _| {
+            if tab_has_rename_entry(&tab_button) {
+                return;
+            }
             activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
             (callbacks.on_state_changed)();
         });
@@ -2133,6 +2224,49 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu.popup();
 }
 
+fn tab_has_rename_entry(tab_button: &gtk::Box) -> bool {
+    fn widget_has_rename_entry(widget: &gtk::Widget) -> bool {
+        if widget
+            .downcast_ref::<gtk::Entry>()
+            .is_some_and(|entry| entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS))
+        {
+            return true;
+        }
+
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if widget_has_rename_entry(&current) {
+                return true;
+            }
+            child = current.next_sibling();
+        }
+
+        false
+    }
+
+    widget_has_rename_entry(&tab_button.clone().upcast())
+}
+
+fn focus_tab_rename_entry(entry: &gtk::Entry, focus_settled: Rc<Cell<bool>>) {
+    focus_settled.set(false);
+    entry.grab_focus();
+    entry.select_region(0, -1);
+
+    let entry = entry.clone();
+    glib::idle_add_local_once(move || {
+        entry.grab_focus();
+        entry.select_region(0, -1);
+
+        let entry = entry.clone();
+        let focus_settled = focus_settled.clone();
+        glib::idle_add_local_once(move || {
+            entry.grab_focus();
+            entry.select_region(0, -1);
+            focus_settled.set(true);
+        });
+    });
+}
+
 fn show_rename_dialog(
     label: &gtk::Label,
     tab_state: &Rc<RefCell<TabState>>,
@@ -2151,15 +2285,20 @@ fn show_rename_dialog(
         .text(&current_name)
         .width_chars(15)
         .build();
+    entry.set_focusable(true);
+    entry.set_can_focus(true);
     for css_class in TAB_RENAME_ENTRY_CSS_CLASSES {
         entry.add_css_class(css_class);
     }
 
+    let parent_can_target = parent.can_target();
+    parent.set_can_target(true);
     label.set_visible(false);
     // Insert entry before the close button
     parent.insert_child_after(&entry, Some(label));
-    entry.grab_focus();
-    entry.select_region(0, -1);
+    let focus_settled = Rc::new(Cell::new(false));
+    focus_tab_rename_entry(&entry, focus_settled.clone());
+    let hover_focus_guard = Rc::new(RefCell::new(Some(terminal::inhibit_hover_terminal_focus())));
 
     // On activate (Enter) or focus-out, commit rename
     let lbl = label.clone();
@@ -2176,6 +2315,7 @@ fn show_rename_dialog(
         let tid = tid.clone();
         let parent = parent_for_cleanup.clone();
         let callbacks = callbacks.clone();
+        let hover_focus_guard = hover_focus_guard.clone();
         move |entry: &gtk::Entry| {
             if commit.get() {
                 return;
@@ -2191,6 +2331,8 @@ fn show_rename_dialog(
             }
             lbl.set_visible(true);
             parent.remove(entry);
+            parent.set_can_target(parent_can_target);
+            hover_focus_guard.borrow_mut().take();
             (callbacks.on_state_changed)();
         }
     };
@@ -2203,10 +2345,24 @@ fn show_rename_dialog(
     }
     {
         let do_rename = do_rename.clone();
+        let focus_settled = focus_settled.clone();
+        let commit = commit.clone();
         let focus_controller = gtk::EventControllerFocus::new();
         focus_controller.connect_leave(move |ctrl| {
             if let Some(widget) = ctrl.widget() {
                 if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                    if !focus_settled.get() && !commit.get() {
+                        let entry = entry.clone();
+                        let focus_settled = focus_settled.clone();
+                        let commit = commit.clone();
+                        glib::idle_add_local_once(move || {
+                            if !focus_settled.get() && !commit.get() {
+                                entry.grab_focus();
+                                entry.select_region(0, -1);
+                            }
+                        });
+                        return;
+                    }
                     do_rename(entry);
                 }
             }
@@ -2383,6 +2539,79 @@ fn rebuild_tab_strip(tab_strip: &gtk::Box, tab_state: &Rc<RefCell<TabState>>) {
     }
     for button in &buttons {
         tab_strip.append(button);
+    }
+}
+
+fn clear_tab_notification_classes(tab_button: &gtk::Box) {
+    tab_button.remove_css_class("limux-tab-unread");
+    tab_button.remove_css_class(PaneNotificationKind::Attention.tab_css_class());
+    tab_button.remove_css_class(PaneNotificationKind::Finished.tab_css_class());
+    if let Some(status) = tab_status_label(tab_button) {
+        status.remove_css_class(PaneNotificationKind::Attention.tab_status_css_class());
+        status.remove_css_class(PaneNotificationKind::Finished.tab_status_css_class());
+        status.set_visible(false);
+    }
+}
+
+fn mark_tab_status_icon(tab_button: &gtk::Box, kind: PaneNotificationKind) {
+    if let Some(status) = tab_status_label(tab_button) {
+        status.remove_css_class(PaneNotificationKind::Attention.tab_status_css_class());
+        status.remove_css_class(PaneNotificationKind::Finished.tab_status_css_class());
+        status.add_css_class(kind.tab_status_css_class());
+        status.set_visible(true);
+    }
+}
+
+fn tab_status_label(tab_button: &gtk::Box) -> Option<gtk::Label> {
+    tab_button
+        .first_child()
+        .and_then(|child| child.downcast::<gtk::Box>().ok())
+        .and_then(|inner_box| {
+            let mut child = inner_box.first_child();
+            while let Some(widget) = child {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    if label.has_css_class("limux-tab-status") {
+                        return Some(label.clone());
+                    }
+                }
+                child = widget.next_sibling();
+            }
+            None
+        })
+}
+
+fn clear_pane_notification_ring(pane_outer: &gtk::Box) {
+    pane_outer.remove_css_class(PaneNotificationKind::Attention.pane_css_class());
+    pane_outer.remove_css_class(PaneNotificationKind::Finished.pane_css_class());
+}
+
+fn pane_outer_for_content_stack(content_stack: &gtk::Stack) -> Option<gtk::Box> {
+    content_stack
+        .parent()
+        .and_then(|overlay| overlay.parent())
+        .and_then(|outer| outer.downcast::<gtk::Box>().ok())
+}
+
+fn refresh_pane_notification_ring_for_tabs(pane_outer: &gtk::Box, tabs: &[TabEntry]) {
+    clear_pane_notification_ring(pane_outer);
+    let kind = if tabs.iter().any(|entry| {
+        entry
+            .tab_button
+            .has_css_class(PaneNotificationKind::Attention.tab_css_class())
+    }) {
+        Some(PaneNotificationKind::Attention)
+    } else if tabs.iter().any(|entry| {
+        entry
+            .tab_button
+            .has_css_class(PaneNotificationKind::Finished.tab_css_class())
+    }) {
+        Some(PaneNotificationKind::Finished)
+    } else {
+        None
+    };
+
+    if let Some(kind) = kind {
+        pane_outer.add_css_class(kind.pane_css_class());
     }
 }
 
@@ -2706,9 +2935,13 @@ fn activate_tab(
     for entry in &ts.tabs {
         if entry.id == tab_id {
             entry.tab_button.add_css_class("limux-tab-active");
+            clear_tab_notification_classes(&entry.tab_button);
         } else {
             entry.tab_button.remove_css_class("limux-tab-active");
         }
+    }
+    if let Some(pane_outer) = pane_outer_for_content_stack(content_stack) {
+        refresh_pane_notification_ring_for_tabs(&pane_outer, &ts.tabs);
     }
 
     if content_stack.child_by_name(tab_id).is_some() {
@@ -2749,6 +2982,9 @@ fn remove_tab(
 
     tab_strip.remove(&entry.tab_button);
     content_stack.remove(&entry.content);
+    if let Some(pane_outer) = pane_outer_for_content_stack(content_stack) {
+        refresh_pane_notification_ring_for_tabs(&pane_outer, &ts.tabs);
+    }
 
     if ts.tabs.is_empty() {
         drop(ts);
@@ -3480,6 +3716,18 @@ mod tests {
         #[cfg(feature = "webkit")]
         assert!(PANE_CSS.contains(BROWSER_WEB_VIEW_CSS_CLASS));
         assert!(!PANE_CSS.contains("border: 1px solid rgba(0, 145, 255, 0.5);"));
+    }
+
+    #[test]
+    fn pane_css_includes_attention_and_finished_notification_rings() {
+        assert!(PANE_CSS.contains(".limux-tab-status"));
+        assert!(PANE_CSS.contains(".limux-tab-status-attention"));
+        assert!(PANE_CSS.contains(".limux-tab-status-finished"));
+        assert!(PANE_CSS.contains(".limux-tab-notify-attention"));
+        assert!(PANE_CSS.contains(".limux-tab-notify-finished"));
+        assert!(PANE_CSS.contains(".limux-pane-notify-attention"));
+        assert!(PANE_CSS.contains(".limux-pane-notify-finished"));
+        assert!(PANE_CSS.contains("inset 0 0 0 2px"));
     }
 
     #[test]

@@ -199,7 +199,7 @@ fn parse_global_args() -> Result<GlobalOptions> {
 
 fn print_help() {
     println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
+        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--kind attention|finished] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [codex|claude|gemini|pi] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook | pi-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
     );
 }
 
@@ -218,21 +218,45 @@ fn host_binary_candidates(exe: &Path) -> Vec<PathBuf> {
 
     if let Some(bin_dir) = exe.parent() {
         if let Some(prefix) = bin_dir.parent() {
-            candidates.push(prefix.join("libexec/limux/limux-host"));
+            push_host_binary_candidate(
+                &mut candidates,
+                prefix.join("libexec/limux/limux-host"),
+                exe,
+            );
         }
 
-        let sibling_host = bin_dir.join("limux-host");
-        if sibling_host != exe {
-            candidates.push(sibling_host);
-        }
-
-        let sibling_dev_host = bin_dir.join("limux");
-        if sibling_dev_host != exe {
-            candidates.push(sibling_dev_host);
+        // Development builds place the CLI and GTK host side by side under
+        // target/{debug,release}. Keep that ahead of any installed fallback.
+        if exe.file_name().and_then(|name| name.to_str()) == Some("limux-cli") {
+            push_host_binary_candidate(&mut candidates, bin_dir.join("limux"), exe);
         }
     }
 
+    for installed in [
+        "/usr/libexec/limux/limux-host",
+        "/usr/local/libexec/limux/limux-host",
+    ] {
+        push_host_binary_candidate(&mut candidates, PathBuf::from(installed), exe);
+    }
+
+    if let Some(bin_dir) = exe.parent() {
+        // Legacy/manual installs sometimes put limux-host next to the CLI.
+        // Prefer libexec layouts first so stale sibling hosts do not shadow
+        // a valid package install.
+        let sibling_host = bin_dir.join("limux-host");
+        push_host_binary_candidate(&mut candidates, sibling_host, exe);
+
+        let sibling_dev_host = bin_dir.join("limux");
+        push_host_binary_candidate(&mut candidates, sibling_dev_host, exe);
+    }
+
     candidates
+}
+
+fn push_host_binary_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf, exe: &Path) {
+    if candidate != exe && !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn resolve_host_binary() -> Result<PathBuf> {
@@ -249,7 +273,7 @@ fn resolve_host_binary() -> Result<PathBuf> {
         .find(|path| path.is_file())
         .ok_or_else(|| {
             anyhow!(
-                "could not find limux host binary; expected limux-host next to the installed CLI"
+                "could not find limux host binary; expected libexec/limux/limux-host for the installed CLI"
             )
         })
 }
@@ -802,7 +826,7 @@ async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
 /// `limux notify` — post a notification into the sidebar + toast overlay.
 ///
 /// Usage:
-///   limux notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>
+///   limux notify [--workspace <id|ref>] [--kind attention|finished] [--subtitle <text>] [--body <text>] <title>
 ///   limux notify --title "..." --subtitle "..." --body "..."
 ///
 /// Mirrors the `cmux notify` shape (title / subtitle / body). Title is
@@ -823,6 +847,7 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     let body = parse_opt(args, "--body")
         .or_else(|| parse_opt(args, "--message"))
         .unwrap_or_default();
+    let kind = parse_opt(args, "--kind").or_else(|| parse_opt(args, "--status"));
 
     let mut params = Map::new();
     params.insert("title".to_string(), Value::String(title));
@@ -831,6 +856,9 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     }
     if !body.is_empty() {
         params.insert("body".to_string(), Value::String(body));
+    }
+    if let Some(kind) = kind.filter(|value| !value.trim().is_empty()) {
+        params.insert("kind".to_string(), Value::String(kind));
     }
 
     call_in_workspace_scope(
@@ -843,7 +871,7 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Agent hooks (claude-hook / opencode-hook / gemini-hook)
+// Agent hooks (claude-hook / opencode-hook / gemini-hook / pi-hook)
 // ---------------------------------------------------------------------------
 //
 // These subcommands read a JSON hook event from stdin and translate it into
@@ -910,53 +938,7 @@ async fn run_agent_hook(
     // Build a human-friendly title + body depending on event + agent.
     let agent_label = agent.label();
     persist_agent_hook_session(agent, args, &payload, &event)?;
-    let (title, body) = match event.as_str() {
-        "Notification" => (
-            format!("{agent_label} needs you"),
-            hook_str(&payload, &["message", "notification"])
-                .unwrap_or("waiting for input")
-                .to_owned(),
-        ),
-        "Stop" | "SubagentStop" => (
-            format!("{agent_label} finished"),
-            hook_str(&payload, &["message", "reason"])
-                .unwrap_or("task complete")
-                .to_owned(),
-        ),
-        "SessionStart" => (
-            format!("{agent_label} session started"),
-            hook_str(&payload, &["cwd", "source"])
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        "SessionEnd" => (
-            format!("{agent_label} session ended"),
-            hook_str(&payload, &["reason"]).unwrap_or("").to_owned(),
-        ),
-        "PreToolUse" | "PostToolUse" => (
-            format!(
-                "{agent_label}: {}",
-                hook_str(&payload, &["tool_name"]).unwrap_or("tool")
-            ),
-            hook_str(&payload, &["tool_input", "summary"])
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        "UserPromptSubmit" => (
-            format!("{agent_label}: new prompt"),
-            hook_str(&payload, &["prompt"])
-                .unwrap_or("")
-                .chars()
-                .take(120)
-                .collect(),
-        ),
-        other => (
-            format!("{agent_label}: {other}"),
-            hook_str(&payload, &["message", "summary"])
-                .unwrap_or("")
-                .to_owned(),
-        ),
-    };
+    let (title, body) = agent_hook_notification_content(agent_label, &event, &payload);
 
     let subtitle = hook_str(&payload, &["session_id"])
         .map(|s| {
@@ -977,6 +959,15 @@ async fn run_agent_hook(
     if !body.is_empty() {
         params.insert("body".to_string(), Value::String(body));
     }
+    if let Some(surface_id) = parse_opt(args, "--surface")
+        .or_else(|| env::var("LIMUX_SURFACE_ID").ok())
+        .filter(|value| !value.trim().is_empty())
+    {
+        params.insert("surface_id".to_string(), Value::String(surface_id));
+    }
+    if let Some(kind) = agent_hook_notification_kind(&event) {
+        params.insert("kind".to_string(), Value::String(kind.to_string()));
+    }
 
     let _ = call_in_workspace_scope(
         client,
@@ -987,6 +978,76 @@ async fn run_agent_hook(
     .await;
 
     Ok(agent_hook_output(&event, &payload))
+}
+
+fn agent_hook_notification_content(
+    agent_label: &str,
+    event: &str,
+    payload: &Value,
+) -> (String, String) {
+    match canonical_agent_hook_display_event(event) {
+        AgentHookDisplayEvent::Notification => (
+            format!("{agent_label} needs you"),
+            hook_str(payload, &["message", "notification"])
+                .unwrap_or("waiting for input")
+                .to_owned(),
+        ),
+        AgentHookDisplayEvent::Stop => (
+            "Process needs attention".to_string(),
+            hook_str(payload, &["message", "reason"])
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{agent_label} finished")),
+        ),
+        AgentHookDisplayEvent::SessionStart => (
+            format!("{agent_label} session started"),
+            hook_str(payload, &["cwd", "source"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        AgentHookDisplayEvent::SessionEnd => (
+            format!("{agent_label} session ended"),
+            hook_str(payload, &["reason"]).unwrap_or("").to_owned(),
+        ),
+        AgentHookDisplayEvent::ToolUse => (
+            format!(
+                "{agent_label}: {}",
+                hook_str(payload, &["tool_name"]).unwrap_or("tool")
+            ),
+            hook_str(payload, &["tool_input", "summary"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        AgentHookDisplayEvent::UserPromptSubmit => (
+            format!("{agent_label}: new prompt"),
+            hook_str(payload, &["prompt"])
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect(),
+        ),
+        AgentHookDisplayEvent::Other => {
+            let event_label = event.trim();
+            let event_label = if event_label.is_empty() {
+                "event"
+            } else {
+                event_label
+            };
+            (
+                format!("{agent_label}: {event_label}"),
+                hook_str(payload, &["message", "summary"])
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        }
+    }
+}
+
+fn agent_hook_notification_kind(event: &str) -> Option<&'static str> {
+    match canonical_agent_hook_display_event(event) {
+        AgentHookDisplayEvent::Notification => Some("attention"),
+        AgentHookDisplayEvent::Stop => Some("finished"),
+        _ => None,
+    }
 }
 
 fn agent_hook_output(event: &str, payload: &Value) -> Value {
@@ -1022,6 +1083,34 @@ fn canonical_hook_event_name(event: &str) -> Option<&'static str> {
         "SessionEnd" | "session-end" => None,
         "Cleanup" | "cleanup" | "restore-exit" => None,
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentHookDisplayEvent {
+    Notification,
+    Stop,
+    SessionStart,
+    SessionEnd,
+    ToolUse,
+    UserPromptSubmit,
+    Other,
+}
+
+fn canonical_agent_hook_display_event(event: &str) -> AgentHookDisplayEvent {
+    match event.trim() {
+        "Notification" | "notification" => AgentHookDisplayEvent::Notification,
+        "Stop" | "stop" | "SubagentStop" | "subagent-stop" | "subagent_stop" => {
+            AgentHookDisplayEvent::Stop
+        }
+        "SessionStart" | "session-start" | "session_start" => AgentHookDisplayEvent::SessionStart,
+        "SessionEnd" | "session-end" | "session_end" => AgentHookDisplayEvent::SessionEnd,
+        "PreToolUse" | "pre-tool-use" | "pre_tool_use" | "PostToolUse" | "post-tool-use"
+        | "post_tool_use" => AgentHookDisplayEvent::ToolUse,
+        "UserPromptSubmit" | "prompt-submit" | "user-prompt-submit" | "user_prompt_submit" => {
+            AgentHookDisplayEvent::UserPromptSubmit
+        }
+        _ => AgentHookDisplayEvent::Other,
     }
 }
 
@@ -1338,7 +1427,7 @@ async fn run_hooks_command(
 ) -> Result<CommandOutput> {
     let Some(first) = args.first().map(String::as_str) else {
         bail!(
-            "Usage: limux hooks setup [agent]|uninstall [agent]|<agent> install|uninstall|<event>"
+            "Usage: limux hooks setup [codex|claude|gemini|pi]|uninstall [agent]|<agent> install|uninstall|<event>"
         );
     };
 
@@ -1450,6 +1539,7 @@ fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
         agent_hooks::AgentKind::Codex,
         agent_hooks::AgentKind::Claude,
         agent_hooks::AgentKind::Gemini,
+        agent_hooks::AgentKind::Pi,
     ]
 }
 
@@ -1486,6 +1576,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("SessionEnd", "session-end"),
             ],
         ),
+        agent_hooks::AgentKind::Pi => install_pi_extension(),
     }
 }
 
@@ -1502,6 +1593,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             opencode_config_unregister_plugin()
         }
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
+        agent_hooks::AgentKind::Pi => uninstall_pi_extension(),
     }
 }
 
@@ -1558,7 +1650,9 @@ fn install_json_hooks(
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Claude => 5,
-        agent_hooks::AgentKind::Codex | agent_hooks::AgentKind::Gemini => 5000,
+        agent_hooks::AgentKind::Codex
+        | agent_hooks::AgentKind::Gemini
+        | agent_hooks::AgentKind::Pi => 5000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
 }
@@ -1672,7 +1766,105 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Codex => "hooks codex",
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
+        agent_hooks::AgentKind::Pi => "hooks pi",
     }
+}
+
+fn pi_extension_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pi/agent/extensions/limux-hooks.ts")
+}
+
+fn install_pi_extension() -> Result<()> {
+    let path = pi_extension_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, pi_extension_source()).context("failed to write Pi extension")
+}
+
+fn uninstall_pi_extension() -> Result<()> {
+    let path = pi_extension_path();
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn pi_extension_source() -> &'static str {
+    r#"// Installed by `limux hooks pi install`. Do not edit manually.
+import { spawnSync } from "node:child_process";
+
+type ExtensionAPI = {
+  on(event: string, handler: (...args: any[]) => unknown): void;
+};
+
+type ExtensionContext = {
+  cwd?: unknown;
+  sessionManager?: {
+    getSessionFile?: () => unknown;
+  };
+};
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function transcriptPath(ctx: ExtensionContext): string | undefined {
+  try {
+    return optionalString(ctx.sessionManager?.getSessionFile?.());
+  } catch {
+    return undefined;
+  }
+}
+
+function send(
+  eventName: string,
+  ctx: ExtensionContext | undefined,
+  extra: Record<string, unknown> = {},
+) {
+  if (process.env.LIMUX_PI_HOOKS_DISABLED === "1") return;
+
+  try {
+    const safeCtx = ctx ?? {};
+    const payload = {
+      transcript_path: transcriptPath(safeCtx),
+      cwd: optionalString(safeCtx.cwd) ?? process.cwd(),
+      pid: process.pid,
+      hook_event_name: eventName,
+      ...extra,
+    };
+    spawnSync("limux", ["--json", "hooks", "pi", eventName], {
+      input: JSON.stringify(payload),
+      encoding: "utf8",
+      timeout: 5000,
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+  } catch {
+    // Hooks must never break pi.
+  }
+}
+
+export default function (pi: ExtensionAPI) {
+  pi.on("session_start", (event: any, ctx: ExtensionContext | undefined) => {
+    send("session-start", ctx, { reason: event?.reason });
+  });
+
+  pi.on("before_agent_start", (event: any, ctx: ExtensionContext | undefined) => {
+    send("prompt-submit", ctx, { prompt: event?.prompt });
+  });
+
+  pi.on("agent_end", (_event: any, ctx: ExtensionContext | undefined) => {
+    send("stop", ctx);
+  });
+
+  pi.on("session_shutdown", (event: any, ctx: ExtensionContext | undefined) => {
+    send("session-end", ctx, { reason: event?.reason });
+  });
+}
+"#
 }
 
 fn read_json_object(path: &Path) -> Result<Map<String, Value>> {
@@ -3425,11 +3617,12 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
-        "claude-hook" | "opencode-hook" | "gemini-hook" => {
+        "claude-hook" | "opencode-hook" | "gemini-hook" | "pi-hook" => {
             let agent = match command {
                 "claude-hook" => agent_hooks::AgentKind::Claude,
                 "opencode-hook" => agent_hooks::AgentKind::OpenCode,
                 "gemini-hook" => agent_hooks::AgentKind::Gemini,
+                "pi-hook" => agent_hooks::AgentKind::Pi,
                 _ => unreachable!(),
             };
             let payload = run_agent_hook(client, agent, args).await?;
@@ -3679,12 +3872,36 @@ mod cli_arg_tests {
     fn host_binary_candidates_cover_installed_and_dev_layouts() {
         let installed = Path::new("/usr/bin/limux");
         let candidates = host_binary_candidates(installed);
-        assert!(candidates.contains(&PathBuf::from("/usr/libexec/limux/limux-host")));
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from("/usr/libexec/limux/limux-host"))
+        );
         assert!(!candidates.contains(&PathBuf::from("/usr/bin/limux")));
 
         let dev = Path::new("/repo/target/debug/limux-cli");
         let candidates = host_binary_candidates(dev);
-        assert!(candidates.contains(&PathBuf::from("/repo/target/debug/limux")));
+        assert_eq!(
+            candidates.get(1),
+            Some(&PathBuf::from("/repo/target/debug/limux"))
+        );
+    }
+
+    #[test]
+    fn host_binary_candidates_prefer_installed_libexec_over_legacy_sibling() {
+        let local = Path::new("/home/user/.local/bin/limux");
+        let candidates = host_binary_candidates(local);
+        let system_libexec = PathBuf::from("/usr/libexec/limux/limux-host");
+        let sibling_host = PathBuf::from("/home/user/.local/bin/limux-host");
+        let system_idx = candidates
+            .iter()
+            .position(|path| path == &system_libexec)
+            .expect("system libexec candidate");
+        let sibling_idx = candidates
+            .iter()
+            .position(|path| path == &sibling_host)
+            .expect("legacy sibling candidate");
+
+        assert!(system_idx < sibling_idx);
     }
 
     #[test]
@@ -3756,6 +3973,7 @@ mod cli_arg_tests {
                 agent_hooks::AgentKind::Codex,
                 agent_hooks::AgentKind::Claude,
                 agent_hooks::AgentKind::Gemini,
+                agent_hooks::AgentKind::Pi,
             ]
         );
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
@@ -3783,6 +4001,16 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn pi_extension_uses_best_effort_session_file() {
+        let source = pi_extension_source();
+
+        assert!(source.contains("getSessionFile"));
+        assert!(source.contains("hooks\", \"pi\""));
+        assert!(!source.contains("getSessionId"));
+        assert!(!source.contains("@earendil-works/pi-coding-agent"));
+    }
+
+    #[test]
     fn stop_hook_output_matches_codex_schema_shape() {
         let output = agent_hook_output("stop", &json!({ "session_id": "session-a" }));
 
@@ -3793,6 +4021,31 @@ mod cli_arg_tests {
                 "suppressOutput": false
             })
         );
+    }
+
+    #[test]
+    fn lowercase_stop_hook_builds_attention_notification() {
+        assert_eq!(
+            canonical_agent_hook_display_event("stop"),
+            AgentHookDisplayEvent::Stop
+        );
+        assert_eq!(
+            agent_hook_notification_content("Codex", "stop", &json!({})),
+            (
+                "Process needs attention".to_string(),
+                "Codex finished".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn hook_notification_kind_separates_finished_from_attention() {
+        assert_eq!(
+            agent_hook_notification_kind("Notification"),
+            Some("attention")
+        );
+        assert_eq!(agent_hook_notification_kind("stop"), Some("finished"));
+        assert_eq!(agent_hook_notification_kind("session-start"), None);
     }
 
     #[test]

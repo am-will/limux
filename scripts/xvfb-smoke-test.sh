@@ -117,13 +117,16 @@ SMOKE_SESSION
 
 echo
 echo "== stage 1: boot limux host under xvfb-run =="
-# Under Xvfb there is no GPU, so Mesa would fall back to llvmpipe, which
-# has historically crashed on Ghostty's shader variants. Force softpipe
-# (slower but stable), and pin GL version to avoid newer-feature probes.
+# Under Xvfb there is no GPU. Force Mesa's software renderer and pin a GL/GLSL
+# level that satisfies embedded Ghostty's OpenGL 4.3 renderer.
 export LIBGL_ALWAYS_SOFTWARE=1
-export GALLIUM_DRIVER=softpipe
-export LP_NUM_THREADS=1
-export MESA_GL_VERSION_OVERRIDE="${MESA_GL_VERSION_OVERRIDE:-3.3}"
+export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+export LP_NUM_THREADS="${LP_NUM_THREADS:-1}"
+export MESA_GL_VERSION_OVERRIDE="${MESA_GL_VERSION_OVERRIDE:-4.3}"
+export MESA_GLSL_VERSION_OVERRIDE="${MESA_GLSL_VERSION_OVERRIDE:-430}"
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
+export XDG_SESSION_TYPE=x11
+unset WAYLAND_DISPLAY
 xvfb-run -a -s "-screen 0 1280x800x24 +extension GLX +render" \
   "$LIMUX_HOST" >"$LOG_DIR/host.stdout" 2>"$LOG_DIR/host.stderr" &
 HOST_PID=$!
@@ -167,55 +170,86 @@ done
 
 [ -S "$SOCKET" ] || { echo "FAIL: socket $SOCKET never appeared"; exit 1; }
 
+# The control socket is created before GTK has necessarily finished restoring
+# the active workspace and first surface. Wait for the same active-context
+# resolution that agent-team uses before exercising the live bridge.
+for i in $(seq 1 60); do
+  if "$LIMUX_CLI" --json identify >"$LOG_DIR/ready.json" 2>"$LOG_DIR/ready.err"; then
+    echo "active workspace ready after ${i}*500ms"
+    break
+  fi
+  if ! kill -0 "$HOST_PID" 2>/dev/null; then
+    echo "FAIL: host process died before active workspace was ready"
+    exit 1
+  fi
+  sleep 0.5
+done
+
+"$LIMUX_CLI" --json identify >"$LOG_DIR/ready.json" 2>"$LOG_DIR/ready.err" \
+  || { echo "FAIL: active workspace never became ready"; cat "$LOG_DIR/ready.err"; exit 1; }
+
 # --- 5. Stage 2: live agent-team ------------------------------------------
 echo
 echo "== stage 2: agent-team against live host (--no-launch) =="
 # --no-launch keeps the workspace commands from actually spawning codex/
 # claude binaries (which may not be installed in CI); the bridge + AGENTS.md
-# + allow_name=true path are still fully exercised.
-"$LIMUX_CLI" --id-format both agent-team \
+# + exact-surface targeting path are still fully exercised.
+"$LIMUX_CLI" --id-format both --json agent-team \
   --agents codex,claude \
   --cwd "$DEMO_DIR" \
   --no-launch \
-  2>&1 | tee "$LOG_DIR/stage2.txt"
+  2>&1 | tee "$LOG_DIR/stage2.json"
 
-grep -q "peers=\[codex, claude\]" "$LOG_DIR/stage2.txt" \
+grep -q '"agent":"codex"' "$LOG_DIR/stage2.json" \
+  || { echo "FAIL: live agent-team did not create codex peer"; exit 1; }
+grep -q '"agent":"claude"' "$LOG_DIR/stage2.json" \
   || { echo "FAIL: live agent-team did not create peers"; exit 1; }
 [ -f "$DEMO_DIR/AGENTS.md" ] \
   || { echo "FAIL: AGENTS.md not written to $DEMO_DIR"; exit 1; }
+
+TEAM_WORKSPACE_ID="$(sed -n 's/.*"workspace_id":"\([^"]*\)".*/\1/p' "$LOG_DIR/stage2.json" | head -1)"
+TEAM_WORKSPACE_NAME="$(sed -n 's/.*"workspace_name":"\([^"]*\)".*/\1/p' "$LOG_DIR/stage2.json" | head -1)"
+CODEX_SURFACE="$(sed -n 's/.*{"agent":"codex"[^}]*"surface_id":"\([^"]*\)".*/\1/p' "$LOG_DIR/stage2.json" | head -1)"
+CLAUDE_SURFACE="$(sed -n 's/.*{"agent":"claude"[^}]*"surface_id":"\([^"]*\)".*/\1/p' "$LOG_DIR/stage2.json" | head -1)"
+
+[ -n "$TEAM_WORKSPACE_ID" ] || { echo "FAIL: stage 2 response missing workspace_id"; exit 1; }
+[ -n "$TEAM_WORKSPACE_NAME" ] || { echo "FAIL: stage 2 response missing workspace_name"; exit 1; }
+[ -n "$CODEX_SURFACE" ] || { echo "FAIL: stage 2 response missing codex surface"; exit 1; }
+[ -n "$CLAUDE_SURFACE" ] || { echo "FAIL: stage 2 response missing claude surface"; exit 1; }
 
 # Assert the runtime AGENTS.md has the protocol envelope + both peers.
 grep -q "<agent-msg"  "$DEMO_DIR/AGENTS.md" || { echo "FAIL: AGENTS.md missing <agent-msg>"; exit 1; }
 grep -q "\bcodex\b"   "$DEMO_DIR/AGENTS.md" || { echo "FAIL: AGENTS.md missing codex peer"; exit 1; }
 grep -q "\bclaude\b"  "$DEMO_DIR/AGENTS.md" || { echo "FAIL: AGENTS.md missing claude peer"; exit 1; }
-echo "stage 2: OK (AGENTS.md + 2 workspaces + allow_name bridge path)"
+echo "stage 2: OK (AGENTS.md + peer panes)"
 
-# --- 6. Stage 3: list-workspaces sanity -----------------------------------
+# --- 6. Stage 3: peer surface sanity --------------------------------------
 echo
-echo "== stage 3: list-workspaces sees both peers =="
-"$LIMUX_CLI" list-workspaces 2>&1 | tee "$LOG_DIR/stage3.txt"
-grep -q codex  "$LOG_DIR/stage3.txt" || { echo "FAIL: list-workspaces missing codex"; exit 1; }
-grep -q claude "$LOG_DIR/stage3.txt" || { echo "FAIL: list-workspaces missing claude"; exit 1; }
+echo "== stage 3: surface.list sees both peer panes =="
+"$LIMUX_CLI" --json list-panels --workspace "$TEAM_WORKSPACE_NAME" 2>&1 | tee "$LOG_DIR/stage3.json"
+grep -Fq "$CODEX_SURFACE" "$LOG_DIR/stage3.json" \
+  || { echo "FAIL: surface.list missing codex surface $CODEX_SURFACE"; exit 1; }
+grep -Fq "$CLAUDE_SURFACE" "$LOG_DIR/stage3.json" \
+  || { echo "FAIL: surface.list missing claude surface $CLAUDE_SURFACE"; exit 1; }
 echo "stage 3: OK"
 
-# --- 7. Stage 4: by-name send (the phase-5 allow_name=true unlock) --------
-# This is the single most important assertion in the whole harness —
-# it proves that `limux send --workspace <name>` resolves to the right
-# workspace via the bridge. Without allow_name=true this errors out.
+# --- 7. Stage 4: by-name workspace + exact-surface send -------------------
 echo
-echo "== stage 4: surface.send_text by workspace name =="
+echo "== stage 4: surface.send_text by workspace name and peer surface =="
 ENVELOPE=$'<agent-msg from="codex" to="claude" id="smoke-1" ts="2026-04-19T23:59:00Z"><request>smoke test ping</request></agent-msg>\n'
-if "$LIMUX_CLI" send --workspace claude "$ENVELOPE" 2>&1 | tee "$LOG_DIR/stage4.txt"; then
-  echo "stage 4: OK (by-name send accepted)"
+if "$LIMUX_CLI" send --workspace "$TEAM_WORKSPACE_NAME" --surface "$CLAUDE_SURFACE" "$ENVELOPE" \
+     2>&1 | tee "$LOG_DIR/stage4.txt"; then
+  echo "stage 4: OK (workspace-name + surface send accepted)"
 else
-  echo "FAIL: by-name send to 'claude' failed — allow_name=true may be regressed"
+  echo "FAIL: send to claude surface failed"
   exit 1
 fi
 
 # --- 8. Stage 5: by-name notify -------------------------------------------
 echo
 echo "== stage 5: notification.create by workspace name =="
-if "$LIMUX_CLI" notify --workspace claude --subtitle "smoke" --body "all good" "Smoke test" \
+if "$LIMUX_CLI" notify --workspace "$TEAM_WORKSPACE_NAME" --kind attention \
+     --subtitle "smoke" --body "all good" "Smoke test" \
      2>&1 | tee "$LOG_DIR/stage5.txt"; then
   echo "stage 5: OK (by-name notify accepted)"
 else
@@ -230,8 +264,9 @@ SELF_SPLIT_PROOF="$DEMO_DIR/self-split-proof"
 SELF_SPLIT_ENV="$DEMO_DIR/self-split-env"
 SELF_SPLIT_CMD="printf split-ok > '$SELF_SPLIT_PROOF'; printf '%s\n%s\n%s\n' \"\$LIMUX_WORKSPACE_ID\" \"\$LIMUX_PANE_ID\" \"\$LIMUX_SURFACE_ID\" > '$SELF_SPLIT_ENV'"
 
-"$LIMUX_CLI" --json new-pane \
-  --workspace claude \
+"$LIMUX_CLI" --id-format both --json new-pane \
+  --workspace "$TEAM_WORKSPACE_NAME" \
+  --surface "$CLAUDE_SURFACE" \
   --direction right \
   --command "$SELF_SPLIT_CMD" \
   2>&1 | tee "$LOG_DIR/stage6.json"
@@ -277,7 +312,7 @@ echo "stage 6: OK (self-split command ran with fresh LIMUX_* env)"
 echo
 echo "== stage 7: claude-hook event translation =="
 if echo '{"hook_event_name":"Notification","message":"hello from smoke"}' \
-  | LIMUX_WORKSPACE_ID="" "$LIMUX_CLI" claude-hook 2>&1 \
+  | LIMUX_WORKSPACE_ID="$TEAM_WORKSPACE_ID" LIMUX_SURFACE_ID="$CLAUDE_SURFACE" "$LIMUX_CLI" claude-hook 2>&1 \
   | tee "$LOG_DIR/stage7.txt"; then
   echo "stage 7: OK (claude-hook accepted JSON on stdin)"
 else

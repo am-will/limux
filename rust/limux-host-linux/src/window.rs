@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -59,8 +59,34 @@ struct Workspace {
     /// The folder path this workspace was opened with.
     folder_path: Option<String>,
     /// Path label shown below workspace name in sidebar.
-    #[allow(dead_code)]
     path_label: gtk::Label,
+    /// Git branch label shown next to the working directory.
+    branch_label: gtk::Label,
+    /// Listening ports label shown next to the working directory.
+    ports_label: gtk::Label,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NotificationRecord {
+    id: u64,
+    target: DesktopNotificationTarget,
+    workspace_name: String,
+    title: String,
+    subtitle: String,
+    body: String,
+    message: String,
+    kind: NotificationVisualKind,
+    unread: bool,
+}
+
+struct NotificationRecordDraft<'a> {
+    title: &'a str,
+    subtitle: &'a str,
+    body: &'a str,
+    message: &'a str,
+    source_focused: bool,
+    target: DesktopNotificationTarget,
+    kind: NotificationVisualKind,
 }
 
 pub(crate) struct AppState {
@@ -69,6 +95,7 @@ pub(crate) struct AppState {
     top_bar: Option<adw::HeaderBar>,
     top_bar_visible: bool,
     config: Rc<RefCell<app_config::AppConfig>>,
+    css_provider: gtk::CssProvider,
     system_prefers_dark: Rc<Cell<Option<bool>>>,
     workspaces: Vec<Workspace>,
     active_idx: usize,
@@ -78,6 +105,9 @@ pub(crate) struct AppState {
     sidebar_shell: gtk::Box,
     sidebar_handle: gtk::Box,
     new_ws_btn: gtk::Button,
+    notification_button: gtk::Button,
+    notification_records: Vec<NotificationRecord>,
+    next_notification_id: u64,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
@@ -201,6 +231,18 @@ fn normalize_pane_handle(raw: &str) -> &str {
 
 fn parse_pane_handle(raw: &str) -> Option<u32> {
     normalize_pane_handle(raw).parse::<u32>().ok()
+}
+
+fn parse_notification_surface_hint(raw: &str) -> Option<(Option<u32>, Option<String>)> {
+    let normalized = raw
+        .trim()
+        .strip_prefix("surface:")
+        .unwrap_or_else(|| raw.trim());
+    let (pane_id, tab_id) = normalized.split_once(':')?;
+    Some((
+        parse_pane_handle(pane_id),
+        (!tab_id.trim().is_empty()).then(|| tab_id.to_string()),
+    ))
 }
 
 fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Option<usize> {
@@ -746,6 +788,7 @@ const GNOME_COLOR_SCHEME_KEY: &str = "color-scheme";
 const DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS: i32 = 1_000;
 const DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS: i32 = 10_000;
 const PORTAL_THEME_READ_TIMEOUT_MS: i32 = 500;
+const MAX_NOTIFICATION_RECORDS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PortalColorSchemePreference {
@@ -775,6 +818,63 @@ struct DesktopNotificationRequest {
     body: String,
     sound: app_config::NotificationSound,
     target: DesktopNotificationTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NotificationVisualKind {
+    Attention,
+    Finished,
+}
+
+impl NotificationVisualKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attention => "attention",
+            Self::Finished => "finished",
+        }
+    }
+
+    fn sidebar_row_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-sidebar-row-attention",
+            Self::Finished => "limux-sidebar-row-finished",
+        }
+    }
+
+    fn sidebar_dot_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-notify-dot-attention",
+            Self::Finished => "limux-notify-dot-finished",
+        }
+    }
+
+    fn sidebar_message_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-notify-msg-attention",
+            Self::Finished => "limux-notify-msg-finished",
+        }
+    }
+
+    fn pane_kind(self) -> pane::PaneNotificationKind {
+        match self {
+            Self::Attention => pane::PaneNotificationKind::Attention,
+            Self::Finished => pane::PaneNotificationKind::Finished,
+        }
+    }
+
+    fn panel_row_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-notification-row-attention",
+            Self::Finished => "limux-notification-row-finished",
+        }
+    }
+
+    fn panel_status_class(self) -> &'static str {
+        match self {
+            Self::Attention => "limux-notification-status-attention",
+            Self::Finished => "limux-notification-status-finished",
+        }
+    }
 }
 
 impl PortalColorSchemePreference {
@@ -1148,51 +1248,48 @@ const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
 const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
 
 const BASE_CSS: &str = r#"
-:root {
-    --limux-host-entry-bg: rgba(255, 255, 255, 0.98);
-    --limux-host-entry-fg: rgba(15, 23, 42, 0.96);
-    --limux-host-entry-border: rgba(15, 23, 42, 0.16);
-    --limux-host-entry-border-focus: rgba(0, 145, 255, 0.72);
-    --limux-host-entry-placeholder: rgba(15, 23, 42, 0.5);
-}
-@media (prefers-color-scheme: dark) {
-    :root {
-        --limux-host-entry-bg: rgba(44, 44, 48, 0.98);
-        --limux-host-entry-fg: rgba(255, 255, 255, 0.96);
-        --limux-host-entry-border: rgba(255, 255, 255, 0.14);
-        --limux-host-entry-border-focus: rgba(0, 145, 255, 0.78);
-        --limux-host-entry-placeholder: rgba(255, 255, 255, 0.48);
-    }
-}
 .limux-host-entry {
-    background-color: var(--limux-host-entry-bg);
-    color: var(--limux-host-entry-fg);
-    border: 1px solid var(--limux-host-entry-border);
+    background-color: alpha(@window_bg_color, 0.98);
+    color: @window_fg_color;
+    border: 1px solid alpha(@window_fg_color, 0.16);
     border-radius: 6px;
     caret-color: currentColor;
 }
 .limux-host-entry:focus-within {
-    border-color: var(--limux-host-entry-border-focus);
+    border-color: alpha(@accent_bg_color, 0.72);
 }
 .limux-host-entry text {
     background-color: transparent;
-    color: var(--limux-host-entry-fg);
+    color: @window_fg_color;
 }
 .limux-host-entry text placeholder {
-    color: var(--limux-host-entry-placeholder);
+    color: alpha(@window_fg_color, 0.5);
 }
 .limux-host-entry image {
-    color: var(--limux-host-entry-placeholder);
+    color: alpha(@window_fg_color, 0.5);
 }
 .limux-sidebar {
     background-color: @window_bg_color;
     color: @window_fg_color;
     border-right: 1px solid alpha(@window_fg_color, 0.08);
 }
+.limux-sidebar .navigation-sidebar > row {
+    background: transparent;
+    padding-left: 0;
+    padding-right: 0;
+    margin-left: 0;
+    margin-right: 0;
+}
 .limux-sidebar-row-box {
-    padding: 8px 6px 8px 3px;
-    border-radius: 6px;
-    margin: 2px 3px 2px 1px;
+    padding: 8px 7px 8px 4px;
+    border-radius: 7px;
+    margin: 2px 0;
+}
+.limux-sidebar .navigation-sidebar > row:selected {
+    background: transparent;
+}
+row:selected .limux-sidebar-row-box {
+    background-color: alpha(@accent_bg_color, 0.18);
 }
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.72);
@@ -1226,12 +1323,20 @@ row:selected .limux-ws-star-btn {
 .limux-notify-dot {
     color: @accent_bg_color;
     font-size: 10px;
+    min-width: 12px;
     margin-right: 6px;
 }
 .limux-notify-dot-hidden {
     color: transparent;
     font-size: 10px;
+    min-width: 12px;
     margin-right: 6px;
+}
+.limux-notify-dot-attention {
+    color: @accent_bg_color;
+}
+.limux-notify-dot-finished {
+    color: rgb(46, 194, 126);
 }
 .limux-notify-msg {
     color: alpha(@window_fg_color, 0.35);
@@ -1241,14 +1346,35 @@ row:selected .limux-ws-star-btn {
     color: alpha(@accent_bg_color, 0.9);
     font-size: 11px;
 }
+.limux-notify-msg-attention {
+    color: alpha(@accent_bg_color, 0.94);
+    font-weight: 600;
+}
+.limux-notify-msg-finished {
+    color: rgb(46, 194, 126);
+    font-weight: 600;
+}
 .limux-sidebar-row-unread {
     background-color: alpha(@accent_bg_color, 0.16);
-    border-left: 3px solid @accent_bg_color;
+    box-shadow: inset 3px 0 0 0 @accent_bg_color;
     border-radius: 6px;
-    margin-left: 0;
-    margin-right: 0;
+}
+.limux-sidebar-row-attention {
+    background-color: alpha(@accent_bg_color, 0.16);
+    box-shadow: inset 3px 0 0 0 @accent_bg_color;
+    border-radius: 7px;
+}
+.limux-sidebar-row-finished {
+    background-color: rgba(46, 194, 126, 0.14);
+    box-shadow: inset 3px 0 0 0 rgb(46, 194, 126);
+    border-radius: 7px;
 }
 .limux-sidebar-row-unread .limux-ws-name {
+    color: @window_fg_color;
+    font-weight: 700;
+}
+.limux-sidebar-row-attention .limux-ws-name,
+.limux-sidebar-row-finished .limux-ws-name {
     color: @window_fg_color;
     font-weight: 700;
 }
@@ -1272,6 +1398,78 @@ row:selected .limux-ws-star-btn {
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 1px;
+}
+.limux-notification-button {
+    background: transparent;
+    color: alpha(@window_fg_color, 0.54);
+    border: none;
+    border-radius: 6px;
+    padding: 4px;
+    min-width: 28px;
+    min-height: 28px;
+}
+.limux-notification-button:hover {
+    background: alpha(@window_fg_color, 0.08);
+    color: @window_fg_color;
+}
+.limux-notification-button-unread {
+    color: @accent_color;
+    background: alpha(@accent_bg_color, 0.12);
+}
+.limux-notification-panel {
+    background-color: @popover_bg_color;
+    color: @popover_fg_color;
+    min-width: 340px;
+    padding: 8px;
+}
+.limux-notification-panel-title {
+    color: alpha(@popover_fg_color, 0.72);
+    font-size: 12px;
+    font-weight: 700;
+}
+.limux-notification-empty {
+    color: alpha(@popover_fg_color, 0.45);
+    font-size: 12px;
+    padding: 16px;
+}
+.limux-notification-row {
+    padding: 8px;
+    border-radius: 7px;
+}
+.limux-notification-row:hover {
+    background: alpha(@popover_fg_color, 0.08);
+}
+.limux-notification-row-unread {
+    background: alpha(@accent_bg_color, 0.10);
+}
+.limux-notification-row-attention {
+    box-shadow: inset 3px 0 0 0 @accent_bg_color;
+}
+.limux-notification-row-finished {
+    box-shadow: inset 3px 0 0 0 rgb(46, 194, 126);
+}
+.limux-notification-status {
+    font-size: 10px;
+    min-width: 12px;
+}
+.limux-notification-status-attention {
+    color: @accent_color;
+}
+.limux-notification-status-finished {
+    color: rgb(46, 194, 126);
+}
+.limux-notification-workspace {
+    color: alpha(@popover_fg_color, 0.48);
+    font-size: 11px;
+}
+.limux-notification-message {
+    color: @popover_fg_color;
+    font-size: 12px;
+    font-weight: 600;
+}
+.limux-notification-detail {
+    color: alpha(@popover_fg_color, 0.56);
+    font-size: 11px;
 }
 .limux-sidebar-btn {
     background: alpha(@window_fg_color, 0.08);
@@ -1311,8 +1509,35 @@ row:selected .limux-ws-star-btn {
     color: alpha(@window_fg_color, 0.3);
     font-size: 12px;
 }
+.limux-ws-meta-row {
+    margin-left: 8px;
+}
+.limux-ws-branch {
+    background-color: alpha(@accent_bg_color, 0.13);
+    color: alpha(@accent_color, 0.95);
+    border-radius: 5px;
+    padding: 1px 5px;
+    font-size: 11px;
+    font-weight: 600;
+}
+.limux-ws-ports {
+    background-color: alpha(@window_fg_color, 0.08);
+    color: alpha(@window_fg_color, 0.58);
+    border-radius: 5px;
+    padding: 1px 5px;
+    font-size: 11px;
+    font-weight: 600;
+}
 row:selected .limux-ws-path {
     color: alpha(@window_fg_color, 0.5);
+}
+row:selected .limux-ws-branch {
+    background-color: alpha(@accent_bg_color, 0.22);
+    color: @accent_color;
+}
+row:selected .limux-ws-ports {
+    background-color: alpha(@window_fg_color, 0.12);
+    color: alpha(@window_fg_color, 0.72);
 }
 .limux-content {
     background-color: @window_bg_color;
@@ -1327,6 +1552,26 @@ row:selected .limux-ws-path {
 "#;
 
 const CONTENT_BACKGROUND_RGB: (u8, u8, u8) = (23, 23, 23);
+
+fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        build_window_css(background_opacity),
+        pane::PANE_CSS,
+        keybind_editor::KEYBIND_EDITOR_CSS,
+        crate::settings_editor::SETTINGS_CSS,
+        crate::settings_editor::ui_font_sizes_css(config),
+    )
+}
+
+fn reload_app_css(state: &State, config: &app_config::AppConfig) {
+    let background_opacity =
+        sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
+    state
+        .borrow()
+        .css_provider
+        .load_from_data(&app_css(background_opacity, config));
+}
 
 // ---------------------------------------------------------------------------
 // Window construction
@@ -1355,13 +1600,7 @@ pub fn build_window(app: &adw::Application) {
 
     // Load CSS
     let provider = gtk::CssProvider::new();
-    let all_css = format!(
-        "{}\n{}\n{}\n{}",
-        build_window_css(background_opacity),
-        pane::PANE_CSS,
-        keybind_editor::KEYBIND_EDITOR_CSS,
-        crate::settings_editor::SETTINGS_CSS,
-    );
+    let all_css = app_css(background_opacity, &config.borrow());
     provider.load_from_data(&all_css);
     gtk::style_context_add_provider_for_display(
         &display,
@@ -1452,6 +1691,13 @@ pub fn build_window(app: &adw::Application) {
         .build();
     sidebar_title_label.add_css_class("limux-sidebar-title");
 
+    let notification_button =
+        gtk::Button::from_icon_name("preferences-system-notifications-symbolic");
+    notification_button.add_css_class("limux-notification-button");
+    notification_button.set_tooltip_text(Some(
+        &shortcuts.tooltip_text(ShortcutId::OpenNotificationPanel, "Notifications"),
+    ));
+
     let sidebar_title = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_top(8)
@@ -1459,6 +1705,7 @@ pub fn build_window(app: &adw::Application) {
         .margin_end(6)
         .build();
     sidebar_title.append(&sidebar_title_label);
+    sidebar_title.append(&notification_button);
 
     {
         let window = window.clone();
@@ -1533,6 +1780,7 @@ pub fn build_window(app: &adw::Application) {
         top_bar: header.clone(),
         top_bar_visible: true,
         config,
+        css_provider: provider.clone(),
         system_prefers_dark: system_prefers_dark.clone(),
         workspaces: Vec::new(),
         active_idx: 0,
@@ -1542,6 +1790,9 @@ pub fn build_window(app: &adw::Application) {
         sidebar_shell: sidebar_shell.clone(),
         sidebar_handle: sidebar_handle.clone(),
         new_ws_btn: new_ws_btn.clone(),
+        notification_button: notification_button.clone(),
+        notification_records: Vec::new(),
+        next_notification_id: 1,
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
@@ -1561,6 +1812,13 @@ pub fn build_window(app: &adw::Application) {
     });
 
     install_sidebar_resize(&state, &main_split, &sidebar, &sidebar_shell);
+
+    {
+        let state = state.clone();
+        notification_button.connect_clicked(move |_| {
+            show_notification_panel(&state);
+        });
+    }
 
     {
         let state = state.clone();
@@ -1697,6 +1955,7 @@ pub fn build_window(app: &adw::Application) {
     }
 
     apply_loaded_session(&state, layout_state::load_session());
+    install_sidebar_port_refresh(&state);
 
     crate::control_bridge::start(dispatch_control_command);
 
@@ -2074,6 +2333,10 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             toggle_sidebar(state);
             true
         }
+        ShortcutCommand::OpenNotificationPanel => {
+            show_notification_panel(state);
+            true
+        }
         ShortcutCommand::ToggleTopBar => {
             toggle_top_bar(state);
             true
@@ -2201,11 +2464,12 @@ fn apply_shortcuts_to_application(app: &adw::Application, shortcuts: &ResolvedSh
 }
 
 fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
-    let (app, workspace_roots, shortcuts_rc) = {
+    let (app, notification_button, workspace_roots, shortcuts_rc) = {
         let mut s = state.borrow_mut();
         s.shortcuts = Rc::new(shortcuts);
         (
             s.app.clone(),
+            s.notification_button.clone(),
             s.workspaces
                 .iter()
                 .map(|ws| ws.root.clone())
@@ -2215,6 +2479,9 @@ fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
     };
 
     apply_shortcuts_to_application(&app, &shortcuts_rc);
+    notification_button.set_tooltip_text(Some(
+        &shortcuts_rc.tooltip_text(ShortcutId::OpenNotificationPanel, "Notifications"),
+    ));
     for root in workspace_roots {
         refresh_shortcut_tooltips_in_layout(&root, &shortcuts_rc);
     }
@@ -2724,6 +2991,274 @@ fn focus_desktop_notification_target(state: &State, target: &DesktopNotification
     false
 }
 
+fn set_notification_button_unread(button: &gtk::Button, unread: bool) {
+    if unread {
+        button.add_css_class("limux-notification-button-unread");
+    } else {
+        button.remove_css_class("limux-notification-button-unread");
+    }
+}
+
+fn sync_notification_button_state(state: &AppState) {
+    set_notification_button_unread(
+        &state.notification_button,
+        state
+            .notification_records
+            .iter()
+            .any(|record| record.unread),
+    );
+}
+
+fn append_notification_record(state: &mut AppState, record: NotificationRecord) {
+    state.notification_records.push(record);
+    let overflow = state
+        .notification_records
+        .len()
+        .saturating_sub(MAX_NOTIFICATION_RECORDS);
+    if overflow > 0 {
+        state.notification_records.drain(0..overflow);
+    }
+    sync_notification_button_state(state);
+}
+
+fn record_notification_for_workspace(
+    state: &State,
+    ws_id: &str,
+    draft: NotificationRecordDraft<'_>,
+) {
+    let mut s = state.borrow_mut();
+    let Some(workspace_idx) = s
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == ws_id)
+    else {
+        return;
+    };
+
+    let id = s.next_notification_id;
+    s.next_notification_id += 1;
+    let workspace_name = s.workspaces[workspace_idx].name.clone();
+    let unread =
+        should_show_workspace_unread_marker(workspace_idx == s.active_idx, draft.source_focused);
+    append_notification_record(
+        &mut s,
+        NotificationRecord {
+            id,
+            target: draft.target,
+            workspace_name,
+            title: draft.title.trim().to_string(),
+            subtitle: draft.subtitle.trim().to_string(),
+            body: draft.body.trim().to_string(),
+            message: draft.message.trim().to_string(),
+            kind: draft.kind,
+            unread,
+        },
+    );
+}
+
+fn mark_notification_records_read_in_state(state: &mut AppState, ws_id: &str) {
+    for record in &mut state.notification_records {
+        if record.target.workspace_id == ws_id {
+            record.unread = false;
+        }
+    }
+    sync_notification_button_state(state);
+}
+
+fn mark_workspace_notifications_read(state: &State, ws_id: &str) {
+    let mut s = state.borrow_mut();
+    if let Some(idx) = s
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == ws_id)
+    {
+        let workspace = &mut s.workspaces[idx];
+        workspace.unread = false;
+        clear_workspace_notification_visuals(workspace);
+    }
+    mark_notification_records_read_in_state(&mut s, ws_id);
+}
+
+fn clear_notification_records(state: &State) {
+    let mut s = state.borrow_mut();
+    s.notification_records.clear();
+    for workspace in &mut s.workspaces {
+        workspace.unread = false;
+        clear_workspace_notification_visuals(workspace);
+    }
+    sync_notification_button_state(&s);
+}
+
+fn notification_detail_text(record: &NotificationRecord) -> Option<String> {
+    let subtitle = record.subtitle.trim();
+    let body = record.body.trim();
+    let detail = match (subtitle.is_empty(), body.is_empty()) {
+        (true, true) => "",
+        (true, false) => body,
+        (false, true) => subtitle,
+        (false, false) => return Some(format!("{subtitle} - {body}")),
+    };
+
+    (!detail.is_empty() && detail != record.message.trim()).then(|| detail.to_string())
+}
+
+fn build_notification_record_row(record: &NotificationRecord) -> gtk::ListBoxRow {
+    let status = gtk::Label::builder()
+        .label("\u{25CF}")
+        .valign(gtk::Align::Start)
+        .build();
+    status.add_css_class("limux-notification-status");
+    status.add_css_class(record.kind.panel_status_class());
+
+    let workspace = gtk::Label::builder()
+        .label(&record.workspace_name)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    workspace.add_css_class("limux-notification-workspace");
+
+    let primary_message = if record.message.is_empty() {
+        record.title.as_str()
+    } else {
+        record.message.as_str()
+    };
+    let message = gtk::Label::builder()
+        .label(primary_message)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    message.add_css_class("limux-notification-message");
+
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .build();
+    text.append(&workspace);
+    text.append(&message);
+
+    if let Some(detail) = notification_detail_text(record) {
+        let detail = gtk::Label::builder()
+            .label(&detail)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        detail.add_css_class("limux-notification-detail");
+        text.append(&detail);
+    }
+
+    let row_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    row_box.add_css_class("limux-notification-row");
+    row_box.add_css_class(record.kind.panel_row_class());
+    if record.unread {
+        row_box.add_css_class("limux-notification-row-unread");
+    }
+    row_box.append(&status);
+    row_box.append(&text);
+
+    let row = gtk::ListBoxRow::new();
+    row.set_selectable(false);
+    row.set_activatable(true);
+    row.set_child(Some(&row_box));
+    row
+}
+
+fn show_notification_panel(state: &State) {
+    let (button, records) = {
+        let s = state.borrow();
+        (
+            s.notification_button.clone(),
+            s.notification_records
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let popover = gtk::Popover::new();
+    popover.set_parent(&button);
+    popover.set_position(gtk::PositionType::Right);
+    popover.connect_closed(|popover| popover.unparent());
+
+    let title = gtk::Label::builder()
+        .label("Notifications")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    title.add_css_class("limux-notification-panel-title");
+
+    let clear_button = gtk::Button::from_icon_name("edit-clear-symbolic");
+    clear_button.add_css_class("limux-notification-button");
+    clear_button.set_tooltip_text(Some("Clear notifications"));
+    clear_button.set_sensitive(!records.is_empty());
+    {
+        let state = state.clone();
+        let popover = popover.clone();
+        clear_button.connect_clicked(move |_| {
+            clear_notification_records(&state);
+            popover.popdown();
+        });
+    }
+
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    header.append(&title);
+    header.append(&clear_button);
+
+    let panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    panel.add_css_class("limux-notification-panel");
+    panel.append(&header);
+
+    if records.is_empty() {
+        let empty = gtk::Label::builder()
+            .label("No notifications")
+            .xalign(0.5)
+            .build();
+        empty.add_css_class("limux-notification-empty");
+        panel.append(&empty);
+    } else {
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        for record in records {
+            let row = build_notification_record_row(&record);
+            let target = record.target.clone();
+            let state = state.clone();
+            let popover = popover.clone();
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            click.connect_released(move |gesture, _, _, _| {
+                mark_workspace_notifications_read(&state, &target.workspace_id);
+                activate_desktop_notification_target(&state, &target, None);
+                popover.popdown();
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            });
+            row.add_controller(click);
+            list.append(&row);
+        }
+
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .min_content_height(80)
+            .max_content_height(360)
+            .child(&list)
+            .build();
+        panel.append(&scroll);
+    }
+
+    popover.set_child(Some(&panel));
+    popover.popup();
+}
+
 fn connect_gnome_appearance_watch(
     settings: &gio::Settings,
     state: State,
@@ -2833,6 +3368,8 @@ fn build_sidebar_row(
     gtk::Label,
     gtk::Label,
     gtk::Label,
+    gtk::Label,
+    gtk::Label,
 ) {
     let notify_dot = gtk::Label::builder().label("\u{25CF}").build();
     notify_dot.add_css_class("limux-notify-dot-hidden");
@@ -2861,16 +3398,36 @@ fn build_sidebar_row(
     let path_label = gtk::Label::builder()
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
-        .margin_start(8)
+        .hexpand(true)
         .build();
     path_label.add_css_class("limux-ws-path");
-    if let Some(p) = folder_path {
-        path_label.set_label(&abbreviate_path(p));
-        path_label.set_tooltip_text(Some(p));
-        path_label.set_visible(true);
-    } else {
-        path_label.set_visible(false);
-    }
+
+    let branch_label = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(14)
+        .visible(false)
+        .build();
+    branch_label.add_css_class("limux-ws-branch");
+
+    let ports_label = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(18)
+        .visible(false)
+        .build();
+    ports_label.add_css_class("limux-ws-ports");
+
+    let meta_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(5)
+        .build();
+    meta_row.add_css_class("limux-ws-meta-row");
+    meta_row.append(&path_label);
+    meta_row.append(&branch_label);
+    meta_row.append(&ports_label);
+    update_sidebar_location_labels(&path_label, &branch_label, folder_path);
+    update_sidebar_ports_label(&ports_label, &[]);
 
     let notify_label = gtk::Label::builder()
         .xalign(0.0)
@@ -2886,7 +3443,7 @@ fn build_sidebar_row(
         .build();
     vbox.add_css_class("limux-sidebar-row-box");
     vbox.append(&top_row);
-    vbox.append(&path_label);
+    vbox.append(&meta_row);
     vbox.append(&notify_label);
 
     let row = gtk::ListBoxRow::new();
@@ -2899,6 +3456,8 @@ fn build_sidebar_row(
         notify_dot,
         notify_label,
         path_label,
+        branch_label,
+        ports_label,
     )
 }
 
@@ -2911,6 +3470,263 @@ fn abbreviate_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+fn update_sidebar_location_labels(
+    path_label: &gtk::Label,
+    branch_label: &gtk::Label,
+    path: Option<&str>,
+) {
+    let Some(path) = path.filter(|path| !path.trim().is_empty()) else {
+        path_label.set_visible(false);
+        branch_label.set_visible(false);
+        return;
+    };
+
+    path_label.set_label(&abbreviate_path(path));
+    path_label.set_tooltip_text(Some(path));
+    path_label.set_visible(true);
+
+    if let Some(branch) = git_branch_for_path(path) {
+        branch_label.set_label(&branch);
+        branch_label.set_tooltip_text(Some(&format!("Git branch: {branch}")));
+        branch_label.set_visible(true);
+    } else {
+        branch_label.set_visible(false);
+    }
+}
+
+fn update_workspace_location_visuals(workspace: &Workspace, path: Option<&str>) {
+    update_sidebar_location_labels(&workspace.path_label, &workspace.branch_label, path);
+}
+
+fn update_sidebar_ports_label(ports_label: &gtk::Label, ports: &[u16]) {
+    if ports.is_empty() {
+        ports_label.set_visible(false);
+        ports_label.set_tooltip_text(None);
+        return;
+    }
+
+    let label = sidebar_ports_summary(ports);
+    let tooltip = ports
+        .iter()
+        .map(|port| format!("localhost:{port}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ports_label.set_label(&label);
+    ports_label.set_tooltip_text(Some(&tooltip));
+    ports_label.set_visible(true);
+}
+
+fn sidebar_ports_summary(ports: &[u16]) -> String {
+    let Some(first) = ports.first() else {
+        return String::new();
+    };
+
+    if ports.len() == 1 {
+        format!("localhost:{first}")
+    } else {
+        format!("localhost:{first} +{}", ports.len() - 1)
+    }
+}
+
+fn install_sidebar_port_refresh(state: &State) {
+    refresh_sidebar_ports(state);
+
+    let state = state.clone();
+    glib::timeout_add_seconds_local(5, move || {
+        refresh_sidebar_ports(&state);
+        glib::ControlFlow::Continue
+    });
+}
+
+fn refresh_sidebar_ports(state: &State) {
+    let workspace_paths = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .filter_map(|workspace| {
+                let path = workspace
+                    .cwd
+                    .borrow()
+                    .clone()
+                    .or_else(|| workspace.folder_path.clone())?;
+                Some((workspace.id.clone(), PathBuf::from(path)))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if workspace_paths.is_empty() {
+        return;
+    }
+
+    let ports_by_workspace = workspace_listening_ports(&workspace_paths);
+    let s = state.borrow();
+    for workspace in &s.workspaces {
+        let ports = ports_by_workspace
+            .get(&workspace.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        update_sidebar_ports_label(&workspace.ports_label, ports);
+    }
+}
+
+fn workspace_listening_ports(workspace_paths: &[(String, PathBuf)]) -> HashMap<String, Vec<u16>> {
+    let listening = proc_listening_socket_ports();
+    if listening.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut ports_by_workspace: HashMap<String, HashSet<u16>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return HashMap::new();
+    };
+
+    for entry in entries.flatten() {
+        let Some(pid_name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if !pid_name.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+
+        let proc_dir = entry.path();
+        let Ok(process_cwd) = std::fs::read_link(proc_dir.join("cwd")) else {
+            continue;
+        };
+        let Some(workspace_id) = workspace_paths
+            .iter()
+            .find(|(_, workspace_path)| path_is_within(&process_cwd, workspace_path))
+            .map(|(workspace_id, _)| workspace_id.clone())
+        else {
+            continue;
+        };
+
+        let Ok(fds) = std::fs::read_dir(proc_dir.join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(inode) = target.to_str().and_then(parse_proc_fd_socket_inode) else {
+                continue;
+            };
+            if let Some(port) = listening.get(&inode).copied() {
+                ports_by_workspace
+                    .entry(workspace_id.clone())
+                    .or_default()
+                    .insert(port);
+            }
+        }
+    }
+
+    ports_by_workspace
+        .into_iter()
+        .map(|(workspace_id, ports)| {
+            let mut ports = ports.into_iter().collect::<Vec<_>>();
+            ports.sort_unstable();
+            (workspace_id, ports)
+        })
+        .collect()
+}
+
+fn path_is_within(path: &Path, ancestor: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(ancestor) = ancestor.canonicalize() else {
+        return false;
+    };
+    path.starts_with(ancestor)
+}
+
+fn proc_listening_socket_ports() -> HashMap<u64, u16> {
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|raw| parse_proc_net_listening_ports(&raw))
+        .collect()
+}
+
+fn parse_proc_net_listening_ports(raw: &str) -> Vec<(u64, u16)> {
+    raw.lines()
+        .skip(1)
+        .filter_map(parse_proc_net_tcp_line)
+        .collect()
+}
+
+fn parse_proc_net_tcp_line(line: &str) -> Option<(u64, u16)> {
+    let columns = line.split_whitespace().collect::<Vec<_>>();
+    if columns.len() <= 9 || columns[3] != "0A" {
+        return None;
+    }
+
+    let (_, port_hex) = columns[1].split_once(':')?;
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    if port == 0 {
+        return None;
+    }
+
+    let inode = columns[9].parse::<u64>().ok()?;
+    Some((inode, port))
+}
+
+fn parse_proc_fd_socket_inode(target: &str) -> Option<u64> {
+    target
+        .strip_prefix("socket:[")
+        .and_then(|value| value.strip_suffix(']'))
+        .and_then(|inode| inode.parse::<u64>().ok())
+}
+
+fn git_branch_for_path(path: &str) -> Option<String> {
+    let mut current = Path::new(path);
+    loop {
+        let dot_git = current.join(".git");
+        if dot_git.is_dir() {
+            return git_branch_from_git_dir(&dot_git);
+        }
+        if dot_git.is_file() {
+            return git_branch_from_git_file(current, &dot_git);
+        }
+        current = current.parent()?;
+    }
+}
+
+fn git_branch_from_git_file(worktree_dir: &Path, dot_git_file: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dot_git_file).ok()?;
+    let gitdir = raw.trim().strip_prefix("gitdir:")?.trim();
+    let gitdir = Path::new(gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir.to_path_buf()
+    } else {
+        worktree_dir.join(gitdir)
+    };
+    git_branch_from_git_dir(&gitdir)
+}
+
+fn git_branch_from_git_dir(git_dir: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    git_branch_from_head(&head)
+}
+
+fn git_branch_from_head(head: &str) -> Option<String> {
+    let head = head.trim();
+    if let Some(reference) = head.strip_prefix("ref:") {
+        let reference = reference.trim();
+        return reference
+            .strip_prefix("refs/heads/")
+            .or_else(|| reference.rsplit('/').next())
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    if head.len() >= 7 && head.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(format!("@{}", &head[..7]));
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3422,8 +4238,17 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
     let root = split_container.widget().clone();
 
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(&seed.name, seed.folder_path.as_deref());
+    let sidebar_location = seed.folder_path.as_deref().or(seed.cwd.as_deref());
+    let (
+        row,
+        name_label,
+        favorite_button,
+        notify_dot,
+        notify_label,
+        path_label,
+        branch_label,
+        ports_label,
+    ) = build_sidebar_row(&seed.name, sidebar_location);
     let row_clone = row.clone();
     {
         let mut app_state = state.borrow_mut();
@@ -3446,6 +4271,8 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
             path_label,
+            branch_label,
+            ports_label,
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
         app_state.stack.set_visible_child_name(&stack_name);
@@ -3457,6 +4284,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
     }
 
     if pane::move_tab_to_pane(&source_pane, tab_id, &pane.clone().upcast()) {
+        refresh_sidebar_ports(state);
         request_session_save(state);
         return true;
     }
@@ -4439,6 +5267,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::CreateNotification {
             target,
+            surface_hint,
+            kind,
             title,
             subtitle,
             body,
@@ -4468,15 +5298,43 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 (false, true) => subtitle.clone(),
                 (false, false) => format!("{subtitle} — {body}"),
             };
+            let visual_kind = notification_visual_kind(kind.as_deref(), &title, &combined_body);
             let message = workspace_notification_message(&title, &combined_body);
+            let (pane_id, tab_id) = surface_hint
+                .as_deref()
+                .and_then(parse_notification_surface_hint)
+                .unwrap_or((None, None));
+            if let (Some(pane_id), Some(tab_id)) = (pane_id, tab_id.as_deref()) {
+                if let Some(pane_widget) = pane::find_pane_widget_by_id(pane_id) {
+                    pane::mark_tab_notification(&pane_widget, tab_id, visual_kind.pane_kind());
+                }
+            }
             let target = DesktopNotificationTarget {
                 workspace_id: ws_id.clone(),
-                pane_id: None,
-                tab_id: None,
+                pane_id,
+                tab_id,
             };
-            if let Some(request) =
-                mark_workspace_unread_with_message(state, &ws_id, &message, false, target)
-            {
+            record_notification_for_workspace(
+                state,
+                &ws_id,
+                NotificationRecordDraft {
+                    title: &title,
+                    subtitle: &subtitle,
+                    body: &body,
+                    message: &message,
+                    source_focused: false,
+                    target: target.clone(),
+                    kind: visual_kind,
+                },
+            );
+            if let Some(request) = mark_workspace_unread_with_message(
+                state,
+                &ws_id,
+                &message,
+                false,
+                target,
+                visual_kind,
+            ) {
                 show_desktop_notification(state, request);
             }
 
@@ -4484,6 +5342,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 "ok": true,
                 "workspace_id": ws_id,
                 "workspace_ref": workspace_ref(&ws_id),
+                "kind": kind.unwrap_or_else(|| visual_kind.as_str().to_string()),
                 "title": title,
                 "subtitle": subtitle,
                 "body": body,
@@ -4517,8 +5376,16 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         build_workspace_root(state, &shortcuts, &id, working_dir, &workspace.layout);
     stack.add_named(&root, Some(&stack_name));
 
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(&workspace.name, workspace.folder_path.as_deref());
+    let (
+        row,
+        name_label,
+        favorite_button,
+        notify_dot,
+        notify_label,
+        path_label,
+        branch_label,
+        ports_label,
+    ) = build_sidebar_row(&workspace.name, working_dir);
     sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
@@ -4538,6 +5405,8 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         cwd,
         folder_path: workspace.folder_path.clone(),
         path_label,
+        branch_label,
+        ports_label,
     };
 
     if workspace.favorite {
@@ -4552,6 +5421,7 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
 
     stack.set_visible_child_name(&stack_name);
     sidebar_list.select_row(Some(&row));
+    refresh_sidebar_ports(state);
 }
 
 /// Create a PaneWidget wired up with callbacks for a specific workspace.
@@ -4627,14 +5497,31 @@ pub(crate) fn create_pane_for_workspace(
                     pane_id: Some(pane_id),
                     tab_id: Some(tab_id),
                 };
+                let visual_kind = notification_visual_kind(None, title, body);
                 let message = workspace_notification_message(title, body);
+                let title = title.to_string();
+                let body = body.to_string();
                 glib::idle_add_local_once(move || {
+                    record_notification_for_workspace(
+                        &state,
+                        &ws_id,
+                        NotificationRecordDraft {
+                            title: &title,
+                            subtitle: "",
+                            body: &body,
+                            message: &message,
+                            source_focused,
+                            target: target.clone(),
+                            kind: visual_kind,
+                        },
+                    );
                     if let Some(request) = mark_workspace_unread_with_message(
                         &state,
                         &ws_id,
                         &message,
                         source_focused,
                         target,
+                        visual_kind,
                     ) {
                         show_desktop_notification(&state, request);
                     }
@@ -4663,9 +5550,18 @@ pub(crate) fn create_pane_for_workspace(
             let ws_id = ws_id_pwd.clone();
             let pwd = pwd.to_string();
             glib::idle_add_local_once(move || {
-                let s = state.borrow();
-                if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
-                    *ws.cwd.borrow_mut() = Some(pwd);
+                let updated = {
+                    let s = state.borrow();
+                    if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
+                        *ws.cwd.borrow_mut() = Some(pwd.clone());
+                        update_workspace_location_visuals(ws, Some(&pwd));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if updated {
+                    refresh_sidebar_ports(&state);
                 }
             });
         }),
@@ -4700,6 +5596,12 @@ pub(crate) fn create_pane_for_workspace(
                 let system_prefers_dark =
                     state_for_config_changed.borrow().system_prefers_dark.get();
                 apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
+                if updated.font_size != previous.font_size {
+                    apply_saved_font_size(updated.font_size);
+                }
+                if updated.ui_font_sizes != previous.ui_font_sizes {
+                    reload_app_css(&state_for_config_changed, updated);
+                }
                 if let Err(err) = app_config::save(updated) {
                     state_for_config_changed
                         .borrow()
@@ -4707,6 +5609,12 @@ pub(crate) fn create_pane_for_workspace(
                         .borrow_mut()
                         .clone_from(previous);
                     apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
+                    if updated.font_size != previous.font_size {
+                        apply_saved_font_size(previous.font_size);
+                    }
+                    if updated.ui_font_sizes != previous.ui_font_sizes {
+                        reload_app_css(&state_for_config_changed, previous);
+                    }
 
                     let detail = format!("Failed to save Limux settings: {err}");
                     eprintln!("limux: {detail}");
@@ -4761,6 +5669,9 @@ fn close_workspace_by_id_internal(
     let ws = s.workspaces.remove(idx);
     s.stack.remove(&ws.root);
     s.sidebar_list.remove(&ws.sidebar_row);
+    s.notification_records
+        .retain(|record| record.target.workspace_id != id);
+    sync_notification_button_state(&s);
 
     if s.workspaces.is_empty() {
         s.active_idx = 0;
@@ -4797,46 +5708,31 @@ fn close_workspace_by_id_internal(
 }
 
 fn switch_workspace(state: &State, idx: usize) {
-    let (stack, stack_name, unread_handles, focus_root) = {
+    let (stack, stack_name, focus_root) = {
         let mut s = state.borrow_mut();
         if idx >= s.workspaces.len() || idx == s.active_idx {
             return;
         }
         s.active_idx = idx;
         let stack = s.stack.clone();
-        let stack_name = format!("ws-{}", s.workspaces[idx].id);
+        let ws_id = s.workspaces[idx].id.clone();
+        let stack_name = format!("ws-{ws_id}");
         let focus_root = s.workspaces[idx].root.clone();
 
-        let unread_handles = if s.workspaces[idx].unread {
+        if s.workspaces[idx].unread {
             let ws = &mut s.workspaces[idx];
             ws.unread = false;
-            Some((
-                ws.notify_dot.clone(),
-                ws.notify_label.clone(),
-                ws.sidebar_row.clone(),
-            ))
-        } else {
-            None
-        };
+            clear_workspace_notification_visuals(ws);
+        }
+        mark_notification_records_read_in_state(&mut s, &ws_id);
 
-        (stack, stack_name, unread_handles, focus_root)
+        (stack, stack_name, focus_root)
     };
 
     stack.set_visible_child_name(&stack_name);
     glib::idle_add_local_once(move || {
         focus_workspace_entrypoint(&focus_root);
     });
-
-    if let Some((notify_dot, notify_label, sidebar_row)) = unread_handles {
-        notify_dot.remove_css_class("limux-notify-dot");
-        notify_dot.add_css_class("limux-notify-dot-hidden");
-        notify_label.remove_css_class("limux-notify-msg-unread");
-        notify_label.add_css_class("limux-notify-msg");
-        notify_label.set_visible(false);
-        if let Some(row_box) = sidebar_row.child() {
-            row_box.remove_css_class("limux-sidebar-row-unread");
-        }
-    }
 
     request_session_save(state);
 }
@@ -5308,13 +6204,20 @@ fn persist_font_size(state: &State, font_size: Option<f32>) -> Result<(), String
 }
 
 fn font_size_after_delta(current: Option<f32>, default: f32, delta: f32) -> f32 {
-    (current.unwrap_or(default) + delta).clamp(1.0, 255.0)
+    (current.unwrap_or(default) + delta).clamp(8.0, 255.0)
 }
 
 fn show_font_size_save_error(state: &State, err: String) {
     let detail = format!("Failed to save Limux settings: {err}");
     eprintln!("limux: {detail}");
     show_runtime_error(state, "Failed to save settings", &detail);
+}
+
+fn apply_saved_font_size(font_size: Option<f32>) {
+    match font_size {
+        Some(size) => broadcast_font_size(size),
+        None => crate::terminal::broadcast_binding_action("reset_font_size"),
+    }
 }
 
 fn broadcast_font_size(size: f32) {
@@ -5703,18 +6606,135 @@ fn should_emit_desktop_notification(
     desktop_notifications_enabled && (!window_active || !workspace_is_active || !source_focused)
 }
 
+fn should_show_workspace_unread_marker(workspace_is_active: bool, source_focused: bool) -> bool {
+    !workspace_is_active || !source_focused
+}
+
+fn normalized_notification_kind_hint(raw: &str) -> Option<NotificationVisualKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "attention" | "needs_attention" | "needs-attention" | "input" | "waiting" | "warning"
+        | "error" => Some(NotificationVisualKind::Attention),
+        "finished" | "finish" | "complete" | "completed" | "done" | "success" | "succeeded" => {
+            Some(NotificationVisualKind::Finished)
+        }
+        _ => None,
+    }
+}
+
+fn text_suggests_finished_task(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|word| {
+            matches!(
+                word,
+                "finished" | "complete" | "completed" | "succeeded" | "success" | "done"
+            )
+        })
+}
+
+fn notification_visual_kind(
+    kind_hint: Option<&str>,
+    title: &str,
+    body: &str,
+) -> NotificationVisualKind {
+    if let Some(kind) = kind_hint.and_then(normalized_notification_kind_hint) {
+        return kind;
+    }
+
+    let combined = format!("{} {}", title.trim(), body.trim());
+    if text_suggests_finished_task(&combined) {
+        NotificationVisualKind::Finished
+    } else {
+        NotificationVisualKind::Attention
+    }
+}
+
+fn clear_workspace_notification_visuals(workspace: &Workspace) {
+    workspace.notify_dot.remove_css_class("limux-notify-dot");
+    workspace
+        .notify_dot
+        .remove_css_class("limux-notify-dot-attention");
+    workspace
+        .notify_dot
+        .remove_css_class("limux-notify-dot-finished");
+    workspace
+        .notify_dot
+        .add_css_class("limux-notify-dot-hidden");
+
+    workspace
+        .notify_label
+        .remove_css_class("limux-notify-msg-unread");
+    workspace
+        .notify_label
+        .remove_css_class("limux-notify-msg-attention");
+    workspace
+        .notify_label
+        .remove_css_class("limux-notify-msg-finished");
+    workspace.notify_label.add_css_class("limux-notify-msg");
+    workspace.notify_label.set_visible(false);
+
+    if let Some(row_box) = workspace.sidebar_row.child() {
+        row_box.remove_css_class("limux-sidebar-row-unread");
+        row_box.remove_css_class("limux-sidebar-row-attention");
+        row_box.remove_css_class("limux-sidebar-row-finished");
+    }
+}
+
+fn apply_workspace_notification_visuals(
+    workspace: &Workspace,
+    message: &str,
+    kind: NotificationVisualKind,
+) {
+    clear_workspace_notification_visuals(workspace);
+    workspace
+        .notify_dot
+        .remove_css_class("limux-notify-dot-hidden");
+    workspace.notify_dot.add_css_class("limux-notify-dot");
+    workspace.notify_dot.add_css_class(kind.sidebar_dot_class());
+
+    workspace.notify_label.set_label(message);
+    workspace.notify_label.remove_css_class("limux-notify-msg");
+    workspace
+        .notify_label
+        .add_css_class("limux-notify-msg-unread");
+    workspace
+        .notify_label
+        .add_css_class(kind.sidebar_message_class());
+    workspace.notify_label.set_visible(true);
+
+    if let Some(row_box) = workspace.sidebar_row.child() {
+        row_box.add_css_class("limux-sidebar-row-unread");
+        row_box.add_css_class(kind.sidebar_row_class());
+    }
+}
+
 fn mark_workspace_unread(
     state: &State,
     ws_id: &str,
     source_focused: bool,
     target: DesktopNotificationTarget,
 ) -> Option<DesktopNotificationRequest> {
+    record_notification_for_workspace(
+        state,
+        ws_id,
+        NotificationRecordDraft {
+            title: "Process needs attention",
+            subtitle: "",
+            body: "",
+            message: "Process needs attention",
+            source_focused,
+            target: target.clone(),
+            kind: NotificationVisualKind::Attention,
+        },
+    );
     mark_workspace_unread_with_message(
         state,
         ws_id,
         "Process needs attention",
         source_focused,
         target,
+        NotificationVisualKind::Attention,
     )
 }
 
@@ -5735,6 +6755,7 @@ fn mark_workspace_unread_with_message(
     message: &str,
     source_focused: bool,
     target: DesktopNotificationTarget,
+    kind: NotificationVisualKind,
 ) -> Option<DesktopNotificationRequest> {
     let mut s = state.borrow_mut();
     let active_idx = s.active_idx;
@@ -5760,18 +6781,9 @@ fn mark_workspace_unread_with_message(
             target: target.clone(),
         });
 
-        if idx != active_idx {
+        if should_show_workspace_unread_marker(workspace_is_active, source_focused) {
             ws.unread = true;
-            ws.notify_dot.remove_css_class("limux-notify-dot-hidden");
-            ws.notify_dot.add_css_class("limux-notify-dot");
-            ws.notify_label.set_label(message);
-            ws.notify_label.remove_css_class("limux-notify-msg");
-            ws.notify_label.add_css_class("limux-notify-msg-unread");
-            ws.notify_label.set_visible(true);
-            // Add glow pulse to the sidebar row box
-            if let Some(row_box) = ws.sidebar_row.child() {
-                row_box.add_css_class("limux-sidebar-row-unread");
-            }
+            apply_workspace_notification_visuals(ws, message, kind);
         }
 
         return desktop_request;
@@ -5877,15 +6889,19 @@ mod tests {
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, next_active_workspace_index,
-        pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
-        resolved_system_prefers_dark, sanitize_background_opacity,
+        ghostty_prefers_dark, git_branch_for_path, git_branch_from_head,
+        gtk_system_prefers_dark_from_raw, next_active_workspace_index, notification_detail_text,
+        notification_visual_kind, pane_create_split_placement, parse_proc_fd_socket_inode,
+        parse_proc_net_listening_ports, path_is_within, queue_session_save_request,
+        resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
+        should_emit_desktop_notification, should_show_workspace_unread_marker,
+        sidebar_ports_summary, tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_notification_message, Direction,
-        EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
+        workspace_folder_path_from_input, workspace_notification_message,
+        DesktopNotificationTarget, Direction, EditableCaptureContext, NeighborScore,
+        NotificationRecord, NotificationVisualKind, PaneBounds, PaneCreateDirection,
         PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
         WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
@@ -6120,18 +7136,118 @@ mod tests {
 
     #[test]
     fn font_size_after_delta_clamps_to_supported_range() {
-        assert_eq!(font_size_after_delta(Some(1.0), 12.0, -5.0), 1.0);
+        assert_eq!(font_size_after_delta(Some(8.0), 12.0, -5.0), 8.0);
         assert_eq!(font_size_after_delta(Some(255.0), 12.0, 5.0), 255.0);
     }
 
     #[test]
-    fn base_css_defines_theme_aware_host_entry_styles() {
-        assert!(BASE_CSS.contains(":root"));
-        assert!(BASE_CSS.contains("@media (prefers-color-scheme: dark)"));
+    fn base_css_defines_gtk_compatible_host_entry_styles() {
+        assert!(!BASE_CSS.contains(":root"));
+        assert!(!BASE_CSS.contains("@media"));
+        assert!(!BASE_CSS.contains("var("));
         assert!(BASE_CSS.contains(".limux-host-entry"));
         assert!(BASE_CSS.contains(".limux-host-entry text"));
         assert!(BASE_CSS.contains(".limux-host-entry text placeholder"));
+        assert!(BASE_CSS.contains("alpha(@window_bg_color, 0.98)"));
         assert!(BASE_CSS.contains("caret-color: currentColor;"));
+    }
+
+    #[test]
+    fn git_branch_from_head_formats_refs_and_detached_heads() {
+        assert_eq!(
+            git_branch_from_head("ref: refs/heads/main\n").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            git_branch_from_head("ref: refs/heads/feature/sidebar-polish\n").as_deref(),
+            Some("feature/sidebar-polish")
+        );
+        assert_eq!(
+            git_branch_from_head("0123456789abcdef\n").as_deref(),
+            Some("@0123456")
+        );
+        assert_eq!(git_branch_from_head("not a head"), None);
+    }
+
+    #[test]
+    fn git_branch_for_path_walks_parent_direct_git_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let nested = repo.join("src/bin");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/ui-polish\n").expect("head");
+
+        assert_eq!(
+            git_branch_for_path(nested.to_str().expect("utf8 path")).as_deref(),
+            Some("ui-polish")
+        );
+    }
+
+    #[test]
+    fn git_branch_for_path_handles_worktree_gitdir_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worktree = dir.path().join("worktree");
+        let gitdir = dir.path().join("common/worktrees/worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::create_dir_all(&gitdir).expect("gitdir");
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../common/worktrees/worktree\n",
+        )
+        .expect("git file");
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/cmux-sidebar\n").expect("head");
+
+        assert_eq!(
+            git_branch_for_path(worktree.to_str().expect("utf8 path")).as_deref(),
+            Some("cmux-sidebar")
+        );
+    }
+
+    #[test]
+    fn proc_net_parser_extracts_listening_socket_ports() {
+        let raw = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:1F90 00000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 67890 1 0000000000000000 100 0 0 10 0
+   2: 00000000000000000000000000000000:C001 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 24680 1 0000000000000000 100 0 0 10 0
+";
+
+        assert_eq!(
+            parse_proc_net_listening_ports(raw),
+            vec![(12345, 3000), (24680, 49153)]
+        );
+    }
+
+    #[test]
+    fn proc_fd_socket_inode_parser_requires_socket_target() {
+        assert_eq!(parse_proc_fd_socket_inode("socket:[12345]"), Some(12345));
+        assert_eq!(parse_proc_fd_socket_inode("anon_inode:[eventfd]"), None);
+        assert_eq!(parse_proc_fd_socket_inode("/tmp/file"), None);
+    }
+
+    #[test]
+    fn sidebar_ports_summary_stays_compact() {
+        assert_eq!(sidebar_ports_summary(&[]), "");
+        assert_eq!(sidebar_ports_summary(&[3000]), "localhost:3000");
+        assert_eq!(
+            sidebar_ports_summary(&[3000, 5173, 8080]),
+            "localhost:3000 +2"
+        );
+    }
+
+    #[test]
+    fn path_is_within_accepts_nested_workspace_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("project");
+        let nested = workspace.join("server");
+        let outside = dir.path().join("other");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::create_dir_all(&outside).expect("outside");
+
+        assert!(path_is_within(&nested, &workspace));
+        assert!(path_is_within(&workspace, &workspace));
+        assert!(!path_is_within(&outside, &workspace));
     }
 
     #[test]
@@ -6141,6 +7257,115 @@ mod tests {
             [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS]
         );
         assert!(BASE_CSS.contains(".limux-ws-rename-entry"));
+    }
+
+    #[test]
+    fn sidebar_workspace_rows_remove_theme_horizontal_insets() {
+        let row_rule = BASE_CSS
+            .split(".limux-sidebar .navigation-sidebar > row {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("sidebar navigation row CSS rule");
+        assert!(row_rule.contains("padding-left: 0;"));
+        assert!(row_rule.contains("padding-right: 0;"));
+        assert!(row_rule.contains("margin-left: 0;"));
+        assert!(row_rule.contains("margin-right: 0;"));
+
+        let row_box_rule = BASE_CSS
+            .split(".limux-sidebar-row-box {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("sidebar row box CSS rule");
+        assert!(row_box_rule.contains("margin: 2px 0;"));
+    }
+
+    #[test]
+    fn workspace_unread_marker_does_not_change_row_width() {
+        let unread_rule = BASE_CSS
+            .split(".limux-sidebar-row-unread {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("workspace unread CSS rule");
+        assert!(unread_rule.contains("box-shadow: inset 3px 0 0 0 @accent_bg_color;"));
+        assert!(!unread_rule.contains("border-left"));
+        assert!(!unread_rule.contains("margin-left"));
+        assert!(!unread_rule.contains("margin-right"));
+    }
+
+    #[test]
+    fn sidebar_notification_css_distinguishes_attention_and_finished_states() {
+        assert!(BASE_CSS.contains(".limux-ws-meta-row"));
+        assert!(BASE_CSS.contains(".limux-ws-branch"));
+        assert!(BASE_CSS.contains(".limux-ws-ports"));
+        assert!(BASE_CSS.contains(".limux-sidebar-row-attention"));
+        assert!(BASE_CSS.contains(".limux-sidebar-row-finished"));
+        assert!(BASE_CSS.contains(".limux-notify-dot-attention"));
+        assert!(BASE_CSS.contains(".limux-notify-dot-finished"));
+        assert!(BASE_CSS.contains(".limux-notify-msg-attention"));
+        assert!(BASE_CSS.contains(".limux-notify-msg-finished"));
+    }
+
+    #[test]
+    fn notification_panel_css_covers_history_states() {
+        assert!(BASE_CSS.contains(".limux-notification-button"));
+        assert!(BASE_CSS.contains(".limux-notification-button-unread"));
+        assert!(BASE_CSS.contains(".limux-notification-panel"));
+        assert!(BASE_CSS.contains(".limux-notification-row-attention"));
+        assert!(BASE_CSS.contains(".limux-notification-row-finished"));
+        assert!(BASE_CSS.contains(".limux-notification-row-unread"));
+        assert!(BASE_CSS.contains(".limux-notification-status-attention"));
+        assert!(BASE_CSS.contains(".limux-notification-status-finished"));
+    }
+
+    #[test]
+    fn notification_detail_text_avoids_duplicate_sidebar_message() {
+        let base = NotificationRecord {
+            id: 1,
+            target: DesktopNotificationTarget {
+                workspace_id: "workspace-a".to_string(),
+                pane_id: Some(7),
+                tab_id: Some("tab-a".to_string()),
+            },
+            workspace_name: "codex".to_string(),
+            title: "Codex".to_string(),
+            subtitle: String::new(),
+            body: "Turn complete".to_string(),
+            message: "Turn complete".to_string(),
+            kind: NotificationVisualKind::Finished,
+            unread: true,
+        };
+
+        assert_eq!(notification_detail_text(&base), None);
+
+        let with_subtitle = NotificationRecord {
+            subtitle: "session-a".to_string(),
+            message: "Codex - Turn complete".to_string(),
+            ..base
+        };
+        assert_eq!(
+            notification_detail_text(&with_subtitle).as_deref(),
+            Some("session-a - Turn complete")
+        );
+    }
+
+    #[test]
+    fn notification_visual_kind_uses_explicit_kind_and_finished_copy() {
+        assert_eq!(
+            notification_visual_kind(Some("finished"), "Process needs attention", ""),
+            NotificationVisualKind::Finished
+        );
+        assert_eq!(
+            notification_visual_kind(Some("attention"), "Task finished", ""),
+            NotificationVisualKind::Attention
+        );
+        assert_eq!(
+            notification_visual_kind(None, "Process needs attention", "Codex finished"),
+            NotificationVisualKind::Finished
+        );
+        assert_eq!(
+            notification_visual_kind(None, "Process needs attention", "agent is unfinished"),
+            NotificationVisualKind::Attention
+        );
     }
 
     #[test]
@@ -6332,6 +7557,14 @@ mod tests {
             false, false, false, false
         ));
         assert!(!should_emit_desktop_notification(true, true, true, true));
+    }
+
+    #[test]
+    fn workspace_unread_marker_shows_for_background_sources() {
+        assert!(should_show_workspace_unread_marker(false, false));
+        assert!(should_show_workspace_unread_marker(false, true));
+        assert!(should_show_workspace_unread_marker(true, false));
+        assert!(!should_show_workspace_unread_marker(true, true));
     }
 
     #[test]

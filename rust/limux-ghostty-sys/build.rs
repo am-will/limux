@@ -17,16 +17,21 @@ fn main() {
     // include when built as a shared library.
     let glad_src = ghostty_root.join("vendor/glad/src/gl.c");
     let glad_include = ghostty_root.join("vendor/glad/include");
-    if glad_src.exists() {
-        cc::Build::new()
-            .file(&glad_src)
-            .include(&glad_include)
-            .compile("glad");
+    if !glad_src.is_file() || !glad_include.is_dir() {
+        panic!(
+            "Ghostty GLAD source not found at {}; initialize the ghostty submodule before building limux-host-linux",
+            glad_src.display()
+        );
     }
+    cc::Build::new()
+        .file(&glad_src)
+        .include(&glad_include)
+        .compile("glad");
 
     // Re-run if libghostty changes
     println!(
         "cargo:rerun-if-changed={}",
         ghostty_lib.join("libghostty.so").display()
     );
+    println!("cargo:rerun-if-changed={}", glad_src.display());
 }

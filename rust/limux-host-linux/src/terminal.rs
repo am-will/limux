@@ -161,6 +161,28 @@ impl TerminalImeState {
 
 thread_local! {
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
+    static HOVER_FOCUS_INHIBIT_COUNT: Cell<u32> = const { Cell::new(0) };
+}
+
+pub struct HoverFocusInhibitGuard;
+
+impl Drop for HoverFocusInhibitGuard {
+    fn drop(&mut self) {
+        HOVER_FOCUS_INHIBIT_COUNT.with(|count| {
+            count.set(count.get().saturating_sub(1));
+        });
+    }
+}
+
+pub fn inhibit_hover_terminal_focus() -> HoverFocusInhibitGuard {
+    HOVER_FOCUS_INHIBIT_COUNT.with(|count| {
+        count.set(count.get().saturating_add(1));
+    });
+    HoverFocusInhibitGuard
+}
+
+fn terminal_focus_inhibited() -> bool {
+    HOVER_FOCUS_INHIBIT_COUNT.with(|count| count.get() > 0)
 }
 
 #[derive(Clone)]
@@ -189,6 +211,9 @@ impl TerminalHandle {
 
     pub fn focus_surface(&self) -> bool {
         self.refresh_display();
+        if terminal_focus_inhibited() {
+            return false;
+        }
         self.gl_area.grab_focus();
         true
     }
@@ -408,16 +433,22 @@ fn terminal_search_action(query: &str) -> String {
 }
 
 fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
+    if terminal_focus_inhibited() {
+        return;
+    }
     had_focus.set(true);
     gl_area.grab_focus();
 }
 
 fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
     let alloc = gl_area.allocation();
-    let w = alloc.width() as u32;
-    let h = alloc.height() as u32;
+    let scale = gl_area.scale_factor();
+    // Ghostty expects physical framebuffer pixels here; GTK allocations are
+    // logical CSS pixels, so include the integer monitor scale factor.
+    let w = (alloc.width() * scale) as u32;
+    let h = (alloc.height() * scale) as u32;
     if w > 0 && h > 0 {
-        let scale = gl_area.scale_factor() as f64;
+        let scale = scale as f64;
         unsafe {
             ghostty_surface_set_content_scale(surface, scale, scale);
             ghostty_surface_set_size(surface, w, h);
@@ -1490,7 +1521,9 @@ pub fn create_terminal(
             if had_focus.get() {
                 let gl_for_focus = gl_for_resize.clone();
                 glib::idle_add_local_once(move || {
-                    gl_for_focus.grab_focus();
+                    if !terminal_focus_inhibited() {
+                        gl_for_focus.grab_focus();
+                    }
                 });
             }
         });
@@ -1684,10 +1717,12 @@ pub fn create_terminal(
         let had_focus = had_focus.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
-            if (hover_focus)() {
+            if (hover_focus)() && !terminal_focus_inhibited() {
                 // Match common Hyprland/Omarchy-style focus-follows-mouse behavior:
                 // as soon as the pointer enters a terminal, focus it so typing works
-                // immediately without an extra click.
+                // immediately without an extra click. Inline host editors inhibit
+                // this temporarily so pointer motion caused by closing a popover
+                // cannot steal focus back from text fields.
                 request_terminal_focus(&gl_for_focus, &had_focus);
             }
 
@@ -2172,7 +2207,6 @@ fn show_clipboard_toast(overlay: &gtk::Overlay) {
             color: white; \
             border-radius: 6px; \
             padding: 6px 14px; \
-            font-size: 12px; \
         } \
         box.limux-toast label { color: white; } \
         box.limux-toast button { \

@@ -63,6 +63,32 @@ For live agent/control-socket behavior, prefer the maintained smoke harness:
 LIMUX_SMOKE_PROFILE=debug ./scripts/xvfb-smoke-test.sh
 ```
 
+## Local Runtime Freshness
+
+For user-visible fixes, make sure the local `limux` entrypoint the maintainer
+actually runs is updated before handing off. The fast local install path is:
+
+```bash
+./scripts/install-local-build.sh
+```
+
+That script builds the CLI and GTK host, installs them under
+`$LIMUX_LOCAL_PREFIX` or `~/.local`, installs a matching `libghostty.so`,
+updates the desktop entry, and verifies that `command -v limux` resolves to the
+freshly installed CLI and that the host resolves the matching local library.
+Restart any already-running Limux GUI before validating the new behavior; a
+running process keeps using the old mapped executable.
+
+If a change touches release packaging, Ghostty resources, system linker config,
+or distro artifacts, use the full package path instead:
+
+```bash
+./scripts/package.sh
+```
+
+When a runtime fix is not installed locally, say so explicitly in the handoff
+instead of implying the user's active Limux app includes it.
+
 ## Runtime Control Path
 
 There are two control-server paths:

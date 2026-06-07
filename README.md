@@ -67,11 +67,30 @@ sudo ./install.sh --uninstall
 sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 ```
 
+### Troubleshooting Launches
+
+Installed packages expose `limux` as the CLI entrypoint. Running `limux` with
+no arguments launches the private GTK host from `libexec/limux/limux-host`;
+desktop files should point at the CLI, not directly at `limux-host`.
+
+If launch fails with an error like:
+
+```text
+libghostty.so: undefined symbol: gladLoaderLoadGLContext
+```
+
+the CLI is usually finding a stale `limux-host` binary that does not match the
+installed `libghostty.so`. Remove old manual-install host binaries from
+`~/.local/bin/limux-host` or reinstall Limux so the CLI, host, and
+`libghostty.so` come from the same package. Source builds also require the full
+Ghostty submodule, including `ghostty/vendor/glad/src/gl.c`; a `ghostty/zig-out`
+stub or copied `libghostty.so` is not enough to build a working host.
+
 ## Build from source
 
 ### Prerequisites
 
-- Rust toolchain (stable)
+- Rust toolchain 1.92 or newer
 - Zig
 - GTK4, libadwaita, WebKitGTK dev packages
 - Initialized Ghostty submodule
@@ -88,7 +107,7 @@ git submodule update --init --recursive
 cargo build --release
 
 # Run (point to libghostty.so location)
-LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
+LD_LIBRARY_PATH=ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
 ### Package a release tarball
@@ -112,8 +131,8 @@ Repository maintainability rules live in [`docs/maintainability.md`](docs/mainta
 
 ## Agent integrations
 
-Limux ships first-class hooks for coding agents (Codex, Claude Code, and
-Gemini CLI). Every terminal limux spawns auto-exports
+Limux ships first-class hooks for coding agents (Codex, Claude Code, Gemini
+CLI, and Pi). Every terminal limux spawns auto-exports
 `LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /
 `LIMUX_TAB_ID` / `LIMUX_SOCKET`, so the CLI auto-targets the right place
 with no flags needed from inside the agent's own terminal.
@@ -128,6 +147,7 @@ limux hooks setup
 # Drop-in hook handlers translate hook JSON on stdin into notify/session state
 echo '{"event":"stop"}' | limux claude-hook --event stop
 echo '{"event":"finished"}' | limux gemini-hook --event finished
+echo '{"event":"stop"}' | limux pi-hook --event stop
 
 # Spin up a multi-agent collaboration team — one workspace per agent,
 # launches each agent's CLI, and writes AGENTS.md describing the
@@ -155,14 +175,29 @@ limux send --workspace "$LIMUX_WORKSPACE_ID" --surface "<peer-surface-id>" \
 See the auto-generated `AGENTS.md` (written into the shared cwd) for
 the full protocol spec, peer table, and editable Policies section.
 
-Checked-in hook templates live in [`hooks/`](hooks/). They mirror
-`limux hooks setup` for Codex, Claude Code, and Gemini CLI; OpenCode is
-omitted until its hook integration is ready.
+Checked-in JSON hook templates live in [`hooks/`](hooks/). They mirror
+`limux hooks setup` for Codex, Claude Code, and Gemini CLI. Pi is installed as
+a generated extension under `~/.pi/agent/extensions/`; OpenCode is omitted
+from default setup until its hook integration is ready.
+
+After installing Pi hooks, restart any already-running Pi session so it loads
+the generated extension. Set `LIMUX_PI_HOOKS_DISABLED=1` to disable the Pi
+extension without uninstalling it.
 
 Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
 and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build
 loop, crate map, and the `feat/cmux-parity` roadmap tracked in
 [`docs/cmux-parity-plan.md`](docs/cmux-parity-plan.md).
+
+## Settings
+
+Open Settings from the gear icon in any pane header. Limux writes preferences
+to `~/.config/limux/settings.json` by default and preserves unrelated keys
+when editing settings.
+
+The Fonts & Icons page controls terminal text size, Limux chrome text sizes,
+and pane header icon sizes. Terminal font shortcuts below update the same
+saved terminal text setting.
 
 ## Keyboard shortcuts
 

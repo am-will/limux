@@ -172,6 +172,8 @@ pub enum ControlCommand {
     /// the currently-active workspace is used.
     CreateNotification {
         target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        kind: Option<String>,
         title: String,
         subtitle: String,
         body: String,
@@ -655,6 +657,7 @@ fn handle_method(
             };
             let subtitle = optional_string(params, &["subtitle"]).unwrap_or_default();
             let body = optional_string(params, &["body", "message"]).unwrap_or_default();
+            let kind = optional_string(params, &["kind", "status", "level"]);
             // allow_name = true: lets agent hooks target a peer by name.
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -664,6 +667,11 @@ fn handle_method(
             (
                 ControlCommand::CreateNotification {
                     target,
+                    surface_hint: optional_string(
+                        params,
+                        &["surface_id", "surface_ref", "surface"],
+                    ),
+                    kind,
                     title,
                     subtitle,
                     body,
@@ -972,6 +980,35 @@ mod tests {
             response.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
+    }
+
+    #[test]
+    fn notification_route_preserves_kind_and_surface_hint() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"notification.create","params":{"workspace_id":"codex","surface_id":"surface:4:tab-a","kind":"finished","title":"Process needs attention","body":"Codex finished"}}"#,
+            &|command| match command {
+                ControlCommand::CreateNotification {
+                    target,
+                    surface_hint,
+                    kind,
+                    title,
+                    body,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint.as_deref(), Some("surface:4:tab-a"));
+                    assert_eq!(kind.as_deref(), Some("finished"));
+                    assert_eq!(title, "Process needs attention");
+                    assert_eq!(body, "Codex finished");
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert!(response.result.is_some());
     }
 
     #[test]

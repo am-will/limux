@@ -19,6 +19,7 @@ pub enum ShortcutId {
     QuitApp,
     NewInstance,
     ToggleSidebar,
+    OpenNotificationPanel,
     ToggleTopBar,
     ToggleFullscreen,
     NextWorkspace,
@@ -71,6 +72,7 @@ pub enum ShortcutCommand {
     QuitApp,
     NewInstance,
     ToggleSidebar,
+    OpenNotificationPanel,
     ToggleTopBar,
     ToggleFullscreen,
     NextWorkspace,
@@ -311,7 +313,7 @@ struct ShortcutConfigFile {
     shortcuts: HashMap<String, serde_json::Value>,
 }
 
-const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 48] = [
+const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 49] = [
     ShortcutDefinition {
         id: ShortcutId::NewWorkspace,
         config_key: "new_workspace",
@@ -364,6 +366,17 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 48] = [
         label: "Toggle Sidebar",
         registers_gtk_accel: true,
         command: ShortcutCommand::ToggleSidebar,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::OpenNotificationPanel,
+        config_key: "open_notification_panel",
+        action_name: "win.open-notification-panel",
+        default_accel: "<Ctrl><Shift>i",
+        label: "Open Notification Panel",
+        registers_gtk_accel: true,
+        command: ShortcutCommand::OpenNotificationPanel,
         scope: ShortcutScope::Window,
         editable_capture_policy: EditableCapturePolicy::BypassInEditable,
     },
@@ -1702,7 +1715,7 @@ mod tests {
 
     #[test]
     fn definitions_cover_current_host_shortcuts() {
-        assert_eq!(definitions().len(), 48);
+        assert_eq!(definitions().len(), 49);
     }
 
     #[test]
@@ -1737,6 +1750,7 @@ mod tests {
                 "app.quit",
                 "app.new-instance",
                 "win.toggle-sidebar",
+                "win.open-notification-panel",
                 "win.toggle-top-bar",
                 "win.toggle-fullscreen",
                 "win.next-workspace",
@@ -2138,7 +2152,7 @@ mod tests {
         .unwrap();
 
         let gtk_accels = resolved.gtk_accel_entries();
-        assert_eq!(gtk_accels.len(), 9);
+        assert_eq!(gtk_accels.len(), 10);
         assert_eq!(
             gtk_accels
                 .iter()
