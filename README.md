@@ -129,6 +129,18 @@ Run the canonical local quality gate before committing:
 
 Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
 
+For user-visible CLI or GTK host changes, install the active local build before
+validating it through the desktop entry or the `limux` command on `PATH`:
+
+```bash
+./scripts/install-local-build.sh
+```
+
+The script builds the CLI and GTK host, installs them under
+`$LIMUX_LOCAL_PREFIX` or `~/.local`, copies a matching `libghostty.so`, and
+verifies that the active `limux` entrypoint resolves to the fresh local build.
+Restart any already-running Limux GUI after installing.
+
 ## Agent integrations
 
 Limux ships first-class hooks for coding agents (Codex, Claude Code, Gemini

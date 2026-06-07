@@ -1,6 +1,7 @@
 target/
 zig/.zig-cache/
 zig/zig-out/
+ghostty.incomplete.*/
 dist/
 *.tar.gz
 .worktrees/
