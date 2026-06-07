@@ -161,6 +161,10 @@ Checked-in JSON hook templates live in [`hooks/`](hooks/). They mirror
 a generated extension under `~/.pi/agent/extensions/`; OpenCode is omitted
 from default setup until its hook integration is ready.
 
+After installing Pi hooks, restart any already-running Pi session so it loads
+the generated extension. Set `LIMUX_PI_HOOKS_DISABLED=1` to disable the Pi
+extension without uninstalling it.
+
 Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
 and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build
 loop, crate map, and the `feat/cmux-parity` roadmap tracked in

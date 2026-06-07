@@ -33,6 +33,9 @@ Regenerate it with:
 limux hooks pi install
 ```
 
+Restart any already-running Pi session after installing so Pi loads the
+extension. New Pi sessions will load it automatically.
+
 Each command calls `limux --json hooks <agent> <event>` and is guarded by a
 per-agent disable variable:
 
