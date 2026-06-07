@@ -169,6 +169,34 @@ copy_ghostty_terminfo_entries() {
     fi
 }
 
+install_app_icon_set() {
+    local src_dir="$1"
+    local hicolor_dir="$2"
+    local icon_name="$3"
+    local size
+    local src
+
+    if [ ! -d "$src_dir" ]; then
+        return 0
+    fi
+
+    for size in 16 32 128 256 512; do
+        src="${src_dir}/${size}.png"
+        if [ -f "$src" ]; then
+            mkdir -p "$hicolor_dir/${size}x${size}/apps"
+            cp "$src" "$hicolor_dir/${size}x${size}/apps/${icon_name}.png"
+        fi
+    done
+}
+
+install_app_icons() {
+    local hicolor_dir="$1"
+
+    install_app_icon_set "$APP_ICONS_DIR" "$hicolor_dir" "limux"
+    install_app_icon_set "$APP_ICONS_DIR/os-dark" "$hicolor_dir" "limux-os-dark"
+    install_app_icon_set "$APP_ICONS_DIR/os-light" "$hicolor_dir" "limux-os-light"
+}
+
 . "${ROOT_DIR}/scripts/appimage-webkit.sh"
 
 configure_ghostty_build_args() {
@@ -340,15 +368,7 @@ populate_tree() {
     done
 
     # App launcher icons
-    if [ -d "$APP_ICONS_DIR" ]; then
-        for size in 16 32 128 256 512; do
-            src="${APP_ICONS_DIR}/${size}.png"
-            if [ -f "$src" ]; then
-                mkdir -p "$icondir/${size}x${size}/apps"
-                cp "$src" "$icondir/${size}x${size}/apps/limux.png"
-            fi
-        done
-    fi
+    install_app_icons "$icondir"
 }
 
 build_rpm_source_tree() {
@@ -427,15 +447,7 @@ fi
 for svg in "$ICONS_DIR"/*.svg; do
     [ -f "$svg" ] && cp "$svg" "$TARBALL_STAGE/share/icons/hicolor/scalable/actions/"
 done
-if [ -d "$APP_ICONS_DIR" ]; then
-    for size in 16 32 128 256 512; do
-        src="${APP_ICONS_DIR}/${size}.png"
-        if [ -f "$src" ]; then
-            mkdir -p "$TARBALL_STAGE/share/icons/hicolor/${size}x${size}/apps"
-            cp "$src" "$TARBALL_STAGE/share/icons/hicolor/${size}x${size}/apps/limux.png"
-        fi
-    done
-fi
+install_app_icons "$TARBALL_STAGE/share/icons/hicolor"
 
 # Generate install.sh
 cat > "$TARBALL_STAGE/install.sh" << 'INSTALL_EOF'
@@ -571,7 +583,9 @@ if $UNINSTALL; then
     rm -f "$PREFIX/share/applications/dev.limux.linux.desktop"
     rm -f "$PREFIX/share/metainfo/dev.limux.linux.metainfo.xml"
     for size in 16 32 128 256 512; do
-        rm -f "$PREFIX/share/icons/hicolor/${size}x${size}/apps/limux.png"
+        for icon_name in limux limux-os-dark limux-os-light; do
+            rm -f "$PREFIX/share/icons/hicolor/${size}x${size}/apps/${icon_name}.png"
+        done
     done
     rm -f "$PREFIX/share/icons/hicolor/scalable/actions/limux-globe-symbolic.svg"
     rm -f "$PREFIX/share/icons/hicolor/scalable/actions/limux-split-horizontal-symbolic.svg"
@@ -748,15 +762,7 @@ fi
 for svg in "$ICONS_DIR"/*.svg; do
     [ -f "$svg" ] && cp "$svg" "$APPDIR/usr/share/icons/hicolor/scalable/actions/"
 done
-if [ -d "$APP_ICONS_DIR" ]; then
-    for size in 16 32 128 256 512; do
-        src="${APP_ICONS_DIR}/${size}.png"
-        if [ -f "$src" ]; then
-            mkdir -p "$APPDIR/usr/share/icons/hicolor/${size}x${size}/apps"
-            cp "$src" "$APPDIR/usr/share/icons/hicolor/${size}x${size}/apps/limux.png"
-        fi
-    done
-fi
+install_app_icons "$APPDIR/usr/share/icons/hicolor"
 
 # AppImage icon (must be at root as .DirIcon and limux.png)
 if [ -f "$APP_ICONS_DIR/256.png" ]; then

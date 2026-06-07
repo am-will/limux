@@ -28,6 +28,8 @@ use crate::split_tree::{self, SplitTreeContainer};
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
+const APP_ICON_FOR_DARK_OS: &str = "limux-os-dark";
+const APP_ICON_FOR_LIGHT_OS: &str = "limux-os-light";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1400,10 +1402,15 @@ pub fn build_window(app: &adw::Application) {
         }
     }
 
+    let initial_app_icon_name =
+        app_icon_name_for_system_theme(system_prefers_dark.get(), style_manager.is_dark());
+    gtk::Window::set_default_icon_name(initial_app_icon_name);
+
     let title = format!("Limux v{}", crate::VERSION);
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title(&title)
+        .icon_name(initial_app_icon_name)
         .default_width(1400)
         .default_height(900)
         .build();
@@ -1566,11 +1573,19 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         let system_prefers_dark = system_prefers_dark.clone();
         style_manager.connect_dark_notify(move |style_manager| {
+            let state = state.borrow();
             sync_ghostty_color_scheme_for_config(
                 style_manager,
                 system_prefers_dark.get(),
-                &state.borrow().config.borrow().appearance,
+                &state.config.borrow().appearance,
             );
+            if system_prefers_dark.get().is_none() {
+                sync_app_icon_for_system_theme(
+                    &state.window,
+                    system_prefers_dark.get(),
+                    style_manager.is_dark(),
+                );
+            }
         });
     }
 
@@ -2361,11 +2376,13 @@ fn sync_system_prefers_dark_change(
     }
 
     system_prefers_dark.set(updated_preference);
+    let state = state.borrow();
     sync_ghostty_color_scheme_for_config(
         style_manager,
         updated_preference,
-        &state.borrow().config.borrow().appearance,
+        &state.config.borrow().appearance,
     );
+    sync_app_icon_for_system_theme(&state.window, updated_preference, style_manager.is_dark());
 }
 
 fn sync_portal_color_scheme_preference_change(
@@ -2766,6 +2783,27 @@ fn sync_ghostty_color_scheme_for_config(
         style_manager.is_dark(),
     );
     crate::terminal::sync_color_scheme(dark);
+}
+
+fn app_icon_name_for_system_theme(
+    system_prefers_dark: Option<bool>,
+    fallback_dark: bool,
+) -> &'static str {
+    if system_prefers_dark.unwrap_or(fallback_dark) {
+        APP_ICON_FOR_DARK_OS
+    } else {
+        APP_ICON_FOR_LIGHT_OS
+    }
+}
+
+fn sync_app_icon_for_system_theme(
+    window: &adw::ApplicationWindow,
+    system_prefers_dark: Option<bool>,
+    fallback_dark: bool,
+) {
+    let icon_name = app_icon_name_for_system_theme(system_prefers_dark, fallback_dark);
+    gtk::Window::set_default_icon_name(icon_name);
+    window.set_icon_name(Some(icon_name));
 }
 
 fn apply_appearance(
@@ -5872,7 +5910,7 @@ mod tests {
     use super::gtk::gdk;
     use super::ToVariant;
     use super::{
-        build_window_css, clamp_workspace_insert_index_for_pinning,
+        app_icon_name_for_system_theme, build_window_css, clamp_workspace_insert_index_for_pinning,
         desktop_notification_action_from_signal, desktop_notification_actions,
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
@@ -5887,8 +5925,8 @@ mod tests {
         workspace_folder_path_from_input, workspace_notification_message, Direction,
         EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
         PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        WorkspaceSeedSource, APP_ICON_FOR_DARK_OS, APP_ICON_FOR_LIGHT_OS, BASE_CSS,
+        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -6270,6 +6308,30 @@ mod tests {
         assert_eq!(
             resolved_system_prefers_dark(PortalColorSchemePreference::Unknown, Some(false)),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn app_icon_name_uses_os_theme_mapping() {
+        assert_eq!(
+            app_icon_name_for_system_theme(Some(true), false),
+            APP_ICON_FOR_DARK_OS
+        );
+        assert_eq!(
+            app_icon_name_for_system_theme(Some(false), true),
+            APP_ICON_FOR_LIGHT_OS
+        );
+    }
+
+    #[test]
+    fn app_icon_name_uses_fallback_when_os_theme_is_unknown() {
+        assert_eq!(
+            app_icon_name_for_system_theme(None, true),
+            APP_ICON_FOR_DARK_OS
+        );
+        assert_eq!(
+            app_icon_name_for_system_theme(None, false),
+            APP_ICON_FOR_LIGHT_OS
         );
     }
 
