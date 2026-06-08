@@ -90,7 +90,8 @@ stub or copied `libghostty.so` is not enough to build a working host.
 
 ### Prerequisites
 
-- Rust toolchain 1.92 or newer
+- Rust toolchain 1.92 or newer. The checkout selects Rust 1.92 through
+  `rust-toolchain.toml` so local scripts do not depend on your global default.
 - Zig
 - GTK4, libadwaita, WebKitGTK dev packages
 - Initialized Ghostty submodule
@@ -121,6 +122,9 @@ This builds the binary, bundles `libghostty.so`, icons, and an install script in
 
 ## Development
 
+The contributor workflow for shipping features while dogfooding the local build
+is documented in [`docs/development-workflow.md`](docs/development-workflow.md).
+
 Run the canonical local quality gate before committing:
 
 ```bash
@@ -139,7 +143,12 @@ validating it through the desktop entry or the `limux` command on `PATH`:
 The script builds the CLI and GTK host, installs them under
 `$LIMUX_LOCAL_PREFIX` or `~/.local`, copies a matching `libghostty.so`, and
 verifies that the active `limux` entrypoint resolves to the fresh local build.
-Restart any already-running Limux GUI after installing.
+Restart any already-running Limux GUI after installing, then confirm the active
+local runtime:
+
+```bash
+./scripts/local-build-status.sh
+```
 
 ## Agent integrations
 

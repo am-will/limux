@@ -13,6 +13,7 @@ resolver = "2"
 authors = ["limux contributors"]
 edition = "2021"
 license = "MIT"
+rust-version = "1.92"
 version = "0.1.19"
 
 [workspace.dependencies]

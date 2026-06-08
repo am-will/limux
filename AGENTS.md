@@ -79,6 +79,13 @@ freshly installed CLI and that the host resolves the matching local library.
 Restart any already-running Limux GUI before validating the new behavior; a
 running process keeps using the old mapped executable.
 
+Use the status check when you need to confirm this PC is dogfooding the local
+build:
+
+```bash
+./scripts/local-build-status.sh
+```
+
 If a change touches release packaging, Ghostty resources, system linker config,
 or distro artifacts, use the full package path instead:
 
@@ -159,6 +166,7 @@ name addressing, and by-name send path.
 
 Useful references:
 
+- Feature and dogfood workflow: `docs/development-workflow.md`
 - Roadmap/current bridge status: `docs/cmux-parity-plan.md`
 - Maintainability rules: `docs/maintainability.md`
 - CLI usage: `README.md` and `./target/debug/limux-cli --help`
