@@ -44,28 +44,28 @@ pub const UI_FONT_DESCRIPTORS: &[UiFontDescriptor] = &[
         label: "Sidebar workspace name",
         subtitle: "Workspace names in the left sidebar",
         selector: ".limux-ws-name",
-        default_size: 15.0,
+        default_size: 12.5,
     },
     UiFontDescriptor {
         id: "sidebar_favorite_star",
         label: "Sidebar favorite star",
         subtitle: "Pinned workspace star icon in sidebar rows",
         selector: ".limux-ws-star-btn",
-        default_size: 22.0,
+        default_size: 9.0,
     },
     UiFontDescriptor {
         id: "sidebar_notification_dot",
         label: "Sidebar notification dot",
         subtitle: "Unread notification marker in workspace rows",
         selector: ".limux-notify-dot, .limux-notify-dot-hidden",
-        default_size: 10.0,
+        default_size: 9.0,
     },
     UiFontDescriptor {
         id: "sidebar_notification_message",
         label: "Sidebar notification message",
         subtitle: "Notification preview text below workspace names",
         selector: ".limux-notify-msg, .limux-notify-msg-unread",
-        default_size: 11.0,
+        default_size: 10.0,
     },
     UiFontDescriptor {
         id: "sidebar_section_title",
@@ -79,35 +79,35 @@ pub const UI_FONT_DESCRIPTORS: &[UiFontDescriptor] = &[
         label: "Sidebar workspace path",
         subtitle: "Folder path text below workspace names",
         selector: ".limux-ws-path",
-        default_size: 12.0,
+        default_size: 10.0,
     },
     UiFontDescriptor {
         id: "sidebar_git_branch",
         label: "Sidebar git branch",
         subtitle: "Git branch pill in workspace rows",
         selector: ".limux-ws-branch",
-        default_size: 11.0,
+        default_size: 10.0,
     },
     UiFontDescriptor {
         id: "sidebar_ports",
         label: "Sidebar ports",
         subtitle: "Localhost port pill in workspace rows",
         selector: ".limux-ws-ports",
-        default_size: 11.0,
+        default_size: 10.0,
     },
     UiFontDescriptor {
         id: "pane_tab_title",
         label: "Pane tab title",
         subtitle: "Terminal and browser tab labels in pane headers",
         selector: ".limux-tab",
-        default_size: 12.0,
+        default_size: 11.0,
     },
     UiFontDescriptor {
         id: "pane_tab_status_icon",
         label: "Pane tab status icon",
         subtitle: "Attention and finished marker shown inside pane tabs",
         selector: ".limux-tab-status",
-        default_size: 10.0,
+        default_size: 8.0,
     },
     UiFontDescriptor {
         id: "pane_pin_icon",
@@ -121,14 +121,14 @@ pub const UI_FONT_DESCRIPTORS: &[UiFontDescriptor] = &[
         label: "Pane tab rename entry",
         subtitle: "Inline text field used while renaming a tab",
         selector: ".limux-tab-rename-entry",
-        default_size: 12.0,
+        default_size: 11.0,
     },
     UiFontDescriptor {
         id: "pane_action_icon",
         label: "Pane action icons",
         subtitle: "New tab, split, settings, close, and browser navigation icons in pane headers",
         selector: ".limux-pane-action image",
-        default_size: 16.0,
+        default_size: 12.0,
     },
     UiFontDescriptor {
         id: "pane_tab_close_icon",
@@ -142,7 +142,7 @@ pub const UI_FONT_DESCRIPTORS: &[UiFontDescriptor] = &[
         label: "Notification panel title",
         subtitle: "Header text in the notification panel",
         selector: ".limux-notification-panel-title",
-        default_size: 12.0,
+        default_size: 18.0,
     },
     UiFontDescriptor {
         id: "notification_panel_empty",
@@ -156,21 +156,21 @@ pub const UI_FONT_DESCRIPTORS: &[UiFontDescriptor] = &[
         label: "Notification status dot",
         subtitle: "Attention and finished status marker in notification rows",
         selector: ".limux-notification-status",
-        default_size: 10.0,
+        default_size: 8.0,
     },
     UiFontDescriptor {
         id: "notification_panel_workspace",
         label: "Notification workspace",
         subtitle: "Workspace label in notification rows",
         selector: ".limux-notification-workspace",
-        default_size: 11.0,
+        default_size: 10.0,
     },
     UiFontDescriptor {
         id: "notification_panel_message",
         label: "Notification message",
         subtitle: "Primary message text in notification rows",
         selector: ".limux-notification-message",
-        default_size: 12.0,
+        default_size: 13.0,
     },
     UiFontDescriptor {
         id: "notification_panel_detail",
@@ -741,8 +741,8 @@ mod tests {
 
         assert!(css.contains(".limux-tab { font-size: 24px; }"));
         assert!(css.contains(".limux-pin-icon { font-size: 20px; }"));
-        assert!(css.contains(".limux-tab-status { font-size: 10px; }"));
-        assert!(css.contains(".limux-tab-rename-entry { font-size: 12px; }"));
+        assert!(css.contains(".limux-tab-status { font-size: 8px; }"));
+        assert!(css.contains(".limux-tab-rename-entry { font-size: 11px; }"));
         assert!(css.contains(".limux-pane-action image { -gtk-icon-size: 18px; }"));
         assert!(css.contains(".limux-tab-close image { -gtk-icon-size: 11px; }"));
         assert!(UI_FONT_DESCRIPTORS

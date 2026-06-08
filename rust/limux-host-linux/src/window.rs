@@ -106,6 +106,7 @@ pub(crate) struct AppState {
     sidebar_handle: gtk::Box,
     new_ws_btn: gtk::Button,
     notification_button: gtk::Button,
+    notification_badge: gtk::Label,
     notification_records: Vec<NotificationRecord>,
     next_notification_id: u64,
     sidebar_animation: Option<adw::TimedAnimation>,
@@ -1249,10 +1250,10 @@ const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
 
 const BASE_CSS: &str = r#"
 .limux-host-entry {
-    background-color: alpha(@window_bg_color, 0.98);
+    background-color: alpha(@window_bg_color, 0.96);
     color: @window_fg_color;
-    border: 1px solid alpha(@window_fg_color, 0.16);
-    border-radius: 6px;
+    border: 1px solid alpha(@window_fg_color, 0.14);
+    border-radius: 7px;
     caret-color: currentColor;
 }
 .limux-host-entry:focus-within {
@@ -1269,9 +1270,16 @@ const BASE_CSS: &str = r#"
     color: alpha(@window_fg_color, 0.5);
 }
 .limux-sidebar {
-    background-color: @window_bg_color;
+    background-color: alpha(@window_bg_color, 0.98);
     color: @window_fg_color;
     border-right: 1px solid alpha(@window_fg_color, 0.08);
+}
+.limux-sidebar-header {
+    padding: 4px 6px 0 6px;
+}
+.limux-sidebar .navigation-sidebar {
+    background: transparent;
+    padding: 8px 0;
 }
 .limux-sidebar .navigation-sidebar > row {
     background: transparent;
@@ -1281,19 +1289,21 @@ const BASE_CSS: &str = r#"
     margin-right: 0;
 }
 .limux-sidebar-row-box {
-    padding: 8px 7px 8px 4px;
-    border-radius: 7px;
-    margin: 2px 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 1px 6px;
 }
 .limux-sidebar .navigation-sidebar > row:selected {
     background: transparent;
 }
 row:selected .limux-sidebar-row-box {
     background-color: alpha(@accent_bg_color, 0.18);
+    box-shadow: inset 0 0 0 1px alpha(@accent_bg_color, 0.16);
 }
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.72);
-    font-size: 15px;
+    font-size: 12.5px;
+    font-weight: 600;
 }
 row:selected .limux-ws-name {
     color: @window_fg_color;
@@ -1303,8 +1313,8 @@ row:selected .limux-ws-name {
     border: none;
     min-height: 0;
     min-width: 0;
-    padding: 0 4px;
-    font-size: 22px;
+    padding: 0 2px 0 4px;
+    font-size: 9px;
 }
 .limux-ws-star-btn:hover {
     color: alpha(@window_fg_color, 0.9);
@@ -1313,7 +1323,7 @@ row:selected .limux-ws-star-btn {
     color: alpha(@window_fg_color, 0.85);
 }
 .limux-ws-star-btn-active {
-    color: @accent_bg_color;
+    color: @accent_color;
 }
 .limux-ws-rename-entry {
     min-height: 0;
@@ -1321,33 +1331,43 @@ row:selected .limux-ws-star-btn {
     margin: 0;
 }
 .limux-notify-dot {
-    color: @accent_bg_color;
-    font-size: 10px;
-    min-width: 12px;
-    margin-right: 6px;
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    font-size: 9px;
+    font-weight: 600;
+    min-width: 16px;
+    min-height: 16px;
+    border-radius: 999px;
+    padding: 0;
+    margin-right: 8px;
 }
 .limux-notify-dot-hidden {
     color: transparent;
-    font-size: 10px;
-    min-width: 12px;
-    margin-right: 6px;
+    background-color: transparent;
+    font-size: 9px;
+    min-width: 16px;
+    min-height: 16px;
+    padding: 0;
+    margin-right: 8px;
 }
 .limux-notify-dot-attention {
-    color: @accent_bg_color;
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
 }
 .limux-notify-dot-finished {
-    color: rgb(46, 194, 126);
+    background-color: rgb(46, 194, 126);
+    color: rgba(255, 255, 255, 0.95);
 }
 .limux-notify-msg {
     color: alpha(@window_fg_color, 0.35);
-    font-size: 11px;
+    font-size: 10px;
 }
 .limux-notify-msg-unread {
-    color: alpha(@accent_bg_color, 0.9);
-    font-size: 11px;
+    color: alpha(@accent_color, 0.9);
+    font-size: 10px;
 }
 .limux-notify-msg-attention {
-    color: alpha(@accent_bg_color, 0.94);
+    color: alpha(@accent_color, 0.94);
     font-weight: 600;
 }
 .limux-notify-msg-finished {
@@ -1355,19 +1375,19 @@ row:selected .limux-ws-star-btn {
     font-weight: 600;
 }
 .limux-sidebar-row-unread {
-    background-color: alpha(@accent_bg_color, 0.16);
+    background-color: alpha(@accent_bg_color, 0.14);
     box-shadow: inset 3px 0 0 0 @accent_bg_color;
     border-radius: 6px;
 }
 .limux-sidebar-row-attention {
-    background-color: alpha(@accent_bg_color, 0.16);
+    background-color: alpha(@accent_bg_color, 0.14);
     box-shadow: inset 3px 0 0 0 @accent_bg_color;
-    border-radius: 7px;
+    border-radius: 6px;
 }
 .limux-sidebar-row-finished {
-    background-color: rgba(46, 194, 126, 0.14);
+    background-color: rgba(46, 194, 126, 0.13);
     box-shadow: inset 3px 0 0 0 rgb(46, 194, 126);
-    border-radius: 7px;
+    border-radius: 6px;
 }
 .limux-sidebar-row-unread .limux-ws-name {
     color: @window_fg_color;
@@ -1377,6 +1397,17 @@ row:selected .limux-ws-star-btn {
 .limux-sidebar-row-finished .limux-ws-name {
     color: @window_fg_color;
     font-weight: 700;
+}
+row:selected .limux-sidebar-row-box,
+row:selected .limux-sidebar-row-unread,
+row:selected .limux-sidebar-row-attention,
+row:selected .limux-sidebar-row-finished {
+    background-color: alpha(@accent_bg_color, 0.18);
+    box-shadow: inset 0 0 0 1px alpha(@accent_bg_color, 0.16);
+}
+row:selected .limux-notify-dot {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
 }
 .limux-drop-above .limux-sidebar-row-box {
     border-radius: 0;
@@ -1397,16 +1428,19 @@ row:selected .limux-ws-star-btn {
     color: alpha(@window_fg_color, 0.55);
     font-size: 11px;
     font-weight: 600;
-    letter-spacing: 1px;
+    letter-spacing: 0;
 }
 .limux-notification-button {
     background: transparent;
     color: alpha(@window_fg_color, 0.54);
     border: none;
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 4px;
     min-width: 28px;
     min-height: 28px;
+}
+.limux-notification-button image {
+    -gtk-icon-size: 16px;
 }
 .limux-notification-button:hover {
     background: alpha(@window_fg_color, 0.08);
@@ -1416,15 +1450,27 @@ row:selected .limux-ws-star-btn {
     color: @accent_color;
     background: alpha(@accent_bg_color, 0.12);
 }
+.limux-notification-badge {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 600;
+    min-width: 16px;
+    min-height: 16px;
+    padding: 0;
+    margin-top: -3px;
+    margin-right: -4px;
+}
 .limux-notification-panel {
     background-color: @popover_bg_color;
     color: @popover_fg_color;
-    min-width: 340px;
-    padding: 8px;
+    min-width: 380px;
+    padding: 16px;
 }
 .limux-notification-panel-title {
-    color: alpha(@popover_fg_color, 0.72);
-    font-size: 12px;
+    color: alpha(@popover_fg_color, 0.82);
+    font-size: 18px;
     font-weight: 700;
 }
 .limux-notification-empty {
@@ -1433,24 +1479,25 @@ row:selected .limux-ws-star-btn {
     padding: 16px;
 }
 .limux-notification-row {
-    padding: 8px;
-    border-radius: 7px;
+    padding: 12px;
+    border-radius: 10px;
+    margin: 4px 0;
 }
 .limux-notification-row:hover {
     background: alpha(@popover_fg_color, 0.08);
 }
 .limux-notification-row-unread {
-    background: alpha(@accent_bg_color, 0.10);
+    background: alpha(@accent_bg_color, 0.12);
 }
 .limux-notification-row-attention {
-    box-shadow: inset 3px 0 0 0 @accent_bg_color;
+    box-shadow: inset 3px 0 0 0 @accent_bg_color, inset 0 0 0 1px alpha(@accent_bg_color, 0.22);
 }
 .limux-notification-row-finished {
-    box-shadow: inset 3px 0 0 0 rgb(46, 194, 126);
+    box-shadow: inset 3px 0 0 0 rgb(46, 194, 126), inset 0 0 0 1px rgba(46, 194, 126, 0.22);
 }
 .limux-notification-status {
-    font-size: 10px;
-    min-width: 12px;
+    font-size: 8px;
+    min-width: 8px;
 }
 .limux-notification-status-attention {
     color: @accent_color;
@@ -1460,11 +1507,11 @@ row:selected .limux-ws-star-btn {
 }
 .limux-notification-workspace {
     color: alpha(@popover_fg_color, 0.48);
-    font-size: 11px;
+    font-size: 10px;
 }
 .limux-notification-message {
     color: @popover_fg_color;
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
 }
 .limux-notification-detail {
@@ -1507,17 +1554,19 @@ row:selected .limux-ws-star-btn {
 }
 .limux-ws-path {
     color: alpha(@window_fg_color, 0.3);
-    font-size: 12px;
+    font-size: 10px;
+    font-family: monospace;
 }
 .limux-ws-meta-row {
-    margin-left: 8px;
+    margin-left: 0;
 }
 .limux-ws-branch {
     background-color: alpha(@accent_bg_color, 0.13);
     color: alpha(@accent_color, 0.95);
     border-radius: 5px;
     padding: 1px 5px;
-    font-size: 11px;
+    font-size: 10px;
+    font-family: monospace;
     font-weight: 600;
 }
 .limux-ws-ports {
@@ -1525,7 +1574,8 @@ row:selected .limux-ws-star-btn {
     color: alpha(@window_fg_color, 0.58);
     border-radius: 5px;
     padding: 1px 5px;
-    font-size: 11px;
+    font-size: 10px;
+    font-family: monospace;
     font-weight: 600;
 }
 row:selected .limux-ws-path {
@@ -1691,12 +1741,22 @@ pub fn build_window(app: &adw::Application) {
         .build();
     sidebar_title_label.add_css_class("limux-sidebar-title");
 
-    let notification_button =
-        gtk::Button::from_icon_name("preferences-system-notifications-symbolic");
+    let notification_button = gtk::Button::new();
     notification_button.add_css_class("limux-notification-button");
     notification_button.set_tooltip_text(Some(
         &shortcuts.tooltip_text(ShortcutId::OpenNotificationPanel, "Notifications"),
     ));
+    let notification_icon = gtk::Image::from_icon_name("preferences-system-notifications-symbolic");
+    let notification_badge = gtk::Label::new(None);
+    notification_badge.add_css_class("limux-notification-badge");
+    notification_badge.set_halign(gtk::Align::End);
+    notification_badge.set_valign(gtk::Align::Start);
+    notification_badge.set_visible(false);
+    let notification_overlay = gtk::Overlay::new();
+    notification_overlay.set_child(Some(&notification_icon));
+    notification_overlay.add_overlay(&notification_badge);
+    notification_overlay.set_clip_overlay(&notification_badge, false);
+    notification_button.set_child(Some(&notification_overlay));
 
     let sidebar_title = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1704,6 +1764,7 @@ pub fn build_window(app: &adw::Application) {
         .margin_bottom(4)
         .margin_end(6)
         .build();
+    sidebar_title.add_css_class("limux-sidebar-header");
     sidebar_title.append(&sidebar_title_label);
     sidebar_title.append(&notification_button);
 
@@ -1791,6 +1852,7 @@ pub fn build_window(app: &adw::Application) {
         sidebar_handle: sidebar_handle.clone(),
         new_ws_btn: new_ws_btn.clone(),
         notification_button: notification_button.clone(),
+        notification_badge: notification_badge.clone(),
         notification_records: Vec::new(),
         next_notification_id: 1,
         sidebar_animation: None,
@@ -3000,13 +3062,28 @@ fn set_notification_button_unread(button: &gtk::Button, unread: bool) {
 }
 
 fn sync_notification_button_state(state: &AppState) {
-    set_notification_button_unread(
-        &state.notification_button,
+    let unread_count = state
+        .notification_records
+        .iter()
+        .filter(|record| record.unread)
+        .count();
+    set_notification_button_unread(&state.notification_button, unread_count > 0);
+    if unread_count > 0 {
         state
-            .notification_records
-            .iter()
-            .any(|record| record.unread),
-    );
+            .notification_badge
+            .set_label(&notification_badge_text(unread_count));
+        state.notification_badge.set_visible(true);
+    } else {
+        state.notification_badge.set_visible(false);
+    }
+}
+
+fn notification_badge_text(count: usize) -> String {
+    if count > 9 {
+        "9+".to_string()
+    } else {
+        count.to_string()
+    }
 }
 
 fn append_notification_record(state: &mut AppState, record: NotificationRecord) {
@@ -3106,6 +3183,7 @@ fn build_notification_record_row(record: &NotificationRecord) -> gtk::ListBoxRow
     let status = gtk::Label::builder()
         .label("\u{25CF}")
         .valign(gtk::Align::Start)
+        .margin_top(6)
         .build();
     status.add_css_class("limux-notification-status");
     status.add_css_class(record.kind.panel_status_class());
@@ -3131,7 +3209,7 @@ fn build_notification_record_row(record: &NotificationRecord) -> gtk::ListBoxRow
 
     let text = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
+        .spacing(6)
         .hexpand(true)
         .build();
     text.append(&workspace);
@@ -3149,7 +3227,7 @@ fn build_notification_record_row(record: &NotificationRecord) -> gtk::ListBoxRow
 
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .spacing(12)
         .build();
     row_box.add_css_class("limux-notification-row");
     row_box.add_css_class(record.kind.panel_row_class());
@@ -3371,7 +3449,7 @@ fn build_sidebar_row(
     gtk::Label,
     gtk::Label,
 ) {
-    let notify_dot = gtk::Label::builder().label("\u{25CF}").build();
+    let notify_dot = gtk::Label::builder().label("1").build();
     notify_dot.add_css_class("limux-notify-dot-hidden");
 
     let name_label = gtk::Label::builder()
@@ -3420,7 +3498,7 @@ fn build_sidebar_row(
 
     let meta_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(5)
+        .spacing(3)
         .build();
     meta_row.add_css_class("limux-ws-meta-row");
     meta_row.append(&path_label);
@@ -3433,13 +3511,12 @@ fn build_sidebar_row(
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .visible(false)
-        .margin_start(8)
         .build();
     notify_label.add_css_class("limux-notify-msg");
 
     let vbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
+        .spacing(4)
         .build();
     vbox.add_css_class("limux-sidebar-row-box");
     vbox.append(&top_row);
@@ -6685,11 +6762,15 @@ fn apply_workspace_notification_visuals(
     workspace: &Workspace,
     message: &str,
     kind: NotificationVisualKind,
+    unread_count: usize,
 ) {
     clear_workspace_notification_visuals(workspace);
     workspace
         .notify_dot
         .remove_css_class("limux-notify-dot-hidden");
+    workspace
+        .notify_dot
+        .set_label(&notification_badge_text(unread_count.max(1)));
     workspace.notify_dot.add_css_class("limux-notify-dot");
     workspace.notify_dot.add_css_class(kind.sidebar_dot_class());
 
@@ -6761,6 +6842,11 @@ fn mark_workspace_unread_with_message(
     let active_idx = s.active_idx;
     let window_active = s.window.is_active();
     let notifications = s.config.borrow().notifications;
+    let unread_count = s
+        .notification_records
+        .iter()
+        .filter(|record| record.target.workspace_id == ws_id && record.unread)
+        .count();
     if let Some((idx, ws)) = s
         .workspaces
         .iter_mut()
@@ -6783,7 +6869,7 @@ fn mark_workspace_unread_with_message(
 
         if should_show_workspace_unread_marker(workspace_is_active, source_focused) {
             ws.unread = true;
-            apply_workspace_notification_visuals(ws, message, kind);
+            apply_workspace_notification_visuals(ws, message, kind, unread_count);
         }
 
         return desktop_request;
@@ -7145,6 +7231,8 @@ mod tests {
         assert!(!BASE_CSS.contains(":root"));
         assert!(!BASE_CSS.contains("@media"));
         assert!(!BASE_CSS.contains("var("));
+        assert!(!BASE_CSS.contains("limux_cmux_accent"));
+        assert!(!BASE_CSS.contains("rgb(0, 145, 255)"));
         assert!(BASE_CSS.contains(".limux-host-entry"));
         assert!(BASE_CSS.contains(".limux-host-entry text"));
         assert!(BASE_CSS.contains(".limux-host-entry text placeholder"));
@@ -7260,7 +7348,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_workspace_rows_remove_theme_horizontal_insets() {
+    fn sidebar_workspace_rows_use_cmux_metrics_without_theme_insets() {
         let row_rule = BASE_CSS
             .split(".limux-sidebar .navigation-sidebar > row {")
             .nth(1)
@@ -7276,7 +7364,20 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("sidebar row box CSS rule");
-        assert!(row_box_rule.contains("margin: 2px 0;"));
+        assert!(row_box_rule.contains("padding: 8px 10px;"));
+        assert!(row_box_rule.contains("border-radius: 6px;"));
+        assert!(row_box_rule.contains("margin: 1px 6px;"));
+    }
+
+    #[test]
+    fn sidebar_selected_row_uses_system_accent_tint() {
+        let selected_rule = BASE_CSS
+            .split("row:selected .limux-sidebar-row-box {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("selected sidebar row CSS rule");
+        assert!(selected_rule.contains("background-color: alpha(@accent_bg_color, 0.18);"));
+        assert!(!selected_rule.contains("background-color: @accent_bg_color;"));
     }
 
     #[test]

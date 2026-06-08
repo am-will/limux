@@ -333,17 +333,17 @@ pub const PANE_CSS: &str = r#"
     background-color: @window_bg_color;
     color: @window_fg_color;
     border-bottom: 1px solid alpha(@window_fg_color, 0.08);
-    min-height: 30px;
+    min-height: 28px;
     padding: 0 2px;
 }
 .limux-tab {
     background: none;
     border: none;
     border-radius: 4px 4px 0 0;
-    padding: 4px 4px 4px 10px;
+    padding: 4px 4px 4px 8px;
     color: alpha(@window_fg_color, 0.5);
     min-height: 0;
-    font-size: 12px;
+    font-size: 11px;
 }
 .limux-tab:hover {
     color: alpha(@window_fg_color, 0.72);
@@ -358,7 +358,7 @@ pub const PANE_CSS: &str = r#"
     font-weight: 600;
 }
 .limux-tab-status {
-    font-size: 10px;
+    font-size: 8px;
     min-width: 10px;
     margin-right: 3px;
 }
@@ -393,11 +393,14 @@ pub const PANE_CSS: &str = r#"
 .limux-pane-action {
     background: none;
     border: none;
-    border-radius: 4px;
-    padding: 4px 5px;
+    border-radius: 6px;
+    padding: 4px;
     min-height: 0;
     min-width: 0;
     color: alpha(@window_fg_color, 0.4);
+}
+.limux-pane-action image {
+    -gtk-icon-size: 12px;
 }
 .limux-pane-action:hover {
     background: alpha(@window_fg_color, 0.08);
@@ -424,8 +427,8 @@ pub const PANE_CSS: &str = r#"
 .limux-split-btn {
     background: none;
     border: none;
-    border-radius: 4px;
-    padding: 4px 5px;
+    border-radius: 6px;
+    padding: 4px;
     min-height: 0;
     min-width: 0;
 }
@@ -439,15 +442,23 @@ pub const PANE_CSS: &str = r#"
 .limux-tab-rename-entry {
     padding: 1px 4px;
     min-height: 0;
-    font-size: 12px;
+    font-size: 11px;
 }
 .limux-browser-url-entry {
-    min-height: 0;
+    min-height: 18px;
     font-size: 12px;
 }
 .limux-browser-search-entry {
-    min-height: 0;
+    min-height: 18px;
     font-size: 12px;
+}
+.limux-browser-nav-button {
+    min-width: 26px;
+    min-height: 26px;
+    padding: 7px;
+}
+.limux-browser-nav-button image {
+    -gtk-icon-size: 12px;
 }
 .limux-browser,
 .limux-browser-web-view {
@@ -3457,6 +3468,9 @@ fn create_browser_widget(
     let back_btn = icon_button("go-previous-symbolic", "Back");
     let fwd_btn = icon_button("go-next-symbolic", "Forward");
     let reload_btn = icon_button("view-refresh-symbolic", "Reload");
+    back_btn.add_css_class("limux-browser-nav-button");
+    fwd_btn.add_css_class("limux-browser-nav-button");
+    reload_btn.add_css_class("limux-browser-nav-button");
 
     let nav_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     nav_bar.add_css_class("limux-pane-header");
@@ -3715,7 +3729,9 @@ mod tests {
         assert!(PANE_CSS.contains(".limux-browser-search-entry"));
         #[cfg(feature = "webkit")]
         assert!(PANE_CSS.contains(BROWSER_WEB_VIEW_CSS_CLASS));
-        assert!(!PANE_CSS.contains("border: 1px solid rgba(0, 145, 255, 0.5);"));
+        assert!(PANE_CSS.contains("@accent_bg_color"));
+        assert!(!PANE_CSS.contains("limux_cmux_accent"));
+        assert!(!PANE_CSS.contains("rgb(0, 145, 255)"));
     }
 
     #[test]

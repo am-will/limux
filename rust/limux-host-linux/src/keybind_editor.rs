@@ -50,7 +50,7 @@ pub const KEYBIND_EDITOR_CSS: &str = r#"
     opacity: 0.7;
 }
 .limux-keybind-capture {
-    min-width: 168px;
+    min-width: 160px;
     padding: 8px 12px;
 }
 .limux-keybind-capture-listening {
@@ -411,7 +411,7 @@ fn validation_error_message(err: &ShortcutConfigError) -> String {
 mod tests {
     use super::{
         binding_button_label, capture_outcome_for_key_event, validation_error_message,
-        CaptureOutcome,
+        CaptureOutcome, KEYBIND_EDITOR_CSS,
     };
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, ShortcutConfigError, ShortcutId,
@@ -454,6 +454,13 @@ mod tests {
             validation_error_message(&err),
             "Use Ctrl, Alt, or Cmd together with another key."
         );
+    }
+
+    #[test]
+    fn keybind_editor_css_uses_system_accent() {
+        assert!(KEYBIND_EDITOR_CSS.contains("@accent_bg_color"));
+        assert!(!KEYBIND_EDITOR_CSS.contains("limux_cmux_accent"));
+        assert!(!KEYBIND_EDITOR_CSS.contains("rgb(0, 145, 255)"));
     }
 
     #[test]
