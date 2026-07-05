@@ -1941,7 +1941,13 @@ fn build_tab_button_from_label(
         let content_stack = internals.content_stack.clone();
         let tab_state = internals.tab_state.clone();
         let callbacks = internals.callbacks.clone();
-        click.connect_pressed(move |_, _, _, _| {
+        let tab_button = tab_btn.clone();
+        click.connect_pressed(move |gesture, _, _, _| {
+            if let Some(entry) = find_tab_rename_entry(&tab_button) {
+                focus_tab_rename_entry(&entry);
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
             (callbacks.on_state_changed)();
         });
@@ -1962,8 +1968,14 @@ fn build_tab_button_from_label(
             pin_icon: pin_icon.clone(),
         };
         let tab_button = tab_btn.clone();
-        right_click.connect_pressed(move |_, _, _, _| {
+        right_click.connect_pressed(move |gesture, _, _, _| {
+            if let Some(entry) = find_tab_rename_entry(&tab_button) {
+                focus_tab_rename_entry(&entry);
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             show_tab_context_menu(&tab_button, &tab_id, &context);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
         });
     }
     tab_btn.add_controller(right_click);
@@ -1973,7 +1985,14 @@ fn build_tab_button_from_label(
     {
         let tab_id = tab_id.to_string();
         let pane_id = internals.pane_id;
-        drag_source.connect_prepare(move |_src, _x, _y| {
+        drag_source.connect_prepare(move |src, _x, _y| {
+            if src
+                .widget()
+                .and_then(|widget| find_tab_rename_entry(&widget))
+                .is_some()
+            {
+                return None;
+            }
             let payload = glib::Value::from(&TabDragPayload::new(pane_id, &tab_id).encode());
             Some(gtk::gdk::ContentProvider::for_value(&payload))
         });
@@ -2055,7 +2074,13 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         let callbacks = context.callbacks.clone();
         rename_btn.connect_clicked(move |_| {
             menu_ref.popdown();
-            show_rename_dialog(&lbl, &state, &tid, &callbacks);
+            let lbl = lbl.clone();
+            let state = state.clone();
+            let tid = tid.clone();
+            let callbacks = callbacks.clone();
+            glib::idle_add_local_once(move || {
+                show_rename_dialog(&lbl, &state, &tid, &callbacks);
+            });
         });
     }
 
@@ -2133,6 +2158,35 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu.popup();
 }
 
+fn find_tab_rename_entry<W: glib::object::IsA<gtk::Widget>>(root: &W) -> Option<gtk::Entry> {
+    fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
+        if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+            if entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS) {
+                return Some(entry.clone());
+            }
+        }
+
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(entry) = find_entry(&current) {
+                return Some(entry);
+            }
+            child = current.next_sibling();
+        }
+
+        None
+    }
+
+    find_entry(root.as_ref())
+}
+
+fn focus_tab_rename_entry(entry: &gtk::Entry) {
+    if !entry.has_focus() {
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    }
+}
+
 fn show_rename_dialog(
     label: &gtk::Label,
     tab_state: &Rc<RefCell<TabState>>,
@@ -2147,6 +2201,15 @@ fn show_rename_dialog(
         return;
     };
 
+    if let Some(entry) = find_tab_rename_entry(&parent) {
+        parent.set_can_target(true);
+        focus_tab_rename_entry(&entry);
+        return;
+    }
+
+    let parent_was_targetable = parent.can_target();
+    parent.set_can_target(true);
+
     let entry = gtk::Entry::builder()
         .text(&current_name)
         .width_chars(15)
@@ -2158,8 +2221,7 @@ fn show_rename_dialog(
     label.set_visible(false);
     // Insert entry before the close button
     parent.insert_child_after(&entry, Some(label));
-    entry.grab_focus();
-    entry.select_region(0, -1);
+    focus_tab_rename_entry(&entry);
 
     // On activate (Enter) or focus-out, commit rename
     let lbl = label.clone();
@@ -2191,6 +2253,7 @@ fn show_rename_dialog(
             }
             lbl.set_visible(true);
             parent.remove(entry);
+            parent.set_can_target(parent_was_targetable);
             (callbacks.on_state_changed)();
         }
     };

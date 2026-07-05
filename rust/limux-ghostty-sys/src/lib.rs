@@ -15,6 +15,17 @@ pub type ghostty_app_t = *mut c_void;
 pub type ghostty_config_t = *mut c_void;
 pub type ghostty_surface_t = *mut c_void;
 
+extern "C" {
+    fn gladLoaderLoadGLContext(context: *mut c_void) -> c_int;
+    fn gladLoaderUnloadGLContext(context: *mut c_void);
+}
+
+// Keep cc-built glad objects in final links; libghostty.so references them.
+#[used]
+static GLAD_LOAD_LINK_ANCHOR: unsafe extern "C" fn(*mut c_void) -> c_int = gladLoaderLoadGLContext;
+#[used]
+static GLAD_UNLOAD_LINK_ANCHOR: unsafe extern "C" fn(*mut c_void) = gladLoaderUnloadGLContext;
+
 // -------------------------------------------------------------------
 // Enums
 // -------------------------------------------------------------------
