@@ -180,7 +180,7 @@ impl TerminalHandle {
             return false;
         };
 
-        let press = translate_key_event(
+        let mut press = translate_key_event(
             GHOSTTY_ACTION_PRESS,
             Some(self.gl_area.upcast_ref()),
             None,
@@ -196,6 +196,14 @@ impl TerminalHandle {
             0,
             modifier,
         );
+
+        // translate_key_event leaves `text` null, but Ghostty relies on it to
+        // write characters to the PTY. Populate it for the control-socket path
+        // so `send-key Return` (and printable keys) actually reach the shell.
+        let key_text = control_socket_key_text(keyval);
+        if let Some(ref text) = key_text {
+            press.text = text.as_ptr();
+        }
 
         unsafe {
             ghostty_surface_key(surface, press);
@@ -2082,6 +2090,27 @@ fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {
     let mut buf = [0u8; 4];
     let s = ch.encode_utf8(&mut buf);
     CString::new(s.as_bytes()).ok()
+}
+
+/// Text bytes to hand Ghostty for a synthetic key coming from the control
+/// socket. `key_event_text` drops control characters, so map the common
+/// control keys (Return, Tab, Escape, Backspace) to their PTY bytes and fall
+/// back to the printable-character text otherwise.
+fn control_socket_key_text(keyval: gtk::gdk::Key) -> Option<CString> {
+    use gtk::gdk::Key;
+    if keyval == Key::Return || keyval == Key::KP_Enter {
+        return CString::new("\r").ok();
+    }
+    if keyval == Key::Tab {
+        return CString::new("\t").ok();
+    }
+    if keyval == Key::Escape {
+        return CString::new("\x1b").ok();
+    }
+    if keyval == Key::BackSpace {
+        return CString::new("\x7f").ok();
+    }
+    key_event_text(keyval)
 }
 
 fn keyval_unicode_unshifted(
