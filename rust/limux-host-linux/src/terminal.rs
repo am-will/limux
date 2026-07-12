@@ -180,12 +180,20 @@ impl TerminalHandle {
             return false;
         };
 
+        // Ghostty resolves the *physical* key from the hardware keycode; it does
+        // not fall back to the keyval. Synthesizing an event with keycode 0 makes
+        // ghostty see an unidentified key and drop it silently — the caller gets a
+        // successful reply and the PTY never sees the keystroke. Map the keyval
+        // back to a real keycode through the display's keymap so control-socket
+        // keys are encoded exactly like keys typed by a human.
+        let keycode = keycode_for_keyval(self.gl_area.upcast_ref(), keyval);
+
         let press = translate_key_event(
             GHOSTTY_ACTION_PRESS,
             Some(self.gl_area.upcast_ref()),
             None,
             keyval,
-            0,
+            keycode,
             modifier,
         );
         let release = translate_key_event(
@@ -193,7 +201,7 @@ impl TerminalHandle {
             Some(self.gl_area.upcast_ref()),
             None,
             keyval,
-            0,
+            keycode,
             modifier,
         );
 
@@ -2071,6 +2079,21 @@ fn translate_key_event(
         unshifted_codepoint: unshifted,
         composing: false,
     }
+}
+
+/// Map a keyval back to a hardware keycode via the display's keymap.
+///
+/// Real key events arrive from GTK with the keycode already filled in. Keys
+/// injected through the control socket only have a keyval (parsed from a string
+/// like `enter`), so we have to ask the keymap for the physical key that
+/// produces it. Returns 0 when the keyval isn't on the current layout, which
+/// preserves the previous behaviour rather than inventing a wrong key.
+fn keycode_for_keyval(widget: &gtk::Widget, keyval: gtk::gdk::Key) -> u32 {
+    widget
+        .display()
+        .map_keyval(keyval)
+        .and_then(|keys| keys.first().map(|key| key.keycode()))
+        .unwrap_or(0)
 }
 
 fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {

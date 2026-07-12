@@ -199,7 +199,7 @@ fn parse_global_args() -> Result<GlobalOptions> {
 
 fn print_help() {
     println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
+        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  select-workspace --workspace <id|ref>\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
     );
 }
 
@@ -2330,6 +2330,23 @@ async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Val
         .await
 }
 
+/// `limux select-workspace --workspace <id|ref>` — bring a workspace to the front.
+///
+/// The host has always implemented `workspace.select`; it just wasn't reachable
+/// from the CLI. It needs to be, because a pane only realizes its ghostty surface
+/// once its workspace is displayed. Splits made in a background workspace stay
+/// unrealized — `surface-health` reports `healthy=false` and `send-key` fails —
+/// until something selects it. Without this verb a purely CLI-driven fleet cannot
+/// bring its own workspace forward, so it can never start.
+async fn run_select_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .ok_or_else(|| anyhow!("select-workspace requires --workspace <id|ref>"))?;
+    client
+        .call("workspace.select", json!({ "workspace_id": workspace }))
+        .await
+}
+
 async fn run_sidebar_state(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
@@ -3447,6 +3464,14 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             } else {
                 let handle = handle_from_payload(&payload, "workspace_id", "workspace_ref");
                 CommandOutput::Text(format!("OK {}", handle))
+            }
+        }
+        "select-workspace" => {
+            let payload = run_select_workspace(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
             }
         }
         "close-workspace" => {
