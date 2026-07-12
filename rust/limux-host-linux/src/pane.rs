@@ -765,6 +765,85 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
     true
 }
 
+/// Give a tab an explicit title, overriding the process-derived one.
+///
+/// The GUI already tracks `custom_name` per tab (it survives into the session
+/// snapshot); nothing could set it from the control socket, which is why
+/// `rename-tab` and `tab-action` were dead ends.
+pub fn rename_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str, title: &str) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let Some(entry) = tab_state.tabs.iter_mut().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        // An empty title clears the override and hands the tab back to the
+        // process-derived title, rather than pinning it to a blank label.
+        entry.custom_name = None;
+    } else {
+        entry.custom_name = Some(trimmed.to_string());
+        entry.title_label.set_text(trimmed);
+    }
+    true
+}
+
+/// Pin or unpin a tab. Pinned tabs refuse to close (see `close_tab_in_pane`).
+pub fn set_tab_pinned_in_pane(pane_widget: &gtk::Widget, tab_id: &str, pinned: bool) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let Some(entry) = tab_state.tabs.iter_mut().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+
+    entry.pinned = pinned;
+    true
+}
+
+/// Resolve a surface hint to the pane that owns it and the tab inside it.
+///
+/// Accepts the composite form (`3:terminal-0`, with or without a `surface:`
+/// prefix) or a bare tab id. `None` resolves to the first pane's active tab,
+/// matching how `terminal_handle_for_surface` falls back.
+///
+/// Returns `(pane widget, pane id, tab id)`.
+pub fn locate_surface_in_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<(gtk::Widget, u32, String)> {
+    for internals in pane_internals_for_root(root) {
+        let pane_id = internals.pane_id;
+        let tab_state = internals.tab_state.borrow();
+
+        let matched = match surface_hint {
+            Some(hint) => tab_state.tabs.iter().find(|entry| {
+                surface_hint_matches(&composite_surface_id(pane_id, &entry.id), &entry.id, hint)
+            }),
+            None => tab_state
+                .active_tab
+                .as_deref()
+                .and_then(|active| tab_state.tabs.iter().find(|entry| entry.id == active))
+                .or_else(|| tab_state.tabs.first()),
+        };
+
+        if let Some(entry) = matched {
+            let tab_id = entry.id.clone();
+            drop(tab_state);
+            let widget = find_pane_widget_by_id(pane_id)?;
+            return Some((widget, pane_id, tab_id));
+        }
+    }
+
+    None
+}
+
 fn normalize_surface_hint(raw: &str) -> &str {
     raw.trim()
         .strip_prefix("surface:")

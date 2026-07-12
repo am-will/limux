@@ -199,7 +199,7 @@ fn parse_global_args() -> Result<GlobalOptions> {
 
 fn print_help() {
     println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  select-workspace --workspace <id|ref>\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
+        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  select-workspace --workspace <id|ref>\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>] [--pane <id|ref>] [--type <terminal|browser>] [--url <url>]\n  close-surface [--workspace <id|ref>] [--surface <id|ref>]\n  focus-surface [--workspace <id|ref>] [--surface <id|ref>]\n  focus-pane [--workspace <id|ref>] [--pane <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
     );
 }
 
@@ -2330,6 +2330,73 @@ async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Val
         .await
 }
 
+/// `limux close-surface [--workspace <id|ref>] [--surface <id|ref>]`
+///
+/// Closes a single tab. Until now `close-workspace` was the only teardown verb
+/// limux had, so an orchestrator could not reclaim one pane without destroying
+/// the whole workspace.
+async fn run_close_surface(client: &mut Client, args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    insert_surface_scope(&mut params, args);
+    client.call("surface.close", Value::Object(params)).await
+}
+
+/// `limux focus-surface [--workspace <id|ref>] [--surface <id|ref>]`
+async fn run_focus_surface(client: &mut Client, args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    insert_surface_scope(&mut params, args);
+    client.call("surface.focus", Value::Object(params)).await
+}
+
+/// `limux focus-pane [--workspace <id|ref>] [--pane <id|ref>]`
+async fn run_focus_pane(client: &mut Client, args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    if let Some(workspace) = workspace_scope(args) {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    if let Some(pane) = parse_opt(args, "--pane").filter(|s| !s.is_empty()) {
+        params.insert("pane_id".to_string(), Value::String(pane));
+    }
+    client.call("pane.focus", Value::Object(params)).await
+}
+
+/// `limux new-surface [--workspace <id|ref>] [--pane <id|ref>] [--type terminal|browser] [--url <url>]`
+///
+/// Opens a new tab inside an existing pane. Previously this returned
+/// `-32601: unknown method: surface.create` — the CLI verb existed with no
+/// backend behind it.
+async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    if let Some(workspace) = workspace_scope(args) {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    if let Some(pane) = parse_opt(args, "--pane").filter(|s| !s.is_empty()) {
+        params.insert("pane_id".to_string(), Value::String(pane));
+    }
+    if let Some(kind) = parse_opt(args, "--type").filter(|s| !s.is_empty()) {
+        params.insert("type".to_string(), Value::String(kind));
+    }
+    if let Some(url) = parse_opt(args, "--url").filter(|s| !s.is_empty()) {
+        params.insert("url".to_string(), Value::String(url));
+    }
+    client.call("surface.create", Value::Object(params)).await
+}
+
+fn workspace_scope(args: &[String]) -> Option<String> {
+    parse_opt(args, "--workspace")
+        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .filter(|s| !s.is_empty())
+}
+
+fn insert_surface_scope(params: &mut Map<String, Value>, args: &[String]) {
+    if let Some(workspace) = workspace_scope(args) {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    if let Some(surface) = parse_opt(args, "--surface").filter(|s| !s.is_empty()) {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
+}
+
 /// `limux select-workspace --workspace <id|ref>` — bring a workspace to the front.
 ///
 /// The host has always implemented `workspace.select`; it just wasn't reachable
@@ -2394,11 +2461,6 @@ async fn run_sidebar_state(client: &mut Client, args: &[String]) -> Result<Value
         "cwd": cwd,
         "git_branch": git_branch,
     }))
-}
-
-async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace");
-    call_in_workspace_scope(client, workspace, "surface.create", json!({})).await
 }
 
 fn env_opt(name: &str) -> Option<String> {
@@ -3464,6 +3526,30 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             } else {
                 let handle = handle_from_payload(&payload, "workspace_id", "workspace_ref");
                 CommandOutput::Text(format!("OK {}", handle))
+            }
+        }
+        "close-surface" => {
+            let payload = run_close_surface(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "focus-surface" => {
+            let payload = run_focus_surface(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "focus-pane" => {
+            let payload = run_focus_pane(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
             }
         }
         "select-workspace" => {
