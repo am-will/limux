@@ -4428,18 +4428,20 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             // A pane hint addresses the pane directly; without one we open the
             // tab in whichever pane owns the active surface.
             let pane_widget = match pane_hint.as_deref() {
+                // Root-scoped: this request named a workspace, so it must not reach a
+                // pane in a different one.
                 Some(hint) => hint
                     .trim()
                     .trim_start_matches("pane:")
                     .parse::<u32>()
                     .ok()
-                    .and_then(pane::find_pane_widget_by_id),
+                    .and_then(|id| pane::find_pane_widget_in_root(&root, id)),
                 None => pane::locate_surface_in_root(&root, None).map(|(widget, _, _)| widget),
             };
 
             let Some(pane_widget) = pane_widget else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
-                    "pane not found",
+                    "pane not found in this workspace",
                 )));
                 return;
             };
@@ -4520,6 +4522,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
+            // Same as focus-pane: focus cannot land on a workspace that is not on
+            // screen. Bring it forward rather than reporting a success that did not
+            // happen.
+            let selected = state.borrow().active_idx == index;
+            if !selected {
+                select_workspace_by_index(state, index);
+            }
+
             pane::activate_tab_in_pane(&pane_widget, &tab_id);
             pane::focus_active_tab_in_pane(&pane_widget);
 
@@ -4549,17 +4559,30 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .trim_start_matches("pane:")
                     .parse::<u32>()
                     .ok()
-                    .and_then(|id| pane::find_pane_widget_by_id(id).map(|widget| (widget, id))),
+                    // Root-scoped: a request that names a workspace must not resolve a
+                    // pane living in a different one.
+                    .and_then(|id| {
+                        pane::find_pane_widget_in_root(&root, id).map(|widget| (widget, id))
+                    }),
                 None => pane::locate_surface_in_root(&root, None)
                     .map(|(widget, pane_id, _)| (widget, pane_id)),
             };
 
             let Some((pane_widget, pane_id)) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
-                    "pane not found",
+                    "pane not found in this workspace",
                 )));
                 return;
             };
+
+            // Focusing a pane in a workspace that is not on screen cannot move visible
+            // focus -- the pane is not displayed. Reporting `ok: true` and changing
+            // nothing is the exact class of silent success this bridge keeps producing,
+            // so bring the workspace forward first and make the call mean what it says.
+            let selected = state.borrow().active_idx == index;
+            if !selected {
+                select_workspace_by_index(state, index);
+            }
 
             pane::focus_active_tab_in_pane(&pane_widget);
 
@@ -4567,6 +4590,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 "pane_id": pane_id,
                 "pane_ref": pane_ref(pane_id),
                 "ok": true,
+                // Say so, rather than leaving the caller to wonder why their sidebar moved.
+                "selected_workspace": !selected,
             })));
         }
         ControlCommand::TabAction {
@@ -4596,10 +4621,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let normalized = action.to_ascii_lowercase().replace('-', "_");
             let applied = match normalized.as_str() {
                 "rename" | "set_title" => {
+                    // An *absent* title is an error; an *empty* one is a request to
+                    // clear the custom name and fall back to the process-derived title.
                     let Some(title) = title.as_deref() else {
                         let _ =
                             reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
-                                "rename requires title",
+                                "rename requires title (pass an empty title to clear a \
+                                 custom name)",
                             )));
                         return;
                     };
@@ -4624,6 +4652,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     "tab action rejected",
                 )));
                 return;
+            }
+
+            // Persist. `custom_name` and `pinned` both live in session.json, and the
+            // GUI's own paths save after mutating them -- the socket path did not, so
+            // a rename or pin made over the socket vanished on the next restart while
+            // reporting success.
+            if matches!(
+                normalized.as_str(),
+                "rename" | "set_title" | "pin" | "unpin" | "close"
+            ) {
+                request_session_save(state);
             }
 
             let _ = reply.send(Ok(serde_json::json!({
@@ -5051,6 +5090,25 @@ fn close_workspace_by_id_internal(
     if persist {
         request_session_save(state);
     }
+}
+
+/// Select a workspace by index and sync the sidebar selection.
+///
+/// The sidebar row must be selected too, or the list keeps highlighting whatever
+/// was there before and the UI disagrees with itself about which workspace is live.
+fn select_workspace_by_index(state: &State, index: usize) {
+    let (row, sidebar_list) = {
+        let app_state = state.borrow();
+        let Some(workspace) = app_state.workspaces.get(index) else {
+            return;
+        };
+        (
+            workspace.sidebar_row.clone(),
+            app_state.sidebar_list.clone(),
+        )
+    };
+    switch_workspace(state, index);
+    sidebar_list.select_row(Some(&row));
 }
 
 fn switch_workspace(state: &State, idx: usize) {

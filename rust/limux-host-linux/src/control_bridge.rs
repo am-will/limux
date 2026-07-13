@@ -746,7 +746,15 @@ fn handle_method(
                     target,
                     surface_hint: optional_string(params, &["surface_id", "tab_id"]),
                     action,
-                    title: optional_string(params, &["title"]),
+                    // NOT `optional_string`: it discards empty strings, which would make
+                    // an explicit `--title ""` indistinguishable from no title at all.
+                    // An empty title is a real request -- it clears a custom name and
+                    // hands the tab back to its process-derived title -- so the absent
+                    // case and the empty case must stay distinguishable.
+                    title: params
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     reply,
                 },
                 rx,
