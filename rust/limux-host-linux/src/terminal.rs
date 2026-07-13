@@ -180,20 +180,48 @@ impl TerminalHandle {
             return false;
         };
 
-        let press = translate_key_event(
+        // A key needs BOTH halves, and supplying only one drops it silently.
+        //
+        // `keycode` — ghostty resolves the *physical* key from the hardware keycode
+        // and does not fall back to the keyval. With `keycode: 0` it sees an
+        // unidentified key and drops the event, so Enter, arrows, F-keys and
+        // ctrl-chords never reach the PTY.
+        //
+        // `text` — ghostty writes ordinary printable input from the text field, not
+        // from the keycode (see the comment on the GTK key controller below: "Ghostty
+        // uses the text field for actual character input and the keycode for
+        // bindings"). With `text` null, `send-key a` is encoded as a keypress that
+        // produces no character, so it too vanishes.
+        //
+        // The GTK path gets `text` from the input method; a socket-injected key has
+        // no IM behind it, so derive it here the same way GTK's fallback does.
+        // `key_event_text` returns None for control characters, which is what we want:
+        // Enter and ctrl-chords must be *encoded* by ghostty from the key + mods, not
+        // written as literal bytes.
+        let keycode = keycode_for_keyval(self.gl_area.upcast_ref(), keyval);
+        let text = key_event_text(keyval);
+
+        let mut press = translate_key_event(
             GHOSTTY_ACTION_PRESS,
             Some(self.gl_area.upcast_ref()),
             None,
             keyval,
-            0,
+            keycode,
             modifier,
         );
+        // The CString must outlive the ghostty call below; `text` owns it until the
+        // end of this function.
+        if let Some(text) = text.as_ref() {
+            press.text = text.as_ptr();
+        }
+
+        // Release carries no text, matching the GTK controller.
         let release = translate_key_event(
             GHOSTTY_ACTION_RELEASE,
             Some(self.gl_area.upcast_ref()),
             None,
             keyval,
-            0,
+            keycode,
             modifier,
         );
 
@@ -201,6 +229,7 @@ impl TerminalHandle {
             ghostty_surface_key(surface, press);
             ghostty_surface_key(surface, release);
         }
+        drop(text);
         true
     }
 
@@ -2073,6 +2102,21 @@ fn translate_key_event(
     }
 }
 
+/// Map a keyval back to a hardware keycode via the display's keymap.
+///
+/// Real key events arrive from GTK with the keycode already filled in. Keys
+/// injected through the control socket only have a keyval (parsed from a string
+/// like `enter`), so we have to ask the keymap for the physical key that
+/// produces it. Returns 0 when the keyval isn't on the current layout, which
+/// preserves the previous behaviour rather than inventing a wrong key.
+fn keycode_for_keyval(widget: &gtk::Widget, keyval: gtk::gdk::Key) -> u32 {
+    widget
+        .display()
+        .map_keyval(keyval)
+        .and_then(|keys| keys.first().map(|key| key.keycode()))
+        .unwrap_or(0)
+}
+
 fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {
     let ch = keyval.to_unicode()?;
     if ch.is_control() {
@@ -2367,6 +2411,53 @@ mod tests {
         assert_eq!(ctrl_shift_h.as_deref(), Some("H"));
         assert_eq!(alt_shift_gt.as_deref(), Some(">"));
         assert!(key_event_text(gtk::gdk::Key::BackSpace).is_none());
+    }
+
+    /// The contract `send-key` depends on, in one place.
+    ///
+    /// A socket-injected key needs BOTH the hardware keycode and, for printable
+    /// input, the text field. Supplying only one drops the key silently:
+    ///
+    ///   * keycode only -> `send-key a` returns OK and writes nothing.
+    ///   * text only    -> Enter/arrows/ctrl-chords cannot be encoded at all.
+    ///
+    /// `key_event_text` is what decides which keys carry text, so pin its behaviour
+    /// for each of the three classes.
+    #[test]
+    fn send_key_text_is_supplied_for_printables_and_withheld_from_control_keys() {
+        // Printable: ghostty writes these from the text field.
+        for (key, expected) in [
+            (gtk::gdk::Key::a, "a"),
+            (gtk::gdk::Key::A, "A"),
+            (gtk::gdk::Key::_1, "1"),
+            (gtk::gdk::Key::space, " "),
+        ] {
+            let text = key_event_text(key).and_then(|s| s.into_string().ok());
+            assert_eq!(
+                text.as_deref(),
+                Some(expected),
+                "printable key must carry text or it is dropped"
+            );
+        }
+
+        // Control keys: text must be WITHHELD so ghostty encodes them from the
+        // key + mods. Writing "\r" as literal text instead of letting ghostty encode
+        // Return is how you break the kitty keyboard protocol.
+        for key in [
+            gtk::gdk::Key::Return,
+            gtk::gdk::Key::Tab,
+            gtk::gdk::Key::Escape,
+            gtk::gdk::Key::BackSpace,
+        ] {
+            assert!(
+                key_event_text(key).is_none(),
+                "{key:?} must be encoded by ghostty, not written as literal text"
+            );
+        }
+
+        // Non-textual keys have no unicode at all.
+        assert!(key_event_text(gtk::gdk::Key::Up).is_none());
+        assert!(key_event_text(gtk::gdk::Key::F1).is_none());
     }
 
     #[test]

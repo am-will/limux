@@ -4410,6 +4410,269 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(Ok(payload));
         }
+        ControlCommand::CreateSurface {
+            target,
+            pane_hint,
+            browser,
+            url,
+            reply,
+        } => {
+            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let root = state.borrow().workspaces[index].root.clone();
+            // A pane hint addresses the pane directly; without one we open the
+            // tab in whichever pane owns the active surface.
+            let pane_widget = match pane_hint.as_deref() {
+                // Root-scoped: this request named a workspace, so it must not reach a
+                // pane in a different one.
+                Some(hint) => hint
+                    .trim()
+                    .trim_start_matches("pane:")
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|id| pane::find_pane_widget_in_root(&root, id)),
+                None => pane::locate_surface_in_root(&root, None).map(|(widget, _, _)| widget),
+            };
+
+            let Some(pane_widget) = pane_widget else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane not found in this workspace",
+                )));
+                return;
+            };
+
+            if browser {
+                pane::add_browser_tab_to_pane_with_uri(&pane_widget, url.as_deref());
+            } else {
+                pane::add_terminal_tab_to_pane(&pane_widget);
+            }
+
+            let workspace_id = state.borrow().workspaces[index].id.clone();
+            let surface_id = pane::active_surface_summary(&pane_widget).map(|s| s.surface_id);
+            let _ = reply.send(Ok(serde_json::json!({
+                "workspace_id": workspace_id,
+                "workspace_ref": workspace_ref(&workspace_id),
+                "surface_id": surface_id,
+                "surface_ref": surface_id.as_deref().map(surface_ref),
+                "ok": true,
+            })));
+        }
+        ControlCommand::CloseSurface {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let root = state.borrow().workspaces[index].root.clone();
+            let Some((pane_widget, pane_id, tab_id)) =
+                pane::locate_surface_in_root(&root, surface_hint.as_deref())
+            else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
+            if !pane::close_tab_in_pane(&pane_widget, &tab_id) {
+                // The only way this fails for a surface we just located is a
+                // pinned tab, which deliberately refuses to close.
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                    "cannot close a pinned surface",
+                )));
+                return;
+            }
+
+            let _ = reply.send(Ok(serde_json::json!({
+                "pane_id": pane_id,
+                "pane_ref": pane_ref(pane_id),
+                "surface_id": format!("{pane_id}:{tab_id}"),
+                "ok": true,
+            })));
+        }
+        ControlCommand::FocusSurface {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let root = state.borrow().workspaces[index].root.clone();
+            let Some((pane_widget, pane_id, tab_id)) =
+                pane::locate_surface_in_root(&root, surface_hint.as_deref())
+            else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
+            // Same as focus-pane: focus cannot land on a workspace that is not on
+            // screen. Bring it forward rather than reporting a success that did not
+            // happen.
+            let selected = state.borrow().active_idx == index;
+            if !selected {
+                select_workspace_by_index(state, index);
+            }
+
+            pane::activate_tab_in_pane(&pane_widget, &tab_id);
+            pane::focus_active_tab_in_pane(&pane_widget);
+
+            let _ = reply.send(Ok(serde_json::json!({
+                "pane_id": pane_id,
+                "pane_ref": pane_ref(pane_id),
+                "surface_id": format!("{pane_id}:{tab_id}"),
+                "ok": true,
+            })));
+        }
+        ControlCommand::FocusPane {
+            target,
+            pane_hint,
+            reply,
+        } => {
+            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let root = state.borrow().workspaces[index].root.clone();
+            let resolved = match pane_hint.as_deref() {
+                Some(hint) => hint
+                    .trim()
+                    .trim_start_matches("pane:")
+                    .parse::<u32>()
+                    .ok()
+                    // Root-scoped: a request that names a workspace must not resolve a
+                    // pane living in a different one.
+                    .and_then(|id| {
+                        pane::find_pane_widget_in_root(&root, id).map(|widget| (widget, id))
+                    }),
+                None => pane::locate_surface_in_root(&root, None)
+                    .map(|(widget, pane_id, _)| (widget, pane_id)),
+            };
+
+            let Some((pane_widget, pane_id)) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane not found in this workspace",
+                )));
+                return;
+            };
+
+            // Focusing a pane in a workspace that is not on screen cannot move visible
+            // focus -- the pane is not displayed. Reporting `ok: true` and changing
+            // nothing is the exact class of silent success this bridge keeps producing,
+            // so bring the workspace forward first and make the call mean what it says.
+            let selected = state.borrow().active_idx == index;
+            if !selected {
+                select_workspace_by_index(state, index);
+            }
+
+            pane::focus_active_tab_in_pane(&pane_widget);
+
+            let _ = reply.send(Ok(serde_json::json!({
+                "pane_id": pane_id,
+                "pane_ref": pane_ref(pane_id),
+                "ok": true,
+                // Say so, rather than leaving the caller to wonder why their sidebar moved.
+                "selected_workspace": !selected,
+            })));
+        }
+        ControlCommand::TabAction {
+            target,
+            surface_hint,
+            action,
+            title,
+            reply,
+        } => {
+            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let root = state.borrow().workspaces[index].root.clone();
+            let Some((pane_widget, pane_id, tab_id)) =
+                pane::locate_surface_in_root(&root, surface_hint.as_deref())
+            else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
+            let normalized = action.to_ascii_lowercase().replace('-', "_");
+            let applied = match normalized.as_str() {
+                "rename" | "set_title" => {
+                    // An *absent* title is an error; an *empty* one is a request to
+                    // clear the custom name and fall back to the process-derived title.
+                    let Some(title) = title.as_deref() else {
+                        let _ =
+                            reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                                "rename requires title (pass an empty title to clear a \
+                                 custom name)",
+                            )));
+                        return;
+                    };
+                    pane::rename_tab_in_pane(&pane_widget, &tab_id, title)
+                }
+                "pin" => pane::set_tab_pinned_in_pane(&pane_widget, &tab_id, true),
+                "unpin" => pane::set_tab_pinned_in_pane(&pane_widget, &tab_id, false),
+                "select" | "activate" | "focus" => {
+                    pane::activate_tab_in_pane(&pane_widget, &tab_id)
+                }
+                "close" => pane::close_tab_in_pane(&pane_widget, &tab_id),
+                other => {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                        format!("unsupported tab action: {other}"),
+                    )));
+                    return;
+                }
+            };
+
+            if !applied {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                    "tab action rejected",
+                )));
+                return;
+            }
+
+            // Persist. `custom_name` and `pinned` both live in session.json, and the
+            // GUI's own paths save after mutating them -- the socket path did not, so
+            // a rename or pin made over the socket vanished on the next restart while
+            // reporting success.
+            if matches!(
+                normalized.as_str(),
+                "rename" | "set_title" | "pin" | "unpin" | "close"
+            ) {
+                request_session_save(state);
+            }
+
+            let _ = reply.send(Ok(serde_json::json!({
+                "pane_id": pane_id,
+                "pane_ref": pane_ref(pane_id),
+                "surface_id": format!("{pane_id}:{tab_id}"),
+                "action": normalized,
+                "ok": true,
+            })));
+        }
         ControlCommand::SendKey {
             target,
             surface_hint,
@@ -4827,6 +5090,25 @@ fn close_workspace_by_id_internal(
     if persist {
         request_session_save(state);
     }
+}
+
+/// Select a workspace by index and sync the sidebar selection.
+///
+/// The sidebar row must be selected too, or the list keeps highlighting whatever
+/// was there before and the UI disagrees with itself about which workspace is live.
+fn select_workspace_by_index(state: &State, index: usize) {
+    let (row, sidebar_list) = {
+        let app_state = state.borrow();
+        let Some(workspace) = app_state.workspaces.get(index) else {
+            return;
+        };
+        (
+            workspace.sidebar_row.clone(),
+            app_state.sidebar_list.clone(),
+        )
+    };
+    switch_workspace(state, index);
+    sidebar_list.select_row(Some(&row));
 }
 
 fn switch_workspace(state: &State, idx: usize) {

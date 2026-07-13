@@ -170,8 +170,30 @@ fn lookup_pane_internals(id: u32) -> Option<Rc<PaneInternals>> {
     PANE_REGISTRY.with(|registry| registry.borrow().get(&id)?.upgrade())
 }
 
+/// Find a pane anywhere in the process, ignoring which workspace owns it.
+///
+/// ⚠️ **Do not use this to resolve a pane id that arrived over the control socket.**
+/// The registry is global, so a request scoped to workspace B will happily resolve a
+/// pane that lives in workspace A and act on it, reporting success. Socket callers
+/// must use [`find_pane_widget_in_root`], which cannot cross a workspace boundary.
+///
+/// This remains correct for the GUI's own paths — drag-and-drop *is* allowed to move
+/// a pane between workspaces, and there the global lookup is the point.
 pub fn find_pane_widget_by_id(pane_id: u32) -> Option<gtk::Widget> {
     lookup_pane_internals(pane_id).map(|internals| internals.pane_outer.clone().upcast())
+}
+
+/// Find a pane by id, but only within one workspace's tree.
+///
+/// This is the resolver every control-socket verb must use. A request that names a
+/// workspace has stated its scope; silently reaching outside it is how
+/// `focus-pane --workspace B --pane 1` ended up focusing a pane in workspace A and
+/// returning `OK`.
+pub fn find_pane_widget_in_root(root: &gtk::Widget, pane_id: u32) -> Option<gtk::Widget> {
+    pane_internals_for_root(root)
+        .into_iter()
+        .find(|internals| internals.pane_id == pane_id)
+        .map(|internals| internals.pane_outer.clone().upcast())
 }
 
 pub fn set_workspace_dragging_all(active: bool) {
@@ -765,6 +787,96 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
     true
 }
 
+/// Give a tab an explicit title, overriding the process-derived one.
+///
+/// The GUI already tracks `custom_name` per tab (it survives into the session
+/// snapshot); nothing could set it from the control socket, which is why
+/// `rename-tab` and `tab-action` were dead ends.
+pub fn rename_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str, title: &str) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let Some(entry) = tab_state.tabs.iter_mut().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        // An empty title clears the override and hands the tab back to the
+        // process-derived title, rather than pinning it to a blank label.
+        entry.custom_name = None;
+        // ...but the label has to actually be *repainted*, or clearing the override
+        // leaves the stale custom title on screen and the rename looks ignored.
+        //
+        // `on_title_changed` refuses to touch the label while a custom name is set,
+        // so it will not do this for us. Reset to the tab kind's default; the process
+        // re-emits its title on the next prompt redraw and the real one lands.
+        entry.title_label.set_text(entry.kind.default_title());
+    } else {
+        entry.custom_name = Some(trimmed.to_string());
+        entry.title_label.set_text(trimmed);
+    }
+    true
+}
+
+/// Pin or unpin a tab. Pinned tabs refuse to close (see `close_tab_in_pane`).
+pub fn set_tab_pinned_in_pane(pane_widget: &gtk::Widget, tab_id: &str, pinned: bool) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let Some(entry) = tab_state.tabs.iter_mut().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+
+    entry.pinned = pinned;
+    // Route through the same visual update the GUI uses. Flipping the flag without
+    // this left the pin indicator stale, so `tab-action --action pin` reported
+    // success while the tab still looked unpinned.
+    apply_pin_visuals(&entry.tab_button, pinned);
+    true
+}
+
+/// Resolve a surface hint to the pane that owns it and the tab inside it.
+///
+/// Accepts the composite form (`3:terminal-0`, with or without a `surface:`
+/// prefix) or a bare tab id. `None` resolves to the first pane's active tab,
+/// matching how `terminal_handle_for_surface` falls back.
+///
+/// Returns `(pane widget, pane id, tab id)`.
+pub fn locate_surface_in_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<(gtk::Widget, u32, String)> {
+    for internals in pane_internals_for_root(root) {
+        let pane_id = internals.pane_id;
+        let tab_state = internals.tab_state.borrow();
+
+        let matched = match surface_hint {
+            Some(hint) => tab_state.tabs.iter().find(|entry| {
+                surface_hint_matches(&composite_surface_id(pane_id, &entry.id), &entry.id, hint)
+            }),
+            None => tab_state
+                .active_tab
+                .as_deref()
+                .and_then(|active| tab_state.tabs.iter().find(|entry| entry.id == active))
+                .or_else(|| tab_state.tabs.first()),
+        };
+
+        if let Some(entry) = matched {
+            let tab_id = entry.id.clone();
+            drop(tab_state);
+            let widget = find_pane_widget_by_id(pane_id)?;
+            return Some((widget, pane_id, tab_id));
+        }
+    }
+
+    None
+}
+
 fn normalize_surface_hint(raw: &str) -> &str {
     raw.trim()
         .strip_prefix("surface:")
@@ -847,6 +959,17 @@ enum TabKind {
     Terminal { state: TerminalTabState },
     Browser { state: BrowserTabState },
     Keybinds,
+}
+
+impl TabKind {
+    /// The label a tab of this kind carries before anything overrides it.
+    fn default_title(&self) -> &'static str {
+        match self {
+            Self::Terminal { .. } => "Terminal",
+            Self::Browser { .. } => "Browser",
+            Self::Keybinds => "Keybinds",
+        }
+    }
 }
 
 enum TabFocusTarget {
@@ -3832,6 +3955,15 @@ mod tests {
             ("XDG_CURRENT_DESKTOP", "GNOME"),
             ("WAYLAND_DISPLAY", "wayland-0"),
         ]));
+    }
+
+    #[test]
+    fn tab_kind_default_titles_are_stable() {
+        // Clearing a custom name repaints the label with these, so they must not be
+        // empty -- an empty label is indistinguishable from a broken rename.
+        use super::TabKind;
+        assert_eq!(TabKind::Keybinds.default_title(), "Keybinds");
+        assert!(!TabKind::Keybinds.default_title().is_empty());
     }
 
     #[test]

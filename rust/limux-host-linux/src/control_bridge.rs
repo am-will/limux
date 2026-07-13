@@ -33,6 +33,11 @@ const METHODS: &[&str] = &[
     "surface.read_text",
     "surface.send_text",
     "surface.send_key",
+    "surface.create",
+    "surface.close",
+    "surface.focus",
+    "pane.focus",
+    "tab.action",
     "notification.create",
 ];
 
@@ -167,6 +172,40 @@ pub enum ControlCommand {
         key: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    /// Open a new tab (surface) inside an existing pane.
+    CreateSurface {
+        target: WorkspaceTarget,
+        pane_hint: Option<String>,
+        browser: bool,
+        url: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Close a single surface (tab). The only sub-workspace teardown there is.
+    CloseSurface {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Make a surface the active tab of its pane.
+    FocusSurface {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Move keyboard focus to a pane.
+    FocusPane {
+        target: WorkspaceTarget,
+        pane_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Act on a tab: `rename`, `pin`, `unpin`, `close`, `select`.
+    TabAction {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        action: String,
+        title: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     /// Post a desktop-style notification into the sidebar + toast overlay.
     /// `target` chooses the workspace to flag as unread; if not provided,
     /// the currently-active workspace is used.
@@ -197,6 +236,11 @@ impl ControlCommand {
             | Self::CloseWorkspace { reply, .. }
             | Self::SendText { reply, .. }
             | Self::SendKey { reply, .. }
+            | Self::CreateSurface { reply, .. }
+            | Self::CloseSurface { reply, .. }
+            | Self::FocusSurface { reply, .. }
+            | Self::FocusPane { reply, .. }
+            | Self::TabAction { reply, .. }
             | Self::CreateNotification { reply, .. } => {
                 let _ = reply.send(result);
             }
@@ -621,6 +665,101 @@ fn handle_method(
                 rx,
             )
         }
+        "surface.create" | "new-surface" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let browser = optional_string(params, &["type", "kind"])
+                .is_some_and(|value| value.eq_ignore_ascii_case("browser"));
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CreateSurface {
+                    target,
+                    pane_hint: optional_string(params, &["pane_id"]),
+                    browser: browser || optional_string(params, &["url"]).is_some(),
+                    url: optional_string(params, &["url"]),
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.close" | "close-surface" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CloseSurface {
+                    target,
+                    surface_hint: optional_string(params, &["surface_id"]),
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.focus" | "focus-surface" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::FocusSurface {
+                    target,
+                    surface_hint: optional_string(params, &["surface_id"]),
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.focus" | "focus-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::FocusPane {
+                    target,
+                    pane_hint: optional_string(params, &["pane_id"]),
+                    reply,
+                },
+                rx,
+            )
+        }
+        "tab.action" | "tab-action" => {
+            let Some(action) = optional_string(params, &["action"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("tab.action requires action"),
+                );
+            };
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::TabAction {
+                    target,
+                    surface_hint: optional_string(params, &["surface_id", "tab_id"]),
+                    action,
+                    // NOT `optional_string`: it discards empty strings, which would make
+                    // an explicit `--title ""` indistinguishable from no title at all.
+                    // An empty title is a real request -- it clears a custom name and
+                    // hands the tab back to its process-derived title -- so the absent
+                    // case and the empty case must stay distinguishable.
+                    title: params
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    reply,
+                },
+                rx,
+            )
+        }
         "surface.send_key" | "send-key" => {
             let Some(key) = optional_string(params, &["key"]) else {
                 return error_response(
@@ -876,6 +1015,68 @@ mod tests {
             parse_optional_workspace_target(params.as_object().expect("object params"), true)
                 .expect("target should parse");
         assert_eq!(target, WorkspaceTarget::Handle(workspace_id.to_string()));
+    }
+
+    /// The surface/tab lifecycle methods used to be advertised in `--help` while
+    /// the bridge answered `-32601: unknown method`. Guard against them silently
+    /// dropping out of the routing table again.
+    #[test]
+    fn surface_and_tab_lifecycle_methods_are_routed() {
+        for method in [
+            "surface.create",
+            "surface.close",
+            "surface.focus",
+            "pane.focus",
+            "tab.action",
+        ] {
+            assert!(
+                METHODS.contains(&method),
+                "{method} must be routed by the GTK bridge, not answered with unknown-method"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_action_requires_an_action() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tab.action",
+            "params": { "surface_id": "3:terminal-0" },
+        })
+        .to_string();
+
+        let response = dispatch_request(&request, &|_command| {
+            panic!("tab.action must be rejected before it reaches the GTK loop");
+        });
+
+        let error = response
+            .error
+            .expect("tab.action without --action must error");
+        assert_eq!(error.code, INVALID_PARAMS_CODE);
+    }
+
+    /// `surface.close` is the only sub-workspace teardown limux has, so it must
+    /// reach the GTK loop rather than being rejected at parse time.
+    #[test]
+    fn surface_close_reaches_the_gtk_loop() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "surface.close",
+            "params": { "workspace_id": "workspace:1", "surface_id": "3:terminal-0" },
+        })
+        .to_string();
+
+        let dispatched = std::cell::Cell::new(false);
+        dispatch_request(&request, &|command| {
+            assert!(matches!(command, ControlCommand::CloseSurface { .. }));
+            dispatched.set(true);
+        });
+        assert!(
+            dispatched.get(),
+            "surface.close should dispatch CloseSurface"
+        );
     }
 
     #[test]
