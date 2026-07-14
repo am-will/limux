@@ -199,7 +199,7 @@ fn parse_global_args() -> Result<GlobalOptions> {
 
 fn print_help() {
     println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
+        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] [--shell-safe] <text>\n      --shell-safe wraps the text in a single-quoted `echo '#…'` so a plain\n      shell at the destination prints it instead of executing it.\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
     );
 }
 
@@ -760,27 +760,55 @@ fn render_list_text(command: &str, payload: &Value) -> String {
     }
 }
 
+fn shell_safe_wrap(text: &str) -> String {
+    let escaped = text.trim_end_matches('\n').replace('\'', "'\\''");
+    format!("echo '#{}'\n", escaped)
+}
+
 async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
         .filter(|s| !s.is_empty());
     let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let shell_safe = parse_flag(args, "--shell-safe");
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
+    let text = if shell_safe {
+        shell_safe_wrap(&text)
+    } else {
+        text
+    };
 
     let mut params = Map::new();
     params.insert("text".to_string(), Value::String(text));
-    if let Some(surface) = surface {
-        params.insert("surface_id".to_string(), Value::String(surface));
+    if let Some(surface) = &surface {
+        params.insert("surface_id".to_string(), Value::String(surface.clone()));
     }
 
-    call_in_workspace_scope(
+    let payload = call_in_workspace_scope(
         client,
-        workspace,
+        workspace.clone(),
         "surface.send_text",
         Value::Object(params),
     )
-    .await
+    .await?;
+
+    if shell_safe {
+        let mut key_params = Map::new();
+        key_params.insert("key".to_string(), Value::String("Enter".to_string()));
+        if let Some(surface) = surface {
+            key_params.insert("surface_id".to_string(), Value::String(surface));
+        }
+        call_in_workspace_scope(
+            client,
+            workspace,
+            "surface.send_key",
+            Value::Object(key_params),
+        )
+        .await?;
+    }
+
+    Ok(payload)
 }
 
 async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
@@ -2267,6 +2295,16 @@ fn build_agents_md(
     out.push_str("Reply with the envelope reversed and `reply-to` set to the original `id`:\n\n");
     out.push_str("```bash\n");
     out.push_str("limux send --surface <orig-sender-surface-id> $'<agent-msg from=\"claude\" to=\"codex\" id=\"<new-uuid>\" reply-to=\"<orig-uuid>\" ts=\"<iso8601>\">\\n<response>...</response>\\n</agent-msg>\\n'\n");
+    out.push_str("```\n\n");
+    out.push_str(
+        "If the destination surface is a plain shell (the orchestrator's\n\
+         terminal, a scratch pane) rather than an agent CLI, add\n\
+         `--shell-safe`: limux wraps the envelope in a single-quoted\n\
+         `echo '#...'` so the shell prints it instead of executing it.\n\
+         Never send a raw envelope at a shell prompt — bash will run it.\n\n",
+    );
+    out.push_str("```bash\n");
+    out.push_str("limux send --shell-safe --surface <orch-surface-id> $'<agent-msg from=\"claude\" to=\"orchestrator\" id=\"<new-uuid>\" reply-to=\"<orig-uuid>\" ts=\"<iso8601>\">\\n<response>...</response>\\n</agent-msg>\\n'\n");
     out.push_str("```\n\n");
 
     out.push_str("## Pinging the human\n\n");
@@ -3986,6 +4024,35 @@ mod agent_team_tests {
         assert!(md.contains("LIMUX_SURFACE_ID"));
         assert!(md.contains("limux new-pane --direction right --command bash"));
         assert!(md.contains("Live GTK self-spawn currently supports terminal"));
+
+        // Shell-safe reply guidance for non-agent (plain shell) surfaces
+        assert!(md.contains("limux send --shell-safe --surface"));
+        assert!(md.contains("Never send a raw envelope at a shell prompt"));
+    }
+
+    #[test]
+    fn shell_safe_wrap_neutralizes_everything_bash_expands() {
+        let wrapped = shell_safe_wrap(
+            "<response>pong $(reboot) `id` !! \"quoted\" (specs 001-004)</response>\n",
+        );
+        assert_eq!(
+            wrapped,
+            "echo '#<response>pong $(reboot) `id` !! \"quoted\" (specs 001-004)</response>'\n"
+        );
+    }
+
+    #[test]
+    fn shell_safe_wrap_escapes_embedded_single_quotes() {
+        assert_eq!(shell_safe_wrap("jana's fix"), "echo '#jana'\\''s fix'\n");
+    }
+
+    #[test]
+    fn shell_safe_wrap_preserves_inner_newlines_and_trims_trailing() {
+        let wrapped = shell_safe_wrap("<agent-msg>\n<response>ok</response>\n</agent-msg>\n\n");
+        assert_eq!(
+            wrapped,
+            "echo '#<agent-msg>\n<response>ok</response>\n</agent-msg>'\n"
+        );
     }
 }
 
