@@ -27,5 +27,8 @@ serde_json = "1"
 dirs = "6"
 shell-quote = { version = "0.7.2", default-features = false, features = ["bash"] }
 
+[build-dependencies]
+cc = "1.2"
+
 [dev-dependencies]
 tempfile.workspace = true

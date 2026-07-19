@@ -788,6 +788,7 @@ dependencies = [
 name = "limux-host-linux"
 version = "0.1.21"
 dependencies = [
+ "cc",
  "dirs",
  "gdk4-wayland",
  "gtk4",
