@@ -41,6 +41,7 @@ mkShell {
   WEBKIT_EXEC_PATH = "${webkitgtk_6_0}/libexec/webkitgtk-6.0";
 
   shellHook = ''
+    addToSearchPath LD_LIBRARY_PATH "$PWD/ghostty/zig-out/lib"
     echo "limux dev shell — nix-shell"
     echo "  cargo build  ← run this"
   '';

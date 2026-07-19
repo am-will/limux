@@ -25,6 +25,7 @@
             PKG_CONFIG_PATH = "${pkgs.gtk4-layer-shell.dev}/lib/pkgconfig";
             shellHook = ''
               export RUSTFLAGS="-C link-arg=-Wl,-rpath,${pkgs.libepoxy}/lib $RUSTFLAGS"
+              addToSearchPath LD_LIBRARY_PATH "$PWD/ghostty/zig-out/lib"
               echo "Limux dev shell. Steps: git submodule update --init --recursive"
               echo "  cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline && cd .."
               echo "  cargo build --release"
@@ -63,13 +64,7 @@
               pushd ghostty
                 zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
               popd
-              # Build glad.o for libghostty's GL loader dependency
-              cc -c ghostty/vendor/glad/src/gl.c -I ghostty/vendor/glad/include \
-                -O2 -o $TMPDIR/glad.o
-              export RUSTFLAGS="-C link-arg=$TMPDIR/glad.o $RUSTFLAGS"
             '';
-
-            # RUSTFLAGS set in preBuild after glad.o is compiled
 
             postInstall = ''
               mkdir -p $out/lib $out/share/limux/ghostty $out/share/terminfo

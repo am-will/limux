@@ -416,6 +416,18 @@ extern "C" {
     pub fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int);
 }
 
+// Force libglad.a to survive --as-needed: cc::Build puts -lglad in the
+// static block before -lghostty in the dynamic block, so --as-needed
+// drops it before ghostty needs gladLoader*. A #[used] function pointer
+// from the Rust rlib keeps the archive alive.
+extern "C" {
+    fn gladLoaderLoadGLContext(ctx: *mut std::ffi::c_void) -> std::ffi::c_int;
+}
+
+#[used]
+static _GLAD_FORCE_LINK: unsafe extern "C" fn(*mut std::ffi::c_void) -> std::ffi::c_int =
+    gladLoaderLoadGLContext;
+
 extern "C" {
     // Init
     pub fn ghostty_init(argc: usize, argv: *mut *mut c_char) -> c_int;
