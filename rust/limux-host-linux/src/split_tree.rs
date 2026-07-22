@@ -475,8 +475,6 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .shrink_start_child(true)
                 .shrink_end_child(true)
                 .build();
-            paned.set_shrink_start_child(false);
-            paned.set_shrink_end_child(false);
             paned.set_resize_start_child(true);
             paned.set_resize_end_child(true);
 
@@ -514,8 +512,10 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 }
                 if last_size_for_notify.get() != size {
                     // Width changed — this position-notify is an auto-adjust,
-                    // not a user drag. Don't update the ratio.
-                    last_size_for_notify.set(size);
+                    // not a user drag. Don't update the ratio, and leave
+                    // `last_size` for the tick callback to update after it
+                    // re-applies the ratio; otherwise consuming the size change
+                    // here would suppress the tick's re-apply and drift the split.
                     return;
                 }
                 let new_ratio = layout_state::snapshot_split_ratio(
