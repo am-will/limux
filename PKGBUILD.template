@@ -1,4 +1,5 @@
-# Maintainer: Anton Barchukov <anton@barchukov.com>
+# Maintainer: Limux contributors
+# Contributor: Anton Barchukov <anton@barchukov.com>
 pkgname=limux-bin
 pkgver=@@VERSION@@
 pkgrel=1
@@ -6,9 +7,9 @@ pkgdesc="GPU-accelerated terminal workspace manager for Linux, powered by Ghostt
 arch=('x86_64')
 url="https://github.com/am-will/limux"
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'webkitgtk-6.0')
+depends=('fontconfig' 'glib2' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'pango' 'webkitgtk-6.0')
 provides=('limux')
-conflicts=('limux')
+conflicts=('limux' 'limux-debug')
 options=(!debug !strip)
 source=("limux-${pkgver}.tar.gz::https://github.com/am-will/limux/releases/download/v${pkgver}/limux-${pkgver}-linux-x86_64.tar.gz")
 sha256sums=('@@SHA256@@')

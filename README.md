@@ -49,12 +49,16 @@ cd limux-*-linux-x86_64
 sudo ./install.sh
 ```
 
-**Arch Linux (unofficial AUR package)** — community-maintained by [antonbarchukov](https://github.com/antonbarchukov):
+**Arch Linux (AUR):**
 ```bash
+# Prebuilt release package
 yay -S limux-bin
+
+# Build Limux and Ghostty from source
+yay -S limux
 ```
 
-The AUR package is available at [`limux-bin`](https://aur.archlinux.org/packages/limux-bin). Thanks to [antonbarchukov](https://github.com/antonbarchukov) for packaging Limux for Arch users. Arch packaging is not currently maintained by upstream; please report AUR packaging issues to the package maintainer first. See [issue #5](https://github.com/am-will/limux/issues/5).
+Both [`limux-bin`](https://aur.archlinux.org/packages/limux-bin) and the source-built [`limux`](https://aur.archlinux.org/packages/limux) package are published from this repository. Thanks to [Anton Barchukov](https://github.com/antonbarchukov) for creating the original Arch packaging in [PR #50](https://github.com/am-will/limux/pull/50).
 
 To uninstall:
 ```bash
