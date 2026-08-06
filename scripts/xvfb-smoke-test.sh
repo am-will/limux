@@ -223,6 +223,23 @@ wait_for_healthy_surfaces() {
   return 1
 }
 
+host_child_count() {
+  awk '{ count += NF } END { print count + 0 }' /proc/"$HOST_PID"/task/*/children
+}
+
+wait_for_host_child_count() {
+  local expected="$1"
+  for _ in $(seq 1 100); do
+    if [ "$(host_child_count)" -eq "$expected" ]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "FAIL: host child count is $(host_child_count), expected $expected"
+  return 1
+}
+
 cleanup() {
   local rc=$?
   echo
@@ -286,6 +303,36 @@ done
 [ "$(cat "$SHIFTED_KEY_PROOF" 2>/dev/null)" = '@A!' ] \
   || { echo "FAIL: plain and shifted send-key did not produce @A!"; exit 1; }
 echo "stage 1b: OK (surface realized, terminal I/O and key levels verified)"
+
+echo
+echo "== stage 1c: terminal teardown releases workspace processes =="
+BASELINE_CHILDREN="$(host_child_count)"
+for cycle in $(seq 1 10); do
+  "$LIMUX_CLI" --json new-workspace --cwd "$DEMO_DIR" \
+    >"$LOG_DIR/stage1c-workspace-$cycle.json"
+  TEARDOWN_WORKSPACE="$(jq -r '.workspace_ref' "$LOG_DIR/stage1c-workspace-$cycle.json")"
+  "$LIMUX_CLI" select-workspace --workspace "$TEARDOWN_WORKSPACE" \
+    >"$LOG_DIR/stage1c-select-$cycle.txt"
+  wait_for_host_child_count "$((BASELINE_CHILDREN + 1))"
+
+  "$LIMUX_CLI" --json new-pane --workspace "$TEARDOWN_WORKSPACE" --direction right \
+    >"$LOG_DIR/stage1c-pane-$cycle-1.json"
+  "$LIMUX_CLI" --json new-pane --workspace "$TEARDOWN_WORKSPACE" --direction down \
+    >"$LOG_DIR/stage1c-pane-$cycle-2.json"
+  wait_for_host_child_count "$((BASELINE_CHILDREN + 3))"
+
+  EXIT_SURFACE="$(jq -r '.surface_ref' "$LOG_DIR/stage1c-pane-$cycle-2.json")"
+  "$LIMUX_CLI" send --workspace "$TEARDOWN_WORKSPACE" --surface "$EXIT_SURFACE" exit \
+    >"$LOG_DIR/stage1c-exit-$cycle.txt"
+  "$LIMUX_CLI" send-key --workspace "$TEARDOWN_WORKSPACE" --surface "$EXIT_SURFACE" Enter \
+    >"$LOG_DIR/stage1c-exit-enter-$cycle.txt"
+  wait_for_host_child_count "$((BASELINE_CHILDREN + 2))"
+
+  "$LIMUX_CLI" close-workspace --workspace "$TEARDOWN_WORKSPACE" \
+    >"$LOG_DIR/stage1c-close-$cycle.txt"
+  wait_for_host_child_count "$BASELINE_CHILDREN"
+done
+echo "stage 1c: OK (10 multi-pane workspace cycles returned to $BASELINE_CHILDREN child process)"
 
 # --- 5. Stage 2: live agent-team ------------------------------------------
 echo
