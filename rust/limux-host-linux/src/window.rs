@@ -1714,6 +1714,23 @@ pub fn build_window(app: &adw::Application) {
         close_btn.connect_clicked(move |_| w.close());
     }
 
+    // On Wayland compositors that provide server-side decorations, the
+    // compositor already draws window controls, so hide our custom
+    // minimize/maximize/close to avoid stacking a duplicate set. This restores
+    // the intent of main's xdg-decoration guard, adapted to the always-on top
+    // bar (the rest of the bar — workspace pills, dock toggle, etc. — stays).
+    let server_side_decorations = display
+        .clone()
+        .downcast::<gdk4_wayland::WaylandDisplay>()
+        .ok()
+        .map(|wayland_display| wayland_display.query_registry("zxdg_decoration_manager_v1"))
+        .unwrap_or(false);
+    if server_side_decorations {
+        minimize_btn.set_visible(false);
+        maximize_btn.set_visible(false);
+        close_btn.set_visible(false);
+    }
+
     let header = gtk::WindowHandle::builder().child(&top_bar_content).build();
 
     let stack = gtk::Stack::new();
@@ -2032,6 +2049,15 @@ pub fn build_window(app: &adw::Application) {
             }
             false
         });
+    }
+
+    // The workspace-DnD drop target (tab drag -> new workspace, workspace drag
+    // -> delete) also lives on the visible top-bar "+" button. The sidebar
+    // new_ws_btn that carries the original target is hidden when the top bar is
+    // shown, so without this the drop target would be unreachable.
+    let top_bar_new_ws_button = state.borrow().top_bar_new_ws_btn_ref.clone();
+    if let Some(button) = top_bar_new_ws_button {
+        install_workspace_dnd_target(&button, &state);
     }
 
     // Save the full session on window close.
@@ -2643,6 +2669,9 @@ fn handle_config_change(
     if updated.appearance.ui_scale != previous.appearance.ui_scale {
         reload_app_css(state, updated);
     }
+    if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
+        sync_workspace_path_visibility(state, updated.appearance.show_workspace_path);
+    }
     if previous.interface.window_controls_side != updated.interface.window_controls_side
         || previous.interface.show_top_bar != updated.interface.show_top_bar
         || previous.interface.show_workspace_indicators
@@ -2655,6 +2684,9 @@ fn handle_config_change(
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
         if updated.appearance.ui_scale != previous.appearance.ui_scale {
             reload_app_css(state, previous);
+        }
+        if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
+            sync_workspace_path_visibility(state, previous.appearance.show_workspace_path);
         }
         apply_top_bar_mode(state);
 
@@ -4145,6 +4177,46 @@ fn handle_tab_drop_to_workspace(state: &State, target_workspace_id: &str, payloa
     };
 
     pane::move_tab_to_pane(&source_pane, tab_id, &target_pane)
+}
+
+/// Wire the workspace drag-and-drop drop target onto a "new workspace" button:
+/// a tab drag (payload `pane:tab`) creates a workspace, a workspace drag deletes
+/// it. Used for both the sidebar button and the top-bar "+" so whichever is
+/// visible accepts the drop.
+fn install_workspace_dnd_target(button: &gtk::Button, state: &State) {
+    let drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+    drop.set_preload(true);
+    {
+        let button = button.clone();
+        drop.connect_motion(move |_, _, _| {
+            if pane::is_tab_dragging() {
+                button.add_css_class("limux-tab-drop-target");
+            }
+            gtk::gdk::DragAction::MOVE
+        });
+    }
+    {
+        let button = button.clone();
+        drop.connect_leave(move |_| {
+            button.remove_css_class("limux-tab-drop-target");
+        });
+    }
+    {
+        let state = state.clone();
+        let button = button.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            button.remove_css_class("limux-tab-drop-target");
+            if let Ok(payload) = value.get::<String>() {
+                if payload.contains(':') {
+                    return create_workspace_for_tab(&state, &payload);
+                }
+                close_workspace_by_id(&state, &payload);
+                return true;
+            }
+            false
+        });
+    }
+    button.add_controller(drop);
 }
 
 fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
