@@ -181,7 +181,15 @@ pub fn retire_pane(pane_widget: &gtk::Widget) {
     };
     let internals = unsafe { outer.steal_data::<Rc<PaneInternals>>("limux-pane-internals") };
     if let Some(internals) = internals {
-        for entry in &internals.tab_state.borrow().tabs {
+        let entries = {
+            let mut tab_state = internals.tab_state.borrow_mut();
+            tab_state.active_tab = None;
+            tab_state.active_rename_tab = None;
+            std::mem::take(&mut tab_state.tabs)
+        };
+        for entry in entries {
+            internals.tab_strip.remove(&entry.tab_button);
+            internals.content_stack.remove(&entry.content);
             entry.prepare_for_removal();
         }
         unregister_pane(internals.pane_id);
@@ -965,8 +973,10 @@ struct TabEntry {
 
 impl TabEntry {
     fn prepare_for_removal(&self) {
-        if let TabKind::Browser { state } = &self.kind {
-            state.handles.prepare_for_removal();
+        match &self.kind {
+            TabKind::Terminal { state } => state.handle.shutdown(),
+            TabKind::Browser { state } => state.handles.prepare_for_removal(),
+            TabKind::Keybinds => {}
         }
     }
 }
@@ -3232,20 +3242,34 @@ fn remove_tab(
 ) {
     commit_active_tab_rename(tab_state);
 
-    let mut ts = tab_state.borrow_mut();
-    let Some(idx) = ts.tabs.iter().position(|e| e.id == tab_id) else {
-        return;
+    let (entry, removed_was_unread, closed_terminal, new_id, was_active) = {
+        let mut ts = tab_state.borrow_mut();
+        let Some(idx) = ts.tabs.iter().position(|e| e.id == tab_id) else {
+            return;
+        };
+        let entry = ts.tabs.remove(idx);
+        let removed_was_unread = entry.unread;
+        let closed_terminal = matches!(&entry.kind, TabKind::Terminal { .. });
+        let was_active = ts.active_tab.as_deref() == Some(tab_id);
+        let new_id = if ts.tabs.is_empty() {
+            None
+        } else {
+            Some(ts.tabs[idx.min(ts.tabs.len() - 1)].id.clone())
+        };
+        (
+            entry,
+            removed_was_unread,
+            closed_terminal,
+            new_id,
+            was_active,
+        )
     };
-    let entry = ts.tabs.remove(idx);
-    let removed_was_unread = entry.unread;
-    let closed_terminal = matches!(&entry.kind, TabKind::Terminal { .. });
 
-    entry.prepare_for_removal();
     tab_strip.remove(&entry.tab_button);
     content_stack.remove(&entry.content);
+    entry.prepare_for_removal();
 
-    if ts.tabs.is_empty() {
-        drop(ts);
+    let Some(new_id) = new_id else {
         if removed_was_unread {
             (callbacks.on_unread_changed)();
         }
@@ -3256,13 +3280,7 @@ fn remove_tab(
         };
         (callbacks.on_empty)(&pane_outer.clone().upcast(), empty_reason);
         return;
-    }
-
-    // Activate neighbor tab
-    let new_idx = idx.min(ts.tabs.len() - 1);
-    let new_id = ts.tabs[new_idx].id.clone();
-    let was_active = ts.active_tab.as_deref() == Some(tab_id);
-    drop(ts);
+    };
 
     if was_active {
         activate_tab(tab_strip, content_stack, tab_state, &new_id);

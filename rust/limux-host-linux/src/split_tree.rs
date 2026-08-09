@@ -37,6 +37,16 @@ impl SplitNode {
         matches!(self, SplitNode::Leaf { .. })
     }
 
+    fn collect_panes(&self, panes: &mut Vec<gtk::Widget>) {
+        match self {
+            SplitNode::Leaf { pane_widget } => panes.push(pane_widget.clone()),
+            SplitNode::Split { left, right, .. } => {
+                left.collect_panes(panes);
+                right.collect_panes(panes);
+            }
+        }
+    }
+
     /// Find the leaf containing `target` and replace it with `replacement`.
     pub(crate) fn replace(&mut self, target: &gtk::Widget, replacement: SplitNode) -> bool {
         match self {
@@ -195,6 +205,14 @@ impl SplitTreeContainer {
     /// Whether the tree is a single leaf (no splits).
     pub(crate) fn is_single_pane(&self) -> bool {
         self.tree.borrow().is_leaf()
+    }
+
+    pub(crate) fn retire_panes(&self) {
+        let mut panes = Vec::new();
+        self.tree.borrow().collect_panes(&mut panes);
+        for pane_widget in panes {
+            pane::retire_pane(&pane_widget);
+        }
     }
 
     pub(crate) fn toggle_zoom(self: &Rc<Self>, target: &gtk::Widget) -> bool {

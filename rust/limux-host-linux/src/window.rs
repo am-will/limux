@@ -1755,6 +1755,15 @@ pub fn build_window(app: &adw::Application) {
         window.connect_close_request(move |_| {
             save_session_now(&state);
             stop_session_saves_for_shutdown(&state);
+            let split_containers: Vec<_> = state
+                .borrow()
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.split_container.clone())
+                .collect();
+            for split_container in split_containers {
+                split_container.retire_panes();
+            }
             CONTROL_STATE.with(|slot| {
                 slot.borrow_mut().take();
             });
@@ -4924,8 +4933,20 @@ fn close_workspace_by_id_internal(
     persist: bool,
     preferred_active_workspace_id: Option<&str>,
 ) {
+    let split_container = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.split_container.clone())
+    };
+    let Some(split_container) = split_container else {
+        return;
+    };
+    split_container.retire_panes();
+
     let mut s = state.borrow_mut();
-    let Some(idx) = s.workspaces.iter().position(|w| w.id == id) else {
+    let Some(idx) = s.workspaces.iter().position(|workspace| workspace.id == id) else {
         return;
     };
     let desired_active_workspace_id = preferred_active_workspace_id
@@ -5414,8 +5435,8 @@ fn show_runtime_error(state: &State, title: &str, detail: &str) {
 }
 
 fn quit_app(state: &State) {
-    save_session_now(state);
-    state.borrow().app.quit();
+    let window = state.borrow().window.clone();
+    window.close();
 }
 
 fn spawn_new_instance(state: &State) -> bool {
