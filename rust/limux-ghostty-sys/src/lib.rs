@@ -462,6 +462,20 @@ extern "C" {
 }
 
 extern "C" {
+    #[link_name = "gladLoaderLoadGLContext"]
+    fn glad_loader_load_gl_context(context: *mut c_void) -> c_int;
+    #[link_name = "gladLoaderUnloadGLContext"]
+    fn glad_loader_unload_gl_context(context: *mut c_void);
+}
+
+/// Retain GLAD loader symbols in the final host executable for `libghostty.so`.
+#[inline(never)]
+pub fn ensure_glad_symbols_linked() {
+    std::hint::black_box(glad_loader_load_gl_context as unsafe extern "C" fn(*mut c_void) -> c_int);
+    std::hint::black_box(glad_loader_unload_gl_context as unsafe extern "C" fn(*mut c_void));
+}
+
+extern "C" {
     // Init
     pub fn ghostty_init(argc: usize, argv: *mut *mut c_char) -> c_int;
 

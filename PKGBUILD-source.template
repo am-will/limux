@@ -1,0 +1,67 @@
+# Maintainer: Limux contributors
+# Contributor: Anton Barchukov <anton@barchukov.com>
+pkgname=limux
+pkgver=@@VERSION@@
+pkgrel=1
+pkgdesc="GPU-accelerated terminal workspace manager for Linux, powered by Ghostty's rendering engine (cmux port)"
+arch=('x86_64')
+url="https://github.com/am-will/limux"
+license=('MIT')
+depends=('fontconfig' 'glib2' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'pango' 'webkitgtk-6.0')
+makedepends=('ghostty' 'git' 'libepoxy' 'rust' 'zig0.15')
+conflicts=('limux-bin' 'limux-bin-debug')
+options=(!debug !lto)
+_limux_commit=@@SOURCE_COMMIT@@
+_ghostty_commit=@@GHOSTTY_COMMIT@@
+source=(
+    "$pkgname-$pkgver::git+@@SOURCE_REPOSITORY@@#commit=$_limux_commit"
+    "ghostty-$pkgver::git+https://github.com/am-will/ghostty.git#commit=$_ghostty_commit"
+)
+sha256sums=('SKIP' 'SKIP')
+
+prepare() {
+    cd "$srcdir/$pkgname-$pkgver"
+    rm -rf ghostty
+    ln -s "$srcdir/ghostty-$pkgver" ghostty
+}
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    local zig_args=(-Doptimize=ReleaseFast -Dcpu=baseline -fno-sys=gtk4-layer-shell)
+
+    (
+        cd ghostty
+        zig-0.15 build -Dapp-runtime=none "${zig_args[@]}"
+    )
+
+    RUSTFLAGS="\
+        -C link-arg=-Wl,-rpath,/usr/lib/limux \
+        -C link-arg=-Wl,--export-dynamic" cargo build --release --locked
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    install -Dm755 target/release/limux-cli "$pkgdir/usr/bin/limux"
+    install -Dm755 target/release/limux "$pkgdir/usr/libexec/limux/limux-host"
+    install -Dm644 ghostty/zig-out/lib/libghostty.so "$pkgdir/usr/lib/limux/libghostty.so"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    install -dm755 "$pkgdir/usr/share/limux/ghostty"
+    cp -a /usr/share/ghostty/. "$pkgdir/usr/share/limux/ghostty/"
+    install -Dm644 /usr/share/terminfo/x/xterm-ghostty \
+        "$pkgdir/usr/share/limux/terminfo/x/xterm-ghostty"
+
+    install -Dm644 rust/limux-host-linux/dev.limux.linux.desktop \
+        "$pkgdir/usr/share/applications/dev.limux.linux.desktop"
+    install -Dm644 rust/limux-host-linux/dev.limux.linux.metainfo.xml \
+        "$pkgdir/usr/share/metainfo/dev.limux.linux.metainfo.xml"
+
+    for size in 16 32 128 256 512; do
+        install -Dm644 "rust/limux-host-linux/icons/app/$size.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/limux.png"
+    done
+    install -dm755 "$pkgdir/usr/share/icons/hicolor/scalable/actions"
+    install -m644 rust/limux-host-linux/icons/*.svg \
+        -t "$pkgdir/usr/share/icons/hicolor/scalable/actions/"
+}

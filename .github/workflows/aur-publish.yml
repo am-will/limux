@@ -1,6 +1,19 @@
 name: Publish to AUR
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/aur-publish.yml
+      - .cargo/config.toml
+      - Cargo.lock
+      - Cargo.toml
+      - LICENSE
+      - PKGBUILD-source.template
+      - PKGBUILD.template
+      - ghostty
+      - rust/**
+      - scripts/render-aur-source-pkgbuild.sh
+      - scripts/tests/test-aur-source-package.sh
   workflow_run:
     workflows: ["Build Linux Release Packages"]
     types: [completed]
@@ -14,61 +27,246 @@ permissions:
   contents: read
 
 jobs:
-  aur-publish:
+  prepare:
     runs-on: ubuntu-latest
     if: >-
       ${{
-        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'pull_request' ||
         (
+          github.repository == 'am-will/limux' &&
+          github.event_name == 'workflow_dispatch' &&
+          github.ref == 'refs/heads/main'
+        ) ||
+        (
+          github.repository == 'am-will/limux' &&
           github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'release' &&
           startsWith(github.event.workflow_run.head_branch, 'v')
         )
       }}
+    outputs:
+      publish: ${{ steps.metadata.outputs.publish }}
+      version: ${{ steps.metadata.outputs.version }}
 
     steps:
-      - name: Check out repository
+      - name: Check out pull request head
+        if: github.event_name == 'pull_request'
         uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
 
-      - name: Extract version
-        id: version
+      - name: Check out upstream
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve package metadata
+        id: metadata
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          PR_REPOSITORY: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event.workflow_run.head_branch }}" == v* ]]; then
-            echo "version=${{ github.event.workflow_run.head_branch }}" | sed 's/^version=v/version=/' >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+            source_repository="$PR_REPOSITORY"
+            source_commit="$PR_SHA"
+            publish=false
           else
-            echo "::error::Cannot infer release version from workflow_run head_branch '${{ github.event.workflow_run.head_branch }}'"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              version="$INPUT_VERSION"
+            else
+              version="${RELEASE_BRANCH#v}"
+            fi
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid release version: $version"
+              exit 1
+            fi
+            git fetch --force origin "refs/tags/v${version}:refs/tags/v${version}"
+            source_repository="https://github.com/am-will/limux.git"
+            source_commit=$(git rev-list -n1 "v${version}")
+            tagged_version=$(git show "$source_commit:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)
+            if [ "$tagged_version" != "$version" ]; then
+              echo "::error::Tag v${version} contains workspace version ${tagged_version}"
+              exit 1
+            fi
+            publish=true
+          fi
+
+          ghostty_commit=$(git ls-tree "$source_commit" ghostty | awk '{print $3}')
+          if [[ ! "$ghostty_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Unable to resolve Ghostty gitlink from $source_commit"
             exit 1
           fi
 
-      - name: Generate AUR PKGBUILD
+          mkdir -p /tmp/aur-pkgbuilds
+          ./scripts/render-aur-source-pkgbuild.sh \
+            PKGBUILD-source.template \
+            /tmp/aur-pkgbuilds/PKGBUILD-source \
+            "$version" \
+            "$source_repository" \
+            "$source_commit" \
+            "$ghostty_commit"
+
+          if [ "$publish" = true ]; then
+            tarball_url="https://github.com/am-will/limux/releases/download/v${version}/limux-${version}-linux-x86_64.tar.gz"
+            curl --fail --location --retry 5 --retry-delay 10 \
+              "$tarball_url" -o /tmp/limux.tar.gz
+            tar -tzf /tmp/limux.tar.gz > /tmp/limux-tarball-files.txt
+            grep -Fxq "limux-${version}-linux-x86_64/limux" /tmp/limux-tarball-files.txt
+            grep -Fxq "limux-${version}-linux-x86_64/libexec/limux/limux-host" /tmp/limux-tarball-files.txt
+            sha256=$(sha256sum /tmp/limux.tar.gz | awk '{print $1}')
+            sed \
+              -e "s/@@VERSION@@/$version/g" \
+              -e "s/@@SHA256@@/$sha256/g" \
+              PKGBUILD.template > /tmp/aur-pkgbuilds/PKGBUILD-bin
+          fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload generated PKGBUILDs
+        uses: actions/upload-artifact@v7
+        with:
+          name: aur-pkgbuilds
+          path: /tmp/aur-pkgbuilds
+          if-no-files-found: error
+
+  validate-source:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    steps:
+      - name: Download generated PKGBUILD
+        uses: actions/download-artifact@v8
+        with:
+          name: aur-pkgbuilds
+          path: /tmp/aur-pkgbuilds
+
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm \
+            curl \
+            git \
+            ghostty \
+            gtk4 \
+            libadwaita \
+            libepoxy \
+            minisign \
+            namcap \
+            rust \
+            webkitgtk-6.0
+
+      - name: Install Zig 0.15 package
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-          TARBALL_URL="https://github.com/am-will/limux/releases/download/v${VERSION}/limux-${VERSION}-linux-x86_64.tar.gz"
+          useradd --create-home builder
+          git clone https://aur.archlinux.org/zig0.15-bin.git /tmp/zig-package
+          git -C /tmp/zig-package checkout --detach 6ec7dad0340e61aa0c98a895d09561ecf7b7270e
+          chown -R builder:builder /tmp/zig-package
+          runuser -u builder -- env HOME=/home/builder \
+            makepkg --dir /tmp/zig-package --cleanbuild --noconfirm
+          pacman -U --noconfirm /tmp/zig-package/zig0.15-bin-*.pkg.tar.zst
 
-          for i in {1..20}; do
-            curl -fL "$TARBALL_URL" -o /tmp/limux.tar.gz && break
-            if [ "$i" -eq 20 ]; then
-              echo "::error::Release tarball is not available after $i attempts: $TARBALL_URL"
-              exit 1
-            fi
-            echo "Attempt $i failed, retrying in 15s..."
-            sleep 15
+      - name: Build source package
+        run: |
+          set -euo pipefail
+          install -d -o builder -g builder /tmp/limux-package
+          install -o builder -g builder -m644 \
+            /tmp/aur-pkgbuilds/PKGBUILD-source \
+            /tmp/limux-package/PKGBUILD
+          runuser -u builder -- env HOME=/home/builder \
+            makepkg --dir /tmp/limux-package --cleanbuild --noconfirm
+
+      - name: Verify and install source package
+        run: |
+          set -euo pipefail
+          package=$(find /tmp/limux-package -maxdepth 1 -name 'limux-*.pkg.tar.zst' ! -name '*-debug-*' -print -quit)
+          test -n "$package"
+          bsdtar -tf "$package" > /tmp/limux-package-files.txt
+
+          for path in \
+            usr/bin/limux \
+            usr/libexec/limux/limux-host \
+            usr/lib/limux/libghostty.so \
+            usr/share/licenses/limux/LICENSE \
+            usr/share/applications/dev.limux.linux.desktop \
+            usr/share/metainfo/dev.limux.linux.metainfo.xml \
+            usr/share/limux/ghostty \
+            usr/share/limux/terminfo/x/xterm-ghostty; do
+            grep -Eq "^${path}(/|$)" /tmp/limux-package-files.txt
           done
-          SHA256=$(sha256sum /tmp/limux.tar.gz | awk '{print $1}')
+          if grep -Fxq usr/libexec/limux/limux /tmp/limux-package-files.txt; then
+            echo "::error::Source package contains legacy host entrypoint"
+            exit 1
+          fi
 
-          sed -e "s/@@VERSION@@/$VERSION/" \
-              -e "s/@@SHA256@@/$SHA256/" \
-              PKGBUILD.template > PKGBUILD
+          namcap "$package"
+          pacman -U --noconfirm "$package"
+          limux --help > /tmp/limux-help.txt
+          grep -q "limux CLI" /tmp/limux-help.txt
+          echo "CLI smoke check passed"
 
-      - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.2
+          readelf -d /usr/libexec/limux/limux-host > /tmp/limux-dynamic.txt
+          grep -q '/usr/lib/limux' /tmp/limux-dynamic.txt
+          echo "Runtime library path check passed"
+
+          if ! ldd -r /usr/libexec/limux/limux-host > /tmp/limux-ldd.txt 2>&1; then
+            cat /tmp/limux-ldd.txt
+            exit 1
+          fi
+          cat /tmp/limux-ldd.txt
+          ! grep -Eq "not found|undefined symbol" /tmp/limux-ldd.txt
+
+  publish-bin:
+    needs: [prepare, validate-source]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download generated PKGBUILDs
+        uses: actions/download-artifact@v8
+        with:
+          name: aur-pkgbuilds
+          path: /tmp/aur-pkgbuilds
+
+      - name: Publish limux-bin to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
           pkgname: limux-bin
-          pkgbuild: PKGBUILD
+          pkgbuild: /tmp/aur-pkgbuilds/PKGBUILD-bin
           commit_username: "limux-aurbot"
           commit_email: limux-aurbot@users.noreply.aur.archlinux.org
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "chore: bump to ${{ steps.version.outputs.version }}"
-          force_push: true
+          commit_message: "chore: bump to ${{ needs.prepare.outputs.version }}"
+
+  publish-source:
+    needs: [prepare, validate-source]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download generated PKGBUILDs
+        uses: actions/download-artifact@v8
+        with:
+          name: aur-pkgbuilds
+          path: /tmp/aur-pkgbuilds
+
+      - name: Publish limux to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: limux
+          pkgbuild: /tmp/aur-pkgbuilds/PKGBUILD-source
+          commit_username: "limux-aurbot"
+          commit_email: limux-aurbot@users.noreply.aur.archlinux.org
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "chore: bump to ${{ needs.prepare.outputs.version }}"

@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     // Find libghostty relative to the workspace root.
@@ -12,22 +12,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", ghostty_lib.display());
     println!("cargo:rustc-link-lib=dylib=ghostty");
     println!("cargo:rustc-link-lib=dylib=epoxy");
-
-    // Compile glad (GL loader) which libghostty depends on but doesn't
-    // include when built as a shared library.
-    let glad_src = ghostty_root.join("vendor/glad/src/gl.c");
-    let glad_include = ghostty_root.join("vendor/glad/include");
-    if glad_src.exists() {
-        cc::Build::new()
-            .file(&glad_src)
-            .include(&glad_include)
-            .cargo_metadata(false)
-            .compile("glad");
-
-        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
-        println!("cargo:rustc-link-search=native={}", out_dir.display());
-        println!("cargo:rustc-link-lib=static:+whole-archive=glad");
-    }
 
     // Re-run if libghostty changes
     println!(
