@@ -5435,8 +5435,8 @@ fn show_runtime_error(state: &State, title: &str, detail: &str) {
 }
 
 fn quit_app(state: &State) {
-    save_session_now(state);
-    state.borrow().app.quit();
+    let window = state.borrow().window.clone();
+    window.close();
 }
 
 fn spawn_new_instance(state: &State) -> bool {
