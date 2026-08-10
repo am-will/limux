@@ -1432,21 +1432,31 @@ pub fn build_window(app: &adw::Application) {
         .build();
     apply_window_background_class(&window, background_opacity);
 
-    // On Wayland compositors with xdg-decoration support, the compositor
-    // already provides the window chrome, so keep Limux from rendering a
-    // duplicate header bar. X11 continues to use the in-app header.
-    let provides_decorations = display
-        .clone()
-        .downcast::<gdk4_wayland::WaylandDisplay>()
-        .ok()
-        .map(|display| display.query_registry("zxdg_decoration_manager_v1"))
-        .unwrap_or(false);
-
-    let header = if provides_decorations {
-        None
-    } else {
+    // Always render the header bar. `adw::ApplicationWindow` installs its own
+    // empty titlebar, which pins GTK4 to client-side decorations, so it never
+    // negotiates server-side decorations even on compositors that offer them.
+    //
+    // A previous version skipped the header whenever the Wayland display
+    // advertised `zxdg_decoration_manager_v1`. Advertising that global only
+    // means the compositor *can* draw server-side decorations, not that it
+    // drew them for this window — and because libadwaita already opted into
+    // CSD, it never did. On KWin/Plasma (and other compositors that advertise
+    // the manager: wlroots, Hyprland) that left the window with no minimize,
+    // maximize or close controls at all. Mutter does not advertise the global,
+    // which is why the bug only showed up outside GNOME.
+    let header = {
         let bar = adw::HeaderBar::new();
         bar.set_title_widget(Some(&gtk::Label::builder().label(&title).build()));
+        // Guarantee the three standard controls are present. GTK's built-in
+        // default for `gtk-decoration-layout` is "menu:close", so on a desktop
+        // that ships no GTK integration the only button would be a lone close
+        // "X" — easily mistaken for the pane toolbar's "Close pane" X.
+        bar.set_decoration_layout(Some(&ensure_window_controls(
+            gtk::Settings::for_display(&display)
+                .gtk_decoration_layout()
+                .as_deref()
+                .unwrap_or_default(),
+        )));
         Some(bar)
     };
 
@@ -1865,6 +1875,57 @@ fn sidebar_width(sidebar_shell: &gtk::Box) -> i32 {
 fn sidebar_min_width(sidebar: &gtk::Box) -> i32 {
     let (minimum, _, _, _) = sidebar.measure(gtk::Orientation::Horizontal, -1);
     minimum.max(1)
+}
+
+/// The three controls a normal desktop window is expected to offer, in the
+/// order GTK draws them.
+const WINDOW_CONTROL_BUTTONS: [&str; 3] = ["minimize", "maximize", "close"];
+
+/// Complete a `gtk-decoration-layout` value so minimize, maximize and close
+/// are all present.
+///
+/// The layout format is `start:end`, where each side is a comma-separated list
+/// of `icon`, `menu`, `minimize`, `maximize`, `close` and `spacer` (GTK splits
+/// on the first colon only). A desktop that already asks for all three
+/// controls is returned untouched, so button order and left/right placement
+/// stay exactly as the user configured them. Otherwise the controls are
+/// re-emitted as a complete set on whichever side already hosted one of them,
+/// which keeps left-handed layouts left-handed; non-control tokens keep their
+/// side.
+fn ensure_window_controls(layout: &str) -> String {
+    let (start, end) = layout.split_once(':').unwrap_or((layout, ""));
+    let tokens = |side: &str| -> Vec<String> {
+        side.split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let (mut start, mut end) = (tokens(start), tokens(end));
+
+    let holds = |side: &[String], name: &str| side.iter().any(|token| token == name);
+    if WINDOW_CONTROL_BUTTONS
+        .iter()
+        .all(|name| holds(&start, name) || holds(&end, name))
+    {
+        return layout.to_owned();
+    }
+
+    let controls_on_start = WINDOW_CONTROL_BUTTONS
+        .iter()
+        .any(|name| holds(&start, name));
+    let is_control = |token: &String| WINDOW_CONTROL_BUTTONS.contains(&token.as_str());
+    start.retain(|token| !is_control(token));
+    end.retain(|token| !is_control(token));
+
+    let side = if controls_on_start {
+        &mut start
+    } else {
+        &mut end
+    };
+    side.extend(WINDOW_CONTROL_BUTTONS.iter().map(|name| (*name).to_owned()));
+
+    format!("{}:{}", start.join(","), end.join(","))
 }
 
 fn sanitize_background_opacity(background_opacity: f64) -> f64 {
@@ -6210,8 +6271,8 @@ mod tests {
         clamp_workspace_insert_index_for_pinning, desktop_notification_action_from_signal,
         desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
-        directional_neighbor_score, favorites_prefix_len, find_leaf_pane, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
+        directional_neighbor_score, ensure_window_controls, favorites_prefix_len, find_leaf_pane,
+        font_size_after_delta, ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
         keep_workspace_open_after_empty_pane, next_active_workspace_index,
         pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
         resolved_system_prefers_dark, sanitize_background_opacity,
@@ -6282,6 +6343,63 @@ mod tests {
             crate::pane::PaneEmptyReason::MovedLastTabOut,
             true,
         ));
+    }
+
+    #[test]
+    fn gtk_default_decoration_layout_gains_minimize_and_maximize() {
+        // GTK's built-in default. Without completion the window would show a
+        // lone close "X", which reads as the pane toolbar's "Close pane".
+        assert_eq!(
+            ensure_window_controls("menu:close"),
+            "menu:minimize,maximize,close"
+        );
+        assert_eq!(ensure_window_controls(""), ":minimize,maximize,close");
+        assert_eq!(
+            ensure_window_controls("appmenu:close"),
+            "appmenu:minimize,maximize,close"
+        );
+    }
+
+    #[test]
+    fn complete_decoration_layouts_are_left_untouched() {
+        // KDE (via kde-gtk-config) and a fully specified GNOME layout already
+        // ask for all three controls; their order and placement must survive.
+        for layout in [
+            "icon:minimize,maximize,close",
+            "appmenu:minimize,maximize,close",
+            "close,maximize,minimize:",
+            "icon,menu:maximize,minimize,close",
+        ] {
+            assert_eq!(ensure_window_controls(layout), layout);
+        }
+    }
+
+    #[test]
+    fn completed_controls_stay_on_the_side_that_already_held_them() {
+        // Left-handed layouts keep their controls on the left.
+        assert_eq!(ensure_window_controls("close:"), "minimize,maximize,close:");
+        assert_eq!(
+            ensure_window_controls("close:icon"),
+            "minimize,maximize,close:icon"
+        );
+        // No controls anywhere: default to the end side.
+        assert_eq!(
+            ensure_window_controls("icon:"),
+            "icon:minimize,maximize,close"
+        );
+    }
+
+    #[test]
+    fn decoration_layout_completion_dedupes_and_tolerates_whitespace() {
+        // A partial layout must not end up with a duplicated control.
+        assert_eq!(
+            ensure_window_controls("menu:maximize,close"),
+            "menu:minimize,maximize,close"
+        );
+        assert_eq!(
+            ensure_window_controls("  menu : close  "),
+            "menu:minimize,maximize,close"
+        );
     }
 
     #[test]

@@ -1816,6 +1816,14 @@ pub fn create_terminal(
         let surface_cell = surface_cell.clone();
         let open_url_external_for_press = open_url_external.clone();
         let open_url_external_for_release = open_url_external.clone();
+        // Resolve Ctrl+click links in the host instead of relying on Ghostty's
+        // configurable `open_url` binding. A user configuration can remove
+        // that binding, but it must not make links in an embedded Limux
+        // terminal inert.
+        let link_click_consumed = Rc::new(Cell::new(false));
+        let link_click_consumed_for_press = link_click_consumed.clone();
+        let link_click_consumed_for_release = link_click_consumed.clone();
+        let callbacks_for_link_click = callbacks.clone();
         let click = gtk::GestureClick::new();
         click.set_button(0); // all buttons
         let sc = surface_cell.clone();
@@ -1836,6 +1844,16 @@ pub fn create_terminal(
                     _ => GHOSTTY_MOUSE_UNKNOWN,
                 };
                 let mods = translate_mouse_mods(gesture.current_event_state());
+                link_click_consumed_for_press.set(false);
+                if is_link_activation_click(button, mods) {
+                    if let Some(url) = url_at_position(Some(surface), x, y, mods) {
+                        let callbacks = callbacks_for_link_click.borrow();
+                        (callbacks.on_open_url)(&url, true);
+                        link_click_consumed_for_press.set(true);
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        return;
+                    }
+                }
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
                     open_url_external_for_press.set(mods & GHOSTTY_MODS_CTRL != 0);
@@ -1848,6 +1866,9 @@ pub fn create_terminal(
         click.connect_released(move |gesture, _n, x, y| {
             let btn = gesture.current_button();
             if btn == 3 {
+                return;
+            }
+            if link_click_consumed_for_release.replace(false) {
                 return;
             }
             if let Some(surface) = *sc2.borrow() {
@@ -2084,6 +2105,10 @@ fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     }
 }
 
+fn is_link_activation_click(button: c_int, mods: c_int) -> bool {
+    button == GHOSTTY_MOUSE_LEFT && mods & GHOSTTY_MODS_CTRL != 0
+}
+
 fn url_at_position(
     surface: Option<ghostty_surface_t>,
     x: f64,
@@ -2181,6 +2206,7 @@ fn show_terminal_context_menu(
 
     let mut items: Vec<(&str, bool)> = vec![("Copy", has_selection)];
     if url.is_some() {
+        items.push(("Open Link", true));
         items.push(("Copy URL", true));
     }
     items.extend([
@@ -2272,6 +2298,12 @@ fn show_terminal_context_menu(
                 pop.popdown();
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
+                    "Open Link" => {
+                        if let Some(url) = url.as_deref() {
+                            let callbacks = cb.borrow();
+                            (callbacks.on_open_url)(url, true);
+                        }
+                    }
                     "Copy URL" => {
                         if let Some(url) = url.as_deref() {
                             copy_text_to_clipboards(url);
@@ -2796,6 +2828,26 @@ mod tests {
         };
 
         assert_eq!(ghostty_open_url_to_string(action), None);
+    }
+
+    #[test]
+    fn ctrl_primary_click_activates_a_link() {
+        assert!(is_link_activation_click(
+            GHOSTTY_MOUSE_LEFT,
+            GHOSTTY_MODS_CTRL
+        ));
+        assert!(is_link_activation_click(
+            GHOSTTY_MOUSE_LEFT,
+            GHOSTTY_MODS_CTRL | GHOSTTY_MODS_SHIFT
+        ));
+        assert!(!is_link_activation_click(
+            GHOSTTY_MOUSE_LEFT,
+            GHOSTTY_MODS_NONE
+        ));
+        assert!(!is_link_activation_click(
+            GHOSTTY_MOUSE_MIDDLE,
+            GHOSTTY_MODS_CTRL
+        ));
     }
 
     #[test]

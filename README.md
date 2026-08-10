@@ -115,6 +115,7 @@ Run the canonical local quality gate before committing:
 
 Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
 Release procedure lives in [`docs/releasing.md`](docs/releasing.md).
+Implementation handoff notes live in [`docs/session-logs/`](docs/session-logs/).
 
 ## Agent integrations
 
