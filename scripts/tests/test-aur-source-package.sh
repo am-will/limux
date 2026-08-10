@@ -33,7 +33,7 @@ expected=$(printf '%s\n' \
     "$SOURCE_COMMIT" \
     "$GHOSTTY_COMMIT" \
     "limux-1.2.3::git+https://github.com/example/limux.git#commit=$SOURCE_COMMIT" \
-    "ghostty-1.2.3::git+https://github.com/am-will/ghostty.git#commit=$GHOSTTY_COMMIT")
+    "ghostty-1.2.3::git+https://github.com/bvolpato/ghostty.git#commit=$GHOSTTY_COMMIT")
 [ "$metadata" = "$expected" ]
 
 if "$ROOT_DIR/scripts/render-aur-source-pkgbuild.sh" \

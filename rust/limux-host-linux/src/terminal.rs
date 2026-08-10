@@ -624,11 +624,11 @@ pub fn init_ghostty() {
             supports_selection_clipboard: true,
             wakeup_cb: ghostty_wakeup_cb,
             action_cb: ghostty_action_cb,
-            clipboard_has_text_cb: ghostty_clipboard_has_text_cb,
             read_clipboard_cb: ghostty_read_clipboard_cb,
             confirm_read_clipboard_cb: ghostty_confirm_read_clipboard_cb,
             write_clipboard_cb: ghostty_write_clipboard_cb,
             close_surface_cb: ghostty_close_surface_cb,
+            tmux_control_cb: None,
         };
 
         let app = unsafe { ghostty_app_new(&runtime_config, config) };
@@ -1157,22 +1157,19 @@ unsafe extern "C" fn ghostty_read_clipboard_cb(
     userdata: *mut c_void,
     clipboard_type: c_int,
     state: *mut c_void,
-) {
+) -> bool {
     let surface_ptr = match unsafe { clipboard_surface_from_userdata(userdata) } {
         Some(surface) => surface,
-        None => return,
+        None => return false,
     };
 
-    let display = match gtk::gdk::Display::default() {
-        Some(d) => d,
-        None => {
-            unsafe {
-                complete_clipboard_request(surface_ptr, ptr::null(), state, true);
-            }
-            return;
-        }
+    let Some(display) = gtk::gdk::Display::default() else {
+        return false;
     };
     let clipboard = clipboard_from_type(&display, clipboard_type);
+    if !clipboard_has_text(&clipboard) {
+        return false;
+    }
 
     clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |result| {
         let text = result.ok().flatten().map(|s| s.to_string());
@@ -1181,6 +1178,8 @@ unsafe extern "C" fn ghostty_read_clipboard_cb(
             complete_clipboard_request(surface_ptr, cstr.as_ptr(), state, true);
         }
     });
+
+    true
 }
 
 fn clipboard_from_type(display: &gtk::gdk::Display, clipboard_type: c_int) -> gtk::gdk::Clipboard {
@@ -1222,17 +1221,6 @@ fn clipboard_formats_include_text<'a>(
         mime.eq_ignore_ascii_case("text/plain")
             || mime.eq_ignore_ascii_case("text/plain;charset=utf-8")
     })
-}
-
-unsafe extern "C" fn ghostty_clipboard_has_text_cb(
-    _userdata: *mut c_void,
-    clipboard_type: c_int,
-) -> bool {
-    let Some(display) = gtk::gdk::Display::default() else {
-        return false;
-    };
-    let clipboard = clipboard_from_type(&display, clipboard_type);
-    clipboard_has_text(&clipboard)
 }
 
 unsafe extern "C" fn ghostty_confirm_read_clipboard_cb(
@@ -1649,7 +1637,7 @@ pub fn create_terminal(
             }));
             config.platform_tag = GHOSTTY_PLATFORM_LINUX;
             config.platform = ghostty_platform_u {
-                linux: ghostty_platform_linux_s {
+                linux_platform: ghostty_platform_linux_s {
                     reserved: ptr::null_mut(),
                 },
             };
