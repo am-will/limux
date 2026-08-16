@@ -984,7 +984,7 @@ unsafe extern "C" fn ghostty_action_cb(
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
                         match url {
-                            Some(url) => {
+                            Some(url) if widget_has_native_surface(&entry.gl_area) => {
                                 entry.link_label.set_text(&url);
                                 let (x, y) = entry.cursor_pos.get();
                                 // GTK default: PositionType::Top centers the
@@ -1002,7 +1002,7 @@ unsafe extern "C" fn ghostty_action_cb(
                                 ));
                                 entry.link_popover.popup();
                             }
-                            None => entry.link_popover.popdown(),
+                            Some(_) | None => entry.link_popover.popdown(),
                         }
                     }
                 });
@@ -1419,6 +1419,7 @@ fn free_terminal_surface(
 
     clipboard_context_cell.set(ptr::null_mut());
     if let Some(entry) = entry.as_ref() {
+        entry.link_popover.popdown();
         unregister_surface_identity(entry.identity);
     }
 
@@ -2139,7 +2140,9 @@ pub fn create_terminal(
     // in connect_realize when the widget is re-realized.
     {
         let surface_cell = surface_cell.clone();
+        let link_popover = link_popover.clone();
         let handler = gl_area.connect_unrealize(move |gl_area| {
+            link_popover.popdown();
             if let Some(surface) = *surface_cell.borrow() {
                 gl_area.make_current();
                 unsafe { ghostty_surface_display_unrealized(surface) };
@@ -2258,6 +2261,14 @@ fn build_floating_popover(
     popover
 }
 
+fn widget_has_native_surface(widget: &impl IsA<gtk::Widget>) -> bool {
+    widget.is_mapped()
+        && widget
+            .native()
+            .and_then(|native| native.surface())
+            .is_some()
+}
+
 /// 4 px box wrapper that matches the inner margin used by the right-click
 /// context menu items. Reused for the hover preview so both popovers have
 /// the same visual breathing room around their content.
@@ -2346,13 +2357,20 @@ fn show_terminal_context_menu(
             ids_popover.set_parent(&btn);
             let ids_popover_for_motion = ids_popover.clone();
             let motion = gtk::EventControllerMotion::new();
-            motion.connect_enter(move |_, _, _| {
-                ids_popover_for_motion.popup();
+            motion.connect_enter(move |motion, _, _| {
+                if motion
+                    .widget()
+                    .is_some_and(|widget| widget_has_native_surface(&widget))
+                {
+                    ids_popover_for_motion.popup();
+                }
             });
             btn.add_controller(motion);
             let ids_popover_for_click = ids_popover.clone();
-            btn.connect_clicked(move |_| {
-                ids_popover_for_click.popup();
+            btn.connect_clicked(move |btn| {
+                if widget_has_native_surface(btn) {
+                    ids_popover_for_click.popup();
+                }
             });
         }
         menu_box.append(&btn);

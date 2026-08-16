@@ -188,9 +188,9 @@ pub fn retire_pane(pane_widget: &gtk::Widget) {
             std::mem::take(&mut tab_state.tabs)
         };
         for entry in entries {
+            entry.prepare_for_removal();
             internals.tab_strip.remove(&entry.tab_button);
             internals.content_stack.remove(&entry.content);
-            entry.prepare_for_removal();
         }
         unregister_pane(internals.pane_id);
     }
@@ -3265,9 +3265,9 @@ fn remove_tab(
         )
     };
 
+    entry.prepare_for_removal();
     tab_strip.remove(&entry.tab_button);
     content_stack.remove(&entry.content);
-    entry.prepare_for_removal();
 
     let Some(new_id) = new_id else {
         if removed_was_unread {
