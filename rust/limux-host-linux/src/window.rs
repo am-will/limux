@@ -3218,7 +3218,7 @@ fn show_workspace_autostart_dialog(state: &State, workspace_id: &str) {
         .build();
     let entry = gtk::Entry::builder()
         .text(current_command.as_deref().unwrap_or_default())
-        .placeholder_text("Command, for example: ssh codex")
+        .placeholder_text("Command, for example: ssh user@server")
         .hexpand(true)
         .activates_default(true)
         .build();
@@ -6528,8 +6528,8 @@ mod tests {
     #[test]
     fn workspace_autostart_normalizes_command_and_empty_input() {
         assert_eq!(
-            normalize_autostart_command("  ssh codex  ").as_deref(),
-            Some("ssh codex")
+            normalize_autostart_command("  ssh user@server  ").as_deref(),
+            Some("ssh user@server")
         );
         assert_eq!(normalize_autostart_command("  \t "), None);
     }

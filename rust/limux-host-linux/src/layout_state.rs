@@ -1087,7 +1087,7 @@ mod tests {
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
-                autostart_command: Some("ssh codex".to_string()),
+                autostart_command: Some("ssh user@server".to_string()),
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(decoded.workspaces[0].name, "workspace");
         assert_eq!(
             decoded.workspaces[0].autostart_command.as_deref(),
-            Some("ssh codex")
+            Some("ssh user@server")
         );
     }
 

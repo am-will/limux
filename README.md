@@ -133,7 +133,7 @@ Release procedure lives in [`docs/releasing.md`](docs/releasing.md).
 Right-click a workspace in the sidebar and select **Set Autostart…** to run a
 command whenever Limux creates a terminal in that workspace. The command is
 stored as part of the workspace session and runs inside the terminal, so
-interactive commands such as `ssh codex` work without modifying `.bashrc`.
+interactive commands such as `ssh user@server` work without modifying `.bashrc`.
 Open **Edit Autostart…** and save an empty command to disable it.
 
 ## Agent integrations

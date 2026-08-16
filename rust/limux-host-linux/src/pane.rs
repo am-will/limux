@@ -4185,17 +4185,17 @@ mod tests {
     #[test]
     fn explicit_terminal_command_can_suppress_workspace_autostart() {
         assert_eq!(
-            select_terminal_commands(None, Some("ssh codex".to_string()), true),
+            select_terminal_commands(None, Some("ssh user@server".to_string()), true),
             (None, None)
         );
         assert_eq!(
-            select_terminal_commands(None, Some("ssh codex".to_string()), false),
-            (None, Some("ssh codex".to_string()))
+            select_terminal_commands(None, Some("ssh user@server".to_string()), false),
+            (None, Some("ssh user@server".to_string()))
         );
         assert_eq!(
             select_terminal_commands(
                 Some("codex resume abc".to_string()),
-                Some("ssh codex".to_string()),
+                Some("ssh user@server".to_string()),
                 true,
             ),
             (Some("codex resume abc".to_string()), None)
