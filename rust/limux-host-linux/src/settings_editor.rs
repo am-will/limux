@@ -5,7 +5,9 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::app_config::{AppConfig, ColorScheme, NotificationSound, UiScale, DEFAULT_UI_SCALE};
+use crate::app_config::{
+    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, DEFAULT_UI_SCALE,
+};
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
@@ -317,6 +319,28 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     auto_copy_row.set_activatable_widget(Some(&auto_copy_switch));
     group.add(&auto_copy_row);
 
+    let link_destination_row = adw::ActionRow::builder()
+        .title("Open links in")
+        .subtitle("Choose whether terminal links open outside Limux or in a browser tab")
+        .build();
+    link_destination_row.set_title_lines(1);
+    link_destination_row.set_subtitle_lines(2);
+    let link_destination_dropdown =
+        gtk::DropDown::from_strings(&["Default browser", "Browser tab"]);
+    link_destination_dropdown.set_selected(
+        input
+            .config
+            .borrow()
+            .links
+            .open_destination
+            .dropdown_index(),
+    );
+    link_destination_dropdown.set_sensitive(cfg!(feature = "webkit"));
+    link_destination_dropdown.set_valign(gtk::Align::Center);
+    link_destination_row.add_suffix(&link_destination_dropdown);
+    link_destination_row.set_activatable_widget(Some(&link_destination_dropdown));
+    group.add(&link_destination_row);
+
     let scale_row = adw::ActionRow::builder()
         .title("Interface scale")
         .subtitle("Scale Limux sidebar, pane header, and settings text")
@@ -428,6 +452,28 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             apply_config_change(&config, &*on_changed, move |c| {
                 c.clipboard.copy_selection_to_clipboard = copy_selection_to_clipboard;
             });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        link_destination_dropdown.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            let destination = LinkOpenDestination::from_dropdown_index(dropdown.selected());
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.links.open_destination = destination;
+            })
+            .links
+            .open_destination
+            .dropdown_index();
+            if dropdown.selected() != effective {
+                syncing.set(true);
+                dropdown.set_selected(effective);
+                syncing.set(false);
+            }
         });
     }
     {

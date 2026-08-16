@@ -4707,6 +4707,7 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_close = state.clone();
     let state_for_bell = state.clone();
     let state_for_desktop_notification = state.clone();
+    let state_for_open_url = state.clone();
     let state_for_keybinds = state.clone();
     let state_for_pwd = state.clone();
     let state_for_empty = state.clone();
@@ -4716,6 +4717,7 @@ pub(crate) fn create_pane_for_workspace(
     let ws_id_close = ws_id.to_string();
     let ws_id_bell = ws_id.to_string();
     let ws_id_desktop_notification = ws_id.to_string();
+    let ws_id_open_url = ws_id.to_string();
     let ws_id_pwd = ws_id.to_string();
     let ws_id_empty = ws_id.to_string();
     let ws_id_unread = ws_id.to_string();
@@ -4788,6 +4790,9 @@ pub(crate) fn create_pane_for_workspace(
         ),
         on_open_browser_here: Box::new(move |pane_widget| {
             pane::add_browser_tab_to_pane(pane_widget);
+        }),
+        on_open_url_in_browser: Box::new(move |pane_widget, url| {
+            open_url_in_browser_tab(&state_for_open_url, &ws_id_open_url, pane_widget, url);
         }),
         on_open_keybinds: Box::new(move |anchor| {
             open_keybind_editor_tab(&state_for_keybinds, anchor);
@@ -5281,6 +5286,32 @@ fn split_pane(
     Some(new_pane.upcast())
 }
 
+fn open_url_in_browser_tab(state: &State, ws_id: &str, pane_widget: &gtk::Widget, url: &str) {
+    if let Some(right_pane) = pane_in_direction(state, pane_widget, Direction::Right) {
+        if !pane::open_url_in_existing_browser_tab(&right_pane, url) {
+            pane::add_browser_tab_to_pane_with_uri(&right_pane, Some(url));
+        }
+        return;
+    }
+
+    if split_pane(
+        state,
+        ws_id,
+        pane_widget,
+        gtk::Orientation::Horizontal,
+        SplitPaneOptions {
+            initial_state: Some(PaneState::browser_only(Some(url))),
+            skip_default_tab: false,
+            new_pane_first: false,
+            persist: true,
+        },
+    )
+    .is_none()
+    {
+        pane::add_browser_tab_to_pane_with_uri(pane_widget, Some(url));
+    }
+}
+
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
     remove_pane_internal(state, ws_id, pane_widget, true);
 }
@@ -5702,6 +5733,20 @@ fn focus_pane_in_direction(state: &State, direction: Direction) {
         Some(v) => v,
         None => return,
     };
+
+    let Some(leaf) = pane_in_direction(state, &pane_widget, direction) else {
+        return;
+    };
+    if let Some(gl) = find_gl_area(&leaf) {
+        gl.grab_focus();
+    }
+}
+
+fn pane_in_direction(
+    state: &State,
+    pane_widget: &gtk::Widget,
+    direction: Direction,
+) -> Option<gtk::Widget> {
     let root = state.borrow().window.clone().upcast::<gtk::Widget>();
 
     // Determine which axis and sides we care about.
@@ -5716,10 +5761,7 @@ fn focus_pane_in_direction(state: &State, direction: Direction) {
     // orientation where the current subtree is on the correct side.
     let mut current: gtk::Widget = pane_widget.clone();
     loop {
-        let parent = match current.parent() {
-            Some(p) => p,
-            None => return, // reached the top without finding a valid split
-        };
+        let parent = current.parent()?;
         if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
             if paned.orientation() == target_orientation {
                 let is_start = paned.start_child().map(|c| c == current).unwrap_or(false);
@@ -5731,20 +5773,15 @@ fn focus_pane_in_direction(state: &State, direction: Direction) {
                         paned.start_child()
                     };
                     if let Some(sibling) = sibling {
-                        let leaf =
-                            best_directional_leaf_pane(&pane_widget, &sibling, &root, direction)
+                        return Some(
+                            best_directional_leaf_pane(pane_widget, &sibling, &root, direction)
                                 .unwrap_or_else(|| {
-                                    // Fall back to the old edge-based heuristic if bounds
-                                    // are unavailable for some reason.
                                     let prefer_start = !must_be_start;
                                     find_leaf_pane(&sibling, target_orientation, prefer_start)
-                                });
-                        // Find the GLArea inside the pane and focus it directly
-                        if let Some(gl) = find_gl_area(&leaf) {
-                            gl.grab_focus();
-                        }
+                                }),
+                        );
                     }
-                    return;
+                    return None;
                 }
             }
         }

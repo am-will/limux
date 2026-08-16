@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use limux_ghostty_sys::*;
 
+use crate::app_config::LinkOpenDestination;
+use crate::link_uri;
 use crate::shortcut_config::NormalizedShortcut;
 
 // ---------------------------------------------------------------------------
@@ -41,10 +43,16 @@ type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
 type DesktopNotificationCallback = dyn Fn(&str, &str, bool);
 type BellCallback = dyn Fn(bool);
-type OpenUrlCallback = dyn Fn(&str, bool);
+type OpenUrlCallback = dyn Fn(&str, LinkOpenRequest);
 type VoidCallback = dyn Fn();
 type WidgetCallback = dyn Fn(&gtk::Widget);
 type IdentityCallback = dyn Fn() -> TerminalIdentity;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkOpenRequest {
+    Configured,
+    Destination(LinkOpenDestination),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalIdentity {
@@ -70,9 +78,8 @@ struct SurfaceEntry {
     on_pwd_changed: Option<Box<PwdChangedCallback>>,
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
     on_bell: Option<Box<BellCallback>>,
-    on_open_url: Option<Box<OpenUrlCallback>>,
+    on_open_url: Option<Rc<OpenUrlCallback>>,
     on_close: Option<Box<VoidCallback>>,
-    open_url_external: Rc<Cell<bool>>,
     clipboard_context: *mut ClipboardContext,
     // Hover URL preview for OSC 8 hyperlinks. The popover is a child of
     // `gl_area` so it inherits libadwaita's popover styling — matching the
@@ -1014,21 +1021,19 @@ unsafe extern "C" fn ghostty_action_cb(
                 let surface_key = unsafe { target.target.surface } as usize;
                 let open_url = unsafe { action.action.open_url };
                 if let Some(url) = ghostty_open_url_to_string(open_url) {
-                    let external = SURFACE_MAP.with(|map| {
-                        map.borrow()
-                            .get(&surface_key)
-                            .map(|entry| entry.open_url_external.get())
-                            .unwrap_or(false)
-                    });
-                    glib::idle_add_local_once(move || {
-                        SURFACE_MAP.with(|map| {
-                            if let Some(entry) = map.borrow().get(&surface_key) {
-                                if let Some(cb) = &entry.on_open_url {
-                                    cb(&url, external);
-                                }
+                    if let Some(identity) = current_surface_identity(surface_key) {
+                        glib::idle_add_local_once(move || {
+                            let callback = SURFACE_MAP.with(|map| {
+                                let map = map.borrow();
+                                map.get(&surface_key)
+                                    .filter(|entry| entry.identity == identity)
+                                    .and_then(|entry| entry.on_open_url.clone())
+                            });
+                            if let Some(callback) = callback {
+                                callback(&url, LinkOpenRequest::Configured);
                             }
                         });
-                    });
+                    }
                 }
             }
             true
@@ -1462,7 +1467,6 @@ pub fn create_terminal(
     let shutting_down = Rc::new(Cell::new(false));
     let had_focus = Rc::new(Cell::new(false));
     let scrollbar_syncing = Rc::new(Cell::new(false));
-    let open_url_external = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
     let cursor_pos: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
@@ -1603,7 +1607,6 @@ pub fn create_terminal(
         let had_focus = had_focus.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
         let scrollbar_syncing = scrollbar_syncing.clone();
-        let open_url_external_for_map = open_url_external.clone();
         let extra_env = extra_env.clone();
         let shutting_down = shutting_down.clone();
         let handler = gl_area.connect_realize(move |gl_area| {
@@ -1762,11 +1765,11 @@ pub fn create_terminal(
                                 (callbacks.on_bell)(source_focused);
                             }
                         })),
-                        on_open_url: Some(Box::new({
+                        on_open_url: Some(Rc::new({
                             let cb = callbacks.clone();
-                            move |url, external| {
+                            move |url, destination| {
                                 let callbacks = cb.borrow();
-                                (callbacks.on_open_url)(url, external);
+                                (callbacks.on_open_url)(url, destination);
                             }
                         })),
                         on_close: Some(Box::new({
@@ -1776,7 +1779,6 @@ pub fn create_terminal(
                                 (callbacks.on_close)();
                             }
                         })),
-                        open_url_external: open_url_external_for_map.clone(),
                         clipboard_context,
                         link_popover: link_popover_for_map.clone(),
                         link_label: link_label_for_map.clone(),
@@ -1937,8 +1939,6 @@ pub fn create_terminal(
     // Mouse buttons (also handles click-to-focus) — skip right-click (handled below)
     {
         let surface_cell = surface_cell.clone();
-        let open_url_external_for_press = open_url_external.clone();
-        let open_url_external_for_release = open_url_external.clone();
         let click = gtk::GestureClick::new();
         click.set_button(0); // all buttons
         let sc = surface_cell.clone();
@@ -1961,9 +1961,7 @@ pub fn create_terminal(
                 let mods = translate_mouse_mods(gesture.current_event_state());
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
-                    open_url_external_for_press.set(mods & GHOSTTY_MODS_CTRL != 0);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, button, mods);
-                    open_url_external_for_press.set(false);
                 }
             }
         });
@@ -1982,9 +1980,7 @@ pub fn create_terminal(
                 let mods = translate_mouse_mods(gesture.current_event_state());
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
-                    open_url_external_for_release.set(mods & GHOSTTY_MODS_CTRL != 0);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, button, mods);
-                    open_url_external_for_release.set(false);
                 }
             }
         });
@@ -2281,6 +2277,31 @@ fn build_popover_inner_box() -> gtk::Box {
     menu_box
 }
 
+fn build_submenu_button(label: &str, popover: &gtk::Popover) -> gtk::MenuButton {
+    let button = gtk::MenuButton::new();
+    button.set_label(label);
+    button.set_direction(gtk::ArrowType::Right);
+    button.set_has_frame(false);
+    button.set_halign(gtk::Align::Fill);
+    button.set_popover(Some(popover));
+    button.add_css_class("flat");
+
+    let weak_button = button.downgrade();
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_enter(move |motion, _, _| {
+        if motion
+            .widget()
+            .is_some_and(|widget| widget_has_native_surface(&widget))
+        {
+            if let Some(button) = weak_button.upgrade() {
+                button.popup();
+            }
+        }
+    });
+    button.add_controller(motion);
+    button
+}
+
 fn show_terminal_context_menu(
     gl_area: &gtk::GLArea,
     overlay: &gtk::Overlay,
@@ -2290,6 +2311,10 @@ fn show_terminal_context_menu(
     y: f64,
     mods: c_int,
 ) {
+    if !widget_has_native_surface(gl_area) {
+        return;
+    }
+
     let menu_box = build_popover_inner_box();
     let url = url_at_position(surface, x, y, mods);
 
@@ -2300,6 +2325,9 @@ fn show_terminal_context_menu(
     let mut items: Vec<(&str, bool)> = vec![("Copy", has_selection)];
     if url.is_some() {
         items.push(("Copy URL", true));
+    }
+    if url.as_deref().is_some_and(link_uri::is_safe_external_url) {
+        items.push(("Open in", true));
     }
     items.extend([
         ("Paste", true),
@@ -2336,6 +2364,33 @@ fn show_terminal_context_menu(
         ids_box.append(btn);
     }
     ids_popover.set_child(Some(&ids_box));
+    let ids_menu_button = build_submenu_button("IDs", &ids_popover);
+
+    let open_in_popover = gtk::Popover::new();
+    open_in_popover.set_has_arrow(false);
+    open_in_popover.set_position(gtk::PositionType::Right);
+    let open_in_box = build_popover_inner_box();
+    let open_default_browser_btn = gtk::Button::with_label("Default browser");
+    let open_browser_tab_btn = gtk::Button::with_label("Browser tab");
+    open_browser_tab_btn.set_sensitive(
+        cfg!(feature = "webkit")
+            && url
+                .as_deref()
+                .is_some_and(link_uri::is_embedded_browser_url),
+    );
+    for btn in [&open_default_browser_btn, &open_browser_tab_btn] {
+        btn.add_css_class("flat");
+        btn.set_halign(gtk::Align::Fill);
+        if let Some(label) = btn
+            .child()
+            .and_then(|child| child.downcast::<gtk::Label>().ok())
+        {
+            label.set_xalign(0.0);
+        }
+        open_in_box.append(btn);
+    }
+    open_in_popover.set_child(Some(&open_in_box));
+    let open_in_menu_button = build_submenu_button("Open in…", &open_in_popover);
 
     for (label, enabled) in &items {
         if *label == "---" {
@@ -2346,32 +2401,21 @@ fn show_terminal_context_menu(
             continue;
         }
 
-        let btn = gtk::Button::with_label(if *label == "IDs" { "IDs >" } else { label });
+        if *label == "IDs" {
+            menu_box.append(&ids_menu_button);
+            continue;
+        }
+        if *label == "Open in" {
+            menu_box.append(&open_in_menu_button);
+            continue;
+        }
+
+        let btn = gtk::Button::with_label(label);
         btn.add_css_class("flat");
         btn.set_sensitive(*enabled);
         btn.set_halign(gtk::Align::Fill);
         if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
             lbl.set_xalign(0.0);
-        }
-        if *label == "IDs" {
-            ids_popover.set_parent(&btn);
-            let ids_popover_for_motion = ids_popover.clone();
-            let motion = gtk::EventControllerMotion::new();
-            motion.connect_enter(move |motion, _, _| {
-                if motion
-                    .widget()
-                    .is_some_and(|widget| widget_has_native_surface(&widget))
-                {
-                    ids_popover_for_motion.popup();
-                }
-            });
-            btn.add_controller(motion);
-            let ids_popover_for_click = ids_popover.clone();
-            btn.connect_clicked(move |btn| {
-                if widget_has_native_surface(btn) {
-                    ids_popover_for_click.popup();
-                }
-            });
         }
         menu_box.append(&btn);
     }
@@ -2384,16 +2428,16 @@ fn show_terminal_context_menu(
     while let Some(widget) = child {
         if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
             let label = btn.label().unwrap_or_default().to_string();
-            let pop = popover.clone();
+            let pop = popover.downgrade();
             let cb = callbacks.clone();
             let gl_area = gl_area.clone();
             let url = url.clone();
             let overlay = overlay.clone();
 
             btn.connect_clicked(move |_| {
-                if label == "IDs >" {
+                let Some(pop) = pop.upgrade() else {
                     return;
-                }
+                };
                 pop.popdown();
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
@@ -2432,9 +2476,33 @@ fn show_terminal_context_menu(
         child = widget.next_sibling();
     }
 
+    for (button, destination) in [
+        (
+            open_default_browser_btn,
+            LinkOpenDestination::DefaultBrowser,
+        ),
+        (open_browser_tab_btn, LinkOpenDestination::BrowserTab),
+    ] {
+        let pop = popover.downgrade();
+        let open_in_pop = open_in_popover.downgrade();
+        let callbacks = callbacks.clone();
+        let url = url.clone();
+        button.connect_clicked(move |_| {
+            if let Some(open_in_pop) = open_in_pop.upgrade() {
+                open_in_pop.popdown();
+            }
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
+            if let Some(url) = url.as_deref() {
+                (callbacks.borrow().on_open_url)(url, LinkOpenRequest::Destination(destination));
+            }
+        });
+    }
+
     {
-        let pop = popover.clone();
-        let ids_pop = ids_popover.clone();
+        let pop = popover.downgrade();
+        let ids_pop = ids_popover.downgrade();
         let overlay = overlay.clone();
         let workspace_id = identity.workspace_id.clone();
         copy_workspace_btn.connect_clicked(move |_| {
@@ -2442,33 +2510,51 @@ fn show_terminal_context_menu(
                 copy_text_to_clipboards(workspace_id);
                 show_clipboard_toast(&overlay);
             }
-            ids_pop.popdown();
-            pop.popdown();
+            if let Some(ids_pop) = ids_pop.upgrade() {
+                ids_pop.popdown();
+            }
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
         });
     }
 
     {
-        let pop = popover.clone();
-        let ids_pop = ids_popover.clone();
+        let pop = popover.downgrade();
+        let ids_pop = ids_popover.downgrade();
         let overlay = overlay.clone();
         let surface_id = identity.surface_id.clone();
         copy_surface_btn.connect_clicked(move |_| {
             copy_text_to_clipboards(&surface_id);
             show_clipboard_toast(&overlay);
-            ids_pop.popdown();
-            pop.popdown();
+            if let Some(ids_pop) = ids_pop.upgrade() {
+                ids_pop.popdown();
+            }
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
         });
     }
 
     {
-        let ids_popover = ids_popover.clone();
+        let ids_menu_button = ids_menu_button.clone();
+        let open_in_menu_button = open_in_menu_button.clone();
         popover.connect_closed(move |p| {
-            ids_popover.popdown();
+            ids_menu_button.popdown();
+            ids_menu_button.set_popover(None::<&gtk::Popover>);
+            open_in_menu_button.popdown();
+            open_in_menu_button.set_popover(None::<&gtk::Popover>);
             p.unparent();
         });
     }
 
-    popover.popup();
+    if widget_has_native_surface(gl_area) {
+        popover.popup();
+    } else {
+        ids_menu_button.set_popover(None::<&gtk::Popover>);
+        open_in_menu_button.set_popover(None::<&gtk::Popover>);
+        popover.unparent();
+    }
 }
 
 // ---------------------------------------------------------------------------
