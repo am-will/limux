@@ -719,14 +719,22 @@ fn handle_client(
             return Ok(());
         }
 
-        let input = std::str::from_utf8(&line_buf)
-            .map(|line| line.trim_end_matches(['\n', '\r']))
-            .unwrap_or("");
-        if input.is_empty() {
-            continue;
-        }
-
-        let response = dispatch_request(input, dispatch);
+        let response = match std::str::from_utf8(&line_buf) {
+            Ok(input) => {
+                let input = input.trim_end_matches(['\n', '\r']);
+                if input.is_empty() {
+                    continue;
+                }
+                dispatch_request(input, dispatch)
+            }
+            Err(error) => error_response(
+                None,
+                BridgeError::new(
+                    PARSE_ERROR_CODE,
+                    format!("invalid request payload: {error}"),
+                ),
+            ),
+        };
         let mut payload = serde_json::to_string(&response)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         payload.push('\n');
@@ -827,6 +835,7 @@ pub fn start(dispatch: fn(ControlCommand)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     #[test]
     fn parses_v2_request_directly() {
@@ -842,6 +851,53 @@ mod tests {
             .expect("v1 request should parse");
         assert_eq!(request.method, "workspace.create");
         assert_eq!(request.params["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn invalid_utf8_returns_parse_error_and_keeps_connection_open() {
+        let (client, server) = UnixStream::pair().expect("socket pair should open");
+        let server_task = std::thread::spawn(move || {
+            handle_client(server, &|command| {
+                panic!("ping should not dispatch a GTK command: {command:?}")
+            })
+        });
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should set");
+        let reader_stream = client.try_clone().expect("client should clone");
+        let mut reader = io::BufReader::new(reader_stream);
+        let mut writer = client;
+
+        writer
+            .write_all(b"\xff\n{\"id\":\"after-error\",\"method\":\"system.ping\",\"params\":{}}\n")
+            .expect("requests should write");
+        writer.flush().expect("requests should flush");
+
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .expect("parse error should read");
+        let response: Value =
+            serde_json::from_str(response_line.trim()).expect("response should be valid json");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], PARSE_ERROR_CODE);
+
+        response_line.clear();
+        reader
+            .read_line(&mut response_line)
+            .expect("ping response should read");
+        let response: Value =
+            serde_json::from_str(response_line.trim()).expect("response should be valid json");
+        assert_eq!(response["id"], "after-error");
+        assert_eq!(response["result"]["pong"], true);
+
+        drop(reader);
+        drop(writer);
+        server_task
+            .join()
+            .expect("server thread should join")
+            .expect("server should stop at EOF");
     }
 
     #[test]

@@ -79,16 +79,23 @@ pub async fn handle_connection(stream: UnixStream, dispatcher: Dispatcher) -> io
             return Ok(());
         }
 
-        let incoming = std::str::from_utf8(&line_buf)
-            .map(|line| line.trim_end_matches(['\n', '\r']))
-            .unwrap_or("");
-        if incoming.is_empty() {
-            continue;
-        }
-
-        let response = match parse_request(incoming) {
-            Ok(request) => dispatcher.dispatch(request).await,
-            Err(message) => V2Response::error(None, -32700, message, None),
+        let response = match std::str::from_utf8(&line_buf) {
+            Ok(incoming) => {
+                let incoming = incoming.trim_end_matches(['\n', '\r']);
+                if incoming.is_empty() {
+                    continue;
+                }
+                match parse_request(incoming) {
+                    Ok(request) => dispatcher.dispatch(request).await,
+                    Err(message) => V2Response::error(None, -32700, message, None),
+                }
+            }
+            Err(error) => V2Response::error(
+                None,
+                -32700,
+                format!("invalid request payload: {error}"),
+                None,
+            ),
         };
 
         let mut payload = serde_json::to_string(&response)

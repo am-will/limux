@@ -103,6 +103,56 @@ async fn socket_roundtrip_accepts_v1_envelope() {
 }
 
 #[tokio::test]
+async fn invalid_utf8_returns_parse_error_and_keeps_connection_open() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let socket_path = temp_dir.path().join("limux-control.sock");
+
+    let listener = UnixListener::bind(&socket_path).expect("listener should bind");
+    let server_task = tokio::spawn(async move {
+        let dispatcher = Dispatcher::new();
+        let _ = server::serve(listener, dispatcher).await;
+    });
+
+    let stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect stream");
+    let (reader_half, mut writer_half) = stream.into_split();
+    let mut reader = BufReader::new(reader_half);
+
+    writer_half
+        .write_all(b"\xff\n{\"id\":\"after-error\",\"method\":\"system.ping\",\"params\":{}}\n")
+        .await
+        .expect("requests should write");
+    writer_half.flush().await.expect("requests should flush");
+
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .await
+        .expect("parse error should read");
+    let response: Value =
+        serde_json::from_str(response_line.trim()).expect("response should be valid json");
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], -32700);
+    assert!(response["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.starts_with("invalid request payload:")));
+
+    response_line.clear();
+    reader
+        .read_line(&mut response_line)
+        .await
+        .expect("ping response should read");
+    let response: Value =
+        serde_json::from_str(response_line.trim()).expect("response should be valid json");
+    assert_eq!(response["id"], "after-error");
+    assert_eq!(response["result"]["pong"], true);
+
+    server_task.abort();
+    let _ = server_task.await;
+}
+
+#[tokio::test]
 async fn run_server_refuses_to_overwrite_non_socket_path() {
     let temp_dir = tempfile::tempdir().expect("temp dir should be created");
     let socket_path = temp_dir.path().join("limux-control.sock");
