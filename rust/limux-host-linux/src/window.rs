@@ -58,6 +58,8 @@ struct Workspace {
     cwd: Rc<RefCell<Option<String>>>,
     /// The folder path this workspace was opened with.
     folder_path: Option<String>,
+    /// Command launched directly in every new terminal for this workspace.
+    autostart_command: Rc<RefCell<Option<String>>>,
     /// Path label shown below workspace name in sidebar.
     path_label: gtk::Label,
 }
@@ -995,6 +997,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
                 favorite: workspace.favorite,
                 cwd,
                 folder_path,
+                autostart_command: workspace.autostart_command.borrow().clone(),
                 layout,
             }
         })
@@ -1061,6 +1064,7 @@ fn build_workspace_root(
     shortcuts: &Rc<ResolvedShortcutConfig>,
     ws_id: &str,
     working_directory: Option<&str>,
+    autostart_command: &Rc<RefCell<Option<String>>>,
     layout: &LayoutNodeState,
 ) -> (gtk::Widget, Rc<SplitTreeContainer>) {
     let tree_node = split_tree::build_split_node_from_layout(
@@ -1068,6 +1072,7 @@ fn build_workspace_root(
         shortcuts,
         ws_id,
         working_directory,
+        autostart_command,
         layout,
     );
     let container = SplitTreeContainer::new_from_tree(state, tree_node);
@@ -3110,11 +3115,26 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
 
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
+    let has_autostart = {
+        let app_state = state.borrow();
+        app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .is_some_and(|workspace| workspace.autostart_command.borrow().is_some())
+    };
+    let autostart_btn = gtk::Button::with_label(if has_autostart {
+        "Edit Autostart…"
+    } else {
+        "Set Autostart…"
+    });
+    autostart_btn.add_css_class("flat");
     let delete_btn = gtk::Button::with_label("Delete");
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
     menu_box.append(&rename_btn);
+    menu_box.append(&autostart_btn);
     menu_box.append(&delete_btn);
 
     let popover = gtk::Popover::new();
@@ -3135,6 +3155,15 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         let state = state.clone();
         let ws_id = workspace_id.to_string();
         let pop = popover.clone();
+        autostart_btn.connect_clicked(move |_| {
+            pop.popdown();
+            show_workspace_autostart_dialog(&state, &ws_id);
+        });
+    }
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
         delete_btn.connect_clicked(move |_| {
             pop.popdown();
             close_workspace_by_id(&state, &ws_id);
@@ -3148,6 +3177,114 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     }
 
     popover.popup();
+}
+
+fn normalize_autostart_command(command: &str) -> Option<String> {
+    let command = command.trim();
+    (!command.is_empty()).then(|| command.to_string())
+}
+
+fn show_workspace_autostart_dialog(state: &State, workspace_id: &str) {
+    let (workspace_name, current_command) = {
+        let app_state = state.borrow();
+        let Some(workspace) = app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        let workspace_name = workspace.name.clone();
+        let current_command = workspace.autostart_command.borrow().clone();
+        (workspace_name, current_command)
+    };
+
+    let dialog = gtk::Window::builder()
+        .title("Workspace Autostart")
+        .modal(true)
+        .default_width(520)
+        .resizable(false)
+        .build();
+    if let Some(window) = active_window(state) {
+        dialog.set_transient_for(Some(&window));
+    }
+
+    let description = gtk::Label::builder()
+        .label(format!(
+            "Run a command whenever a new terminal opens in {workspace_name}."
+        ))
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .build();
+    let entry = gtk::Entry::builder()
+        .text(current_command.as_deref().unwrap_or_default())
+        .placeholder_text("Command, for example: ssh codex")
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    let hint = gtk::Label::builder()
+        .label("Leave the command empty to disable autostart for this workspace.")
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .build();
+    hint.add_css_class("dim-label");
+
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::End)
+        .spacing(8)
+        .build();
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let save_button = gtk::Button::with_label("Save");
+    save_button.add_css_class("suggested-action");
+    buttons.append(&cancel_button);
+    buttons.append(&save_button);
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+    content.append(&description);
+    content.append(&entry);
+    content.append(&hint);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+    dialog.set_default_widget(Some(&save_button));
+
+    let dialog_for_cancel = dialog.clone();
+    cancel_button.connect_clicked(move |_| dialog_for_cancel.close());
+
+    let state_for_save = state.clone();
+    let workspace_id_for_save = workspace_id.to_string();
+    let dialog_for_save = dialog.clone();
+    let entry_for_save = entry.clone();
+    save_button.connect_clicked(move |_| {
+        let command = normalize_autostart_command(entry_for_save.text().as_str());
+        {
+            let app_state = state_for_save.borrow();
+            let Some(workspace) = app_state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id_for_save)
+            else {
+                dialog_for_save.close();
+                return;
+            };
+            *workspace.autostart_command.borrow_mut() = command;
+        }
+        request_session_save(&state_for_save);
+        dialog_for_save.close();
+    });
+
+    let save_button_for_entry = save_button.clone();
+    entry.connect_activate(move |_| save_button_for_entry.emit_clicked());
+    entry.grab_focus();
+    entry.set_position(-1);
+    dialog.present();
 }
 
 fn clamp_workspace_insert_index_for_pinning(
@@ -3518,14 +3655,19 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         app_state.shortcuts.clone()
     };
     let new_workspace_id = uuid::Uuid::new_v4().to_string();
+    let autostart_command = Rc::new(RefCell::new(None));
     let stack_name = format!("ws-{new_workspace_id}");
     let pane = create_pane_for_workspace(
         state,
         &shortcuts,
         &new_workspace_id,
         seed.cwd.as_deref(),
-        None,
-        true,
+        autostart_command.clone(),
+        PaneCreationOptions {
+            initial_state: None,
+            skip_default_tab: true,
+            suppress_initial_autostart: false,
+        },
     );
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
     let root = split_container.widget().clone();
@@ -3559,6 +3701,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             favorite: false,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
+            autostart_command,
             path_label,
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
@@ -3998,6 +4141,7 @@ fn workspace_state_with_folder(name: &str, folder_path: &str) -> WorkspaceState 
         favorite: false,
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
+        autostart_command: None,
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     }
 }
@@ -4184,6 +4328,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     skip_default_tab: false,
                     new_pane_first: resolved.placement.new_pane_first,
                     persist: true,
+                    suppress_initial_autostart: request.command.is_some(),
                 },
             );
             let Some(new_pane) = new_pane else {
@@ -4662,8 +4807,15 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         .folder_path
         .as_deref()
         .or(workspace.cwd.as_deref());
-    let (root, split_container) =
-        build_workspace_root(state, &shortcuts, &id, working_dir, &workspace.layout);
+    let autostart_command = Rc::new(RefCell::new(workspace.autostart_command.clone()));
+    let (root, split_container) = build_workspace_root(
+        state,
+        &shortcuts,
+        &id,
+        working_dir,
+        &autostart_command,
+        &workspace.layout,
+    );
     stack.add_named(&root, Some(&stack_name));
 
     let show_workspace_path = state
@@ -4696,6 +4848,7 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         favorite: workspace.favorite,
         cwd,
         folder_path: workspace.folder_path.clone(),
+        autostart_command,
         path_label,
     };
 
@@ -4714,13 +4867,19 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
 }
 
 /// Create a PaneWidget wired up with callbacks for a specific workspace.
+pub(crate) struct PaneCreationOptions<'a> {
+    pub(crate) initial_state: Option<&'a PaneState>,
+    pub(crate) skip_default_tab: bool,
+    pub(crate) suppress_initial_autostart: bool,
+}
+
 pub(crate) fn create_pane_for_workspace(
     state: &State,
     shortcuts: &Rc<ResolvedShortcutConfig>,
     ws_id: &str,
     working_directory: Option<&str>,
-    initial_state: Option<&PaneState>,
-    skip_default_tab: bool,
+    autostart_command: Rc<RefCell<Option<String>>>,
+    options: PaneCreationOptions<'_>,
 ) -> gtk::Box {
     let state_for_split = state.clone();
     let state_for_close = state.clone();
@@ -4749,6 +4908,8 @@ pub(crate) fn create_pane_for_workspace(
 
     let callbacks = Rc::new(PaneCallbacks {
         workspace_id: ws_id.to_string(),
+        autostart_command,
+        suppress_next_autostart: Cell::new(options.suppress_initial_autostart),
         on_split: Box::new(move |pane_widget, orientation| {
             split_pane(
                 &state_for_split,
@@ -4760,6 +4921,7 @@ pub(crate) fn create_pane_for_workspace(
                     skip_default_tab: false,
                     new_pane_first: false,
                     persist: true,
+                    suppress_initial_autostart: false,
                 },
             );
         }),
@@ -4932,8 +5094,8 @@ pub(crate) fn create_pane_for_workspace(
         callbacks,
         shortcuts.clone(),
         working_directory,
-        initial_state,
-        skip_default_tab,
+        options.initial_state,
+        options.skip_default_tab,
     )
 }
 
@@ -5250,6 +5412,7 @@ struct SplitPaneOptions {
     skip_default_tab: bool,
     new_pane_first: bool,
     persist: bool,
+    suppress_initial_autostart: bool,
 }
 
 fn split_pane(
@@ -5259,21 +5422,18 @@ fn split_pane(
     orientation: gtk::Orientation,
     options: SplitPaneOptions,
 ) -> Option<gtk::Widget> {
-    let (shortcuts, wd, container) = {
+    let (shortcuts, wd, autostart_command, container) = {
         let s = state.borrow();
+        let workspace = s.workspaces.iter().find(|w| w.id == ws_id);
         (
             s.shortcuts.clone(),
-            s.workspaces
-                .iter()
-                .find(|w| w.id == ws_id)
-                .and_then(|ws| ws.folder_path.clone().or_else(|| ws.cwd.borrow().clone())),
-            s.workspaces
-                .iter()
-                .find(|w| w.id == ws_id)
-                .map(|ws| ws.split_container.clone()),
+            workspace.and_then(|ws| ws.folder_path.clone().or_else(|| ws.cwd.borrow().clone())),
+            workspace.map(|ws| ws.autostart_command.clone()),
+            workspace.map(|ws| ws.split_container.clone()),
         )
     };
     let container = container?;
+    let autostart_command = autostart_command?;
     if !container.can_split(pane_widget, orientation) {
         return None;
     }
@@ -5283,8 +5443,12 @@ fn split_pane(
         &shortcuts,
         ws_id,
         wd.as_deref(),
-        options.initial_state.as_ref(),
-        options.skip_default_tab,
+        autostart_command,
+        PaneCreationOptions {
+            initial_state: options.initial_state.as_ref(),
+            skip_default_tab: options.skip_default_tab,
+            suppress_initial_autostart: options.suppress_initial_autostart,
+        },
     );
 
     // Mutate the data model and trigger async widget tree rebuild.
@@ -5412,6 +5576,7 @@ fn handle_split_with_tab(
             skip_default_tab: true,
             new_pane_first,
             persist: false,
+            suppress_initial_autostart: false,
         },
     );
     let Some(new_pane) = new_pane else { return };
@@ -5608,6 +5773,7 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
                 skip_default_tab: false,
                 new_pane_first: false,
                 persist: true,
+                suppress_initial_autostart: false,
             },
         )
         .is_some();
@@ -5645,6 +5811,7 @@ fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
                 skip_default_tab: false,
                 new_pane_first: false,
                 persist: true,
+                suppress_initial_autostart: false,
             },
         );
     }
@@ -6316,8 +6483,8 @@ mod tests {
         directional_neighbor_score, favorites_prefix_len, find_leaf_pane, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
         initial_workspace_state, keep_workspace_open_after_empty_pane, next_active_workspace_index,
-        pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
-        resolved_system_prefers_dark, sanitize_background_opacity,
+        normalize_autostart_command, pane_create_split_placement, queue_session_save_request,
+        resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
@@ -6356,6 +6523,15 @@ mod tests {
     fn favorites_prefix_len_counts_only_leading_favorites() {
         let flags = [true, true, false, true, false];
         assert_eq!(favorites_prefix_len(&flags), 2);
+    }
+
+    #[test]
+    fn workspace_autostart_normalizes_command_and_empty_input() {
+        assert_eq!(
+            normalize_autostart_command("  ssh codex  ").as_deref(),
+            Some("ssh codex")
+        );
+        assert_eq!(normalize_autostart_command("  \t "), None);
     }
 
     #[test]

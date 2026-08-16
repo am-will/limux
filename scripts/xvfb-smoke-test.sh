@@ -99,6 +99,7 @@ cat > "$XDG_DATA_HOME/limux/session.json" <<SMOKE_SESSION
       "favorite": false,
       "cwd": "$DEMO_DIR",
       "folder_path": "$DEMO_DIR",
+      "autostart_command": "echo native-autostart-visible; if [ -t 0 ] && [ -t 1 ]; then printf native-autostart-pty > $DEMO_DIR/autostart-proof; fi",
       "layout": {
         "kind": "pane",
         "pane_id": 1,
@@ -271,6 +272,20 @@ start_host host
 echo
 echo "== stage 1b: terminal surface health and screen I/O =="
 wait_for_healthy_surfaces limux "$LOG_DIR/stage1-health.json"
+
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/autostart-proof" ] && break
+  sleep 0.1
+done
+[ "$(cat "$DEMO_DIR/autostart-proof" 2>/dev/null)" = "native-autostart-pty" ] \
+  || { echo "FAIL: native workspace autostart did not receive a terminal PTY"; exit 1; }
+"$LIMUX_CLI" read-screen --workspace limux --scrollback \
+  >"$LOG_DIR/stage1-autostart-screen.txt"
+[ "$(grep -Fxc "native-autostart-visible" "$LOG_DIR/stage1-autostart-screen.txt")" -eq 1 ] \
+  || { echo "FAIL: workspace autostart output was missing or duplicated"; exit 1; }
+! grep -Fq "echo native-autostart-visible" "$LOG_DIR/stage1-autostart-screen.txt" \
+  || { echo "FAIL: workspace autostart command was visibly typed into the terminal"; exit 1; }
+echo "native workspace autostart: OK"
 
 SCREEN_PROOF="limux-screen-proof-$$"
 SCREEN_COMMAND="clear; printf '%s\\n' '$SCREEN_PROOF'; printf screen-ok > '$DEMO_DIR/screen-command-proof'"
@@ -488,8 +503,14 @@ start_host host-restart
 "$LIMUX_CLI" list-workspaces >"$LOG_DIR/stage8-workspaces.txt"
 grep -Fq "$RESTORED_WORKSPACE" "$LOG_DIR/stage8-workspaces.txt" \
   || { echo "FAIL: renamed workspace was not restored"; exit 1; }
-"$LIMUX_CLI" --json list-panes --workspace "$RESTORED_WORKSPACE" \
-  >"$LOG_DIR/stage8-panes.json"
+for _ in $(seq 1 50); do
+  "$LIMUX_CLI" --json list-panes --workspace "$RESTORED_WORKSPACE" \
+    >"$LOG_DIR/stage8-panes.json"
+  if jq -e '(.panes | length) == 4' "$LOG_DIR/stage8-panes.json" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
 jq -e '(.panes | length) == 4' "$LOG_DIR/stage8-panes.json" >/dev/null \
   || { echo "FAIL: restored workspace did not retain all panes"; exit 1; }
 wait_for_healthy_surfaces "$RESTORED_WORKSPACE" "$LOG_DIR/stage8-health.json"

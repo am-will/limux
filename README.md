@@ -10,6 +10,7 @@ https://github.com/user-attachments/assets/6f3047c2-e2b6-49f2-b536-570a1570d0f8
 
 - **GPU-rendered terminals** via embedded Ghostty (OpenGL)
 - **Workspaces** with folder-based naming, persistence across restarts, and sidebar management
+- **Workspace autostart** commands configured directly from the workspace menu
 - **Split panes** (horizontal/vertical) with keyboard navigation
 - **Tabbed terminals** within each pane
 - **Built-in browser** (WebKitGTK)
@@ -126,6 +127,14 @@ Run the canonical local quality gate before committing:
 
 Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
 Release procedure lives in [`docs/releasing.md`](docs/releasing.md).
+
+## Workspace autostart
+
+Right-click a workspace in the sidebar and select **Set Autostart…** to run a
+command whenever Limux creates a terminal in that workspace. The command is
+stored as part of the workspace session and runs inside the terminal, so
+interactive commands such as `ssh codex` work without modifying `.bashrc`.
+Open **Edit Autostart…** and save an empty command to disable it.
 
 ## Agent integrations
 
