@@ -157,25 +157,19 @@ jobs:
           pacman -S --needed --noconfirm \
             curl \
             git \
-            ghostty \
             gtk4 \
             libadwaita \
             libepoxy \
             minisign \
             namcap \
             rust \
+            zig \
             webkitgtk-6.0
 
-      - name: Install Zig 0.15 package
+      - name: Create package builder user
         run: |
           set -euo pipefail
           useradd --create-home builder
-          git clone https://aur.archlinux.org/zig0.15-bin.git /tmp/zig-package
-          git -C /tmp/zig-package checkout --detach 6ec7dad0340e61aa0c98a895d09561ecf7b7270e
-          chown -R builder:builder /tmp/zig-package
-          runuser -u builder -- env HOME=/home/builder \
-            makepkg --dir /tmp/zig-package --cleanbuild --noconfirm
-          pacman -U --noconfirm /tmp/zig-package/zig0.15-bin-*.pkg.tar.zst
 
       - name: Build source package
         run: |
@@ -197,7 +191,7 @@ jobs:
           for path in \
             usr/bin/limux \
             usr/libexec/limux/limux-host \
-            usr/lib/limux/libghostty.so \
+            usr/lib/limux/libghostty-internal.so \
             usr/share/licenses/limux/LICENSE \
             usr/share/applications/dev.limux.linux.desktop \
             usr/share/metainfo/dev.limux.linux.metainfo.xml \

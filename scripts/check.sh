@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 GHOSTTY_LIB_DIR="$ROOT_DIR/ghostty/zig-out/lib"
-GHOSTTY_SO="$GHOSTTY_LIB_DIR/libghostty.so"
+GHOSTTY_SO="$GHOSTTY_LIB_DIR/libghostty-internal.so"
 
 if [ ! -f "$GHOSTTY_SO" ]; then
-  echo "ERROR: libghostty.so not found at $GHOSTTY_SO" >&2
-  echo "Build it with: (cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline)" >&2
+  echo "ERROR: libghostty-internal.so not found at $GHOSTTY_SO" >&2
+  echo "Build it with Zig 0.16: (cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline)" >&2
   exit 1
 fi
 

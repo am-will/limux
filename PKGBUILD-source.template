@@ -8,14 +8,14 @@ arch=('x86_64')
 url="https://github.com/am-will/limux"
 license=('MIT')
 depends=('fontconfig' 'glib2' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'pango' 'webkitgtk-6.0')
-makedepends=('ghostty' 'git' 'libepoxy' 'rust' 'zig0.15')
+makedepends=('git' 'libepoxy' 'rust' 'zig')
 conflicts=('limux-bin' 'limux-bin-debug')
 options=(!debug !lto)
 _limux_commit=@@SOURCE_COMMIT@@
 _ghostty_commit=@@GHOSTTY_COMMIT@@
 source=(
     "$pkgname-$pkgver::git+@@SOURCE_REPOSITORY@@#commit=$_limux_commit"
-    "ghostty-$pkgver::git+https://github.com/am-will/ghostty.git#commit=$_ghostty_commit"
+    "ghostty-$pkgver::git+https://github.com/bvolpato/ghostty.git#commit=$_ghostty_commit"
 )
 sha256sums=('SKIP' 'SKIP')
 
@@ -31,7 +31,7 @@ build() {
 
     (
         cd ghostty
-        zig-0.15 build -Dapp-runtime=none "${zig_args[@]}"
+        zig build -Dapp-runtime=none "${zig_args[@]}"
     )
 
     RUSTFLAGS="\
@@ -44,12 +44,12 @@ package() {
 
     install -Dm755 target/release/limux-cli "$pkgdir/usr/bin/limux"
     install -Dm755 target/release/limux "$pkgdir/usr/libexec/limux/limux-host"
-    install -Dm644 ghostty/zig-out/lib/libghostty.so "$pkgdir/usr/lib/limux/libghostty.so"
+    install -Dm644 ghostty/zig-out/lib/libghostty-internal.so "$pkgdir/usr/lib/limux/libghostty-internal.so"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
     install -dm755 "$pkgdir/usr/share/limux/ghostty"
-    cp -a /usr/share/ghostty/. "$pkgdir/usr/share/limux/ghostty/"
-    install -Dm644 /usr/share/terminfo/x/xterm-ghostty \
+    cp -a ghostty/zig-out/share/ghostty/. "$pkgdir/usr/share/limux/ghostty/"
+    install -Dm644 ghostty/zig-out/share/terminfo/x/xterm-ghostty \
         "$pkgdir/usr/share/limux/terminfo/x/xterm-ghostty"
 
     install -Dm644 rust/limux-host-linux/dev.limux.linux.desktop \

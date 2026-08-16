@@ -15,7 +15,8 @@ RPM_ARCH="x86_64"
 PKG_BASE="limux-${VERSION}-linux-${ARCH}"
 STAGE="/tmp/limux-staging"
 GHOSTTY_INSTALL_ROOT="/tmp/limux-ghostty-install"
-GHOSTTY_SO="${ROOT_DIR}/ghostty/zig-out/lib/libghostty.so"
+GHOSTTY_LIBRARY_NAME="libghostty-internal.so"
+GHOSTTY_SO="${ROOT_DIR}/ghostty/zig-out/lib/${GHOSTTY_LIBRARY_NAME}"
 MAX_GLIBC_VERSION="${LIMUX_MAX_GLIBC:-2.39}"
 GHOSTTY_SHARE_DIR=""
 GHOSTTY_TERMINFO_DIR=""
@@ -213,6 +214,7 @@ build_ghostty_resources() {
         DESTDIR="$GHOSTTY_INSTALL_ROOT" \
             zig build \
             --prefix /usr \
+            -Dapp-runtime=none \
             "${GHOSTTY_ZIG_ARGS[@]}" \
             -Demit-docs=false
     )
@@ -250,7 +252,7 @@ echo "Building libghostty (ReleaseFast, cpu=baseline)..."
 build_ghostty_resources
 
 if [ ! -f "$GHOSTTY_SO" ]; then
-    echo "ERROR: libghostty.so not found at ${GHOSTTY_SO} after build"
+    echo "ERROR: ${GHOSTTY_LIBRARY_NAME} not found at ${GHOSTTY_SO} after build"
     exit 1
 fi
 
@@ -301,7 +303,7 @@ if [ ! -f "$HOST_BINARY" ]; then
     exit 1
 fi
 
-assert_glibc_compatibility "$GHOSTTY_SO" "libghostty.so"
+assert_glibc_compatibility "$GHOSTTY_SO" "$GHOSTTY_LIBRARY_NAME"
 assert_glibc_compatibility "$CLI_BINARY" "limux CLI"
 assert_glibc_compatibility "$HOST_BINARY" "limux host"
 assert_cli_entrypoint "$CLI_BINARY" "target/release/limux-cli"
@@ -342,9 +344,9 @@ populate_tree() {
     assert_no_legacy_host_entrypoint "$libexecdir/limux" "packaged $prefix libexec tree"
 
     # Shared library
-    cp "$GHOSTTY_SO" "$libdir/libghostty.so"
+    cp "$GHOSTTY_SO" "$libdir/$GHOSTTY_LIBRARY_NAME"
     if [ "$strip_files" = "true" ]; then
-        strip --strip-debug "$libdir/libghostty.so"
+        strip --strip-debug "$libdir/$GHOSTTY_LIBRARY_NAME"
     fi
 
     # Ghostty resources required for named themes and shell integration
@@ -439,8 +441,8 @@ strip "$TARBALL_STAGE/limux"
 strip "$TARBALL_STAGE/libexec/limux/limux-host"
 chmod 755 "$TARBALL_STAGE/limux" "$TARBALL_STAGE/libexec/limux/limux-host"
 assert_cli_entrypoint "$TARBALL_STAGE/limux" "tarball limux"
-cp "$GHOSTTY_SO" "$TARBALL_STAGE/lib/libghostty.so"
-strip --strip-debug "$TARBALL_STAGE/lib/libghostty.so"
+cp "$GHOSTTY_SO" "$TARBALL_STAGE/lib/$GHOSTTY_LIBRARY_NAME"
+strip --strip-debug "$TARBALL_STAGE/lib/$GHOSTTY_LIBRARY_NAME"
 cp -r "$GHOSTTY_SHARE_DIR"/. "$TARBALL_STAGE/share/limux/ghostty"
 copy_ghostty_terminfo_entries "$GHOSTTY_TERMINFO_DIR" "$TARBALL_STAGE/share/limux/terminfo"
 cp "$DESKTOP_FILE" "$TARBALL_STAGE/share/applications/dev.limux.linux.desktop"
@@ -468,6 +470,8 @@ cat > "$TARBALL_STAGE/install.sh" << 'INSTALL_EOF'
 set -euo pipefail
 
 PREFIX="/usr/local"
+GHOSTTY_LIBRARY_NAME="libghostty-internal.so"
+LEGACY_GHOSTTY_LIBRARY_NAME="libghostty.so"
 UNINSTALL=false
 
 for arg in "$@"; do
@@ -614,7 +618,8 @@ echo "Installing Limux to ${PREFIX}..."
 install -Dm755 "$SCRIPT_DIR/limux" "$PREFIX/bin/limux"
 clean_legacy_limux_entrypoints
 install -Dm755 "$SCRIPT_DIR/libexec/limux/limux-host" "$PREFIX/libexec/limux/limux-host"
-install -Dm644 "$SCRIPT_DIR/lib/libghostty.so" "$PREFIX/lib/limux/libghostty.so"
+rm -f "$PREFIX/lib/limux/$LEGACY_GHOSTTY_LIBRARY_NAME"
+install -Dm644 "$SCRIPT_DIR/lib/$GHOSTTY_LIBRARY_NAME" "$PREFIX/lib/limux/$GHOSTTY_LIBRARY_NAME"
 if [ -d "$SCRIPT_DIR/share/limux" ]; then
     cp -r "$SCRIPT_DIR/share/limux" "$PREFIX/share/"
 fi
@@ -636,7 +641,7 @@ echo ""
 echo "Limux installed successfully!"
 echo "  CLI:     $PREFIX/bin/limux"
 echo "  Host:    $PREFIX/libexec/limux/limux-host"
-echo "  Library: $PREFIX/lib/limux/libghostty.so"
+echo "  Library: $PREFIX/lib/limux/$GHOSTTY_LIBRARY_NAME"
 echo "  App:     limux"
 echo ""
 echo "System dependencies (install if missing):"
@@ -752,8 +757,8 @@ chmod 755 "$APPDIR/usr/bin/limux" "$APPDIR/usr/libexec/limux/limux-host"
 assert_cli_entrypoint "$APPDIR/usr/bin/limux" "AppImage usr/bin/limux"
 
 # Shared library
-cp "$GHOSTTY_SO" "$APPDIR/usr/lib/libghostty.so"
-strip --strip-debug "$APPDIR/usr/lib/libghostty.so"
+cp "$GHOSTTY_SO" "$APPDIR/usr/lib/$GHOSTTY_LIBRARY_NAME"
+strip --strip-debug "$APPDIR/usr/lib/$GHOSTTY_LIBRARY_NAME"
 
 # WebKitGTK runtime, helper processes, and non-glibc library dependencies.
 copy_appimage_webkit_runtime "$APPDIR"

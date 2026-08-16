@@ -81,7 +81,7 @@ sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 ### Prerequisites
 
 - Rust toolchain (stable)
-- Zig
+- Zig 0.16.0
 - GTK4, libadwaita, WebKitGTK dev packages
 - Initialized Ghostty submodule
 
@@ -96,7 +96,7 @@ git submodule update --init --recursive
 # Build limux
 cargo build --release
 
-# Run (point to libghostty.so location)
+# Run (point to libghostty-internal.so location)
 LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
@@ -106,8 +106,8 @@ LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ./scripts/package.sh
 ```
 
-This builds the binary, bundles `libghostty.so`, icons, and an install script into a tarball.
-`package.sh` also rebuilds `libghostty.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig and the initialized Ghostty submodule must be present.
+This builds the binary, bundles `libghostty-internal.so`, icons, and an install script into a tarball.
+`package.sh` also rebuilds `libghostty-internal.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig 0.16.0 and initialized Ghostty submodule must be present.
 
 ## Development
 
@@ -251,7 +251,7 @@ rust/
   limux-cli/           # CLI client
 ```
 
-The terminal rendering is handled entirely by Ghostty's embedded library (`libghostty.so`), which provides GPU-accelerated OpenGL rendering. The UI layer is native GTK4 with libadwaita.
+The terminal rendering is handled entirely by Ghostty's embedded library (`libghostty-internal.so`), which provides GPU-accelerated OpenGL rendering. The UI layer is native GTK4 with libadwaita.
 
 ## License
 

@@ -19,7 +19,7 @@ package() {
 
     install -Dm755 limux "${pkgdir}/usr/bin/limux"
     install -Dm755 libexec/limux/limux-host "${pkgdir}/usr/libexec/limux/limux-host"
-    install -Dm644 lib/libghostty.so "${pkgdir}/usr/lib/limux/libghostty.so"
+    install -Dm644 lib/libghostty-internal.so "${pkgdir}/usr/lib/limux/libghostty-internal.so"
 
     install -Dm644 /dev/stdin "${pkgdir}/etc/ld.so.conf.d/limux.conf" <<< "/usr/lib/limux"
 
