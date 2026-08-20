@@ -1421,6 +1421,7 @@ pub struct TerminalOptions {
     pub copy_selection_to_clipboard: Rc<dyn Fn() -> bool>,
     pub saved_font_size: Option<f32>,
     pub startup_command: Option<String>,
+    pub initial_input: Option<String>,
     /// Extra environment variables to expose to the spawned shell
     /// (e.g. `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, `LIMUX_PANE_ID`, `LIMUX_SOCKET`).
     ///
@@ -1438,6 +1439,7 @@ impl Default for TerminalOptions {
             copy_selection_to_clipboard: Rc::new(|| true),
             saved_font_size: None,
             startup_command: None,
+            initial_input: None,
             extra_env: Vec::new(),
         }
     }
@@ -1498,6 +1500,7 @@ pub fn create_terminal(
     let wd = working_directory.map(|s| s.to_string());
     let saved_font_size = options.saved_font_size;
     let startup_command = options.startup_command;
+    let initial_input = options.initial_input;
     let hover_focus = options.hover_focus;
     let copy_selection_to_clipboard = options.copy_selection_to_clipboard;
     let extra_env = options.extra_env;
@@ -1738,6 +1741,13 @@ pub fn create_terminal(
                     "limux: starting restored terminal command={}",
                     command.to_string_lossy()
                 );
+            }
+
+            let c_initial_input = initial_input
+                .as_ref()
+                .and_then(|input| CString::new(input.as_str()).ok());
+            if let Some(ref input) = c_initial_input {
+                config.initial_input = input.as_ptr();
             }
 
             let surface = unsafe { ghostty_surface_new(app, &config) };

@@ -5,13 +5,8 @@
 //! All on one line. Tabs left-justified, icons right-justified.
 
 use std::cell::{Cell, RefCell};
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
 
 use gtk::glib;
 #[allow(unused_imports)]
@@ -1474,25 +1469,18 @@ fn add_terminal_tab_inner(
         );
     }
     let suppress_autostart = internals.callbacks.suppress_next_autostart.replace(false);
-    let (mut startup_command, workspace_autostart_command) = select_terminal_commands(
+    let (startup_command, workspace_autostart_command) = select_terminal_commands(
         restored_agent_command,
         internals.callbacks.autostart_command.borrow().clone(),
         suppress_autostart,
     );
-    let mut injected_autostart_command = None;
+    let mut initial_input = None;
     if let Some(command) = workspace_autostart_command.as_deref() {
         eprintln!(
-            "limux: running workspace autostart workspace={} surface={}:{} command={}",
-            internals.callbacks.workspace_id, internals.pane_id, tab_id, command
+            "limux: running workspace autostart workspace={} surface={}:{}",
+            internals.callbacks.workspace_id, internals.pane_id, tab_id
         );
-        if let Some(command_line) = prepare_bash_workspace_autostart(command, &mut extra_env) {
-            startup_command = Some(command_line);
-        } else {
-            // Keep non-Bash shells functional until they gain a native startup
-            // adapter of their own. Bash is adapted through its rc startup so
-            // the command is not visibly typed into the terminal or history.
-            injected_autostart_command = Some(command.to_string());
-        }
+        initial_input = workspace_autostart_initial_input(command);
     }
 
     let term = terminal::create_terminal(
@@ -1502,13 +1490,11 @@ fn add_terminal_tab_inner(
             copy_selection_to_clipboard,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
             startup_command,
+            initial_input,
             extra_env,
         },
         term_callbacks,
     );
-    if let Some(command) = injected_autostart_command {
-        send_workspace_autostart_when_ready(term.handle.clone(), command);
-    }
     let widget = term.root.clone();
     internals.content_stack.add_named(&widget, Some(&tab_id));
 
@@ -1585,137 +1571,16 @@ fn select_terminal_commands(
     (None, autostart_command)
 }
 
-fn send_workspace_autostart_when_ready(handle: terminal::TerminalHandle, command: String) {
-    let mut attempts = 0;
-    let mut command_sent = false;
-    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-        attempts += 1;
-        if !command_sent {
-            command_sent = handle.send_text(&command);
-        }
-        if command_sent && handle.send_key("Enter") {
-            return glib::ControlFlow::Break;
-        }
-        if attempts >= 40 {
-            eprintln!("limux: workspace autostart terminal never became writable");
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
-    });
-}
-
-const BASH_AUTOSTART_ENV: &str = "LIMUX_WORKSPACE_AUTOSTART_COMMAND";
-const BASH_AUTOSTART_RC: &str = r#"# Limux workspace autostart adapter.
-# Ghostty sources this file in place of ~/.bashrc when --rcfile is used.
-if [[ ${LIMUX_WORKSPACE_AUTOSTART_COMMAND+x} ]]; then
-  __limux_workspace_autostart_command=$LIMUX_WORKSPACE_AUTOSTART_COMMAND
-  builtin unset LIMUX_WORKSPACE_AUTOSTART_COMMAND
-fi
-
-[[ -r "$HOME/.bashrc" ]] && builtin source "$HOME/.bashrc"
-
-function __limux_run_workspace_autostart {
-  if [[ ${__limux_workspace_autostart_command+x} ]]; then
-    builtin local __limux_command="$__limux_workspace_autostart_command"
-    builtin unset __limux_workspace_autostart_command
-    builtin eval "$__limux_command"
-  fi
-}
-
-if [[ $(builtin declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
-  PROMPT_COMMAND=("__limux_run_workspace_autostart" "${PROMPT_COMMAND[@]}")
-elif [[ -n ${PROMPT_COMMAND-} ]]; then
-  PROMPT_COMMAND="__limux_run_workspace_autostart;${PROMPT_COMMAND}"
-else
-  PROMPT_COMMAND="__limux_run_workspace_autostart"
-fi
-"#;
-
-fn prepare_bash_workspace_autostart(
-    command: &str,
-    extra_env: &mut Vec<(String, String)>,
-) -> Option<String> {
+fn workspace_autostart_initial_input(command: &str) -> Option<String> {
     if command.contains('\0') {
         eprintln!("limux: workspace autostart contains a NUL byte; refusing to run it");
         return None;
     }
-
-    let shell = std::env::var_os("SHELL")?;
-    let shell_path = Path::new(&shell);
-    if shell_path.file_name().and_then(|name| name.to_str()) != Some("bash") {
-        return None;
-    }
-    let shell_path = shell_path.to_str()?;
-    let rc_path = bash_autostart_rc_path()?;
-    let rc_path = rc_path.to_str()?;
-
-    extra_env.push((BASH_AUTOSTART_ENV.to_string(), command.to_string()));
-    Some(format!(
-        "{} --rcfile {}",
-        shell_quote(shell_path),
-        shell_quote(rc_path)
-    ))
-}
-
-fn bash_autostart_rc_path() -> Option<&'static PathBuf> {
-    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    PATH.get_or_init(create_bash_autostart_rc).as_ref()
-}
-
-fn create_bash_autostart_rc() -> Option<PathBuf> {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    if runtime_dir.is_empty() {
-        eprintln!("limux: XDG_RUNTIME_DIR is unset; falling back to terminal input autostart");
-        return None;
-    }
-
-    let dir = PathBuf::from(runtime_dir).join("limux");
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!("limux: failed to create autostart runtime directory: {error}");
-        return None;
-    }
-
-    for suffix in 0..100_u8 {
-        let path = dir.join(format!(
-            "workspace-autostart-bashrc-{}-{suffix}",
-            std::process::id()
-        ));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path);
-        match file {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(BASH_AUTOSTART_RC.as_bytes()) {
-                    let _ = std::fs::remove_file(&path);
-                    eprintln!("limux: failed to write Bash autostart adapter: {error}");
-                    return None;
-                }
-                return Some(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                eprintln!("limux: failed to create Bash autostart adapter: {error}");
-                return None;
-            }
-        }
-    }
-
-    eprintln!("limux: failed to allocate a unique Bash autostart adapter path");
-    None
-}
-
-fn shell_quote(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
+    // Let Ghostty launch its configured command unchanged. Clearing the input
+    // line immediately before execution keeps the injected command out of the
+    // rendered terminal while remaining compatible with common interactive
+    // shells (Bash, Zsh, and Fish).
+    Some(format!("printf '\\033[2K\\r'; {command}\n"))
 }
 
 fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
@@ -4170,7 +4035,8 @@ mod tests {
         effective_drop_target_dimensions, is_localhost_input, is_safe_browser_url,
         next_active_after_tab_removal, normalize_browser_entry_input,
         normalize_reorder_insert_index, pane_action_tooltip, select_terminal_commands,
-        resolved_link_destination, surface_hint_matches, ContentDropZone, TabDragPayload,
+        resolved_link_destination, surface_hint_matches, workspace_autostart_initial_input,
+        ContentDropZone, TabDragPayload,
         BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
@@ -4200,6 +4066,15 @@ mod tests {
             ),
             (Some("codex resume abc".to_string()), None)
         );
+    }
+
+    #[test]
+    fn workspace_autostart_uses_hidden_initial_input() {
+        assert_eq!(
+            workspace_autostart_initial_input("echo ready").as_deref(),
+            Some("printf '\\033[2K\\r'; echo ready\n")
+        );
+        assert_eq!(workspace_autostart_initial_input("echo bad\0input"), None);
     }
 
     #[test]
