@@ -1724,66 +1724,6 @@ pub fn add_browser_tab_to_pane_with_uri(pane_widget: &gtk::Widget, uri: Option<&
     }
 }
 
-pub fn open_url_in_existing_browser_tab(pane_widget: &gtk::Widget, url: &str) -> bool {
-    let Some(internals) = find_pane_internals(pane_widget) else {
-        return false;
-    };
-
-    let target = {
-        let tab_state = internals.tab_state.borrow();
-        let target_id = preferred_browser_tab_id(
-            tab_state.active_tab.as_deref(),
-            tab_state.tabs.iter().map(|entry| {
-                (
-                    entry.id.as_str(),
-                    matches!(entry.kind, TabKind::Browser { .. }),
-                )
-            }),
-        );
-        target_id
-            .and_then(|target_id| tab_state.tabs.iter().find(|entry| entry.id == target_id))
-            .and_then(|entry| match &entry.kind {
-                TabKind::Browser { state } => {
-                    Some((entry.id.clone(), state.uri.clone(), state.handles.clone()))
-                }
-                _ => None,
-            })
-    };
-
-    let Some((tab_id, saved_uri, handles)) = target else {
-        return false;
-    };
-    if !handles.load_uri(url) {
-        return false;
-    }
-    *saved_uri.borrow_mut() = Some(url.to_string());
-    activate_tab(
-        &internals.tab_strip,
-        &internals.content_stack,
-        &internals.tab_state,
-        &tab_id,
-    );
-    (internals.callbacks.on_state_changed)();
-    true
-}
-
-fn preferred_browser_tab_id<'a>(
-    active_tab_id: Option<&str>,
-    tabs: impl IntoIterator<Item = (&'a str, bool)>,
-) -> Option<&'a str> {
-    let mut first_browser = None;
-    for (tab_id, is_browser) in tabs {
-        if !is_browser {
-            continue;
-        }
-        if Some(tab_id) == active_tab_id {
-            return Some(tab_id);
-        }
-        first_browser.get_or_insert(tab_id);
-    }
-    first_browser
-}
-
 pub fn add_keybind_editor_tab_to_pane(
     pane_widget: &gtk::Widget,
     shortcuts: Rc<ResolvedShortcutConfig>,
@@ -3437,11 +3377,6 @@ impl BrowserShortcutTarget {
 
 #[cfg(feature = "webkit")]
 impl BrowserHandles {
-    fn load_uri(&self, uri: &str) -> bool {
-        self.webview.load_uri(uri);
-        true
-    }
-
     fn prepare_for_removal(&self) {
         self.find_controller.search_finish();
         self.search_bar.set_search_mode(false);
@@ -3597,10 +3532,6 @@ fn search_for_browser_text(find_controller: &webkit6::FindController, query: &st
 
 #[cfg(not(feature = "webkit"))]
 impl BrowserHandles {
-    fn load_uri(&self, _uri: &str) -> bool {
-        false
-    }
-
     fn prepare_for_removal(&self) {}
 
     fn is_find_active(&self) -> bool {
@@ -4061,8 +3992,8 @@ mod tests {
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
         effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
         normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        preferred_browser_tab_id, resolved_link_destination, surface_hint_matches, ContentDropZone,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        resolved_link_destination, surface_hint_matches, ContentDropZone, TabDragPayload,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -4370,25 +4301,6 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(normalize_browser_entry_input(input), expected, "{input}");
         }
-    }
-
-    #[test]
-    fn preferred_browser_tab_uses_active_browser_then_first_browser() {
-        let tabs = [
-            ("terminal", false),
-            ("browser-1", true),
-            ("browser-2", true),
-        ];
-
-        assert_eq!(
-            preferred_browser_tab_id(Some("browser-2"), tabs),
-            Some("browser-2")
-        );
-        assert_eq!(
-            preferred_browser_tab_id(Some("terminal"), tabs),
-            Some("browser-1")
-        );
-        assert_eq!(preferred_browser_tab_id(None, [("terminal", false)]), None);
     }
 
     #[test]

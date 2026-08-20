@@ -5288,9 +5288,7 @@ fn split_pane(
 
 fn open_url_in_browser_tab(state: &State, ws_id: &str, pane_widget: &gtk::Widget, url: &str) {
     if let Some(right_pane) = pane_in_direction(state, pane_widget, Direction::Right) {
-        if !pane::open_url_in_existing_browser_tab(&right_pane, url) {
-            pane::add_browser_tab_to_pane_with_uri(&right_pane, Some(url));
-        }
+        pane::add_browser_tab_to_pane_with_uri(&right_pane, Some(url));
         return;
     }
 
