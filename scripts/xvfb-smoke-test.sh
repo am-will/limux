@@ -279,6 +279,11 @@ for _ in $(seq 1 50); do
 done
 [ "$(cat "$DEMO_DIR/autostart-proof" 2>/dev/null)" = "native-autostart-pty" ] \
   || { echo "FAIL: native workspace autostart did not receive a terminal PTY"; exit 1; }
+if find "$XDG_RUNTIME_DIR/limux" -maxdepth 1 -name 'workspace-autostart-*.sh' -print -quit \
+  | grep -q .; then
+  echo "FAIL: workspace autostart script was not removed after launch"
+  exit 1
+fi
 "$LIMUX_CLI" read-screen --workspace limux --scrollback \
   >"$LOG_DIR/stage1-autostart-screen.txt"
 [ "$(grep -Fxc "native-autostart-visible" "$LOG_DIR/stage1-autostart-screen.txt")" -eq 1 ] \

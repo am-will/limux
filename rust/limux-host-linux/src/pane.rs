@@ -5,6 +5,10 @@
 //! All on one line. Tabs left-justified, icons right-justified.
 
 use std::cell::{Cell, RefCell};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1480,7 +1484,7 @@ fn add_terminal_tab_inner(
             "limux: running workspace autostart workspace={} surface={}:{}",
             internals.callbacks.workspace_id, internals.pane_id, tab_id
         );
-        initial_input = workspace_autostart_initial_input(command);
+        initial_input = prepare_workspace_autostart(command);
     }
 
     let term = terminal::create_terminal(
@@ -1571,16 +1575,82 @@ fn select_terminal_commands(
     (None, autostart_command)
 }
 
-fn workspace_autostart_initial_input(command: &str) -> Option<String> {
+fn prepare_workspace_autostart(command: &str) -> Option<String> {
     if command.contains('\0') {
         eprintln!("limux: workspace autostart contains a NUL byte; refusing to run it");
         return None;
     }
-    // Let Ghostty launch its configured command unchanged. Clearing the input
-    // line immediately before execution keeps the injected command out of the
-    // rendered terminal while remaining compatible with common interactive
-    // shells (Bash, Zsh, and Fish).
-    Some(format!("printf '\\033[2K\\r'; {command}\n"))
+
+    let script_path = create_workspace_autostart_script(command)?;
+    workspace_autostart_initial_input(&script_path)
+}
+
+fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    if runtime_dir.is_empty() {
+        eprintln!("limux: XDG_RUNTIME_DIR is unset; workspace autostart was not started");
+        return None;
+    }
+
+    let dir = PathBuf::from(runtime_dir).join("limux");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("limux: failed to create autostart runtime directory: {error}");
+        return None;
+    }
+
+    for suffix in 0..100_u8 {
+        let path = dir.join(format!(
+            "workspace-autostart-{}-{suffix}.sh",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path);
+        match file {
+            Ok(mut file) => {
+                let script = workspace_autostart_script(command);
+                if let Err(error) = file.write_all(script.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    eprintln!("limux: failed to write workspace autostart script: {error}");
+                    return None;
+                }
+                return Some(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                eprintln!("limux: failed to create workspace autostart script: {error}");
+                return None;
+            }
+        }
+    }
+
+    eprintln!("limux: failed to allocate a unique workspace autostart script path");
+    None
+}
+
+fn workspace_autostart_script(command: &str) -> String {
+    format!("#!/bin/sh\nrm -f -- \"$0\"\n{command}\n")
+}
+
+fn workspace_autostart_initial_input(script_path: &Path) -> Option<String> {
+    let script_path = script_path.to_str()?;
+    // Only the private script path enters terminal input. The configured
+    // autostart text stays out of shell history and scrollback, while Ghostty's
+    // configured shell/custom command remains untouched.
+    Some(format!("{}\n", shell_quote(script_path)))
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
@@ -4036,7 +4106,7 @@ mod tests {
         next_active_after_tab_removal, normalize_browser_entry_input,
         normalize_reorder_insert_index, pane_action_tooltip, select_terminal_commands,
         resolved_link_destination, surface_hint_matches, workspace_autostart_initial_input,
-        ContentDropZone, TabDragPayload,
+        workspace_autostart_script, ContentDropZone, TabDragPayload,
         BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
@@ -4071,10 +4141,16 @@ mod tests {
     #[test]
     fn workspace_autostart_uses_hidden_initial_input() {
         assert_eq!(
-            workspace_autostart_initial_input("echo ready").as_deref(),
-            Some("printf '\\033[2K\\r'; echo ready\n")
+            workspace_autostart_initial_input(std::path::Path::new(
+                "/run/user/1000/limux/workspace-autostart-42-0.sh"
+            ))
+            .as_deref(),
+            Some("/run/user/1000/limux/workspace-autostart-42-0.sh\n")
         );
-        assert_eq!(workspace_autostart_initial_input("echo bad\0input"), None);
+        assert_eq!(
+            workspace_autostart_script("echo ready"),
+            "#!/bin/sh\nrm -f -- \"$0\"\necho ready\n"
+        );
     }
 
     #[test]
