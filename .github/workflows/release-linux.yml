@@ -1,6 +1,14 @@
 name: Build Linux Release Packages
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/release-linux.yml
+      - Cargo.lock
+      - Cargo.toml
+      - ghostty
+      - rust/**
+      - scripts/**
   release:
     types: [published]
   workflow_dispatch:
@@ -28,6 +36,9 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
           else
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
@@ -84,11 +95,18 @@ jobs:
             exit 1
           fi
 
-      - name: Install appimagetool
+      - name: Install pinned AppImage tooling
         run: |
-          curl -L \
-            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage \
+          APPIMAGETOOL_VERSION=1.9.1
+          APPIMAGE_RUNTIME_VERSION=20251108
+          curl --fail --location --retry 5 --retry-delay 5 \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage" \
             -o /tmp/appimagetool
+          curl --fail --location --retry 5 --retry-delay 5 \
+            "https://github.com/AppImage/type2-runtime/releases/download/${APPIMAGE_RUNTIME_VERSION}/runtime-x86_64" \
+            -o /tmp/appimage-runtime
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  /tmp/appimagetool" | sha256sum --check
+          echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  /tmp/appimage-runtime" | sha256sum --check
           chmod +x /tmp/appimagetool
 
       - name: Test AppImage SVG loader packaging
@@ -97,6 +115,7 @@ jobs:
       - name: Build Linux packages
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          APPIMAGETOOL_RUNTIME_FILE: /tmp/appimage-runtime
           LIMUX_MAX_GLIBC: "2.39"
           LIMUX_REQUIRE_SVG_LOADER: "1"
         run: ./scripts/package.sh "${{ steps.version.outputs.version }}"

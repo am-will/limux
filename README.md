@@ -38,6 +38,11 @@ AppImage-only loader modules such as the gdk-pixbuf SVG loader. They still use
 the host GTK4 and libadwaita runtime, so older distributions may need the
 `.deb`, tarball, or a source build with matching system packages instead.
 
+The embedded [AppImage type-2 runtime](https://github.com/AppImage/type2-runtime)
+statically includes FUSE 3, so the AppImage does not require a host
+`libfuse.so.2` or `libfuse.so.3`. It works with versioned FUSE 3 helpers such as
+`fusermount3` while retaining support for the traditional `fusermount` helper.
+
 AppImage runtime library paths are scoped to the Limux app process. Terminals
 spawned inside Limux restore the user's original library/loader environment so
 host tools such as Flatpak do not load AppImage-private libraries first.

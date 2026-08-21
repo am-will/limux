@@ -974,7 +974,17 @@ else
 fi
 
 if [ -n "$APPIMAGETOOL" ]; then
-    ARCH="$ARCH" "$APPIMAGETOOL" "$APPDIR" "$APPIMAGE_FILE" 2>&1 | tail -3
+    APPIMAGETOOL_ARGS=()
+    if [ -n "${APPIMAGETOOL_RUNTIME_FILE:-}" ]; then
+        if [ ! -f "$APPIMAGETOOL_RUNTIME_FILE" ]; then
+            echo "ERROR: APPIMAGETOOL_RUNTIME_FILE does not exist: $APPIMAGETOOL_RUNTIME_FILE"
+            exit 1
+        fi
+        APPIMAGETOOL_ARGS+=(--runtime-file "$APPIMAGETOOL_RUNTIME_FILE")
+    fi
+
+    ARCH="$ARCH" "$APPIMAGETOOL" "${APPIMAGETOOL_ARGS[@]}" "$APPDIR" "$APPIMAGE_FILE" 2>&1 | tail -3
+    "$ROOT_DIR/scripts/verify-appimage-runtime.sh" "$APPIMAGE_FILE"
     echo "  -> dist/Limux-${VERSION}-${ARCH}.AppImage"
 fi
 
