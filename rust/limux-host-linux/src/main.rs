@@ -150,6 +150,16 @@ pub(crate) fn terminal_child_environment_overrides() -> Vec<(String, String)> {
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH",
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET",
         ),
+        (
+            "GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET",
+        ),
+        (
+            "LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET",
+        ),
     ];
 
     RESTORE_VARS
@@ -344,6 +354,12 @@ mod tests {
             "WEBKIT_INJECTED_BUNDLE_PATH",
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH",
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET",
+            "GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET",
+            "LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET",
         ]);
 
         std::env::set_var("LD_LIBRARY_PATH", "/tmp/.mount_Limux/usr/lib");
@@ -364,6 +380,12 @@ mod tests {
         );
         std::env::set_var("LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH", "");
         std::env::set_var("LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET", "0");
+        std::env::set_var("GBM_BACKENDS_PATH", "/usr/lib/gbm");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH", "");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET", "0");
+        std::env::set_var("LIBGL_DRIVERS_PATH", "/usr/lib/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH", "/host/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET", "1");
 
         let overrides = terminal_child_environment_overrides();
 
@@ -371,6 +393,8 @@ mod tests {
         assert!(overrides.contains(&("GDK_PIXBUF_MODULE_FILE".to_string(), String::new())));
         assert!(overrides.contains(&("WEBKIT_EXEC_PATH".to_string(), "/host/webkit".to_string())));
         assert!(overrides.contains(&("WEBKIT_INJECTED_BUNDLE_PATH".to_string(), String::new())));
+        assert!(overrides.contains(&("GBM_BACKENDS_PATH".to_string(), String::new())));
+        assert!(overrides.contains(&("LIBGL_DRIVERS_PATH".to_string(), "/host/dri".to_string())));
     }
 
     #[test]
