@@ -931,9 +931,44 @@ else
     export LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET=0
     export LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH=""
 fi
+if [ "${GBM_BACKENDS_PATH+x}" = x ]; then
+    export LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET=1
+    export LIMUX_ORIGINAL_GBM_BACKENDS_PATH="${GBM_BACKENDS_PATH}"
+else
+    export LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET=0
+    export LIMUX_ORIGINAL_GBM_BACKENDS_PATH=""
+fi
+if [ "${LIBGL_DRIVERS_PATH+x}" = x ]; then
+    export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET=1
+    export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH="${LIBGL_DRIVERS_PATH}"
+else
+    export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET=0
+    export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH=""
+fi
 
 export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/share}"
+
+# The bundled WebKitGTK closure includes Ubuntu's Mesa loader libraries, whose
+# compiled-in driver paths do not match Fedora or Arch. Point those loaders at
+# the host's actual GBM and DRI modules without overriding an explicit user
+# choice. Terminals restore the original values via the markers above.
+if [ -z "${GBM_BACKENDS_PATH:-}" ]; then
+    for candidate in /usr/lib/gbm /usr/lib64/gbm /usr/lib/*-linux-gnu/gbm; do
+        if [ -d "$candidate" ] && compgen -G "${candidate}/*_gbm.so" >/dev/null; then
+            export GBM_BACKENDS_PATH="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "${LIBGL_DRIVERS_PATH:-}" ]; then
+    for candidate in /usr/lib/dri /usr/lib64/dri /usr/lib/*-linux-gnu/dri; do
+        if [ -d "$candidate" ] && compgen -G "${candidate}/*_dri.so" >/dev/null; then
+            export LIBGL_DRIVERS_PATH="$candidate"
+            break
+        fi
+    done
+fi
 
 # Activate bundled gdk-pixbuf SVG loader by materializing loaders.cache with
 # the current mount path. Written to $XDG_CACHE_HOME so it works on a
@@ -974,7 +1009,17 @@ else
 fi
 
 if [ -n "$APPIMAGETOOL" ]; then
-    ARCH="$ARCH" "$APPIMAGETOOL" "$APPDIR" "$APPIMAGE_FILE" 2>&1 | tail -3
+    APPIMAGETOOL_ARGS=()
+    if [ -n "${APPIMAGETOOL_RUNTIME_FILE:-}" ]; then
+        if [ ! -f "$APPIMAGETOOL_RUNTIME_FILE" ]; then
+            echo "ERROR: APPIMAGETOOL_RUNTIME_FILE does not exist: $APPIMAGETOOL_RUNTIME_FILE"
+            exit 1
+        fi
+        APPIMAGETOOL_ARGS+=(--runtime-file "$APPIMAGETOOL_RUNTIME_FILE")
+    fi
+
+    ARCH="$ARCH" "$APPIMAGETOOL" "${APPIMAGETOOL_ARGS[@]}" "$APPDIR" "$APPIMAGE_FILE" 2>&1 | tail -3
+    "$ROOT_DIR/scripts/verify-appimage-runtime.sh" "$APPIMAGE_FILE"
     echo "  -> dist/Limux-${VERSION}-${ARCH}.AppImage"
 fi
 

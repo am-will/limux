@@ -901,14 +901,18 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
             add_workspace_from_state(state, workspace);
         }
         restore_active_workspace(state, loaded.state.active_workspace_index);
-        apply_sidebar_state_immediately(state, &loaded.state.sidebar);
+    } else {
+        let workspace = initial_workspace_state(
+            dirs::home_dir().as_deref(),
+            std::env::current_dir().ok().as_deref(),
+        );
+        add_workspace_from_state(state, &workspace);
     }
+    apply_sidebar_state_immediately(state, &loaded.state.sidebar);
 
     suspend_persistence(state, false);
 
-    if restored_any || matches!(loaded.source, layout_state::SessionLoadSource::Legacy) {
-        save_session_now(state);
-    }
+    save_session_now(state);
 }
 
 fn restore_active_workspace(state: &State, index: usize) {
@@ -3982,16 +3986,31 @@ fn workspace_folder_path_from_input(
 }
 
 fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
-    let workspace = WorkspaceState {
+    let workspace = workspace_state_with_folder(name, folder_path);
+    add_workspace_from_state(state, &workspace);
+    request_session_save(state);
+}
+
+fn workspace_state_with_folder(name: &str, folder_path: &str) -> WorkspaceState {
+    WorkspaceState {
         id: None,
         name: name.to_string(),
         favorite: false,
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
-    };
-    add_workspace_from_state(state, &workspace);
-    request_session_save(state);
+    }
+}
+
+fn initial_workspace_state(home_dir: Option<&Path>, current_dir: Option<&Path>) -> WorkspaceState {
+    let folder = home_dir.or(current_dir).unwrap_or_else(|| Path::new("/"));
+    let folder_path = folder.to_string_lossy();
+    let name = folder
+        .file_name()
+        .map(|segment| segment.to_string_lossy())
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or_else(|| folder_path.clone());
+    workspace_state_with_folder(&name, &folder_path)
 }
 
 fn dispatch_control_command(command: ControlCommand) {
@@ -6296,7 +6315,7 @@ mod tests {
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, find_leaf_pane, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
-        keep_workspace_open_after_empty_pane, next_active_workspace_index,
+        initial_workspace_state, keep_workspace_open_after_empty_pane, next_active_workspace_index,
         pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
         resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
@@ -7235,6 +7254,22 @@ mod tests {
             workspace_folder_path_from_input("relative", Some(home), Some(current)).unwrap(),
             std::path::PathBuf::from("/tmp/current/relative")
         );
+    }
+
+    #[test]
+    fn initial_workspace_uses_home_with_a_terminal_fallback() {
+        let workspace = initial_workspace_state(
+            Some(std::path::Path::new("/home/tester")),
+            Some(std::path::Path::new("/tmp/current")),
+        );
+
+        assert_eq!(workspace.name, "tester");
+        assert_eq!(workspace.cwd.as_deref(), Some("/home/tester"));
+        assert_eq!(workspace.folder_path.as_deref(), Some("/home/tester"));
+        let LayoutNodeState::Pane(pane) = workspace.layout else {
+            panic!("initial workspace must contain a terminal pane");
+        };
+        assert_eq!(pane.tabs.len(), 1);
     }
 
     #[test]
