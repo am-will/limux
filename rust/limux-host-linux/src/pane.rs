@@ -15,14 +15,15 @@ use gtk4 as gtk;
 #[cfg(feature = "webkit")]
 use webkit6::prelude::*;
 
-use crate::app_config::AppConfig;
+use crate::app_config::{AppConfig, LinkOpenDestination};
 use crate::keybind_editor;
 use crate::layout_state::{
     PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
 };
+use crate::link_uri;
 use crate::settings_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
-use crate::terminal::{self, TerminalCallbacks};
+use crate::terminal::{self, LinkOpenRequest, TerminalCallbacks};
 
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -218,6 +219,7 @@ type PanePathCallback = dyn Fn(&str);
 type PaneDesktopNotificationCallback = dyn Fn(&str, &str, bool, u32, &str);
 type PaneEmptyCallback = dyn Fn(&gtk::Widget, PaneEmptyReason);
 type PaneOpenBrowserHereCallback = dyn Fn(&gtk::Widget);
+type PaneOpenUrlInBrowserCallback = dyn Fn(&gtk::Widget, &str);
 type PaneVisibilityCallback = dyn Fn(&gtk::Widget) -> bool;
 type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
 type PaneShortcutCaptureCallback =
@@ -237,6 +239,7 @@ pub struct PaneCallbacks {
     pub on_bell: Box<PaneBellCallback>,
     pub on_desktop_notification: Box<PaneDesktopNotificationCallback>,
     pub on_open_browser_here: Box<PaneOpenBrowserHereCallback>,
+    pub on_open_url_in_browser: Box<PaneOpenUrlInBrowserCallback>,
     pub on_open_keybinds: Box<PaneWidgetCallback>,
     pub current_shortcuts: Box<PaneShortcutStateCallback>,
     pub on_capture_shortcut: Rc<PaneShortcutCaptureCallback>,
@@ -1194,6 +1197,7 @@ fn make_terminal_callbacks(
     let callbacks_for_pwd = internals.callbacks.clone();
     let callbacks_for_close = internals.callbacks.clone();
     let callbacks_for_browser_here = internals.callbacks.clone();
+    let callbacks_for_open_url = internals.callbacks.clone();
     let callbacks_for_split_right = internals.callbacks.clone();
     let callbacks_for_split_down = internals.callbacks.clone();
     let callbacks_for_keybinds = internals.callbacks.clone();
@@ -1259,14 +1263,23 @@ fn make_terminal_callbacks(
         }),
         on_open_url: Box::new({
             let pane_outer = internals.pane_outer.clone();
-            move |url, external| {
-                if external {
-                    open_url_in_external_browser(url);
+            move |url, request| {
+                let configured_destination = (callbacks_for_open_url.current_config)()
+                    .borrow()
+                    .links
+                    .open_destination;
+                let Some(destination) =
+                    resolved_link_destination(configured_destination, request, url)
+                else {
+                    eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
                     return;
-                }
-
+                };
                 let pane_widget: gtk::Widget = pane_outer.clone().upcast();
-                add_browser_tab_to_pane_with_uri(&pane_widget, Some(url));
+                if destination == LinkOpenDestination::BrowserTab {
+                    (callbacks_for_open_url.on_open_url_in_browser)(&pane_widget, url);
+                } else {
+                    open_url_in_external_browser(url);
+                }
             }
         }),
         on_open_browser_here: Box::new({
@@ -1322,39 +1335,28 @@ fn display_terminal_title(title: &str) -> String {
     format!("{}…", &title[..truncate_at])
 }
 
-fn is_safe_browser_url(url: &str) -> bool {
-    // Minimal allow-list of URI schemes that may be handed to the system
-    // browser on Ctrl+click. The threat model is hostile terminal output:
-    // anything that ends up in a pane's scrollback can craft an OSC 8
-    // hyperlink, and clicking it must not lead to code execution.
-    //
-    // Why only http/https/mailto?
-    // - `javascript:`, `vbscript:`, `data:` are classic XSS sinks (Gitea
-    //   blocks these unconditionally — github.com/go-gitea/gitea#25960).
-    // - `file://` directly opens local files via the registered handler;
-    //   a hostile `cat` of a crafted .desktop file would be RCE.
-    // - `ftp://`, `ftps://`, `smb://`, `nfs://`, `dav://`, `sftp://` all
-    //   auto-mount via gvfs and can execute binaries on the mounted share
-    //   (positive.security/blog/url-open-rce).
-    // - Custom schemes (`vscode://`, `slack://`, `obsidian://`, ...) have
-    //   historically had RCE CVEs in their handlers; we don't second-guess
-    //   that surface area here.
-    //
-    // RFC 3986 §3.1: scheme matching is case-insensitive.
-    let Some(colon) = url.find(':') else {
-        return false;
-    };
-    let scheme = url[..colon].to_ascii_lowercase();
-    let rest = &url[colon..];
-    match scheme.as_str() {
-        "https" | "http" => rest.starts_with("://"),
-        "mailto" => rest.starts_with(':'),
-        _ => false,
+fn resolved_link_destination(
+    configured: LinkOpenDestination,
+    request: LinkOpenRequest,
+    url: &str,
+) -> Option<LinkOpenDestination> {
+    if !link_uri::is_safe_external_url(url) {
+        return None;
     }
+
+    let destination = match request {
+        LinkOpenRequest::Configured => configured,
+        LinkOpenRequest::Destination(destination) => destination,
+    }
+    .effective(cfg!(feature = "webkit"));
+    if destination == LinkOpenDestination::BrowserTab && !link_uri::is_embedded_browser_url(url) {
+        return Some(LinkOpenDestination::DefaultBrowser);
+    }
+    Some(destination)
 }
 
 fn open_url_in_external_browser(url: &str) {
-    if !is_safe_browser_url(url) {
+    if !link_uri::is_safe_external_url(url) {
         eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
         return;
     }
@@ -1715,6 +1717,9 @@ pub fn add_browser_tab_to_pane_with_uri(pane_widget: &gtk::Widget, uri: Option<&
             uri: Some(uri),
         });
         add_browser_tab_inner(&internals, options);
+        if uri.is_some() {
+            (internals.callbacks.on_state_changed)();
+        }
     }
 }
 
@@ -3984,10 +3989,10 @@ fn create_browser_widget(
 mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, is_safe_browser_url,
-        next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches, ContentDropZone,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
+        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
+        resolved_link_destination, surface_hint_matches, ContentDropZone, TabDragPayload,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -3996,6 +4001,7 @@ mod tests {
         env_value_contains_token, is_kde_wayland_session_from_env, BROWSER_WEB_VIEW_CSS_CLASS,
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
+    use crate::{app_config::LinkOpenDestination, terminal::LinkOpenRequest};
 
     #[test]
     fn terminal_title_truncation_preserves_utf8_boundaries() {
@@ -4297,72 +4303,34 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_browser_url_accepts_navigable_schemes() {
-        // Web + email only — see the rationale on `is_safe_browser_url`.
-        for url in [
-            "https://example.com",
-            "https://example.com/path?x=1&y=2",
-            "http://example.com",
-            "http://localhost:8080/foo",
-            "mailto:user@example.com",
-            "mailto:user@example.com?subject=hi",
-        ] {
-            assert!(is_safe_browser_url(url), "should accept {url}");
-        }
-    }
-
-    #[test]
-    fn is_safe_browser_url_is_scheme_case_insensitive() {
-        // RFC 3986 §3.1: scheme matching is case-insensitive. OSC 8 hyperlinks
-        // sometimes preserve the original case from upstream sources, so we
-        // must not reject syntactically valid uppercase/mixed-case schemes.
-        for url in [
-            "HTTPS://example.com",
-            "Https://example.com",
-            "HTTP://example.com",
-            "MAILTO:user@example.com",
-        ] {
-            assert!(is_safe_browser_url(url), "should accept {url}");
-        }
-    }
-
-    #[test]
-    fn is_safe_browser_url_rejects_unsupported_or_dangerous_schemes() {
-        // Threat model: hostile terminal output can craft any OSC 8 hyperlink.
-        // The schemes below are either classic XSS sinks (`javascript:`,
-        // `data:`, `vbscript:`), gvfs auto-mount + exec vectors
-        // (`smb:`, `nfs:`, `dav:`, `davs:`, `sftp:`, `ftp:`, `ftps:`), local
-        // RCE via the file handler (`file:`), or app-specific URIs whose
-        // handlers have a history of RCE CVEs (`vscode:`, `slack:`, etc.).
-        // Leading whitespace and bare paths are also rejected as malformed.
-        for url in [
-            "javascript:alert(1)",
-            "JavaScript:alert(1)",
-            "data:text/html,<script>alert(1)</script>",
-            "vbscript:msgbox(1)",
-            "file:///etc/passwd",
-            "File:///home/manu/notes.md",
-            "ftp://ftp.example.com/pub/file",
-            "ftps://ftp.example.com/pub/file",
-            "smb://server/share",
-            "nfs://server/export",
-            "dav://server/path",
-            "davs://server/path",
-            "sftp://user@host/path",
-            "ssh://user@host",
-            "magnet:?xt=urn:btih:abc",
-            "chrome://settings",
-            "about:blank",
-            "vscode://file/path",
-            "slack://open?team=T",
-            "  https://example.com",
-            "/etc/passwd",
-            "example.com",
-            "",
-            "https:",
-            "http:/example.com",
-        ] {
-            assert!(!is_safe_browser_url(url), "should reject {url:?}");
-        }
+    fn resolved_link_destination_honors_config_and_keeps_mailto_external() {
+        assert_eq!(
+            resolved_link_destination(
+                LinkOpenDestination::BrowserTab,
+                LinkOpenRequest::Configured,
+                "https://example.com",
+            ),
+            Some(if cfg!(feature = "webkit") {
+                LinkOpenDestination::BrowserTab
+            } else {
+                LinkOpenDestination::DefaultBrowser
+            })
+        );
+        assert_eq!(
+            resolved_link_destination(
+                LinkOpenDestination::DefaultBrowser,
+                LinkOpenRequest::Destination(LinkOpenDestination::BrowserTab),
+                "mailto:user@example.com",
+            ),
+            Some(LinkOpenDestination::DefaultBrowser)
+        );
+        assert_eq!(
+            resolved_link_destination(
+                LinkOpenDestination::DefaultBrowser,
+                LinkOpenRequest::Configured,
+                "file:///etc/passwd",
+            ),
+            None
+        );
     }
 }

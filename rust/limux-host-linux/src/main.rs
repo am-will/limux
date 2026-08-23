@@ -1,9 +1,11 @@
 mod app_config;
+mod browser_link;
 mod control_bridge;
 mod ghostty_config;
 mod ime;
 mod keybind_editor;
 mod layout_state;
+mod link_uri;
 mod pane;
 mod settings_editor;
 mod shortcut_config;
