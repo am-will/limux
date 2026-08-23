@@ -107,6 +107,8 @@ pub extern "C" fn limux_control_shutdown() {
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Barrier};
+
     #[test]
     fn ffi_init_dispatch_shutdown_roundtrip() {
         assert_eq!(limux_control_init(), 0);
@@ -127,6 +129,41 @@ mod tests {
         assert_eq!(
             unsafe { limux_control_dispatch(bad.as_ptr(), bad.len()) },
             2
+        );
+        limux_control_shutdown();
+    }
+
+    #[test]
+    fn ffi_lifecycle_stays_consistent_under_concurrent_calls() {
+        const THREADS: usize = 6;
+        const ITERATIONS: usize = 18;
+        const MESSAGE: &[u8] = br#"{"id":"ffi-concurrent","method":"system.ping","params":{}}"#;
+
+        limux_control_shutdown();
+        let start = Arc::new(Barrier::new(THREADS));
+
+        std::thread::scope(|scope| {
+            for worker in 0..THREADS {
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for iteration in 0..ITERATIONS {
+                        match (worker + iteration) % 3 {
+                            0 => assert_eq!(limux_control_init(), 0),
+                            1 => assert_eq!(
+                                unsafe { limux_control_dispatch(MESSAGE.as_ptr(), MESSAGE.len()) },
+                                0
+                            ),
+                            _ => limux_control_shutdown(),
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            unsafe { limux_control_dispatch(MESSAGE.as_ptr(), MESSAGE.len()) },
+            0
         );
         limux_control_shutdown();
     }
