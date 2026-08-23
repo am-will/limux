@@ -7,15 +7,15 @@ use tokio::runtime::{Builder, Runtime};
 
 use crate::Dispatcher;
 
-static DISPATCHER_CELL: OnceLock<Mutex<Option<Dispatcher>>> = OnceLock::new();
-static RUNTIME_CELL: OnceLock<Mutex<Option<Runtime>>> = OnceLock::new();
-
-fn dispatcher_slot() -> &'static Mutex<Option<Dispatcher>> {
-    DISPATCHER_CELL.get_or_init(|| Mutex::new(None))
+struct ControlSession {
+    dispatcher: Dispatcher,
+    runtime: Runtime,
 }
 
-fn runtime_slot() -> &'static Mutex<Option<Runtime>> {
-    RUNTIME_CELL.get_or_init(|| Mutex::new(None))
+static SESSION_CELL: OnceLock<Mutex<Option<ControlSession>>> = OnceLock::new();
+
+fn session_slot() -> &'static Mutex<Option<ControlSession>> {
+    SESSION_CELL.get_or_init(|| Mutex::new(None))
 }
 
 fn parse_request(input: &str) -> Result<V2Request, ()> {
@@ -35,19 +35,15 @@ pub extern "C" fn limux_control_init() -> i32 {
         Err(_) => return 1,
     };
 
-    let dispatcher = Dispatcher::new();
-
-    let mut runtime_guard = match runtime_slot().lock() {
-        Ok(guard) => guard,
-        Err(_) => return 1,
-    };
-    let mut dispatcher_guard = match dispatcher_slot().lock() {
+    let mut session_guard = match session_slot().lock() {
         Ok(guard) => guard,
         Err(_) => return 1,
     };
 
-    *runtime_guard = Some(runtime);
-    *dispatcher_guard = Some(dispatcher);
+    *session_guard = Some(ControlSession {
+        dispatcher: Dispatcher::new(),
+        runtime,
+    });
     0
 }
 
@@ -72,30 +68,27 @@ pub unsafe extern "C" fn limux_control_dispatch(message_ptr: *const u8, message_
         Err(_) => return 2,
     };
 
-    let mut runtime_guard = match runtime_slot().lock() {
-        Ok(guard) => guard,
-        Err(_) => return 1,
-    };
-    let mut dispatcher_guard = match dispatcher_slot().lock() {
+    let mut session_guard = match session_slot().lock() {
         Ok(guard) => guard,
         Err(_) => return 1,
     };
 
-    if runtime_guard.is_none() || dispatcher_guard.is_none() {
-        *runtime_guard = Builder::new_multi_thread().enable_all().build().ok();
-        *dispatcher_guard = Some(Dispatcher::new());
+    if session_guard.is_none() {
+        let runtime = match Builder::new_multi_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(_) => return 1,
+        };
+        *session_guard = Some(ControlSession {
+            dispatcher: Dispatcher::new(),
+            runtime,
+        });
     }
 
-    let runtime = match runtime_guard.as_mut() {
-        Some(runtime) => runtime,
-        None => return 1,
-    };
-    let dispatcher = match dispatcher_guard.as_ref() {
-        Some(dispatcher) => dispatcher,
-        None => return 1,
-    };
+    let session = session_guard.as_mut().expect("session initialized above");
 
-    let response = runtime.block_on(dispatcher.dispatch(request));
+    let response = session
+        .runtime
+        .block_on(session.dispatcher.dispatch(request));
     if response.error.is_some() {
         3
     } else {
@@ -105,17 +98,16 @@ pub unsafe extern "C" fn limux_control_dispatch(message_ptr: *const u8, message_
 
 #[unsafe(no_mangle)]
 pub extern "C" fn limux_control_shutdown() {
-    if let Ok(mut dispatcher_guard) = dispatcher_slot().lock() {
-        *dispatcher_guard = None;
-    }
-    if let Ok(mut runtime_guard) = runtime_slot().lock() {
-        *runtime_guard = None;
+    if let Ok(mut session_guard) = session_slot().lock() {
+        *session_guard = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn ffi_init_dispatch_shutdown_roundtrip() {
@@ -137,6 +129,41 @@ mod tests {
         assert_eq!(
             unsafe { limux_control_dispatch(bad.as_ptr(), bad.len()) },
             2
+        );
+        limux_control_shutdown();
+    }
+
+    #[test]
+    fn ffi_lifecycle_stays_consistent_under_concurrent_calls() {
+        const THREADS: usize = 6;
+        const ITERATIONS: usize = 18;
+        const MESSAGE: &[u8] = br#"{"id":"ffi-concurrent","method":"system.ping","params":{}}"#;
+
+        limux_control_shutdown();
+        let start = Arc::new(Barrier::new(THREADS));
+
+        std::thread::scope(|scope| {
+            for worker in 0..THREADS {
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for iteration in 0..ITERATIONS {
+                        match (worker + iteration) % 3 {
+                            0 => assert_eq!(limux_control_init(), 0),
+                            1 => assert_eq!(
+                                unsafe { limux_control_dispatch(MESSAGE.as_ptr(), MESSAGE.len()) },
+                                0
+                            ),
+                            _ => limux_control_shutdown(),
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            unsafe { limux_control_dispatch(MESSAGE.as_ptr(), MESSAGE.len()) },
+            0
         );
         limux_control_shutdown();
     }
