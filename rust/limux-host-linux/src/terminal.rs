@@ -2591,6 +2591,7 @@ fn translate_key_event(
     let consumed = key_event
         .map(translate_consumed_mods)
         .unwrap_or_else(|| fallback_consumed_mods(keyval, modifier));
+    let keycode = ghostty_keycode_with_caps_escape_remap(keyval, keycode);
 
     ghostty_input_key_s {
         action,
@@ -2600,6 +2601,20 @@ fn translate_key_event(
         text: ptr::null(),
         unshifted_codepoint: unshifted,
         composing: false,
+    }
+}
+
+fn ghostty_keycode_with_caps_escape_remap(keyval: gtk::gdk::Key, keycode: u32) -> u32 {
+    const XKB_KEYCODE_ESCAPE: u32 = 9;
+    const XKB_KEYCODE_CAPS_LOCK: u32 = 66;
+
+    // Embedded Ghostty derives its key from the XKB keycode and cannot see GTK's remapped keyval.
+    if keyval == gtk::gdk::Key::Escape {
+        XKB_KEYCODE_ESCAPE
+    } else if keyval == gtk::gdk::Key::Caps_Lock {
+        XKB_KEYCODE_CAPS_LOCK
+    } else {
+        keycode
     }
 }
 
@@ -2974,6 +2989,39 @@ mod tests {
             '-' as u32
         );
         assert_eq!(fallback_unshifted_codepoint(gtk::gdk::Key::A), 'a' as u32);
+    }
+
+    #[test]
+    fn key_translation_honors_caps_lock_escape_remaps() {
+        let modifiers = gtk::gdk::ModifierType::empty();
+        let caps_as_escape = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            gtk::gdk::Key::Escape,
+            66,
+            modifiers,
+        );
+        let escape_as_caps = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            gtk::gdk::Key::Caps_Lock,
+            9,
+            modifiers,
+        );
+        let writing_key = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            gtk::gdk::Key::a,
+            38,
+            modifiers,
+        );
+
+        assert_eq!(caps_as_escape.keycode, 9);
+        assert_eq!(escape_as_caps.keycode, 66);
+        assert_eq!(writing_key.keycode, 38);
     }
 
     #[test]
