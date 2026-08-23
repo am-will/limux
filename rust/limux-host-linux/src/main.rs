@@ -1,4 +1,5 @@
 mod app_config;
+mod browser_link;
 mod control_bridge;
 mod ghostty_config;
 mod ime;

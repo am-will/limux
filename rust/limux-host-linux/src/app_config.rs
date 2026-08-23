@@ -161,6 +161,14 @@ impl LinkOpenDestination {
             _ => Self::DefaultBrowser,
         }
     }
+
+    pub fn effective(self, embedded_browser_available: bool) -> Self {
+        if self == Self::BrowserTab && !embedded_browser_available {
+            Self::DefaultBrowser
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -879,6 +887,22 @@ mod tests {
         let loaded = load_from_path(&path);
         assert_eq!(
             loaded.config.links.open_destination,
+            LinkOpenDestination::DefaultBrowser
+        );
+    }
+
+    #[test]
+    fn link_destination_matches_embedded_browser_availability() {
+        assert_eq!(
+            LinkOpenDestination::BrowserTab.effective(true),
+            LinkOpenDestination::BrowserTab
+        );
+        assert_eq!(
+            LinkOpenDestination::BrowserTab.effective(false),
+            LinkOpenDestination::DefaultBrowser
+        );
+        assert_eq!(
+            LinkOpenDestination::DefaultBrowser.effective(false),
             LinkOpenDestination::DefaultBrowser
         );
     }

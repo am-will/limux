@@ -5287,27 +5287,27 @@ fn split_pane(
 }
 
 fn open_url_in_browser_tab(state: &State, ws_id: &str, pane_widget: &gtk::Widget, url: &str) {
-    if let Some(right_pane) = pane_in_direction(state, pane_widget, Direction::Right) {
-        pane::add_browser_tab_to_pane_with_uri(&right_pane, Some(url));
-        return;
-    }
-
-    if split_pane(
-        state,
-        ws_id,
+    let right_pane = pane_in_direction(state, pane_widget, Direction::Right);
+    crate::browser_link::open_in_right_pane(
         pane_widget,
-        gtk::Orientation::Horizontal,
-        SplitPaneOptions {
-            initial_state: Some(PaneState::browser_only(Some(url))),
-            skip_default_tab: false,
-            new_pane_first: false,
-            persist: true,
+        right_pane.as_ref(),
+        || {
+            split_pane(
+                state,
+                ws_id,
+                pane_widget,
+                gtk::Orientation::Horizontal,
+                SplitPaneOptions {
+                    initial_state: Some(PaneState::browser_only(Some(url))),
+                    skip_default_tab: false,
+                    new_pane_first: false,
+                    persist: true,
+                },
+            )
+            .is_some()
         },
-    )
-    .is_none()
-    {
-        pane::add_browser_tab_to_pane_with_uri(pane_widget, Some(url));
-    }
+        |target| pane::add_browser_tab_to_pane_with_uri(target, Some(url)),
+    );
 }
 
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {

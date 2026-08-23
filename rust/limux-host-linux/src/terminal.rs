@@ -446,7 +446,7 @@ impl TerminalHandle {
             return Some(String::new());
         }
 
-        let bytes = unsafe { std::slice::from_raw_parts(text.text as *const u8, text.text_len) };
+        let bytes = unsafe { std::slice::from_raw_parts(text.text.cast::<u8>(), text.text_len) };
         let output = String::from_utf8_lossy(bytes).into_owned();
         unsafe { ghostty_surface_free_text(surface, &mut text) };
         Some(output)
@@ -518,7 +518,7 @@ impl TerminalHandle {
             return String::new();
         }
 
-        let bytes = unsafe { std::slice::from_raw_parts(text.text as *const u8, text.text_len) };
+        let bytes = unsafe { std::slice::from_raw_parts(text.text.cast::<u8>(), text.text_len) };
         let selection = String::from_utf8_lossy(bytes).into_owned();
         unsafe { ghostty_surface_free_text(surface, &mut text) };
         selection

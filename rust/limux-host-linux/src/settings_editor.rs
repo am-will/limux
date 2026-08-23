@@ -333,6 +333,7 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             .borrow()
             .links
             .open_destination
+            .effective(cfg!(feature = "webkit"))
             .dropdown_index(),
     );
     link_destination_dropdown.set_sensitive(cfg!(feature = "webkit"));

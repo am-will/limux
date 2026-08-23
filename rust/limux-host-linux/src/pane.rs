@@ -1347,10 +1347,9 @@ fn resolved_link_destination(
     let destination = match request {
         LinkOpenRequest::Configured => configured,
         LinkOpenRequest::Destination(destination) => destination,
-    };
-    if destination == LinkOpenDestination::BrowserTab
-        && (!cfg!(feature = "webkit") || !link_uri::is_embedded_browser_url(url))
-    {
+    }
+    .effective(cfg!(feature = "webkit"));
+    if destination == LinkOpenDestination::BrowserTab && !link_uri::is_embedded_browser_url(url) {
         return Some(LinkOpenDestination::DefaultBrowser);
     }
     Some(destination)
