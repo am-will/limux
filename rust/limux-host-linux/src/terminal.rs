@@ -597,13 +597,11 @@ fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
 
 /// Tracks whether Ghostty's renderer is realized for one surface.
 ///
-/// Ghostty guards its own realize path this way in `renderer/Thread.zig`
-/// (`if (self.renderer_realized == value) return;`), but the C export
-/// `ghostty_surface_display_realized` bypasses that guard and calls the
-/// renderer directly. A second realize with no intervening unrealize makes
-/// `Renderer.displayRealized` overwrite `self.swap_chain` without deiniting
-/// it, orphaning a full-size render target and a colour atlas texture. That
-/// is the leak in issue #155, so the host must pair the two calls itself.
+/// `ghostty_surface_display_realized` is not idempotent: a second call with
+/// no intervening unrealize replaces the renderer's swap chain without
+/// freeing the old one, orphaning its render target and colour atlas
+/// texture. The C export does not guard against that, so the host pairs the
+/// two calls itself.
 #[derive(Default)]
 struct DisplayRealizeState {
     realized: Cell<bool>,
@@ -620,9 +618,8 @@ impl DisplayRealizeState {
         self.realized.replace(false)
     }
 
-    /// Adopt the state Ghostty gives a freshly created surface. Its renderer
-    /// thread starts realized (`Thread.renderer_realized` defaults to `true`),
-    /// so the first `unrealize` must still be forwarded.
+    /// Adopt the realized state a freshly created surface already carries,
+    /// so its first unrealize is still forwarded.
     fn adopt_realized(&self) {
         self.realized.set(true);
     }
@@ -2188,15 +2185,11 @@ pub fn create_terminal(
             let Some(surface) = *surface_cell.borrow() else {
                 return;
             };
-            // Deliberately asymmetric with the realize path, which gates on
-            // `gl_area.error()`. GTK destroys this GL context once the
-            // unrealize handlers return, so the teardown must be forwarded
-            // either way. Holding the state realized after a failed
-            // `make_current` would make the next `connect_realize` suppress
-            // its own `display_realized`, leaving the renderer bound to a
-            // swap chain from a dead context. Surface teardown stays safe
-            // regardless: `SwapChain.drainForDeinit` returns early once the
-            // chain is defunct, so `ghostty_surface_free` cannot double-free.
+            // Unlike the realize path, this does not gate on
+            // `gl_area.error()`. GTK destroys the context once these handlers
+            // return, so staying realized after a failed `make_current` would
+            // make the next realize suppress itself and leave the renderer
+            // bound to a dead context.
             if display_realized.begin_unrealize() {
                 gl_area.make_current();
                 unsafe { ghostty_surface_display_unrealized(surface) };
@@ -2934,9 +2927,6 @@ mod tests {
 
     #[test]
     fn display_realize_state_suppresses_a_second_realize() {
-        // Issue #155: Ghostty's `Renderer.displayRealized` overwrites its
-        // swap chain without deiniting it, so a repeated realize orphans a
-        // full-size render target.
         let state = DisplayRealizeState::default();
         assert!(state.begin_realize());
         assert!(!state.begin_realize());
@@ -2963,8 +2953,6 @@ mod tests {
 
     #[test]
     fn display_realize_state_adopts_a_freshly_created_surface() {
-        // `Thread.renderer_realized` defaults to true, so a new surface is
-        // already realized and its first unrealize must be forwarded.
         let state = DisplayRealizeState::default();
         state.adopt_realized();
         assert!(!state.begin_realize());
