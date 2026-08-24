@@ -294,7 +294,7 @@ impl TerminalHandle {
             return;
         };
 
-        refresh_realized_surface_display(surface, &self.gl_area);
+        refresh_surface_display(surface, &self.gl_area);
     }
 
     pub fn perform_binding_action(&self, action: &str) -> bool {
@@ -595,10 +595,52 @@ fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
     gl_area.queue_render();
 }
 
-fn refresh_realized_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+/// Tracks whether Ghostty's renderer is realized for one surface.
+///
+/// Ghostty guards its own realize path this way in `renderer/Thread.zig`
+/// (`if (self.renderer_realized == value) return;`), but the C export
+/// `ghostty_surface_display_realized` bypasses that guard and calls the
+/// renderer directly. A second realize with no intervening unrealize makes
+/// `Renderer.displayRealized` overwrite `self.swap_chain` without deiniting
+/// it, orphaning a full-size render target and a colour atlas texture. That
+/// is the leak in issue #155, so the host must pair the two calls itself.
+#[derive(Default)]
+struct DisplayRealizeState {
+    realized: Cell<bool>,
+}
+
+impl DisplayRealizeState {
+    /// True when the caller must invoke `ghostty_surface_display_realized`.
+    fn begin_realize(&self) -> bool {
+        !self.realized.replace(true)
+    }
+
+    /// True when the caller must invoke `ghostty_surface_display_unrealized`.
+    fn begin_unrealize(&self) -> bool {
+        self.realized.replace(false)
+    }
+
+    /// Adopt the state Ghostty gives a freshly created surface. Its renderer
+    /// thread starts realized (`Thread.renderer_realized` defaults to `true`),
+    /// so the first `unrealize` must still be forwarded.
+    fn adopt_realized(&self) {
+        self.realized.set(true);
+    }
+}
+
+/// Realize Ghostty's renderer for a freshly realized `GLArea`, then resize.
+///
+/// Only the `realize` signal may call this. Every other path that needs the
+/// surface to match the widget calls [`refresh_surface_display`], which
+/// resizes without touching renderer lifetime.
+fn refresh_realized_surface_display(
+    surface: ghostty_surface_t,
+    gl_area: &gtk::GLArea,
+    display_realized: &DisplayRealizeState,
+) {
     if gl_area.is_realized() {
         gl_area.make_current();
-        if gl_area.error().is_none() {
+        if gl_area.error().is_none() && display_realized.begin_realize() {
             unsafe { ghostty_surface_display_realized(surface) };
         }
     }
@@ -1464,6 +1506,7 @@ pub fn create_terminal(
     let extra_env = options.extra_env;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
+    let display_realized: Rc<DisplayRealizeState> = Rc::new(DisplayRealizeState::default());
     let shutting_down = Rc::new(Cell::new(false));
     let had_focus = Rc::new(Cell::new(false));
     let scrollbar_syncing = Rc::new(Cell::new(false));
@@ -1542,7 +1585,7 @@ pub fn create_terminal(
         let surface_cell = surface_cell.clone();
         let handler = gl_area.connect_map(move |gl_area| {
             if let Some(surface) = *surface_cell.borrow() {
-                refresh_realized_surface_display(surface, gl_area);
+                refresh_surface_display(surface, gl_area);
             } else {
                 gl_area.queue_render();
             }
@@ -1609,6 +1652,7 @@ pub fn create_terminal(
         let scrollbar_syncing = scrollbar_syncing.clone();
         let extra_env = extra_env.clone();
         let shutting_down = shutting_down.clone();
+        let display_realized = display_realized.clone();
         let handler = gl_area.connect_realize(move |gl_area| {
             if shutting_down.get() {
                 return;
@@ -1623,7 +1667,7 @@ pub fn create_terminal(
             // reinitialize the GL renderer with the new GL context while
             // preserving the terminal/pty state.
             if let Some(surface) = *surface_cell.borrow() {
-                refresh_realized_surface_display(surface, gl_area);
+                refresh_realized_surface_display(surface, gl_area, &display_realized);
                 let gl_area = gl_area.clone();
                 glib::idle_add_local_once(move || {
                     gl_area.queue_render();
@@ -1788,6 +1832,7 @@ pub fn create_terminal(
                 );
             });
 
+            display_realized.adopt_realized();
             *surface_cell.borrow_mut() = Some(surface);
 
             unsafe {
@@ -2137,9 +2182,13 @@ pub fn create_terminal(
     {
         let surface_cell = surface_cell.clone();
         let link_popover = link_popover.clone();
+        let display_realized = display_realized.clone();
         let handler = gl_area.connect_unrealize(move |gl_area| {
             link_popover.popdown();
-            if let Some(surface) = *surface_cell.borrow() {
+            let Some(surface) = *surface_cell.borrow() else {
+                return;
+            };
+            if display_realized.begin_unrealize() {
                 gl_area.make_current();
                 unsafe { ghostty_surface_display_unrealized(surface) };
             }
@@ -2872,6 +2921,45 @@ mod tests {
             physical_size_for_allocation(640, 480, 3),
             Some((1920, 1440, 3))
         );
+    }
+
+    #[test]
+    fn display_realize_state_suppresses_a_second_realize() {
+        // Issue #155: Ghostty's `Renderer.displayRealized` overwrites its
+        // swap chain without deiniting it, so a repeated realize orphans a
+        // full-size render target.
+        let state = DisplayRealizeState::default();
+        assert!(state.begin_realize());
+        assert!(!state.begin_realize());
+        assert!(!state.begin_realize());
+    }
+
+    #[test]
+    fn display_realize_state_forwards_every_paired_transition() {
+        let state = DisplayRealizeState::default();
+        for _ in 0..3 {
+            assert!(state.begin_realize());
+            assert!(state.begin_unrealize());
+        }
+    }
+
+    #[test]
+    fn display_realize_state_suppresses_unrealize_when_not_realized() {
+        let state = DisplayRealizeState::default();
+        assert!(!state.begin_unrealize());
+        state.begin_realize();
+        assert!(state.begin_unrealize());
+        assert!(!state.begin_unrealize());
+    }
+
+    #[test]
+    fn display_realize_state_adopts_a_freshly_created_surface() {
+        // `Thread.renderer_realized` defaults to true, so a new surface is
+        // already realized and its first unrealize must be forwarded.
+        let state = DisplayRealizeState::default();
+        state.adopt_realized();
+        assert!(!state.begin_realize());
+        assert!(state.begin_unrealize());
     }
 
     #[test]
