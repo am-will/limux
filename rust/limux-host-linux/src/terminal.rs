@@ -2188,6 +2188,15 @@ pub fn create_terminal(
             let Some(surface) = *surface_cell.borrow() else {
                 return;
             };
+            // Deliberately asymmetric with the realize path, which gates on
+            // `gl_area.error()`. GTK destroys this GL context once the
+            // unrealize handlers return, so the teardown must be forwarded
+            // either way. Holding the state realized after a failed
+            // `make_current` would make the next `connect_realize` suppress
+            // its own `display_realized`, leaving the renderer bound to a
+            // swap chain from a dead context. Surface teardown stays safe
+            // regardless: `SwapChain.drainForDeinit` returns early once the
+            // chain is defunct, so `ghostty_surface_free` cannot double-free.
             if display_realized.begin_unrealize() {
                 gl_area.make_current();
                 unsafe { ghostty_surface_display_unrealized(surface) };
