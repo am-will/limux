@@ -1536,12 +1536,21 @@ pub fn create_terminal(
     let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scrollbar_adjustment));
     scrollbar.set_visible(false);
     scrollbar.set_vexpand(true);
+    // The scrollbar must be an overlay child, not a sibling in the box below.
+    // Ghostty emits a SCROLLBAR action whenever `total > len` flips, and we
+    // toggle visibility in response. As a Box sibling that consumes layout
+    // width, showing/hiding it reallocated the GLArea, changed the terminal
+    // grid columns, and reflowed the text left/right — the "window bounces"
+    // flicker in issue #136. Overlaid, the terminal keeps its full width and
+    // the scrollbar just draws (or stops drawing) on top of it.
+    scrollbar.set_halign(gtk::Align::End);
+    scrollbar.set_valign(gtk::Align::Fill);
+    overlay.add_overlay(&scrollbar);
 
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
     root.append(&overlay);
-    root.append(&scrollbar);
 
     let search_entry = gtk::SearchEntry::builder()
         .hexpand(true)
