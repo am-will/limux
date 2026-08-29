@@ -290,7 +290,7 @@ fi
 
 # Build release binary
 echo "Building release binary..."
-cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml"
+cargo build --release --locked --manifest-path "${ROOT_DIR}/Cargo.toml"
 
 CLI_BINARY="${ROOT_DIR}/target/release/limux-cli"
 HOST_BINARY="${ROOT_DIR}/target/release/limux"

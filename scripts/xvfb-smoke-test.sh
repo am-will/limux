@@ -43,10 +43,10 @@ else
 fi
 
 echo "-- building limux-cli ($PROFILE)..."
-cargo build $CARGO_FLAGS -p limux-cli --bin limux-cli 2>&1 | tail -3
+cargo build --locked $CARGO_FLAGS -p limux-cli --bin limux-cli 2>&1 | tail -3
 
 echo "-- building limux-host-linux ($PROFILE)..."
-cargo build $CARGO_FLAGS -p limux-host-linux 2>&1 | tail -3
+cargo build --locked $CARGO_FLAGS -p limux-host-linux 2>&1 | tail -3
 
 LIMUX_HOST="$ROOT_DIR/$BIN_DIR/limux"
 LIMUX_CLI="$ROOT_DIR/$BIN_DIR/limux-cli"

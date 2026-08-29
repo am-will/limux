@@ -5,9 +5,45 @@ on:
     branches:
       - main
   pull_request:
+  schedule:
+    - cron: "17 9 * * *"
+
+permissions:
+  contents: read
 
 jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pinned cargo-audit
+        env:
+          CARGO_AUDIT_VERSION: 0.22.2
+          CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        run: |
+          set -euo pipefail
+          asset="cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}.tgz"
+          archive="$RUNNER_TEMP/$asset"
+          install_dir="$RUNNER_TEMP/cargo-audit"
+          bin_dir="$RUNNER_TEMP/bin"
+          curl --fail --location --retry 5 --retry-delay 5 \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CARGO_AUDIT_VERSION}/${asset}" \
+            -o "$archive"
+          printf '%s  %s\n' "$CARGO_AUDIT_SHA256" "$archive" | sha256sum --check
+          mkdir -p "$install_dir" "$bin_dir"
+          tar -xzf "$archive" -C "$install_dir" --strip-components=1
+          install -m755 "$install_dir/cargo-audit" "$bin_dir/cargo-audit"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+      - name: Audit locked dependencies
+        run: cargo audit --deny warnings
+
   quality:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -49,6 +85,7 @@ jobs:
 
   gtk-host-smoke:
     name: GTK host smoke
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
 
     steps:
