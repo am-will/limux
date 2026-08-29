@@ -87,6 +87,9 @@ is_appimage_system_library() {
         ld-linux*.so*|libanl.so*|libBrokenLocale.so*|libc.so*|libcidn.so*|libdl.so*|libm.so*|libmvec.so*|libnsl.so*|libnss_*.so*|libpthread.so*|libresolv.so*|librt.so*|libthread_db.so*|libutil.so*)
             return 0
             ;;
+        libEGL.so*|libGL.so*|libGLX.so*|libGLdispatch.so*|libOpenGL.so*|libdrm*.so*|libgbm.so*|libglapi.so*|libwayland-client.so*|libwayland-cursor.so*|libwayland-egl.so*|libwayland-server.so*)
+            return 0
+            ;;
     esac
 
     return 1

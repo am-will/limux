@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Unit tests for the AppImage SVG-loader bundling logic in scripts/package.sh.
+# Regression tests for AppImage packaging logic.
 #
 # Tests are pure-shell. They isolate the relevant blocks so they can be
 # exercised without running a full package build.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PACKAGE_SH="$SCRIPT_DIR/../package.sh"
+APPIMAGE_WEBKIT_SH="$SCRIPT_DIR/../appimage-webkit.sh"
+
+# shellcheck disable=SC1090,SC1091
+source "$APPIMAGE_WEBKIT_SH"
 
 PASS=0
 FAIL=0
@@ -267,6 +270,38 @@ if [ "$ec" = "99" ]; then
     pass "LIMUX_REQUIRE_SVG_LOADER=1 -> hard fail (exit 99)"
 else
     fail "hard-fail path" "expected exit 99, got $ec"
+fi
+
+# ----- T7: host graphics libraries stay outside the AppImage -----
+
+echo "T7: AppImage uses host graphics libraries"
+
+for library in \
+    libEGL.so.1 \
+    libGL.so.1 \
+    libGLX.so.0 \
+    libGLdispatch.so.0 \
+    libOpenGL.so.0 \
+    libdrm.so.2 \
+    libdrm_amdgpu.so.1 \
+    libgbm.so.1 \
+    libglapi.so.0 \
+    libwayland-client.so.0 \
+    libwayland-cursor.so.0 \
+    libwayland-egl.so.1 \
+    libwayland-server.so.0
+do
+    if is_appimage_system_library "/usr/lib/$library"; then
+        pass "excludes $library"
+    else
+        fail "host graphics exclusion" "$library would be bundled"
+    fi
+done
+
+if ! is_appimage_system_library "/usr/lib/libwebkitgtk-6.0.so.4"; then
+    pass "keeps application runtime libraries bundled"
+else
+    fail "application runtime closure" "libwebkitgtk-6.0.so.4 would be excluded"
 fi
 
 # ----- Summary -----

@@ -949,10 +949,9 @@ fi
 export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/share}"
 
-# The bundled WebKitGTK closure includes Ubuntu's Mesa loader libraries, whose
-# compiled-in driver paths do not match Fedora or Arch. Point those loaders at
-# the host's actual GBM and DRI modules without overriding an explicit user
-# choice. Terminals restore the original values via the markers above.
+# Host Mesa loaders use distro-specific GBM and DRI module paths. Discover
+# common locations without overriding an explicit user choice. Terminals
+# restore the original values via the markers above.
 if [ -z "${GBM_BACKENDS_PATH:-}" ]; then
     for candidate in /usr/lib/gbm /usr/lib64/gbm /usr/lib/*-linux-gnu/gbm; do
         if [ -d "$candidate" ] && compgen -G "${candidate}/*_gbm.so" >/dev/null; then
