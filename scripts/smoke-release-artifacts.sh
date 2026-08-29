@@ -104,6 +104,8 @@ smoke_linux() {
     local appimage="$DIST_DIR/Limux-${VERSION}-${ARCH}.AppImage"
     local tar_root="$SMOKE_ROOT/tar/limux-$VERSION-linux-$ARCH"
     local deb_root="$SMOKE_ROOT/deb"
+    local appimage_extract_root="$SMOKE_ROOT/appimage"
+    local appimage_root="$appimage_extract_root/squashfs-root"
     local actual
     local help
 
@@ -137,6 +139,13 @@ smoke_linux() {
         echo "ERROR: AppImage does not contain the Limux CLI entrypoint" >&2
         exit 1
     fi
+
+    mkdir -p "$appimage_extract_root"
+    (
+        cd "$appimage_extract_root"
+        "$appimage" --appimage-extract >/dev/null
+    )
+    verify_tree "$appimage_root/usr" "$appimage_root/usr/bin/limux" "$appimage_root/usr/lib" "AppImage"
 
     echo "Linux release artifact smoke: OK"
 }
