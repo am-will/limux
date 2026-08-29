@@ -279,6 +279,8 @@ echo "T7: AppImage uses host graphics libraries"
 for library in \
     libEGL.so.1 \
     libGL.so.1 \
+    libGLESv1_CM.so.1 \
+    libGLESv2.so.2 \
     libGLX.so.0 \
     libGLdispatch.so.0 \
     libOpenGL.so.0 \
