@@ -16,8 +16,8 @@ export LD_LIBRARY_PATH="$GHOSTTY_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 cd "$ROOT_DIR"
 
 cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace -- --test-threads=1
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace -- --test-threads=1
 ./scripts/tests/test-release-version.sh
 ./scripts/tests/test-package-svg-loader.sh
 ./scripts/tests/test-aur-source-package.sh
