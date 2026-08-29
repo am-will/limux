@@ -8,7 +8,7 @@ fn ghostty_config_contents() -> Option<String> {
 }
 
 fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
-    for line in contents.lines() {
+    for line in contents.lines().rev() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(key) {
             let rest = rest.trim();
@@ -18,6 +18,43 @@ fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+pub fn terminal_command_accepts_shell_input() -> bool {
+    let configured_command =
+        ghostty_config_contents().and_then(|contents| read_ghostty_value(&contents, "command"));
+
+    match configured_command {
+        Some(command) => command_launches_interactive_shell(&command),
+        None => std::env::var_os("SHELL")
+            .map(|shell| command_launches_interactive_shell(&shell.to_string_lossy()))
+            // Ghostty falls back to the user's passwd shell when SHELL is
+            // absent, so the default command remains an interactive shell.
+            .unwrap_or(true),
+    }
+}
+
+fn command_launches_interactive_shell(command: &str) -> bool {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("direct:")
+        .or_else(|| command.strip_prefix("shell:"))
+        .unwrap_or(command)
+        .trim_start();
+    let executable = command
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['\'', '"']);
+    let name = std::path::Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    matches!(
+        name,
+        "sh" | "bash" | "dash" | "zsh" | "fish" | "ksh" | "mksh" | "nu" | "elvish" | "xonsh"
+    )
 }
 
 /// Read background-opacity from the Ghostty config file.
@@ -39,4 +76,43 @@ pub fn read_font_size() -> f32 {
         .and_then(|v| v.parse::<f32>().ok())
         .map(|v| v.clamp(1.0, 255.0))
         .unwrap_or(DEFAULT_FONT_SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_launches_interactive_shell, read_ghostty_value};
+
+    #[test]
+    fn last_ghostty_value_wins() {
+        let contents = "command = /usr/bin/vim\ncommand = direct:/usr/bin/zsh -l\n";
+        assert_eq!(
+            read_ghostty_value(contents, "command").as_deref(),
+            Some("direct:/usr/bin/zsh -l")
+        );
+    }
+
+    #[test]
+    fn terminal_command_classification_rejects_non_shell_commands() {
+        for command in [
+            "direct:/usr/bin/vim",
+            "/usr/bin/nvim file.txt",
+            "shell:tmux new-session",
+            "",
+        ] {
+            assert!(!command_launches_interactive_shell(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn terminal_command_classification_accepts_supported_shells() {
+        for command in [
+            "/bin/bash",
+            "direct:/usr/bin/zsh -l",
+            "shell:fish --login",
+            "'sh'",
+            "nu",
+        ] {
+            assert!(command_launches_interactive_shell(command), "{command}");
+        }
+    }
 }

@@ -1480,11 +1480,18 @@ fn add_terminal_tab_inner(
     );
     let mut initial_input = None;
     if let Some(command) = workspace_autostart_command.as_deref() {
-        eprintln!(
-            "limux: running workspace autostart workspace={} surface={}:{}",
-            internals.callbacks.workspace_id, internals.pane_id, tab_id
-        );
-        initial_input = prepare_workspace_autostart(command);
+        if crate::ghostty_config::terminal_command_accepts_shell_input() {
+            eprintln!(
+                "limux: running workspace autostart workspace={} surface={}:{}",
+                internals.callbacks.workspace_id, internals.pane_id, tab_id
+            );
+            initial_input = prepare_workspace_autostart(command);
+        } else {
+            eprintln!(
+                "limux: skipping workspace autostart for non-shell terminal command workspace={} surface={}:{}",
+                internals.callbacks.workspace_id, internals.pane_id, tab_id
+            );
+        }
     }
 
     let term = terminal::create_terminal(
@@ -4102,12 +4109,11 @@ fn create_browser_widget(
 mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, is_safe_browser_url,
-        next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, select_terminal_commands,
-        resolved_link_destination, surface_hint_matches, workspace_autostart_initial_input,
-        workspace_autostart_script, ContentDropZone, TabDragPayload,
-        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
+        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
+        resolved_link_destination, select_terminal_commands, surface_hint_matches,
+        workspace_autostart_initial_input, workspace_autostart_script, ContentDropZone,
+        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };

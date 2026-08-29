@@ -83,8 +83,9 @@ export LIMUX_SOCKET_MODE="runtime"
 unset LIMUX_PANE_ID LIMUX_SURFACE_ID LIMUX_TAB_ID LIMUX_WORKSPACE_ID
 export XDG_DATA_HOME="$DEMO_DIR/data"
 export XDG_STATE_HOME="$DEMO_DIR/state"
+export XDG_CONFIG_HOME="$DEMO_DIR/config"
 export XDG_RUNTIME_DIR="$DEMO_DIR/runtime"
-mkdir -p "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+mkdir -p "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 cat > "$XDG_DATA_HOME/limux/session.json" <<SMOKE_SESSION
 {
@@ -520,6 +521,82 @@ jq -e '(.panes | length) == 4' "$LOG_DIR/stage8-panes.json" >/dev/null \
   || { echo "FAIL: restored workspace did not retain all panes"; exit 1; }
 wait_for_healthy_surfaces "$RESTORED_WORKSPACE" "$LOG_DIR/stage8-health.json"
 stop_host
+
+# --- 12. Stage 9: explicit non-shell Ghostty commands receive no input -----
+echo
+echo "== stage 9: non-shell Ghostty command suppresses autostart input =="
+mkdir -p "$XDG_CONFIG_HOME/ghostty"
+DIRECT_COMMAND="$DEMO_DIR/direct-command.py"
+cat > "$DIRECT_COMMAND" <<'PY'
+#!/usr/bin/python3
+import pathlib
+import select
+import sys
+import time
+
+root = pathlib.Path(__file__).parent
+(root / "direct-command-started").write_text("started")
+readable, _, _ = select.select([sys.stdin], [], [], 2.0)
+if readable:
+    data = sys.stdin.buffer.read1(4096)
+    if data:
+        (root / "direct-command-input").write_bytes(data)
+time.sleep(30)
+PY
+chmod 700 "$DIRECT_COMMAND"
+printf 'command = direct:%s\n' "$DIRECT_COMMAND" > "$XDG_CONFIG_HOME/ghostty/config"
+rm -f "$DEMO_DIR/autostart-proof" "$DEMO_DIR/direct-command-started" \
+  "$DEMO_DIR/direct-command-input"
+cat > "$XDG_DATA_HOME/limux/session.json" <<DIRECT_SESSION
+{
+  "version": 1,
+  "active_workspace_index": 0,
+  "top_bar_visible": true,
+  "sidebar": { "visible": true, "width": 220 },
+  "workspaces": [
+    {
+      "id": "00000000-0000-4000-8000-000000000009",
+      "name": "direct-command",
+      "favorite": false,
+      "cwd": "$DEMO_DIR",
+      "folder_path": "$DEMO_DIR",
+      "autostart_command": "printf should-not-run > $DEMO_DIR/autostart-proof",
+      "layout": {
+        "kind": "pane",
+        "pane_id": 1,
+        "active_tab_id": "terminal-direct",
+        "tabs": [
+          {
+            "id": "terminal-direct",
+            "custom_name": null,
+            "pinned": false,
+            "tab_kind": "terminal",
+            "cwd": "$DEMO_DIR"
+          }
+        ]
+      }
+    }
+  ]
+}
+DIRECT_SESSION
+start_host host-direct-command
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/direct-command-started" ] && break
+  sleep 0.1
+done
+[ -f "$DEMO_DIR/direct-command-started" ] \
+  || { echo "FAIL: configured direct command did not start"; exit 1; }
+sleep 3
+[ ! -e "$DEMO_DIR/direct-command-input" ] \
+  || { echo "FAIL: configured direct command received injected terminal input"; exit 1; }
+[ ! -e "$DEMO_DIR/autostart-proof" ] \
+  || { echo "FAIL: workspace autostart ran for a configured non-shell command"; exit 1; }
+grep -Fq "skipping workspace autostart for non-shell terminal command" \
+  "$LOG_DIR/host-direct-command.stderr" \
+  || { echo "FAIL: non-shell autostart suppression was not diagnosed"; exit 1; }
+stop_host
+echo "stage 9: OK (direct command started without autostart input)"
+
 kill -TERM -- "-$WESTON_PID"
 for _ in $(seq 1 50); do
   if ! kill -0 -- "-$WESTON_PID" 2>/dev/null; then

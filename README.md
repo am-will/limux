@@ -136,6 +136,10 @@ stored as part of the workspace session and runs inside the terminal, so
 interactive commands such as `ssh user@server` work without modifying `.bashrc`.
 Open **Edit Autostart…** and save an empty command to disable it.
 
+Autostart applies to interactive shell terminals. If Ghostty is configured to
+launch a non-shell command such as `command = direct:/usr/bin/vim`, Limux skips
+autostart for that terminal so it does not inject keystrokes into the program.
+
 ## Agent integrations
 
 Limux ships first-class hooks for coding agents (Codex, Claude Code, and

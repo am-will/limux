@@ -5485,6 +5485,7 @@ fn open_url_in_browser_tab(state: &State, ws_id: &str, pane_widget: &gtk::Widget
                     skip_default_tab: false,
                     new_pane_first: false,
                     persist: true,
+                    suppress_initial_autostart: false,
                 },
             )
             .is_some()
