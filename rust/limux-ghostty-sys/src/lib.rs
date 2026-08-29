@@ -15,6 +15,14 @@ pub type ghostty_app_t = *mut c_void;
 pub type ghostty_config_t = *mut c_void;
 pub type ghostty_surface_t = *mut c_void;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_string_s {
+    pub ptr: *const c_char,
+    pub len: usize,
+    pub sentinel: bool,
+}
+
 // -------------------------------------------------------------------
 // Enums
 // -------------------------------------------------------------------
@@ -520,6 +528,8 @@ extern "C" {
     pub fn ghostty_config_load_default_files(config: ghostty_config_t);
     pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
     pub fn ghostty_config_finalize(config: ghostty_config_t);
+    pub fn ghostty_config_serialize(config: ghostty_config_t) -> ghostty_string_s;
+    pub fn ghostty_string_free(value: ghostty_string_s);
 
     // App
     pub fn ghostty_app_new(

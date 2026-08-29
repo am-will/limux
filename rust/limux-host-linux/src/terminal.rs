@@ -36,6 +36,7 @@ unsafe impl Sync for GhosttyState {}
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
+static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
 static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
 
@@ -654,6 +655,23 @@ fn load_ghostty_config() -> ghostty_config_t {
     }
 }
 
+fn load_command_accepts_shell_input(config: ghostty_config_t) -> bool {
+    let serialized = unsafe { ghostty_config_serialize(config) };
+    let contents = if serialized.ptr.is_null() {
+        None
+    } else {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(serialized.ptr.cast::<u8>(), serialized.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    };
+    unsafe { ghostty_string_free(serialized) };
+
+    let command = contents
+        .as_deref()
+        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "command"));
+    crate::ghostty_config::terminal_command_accepts_shell_input(command.as_deref())
+}
+
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
 pub fn init_ghostty() {
     GHOSTTY.get_or_init(|| {
@@ -664,6 +682,8 @@ pub fn init_ghostty() {
         let config = load_ghostty_config();
         let background_opacity = load_background_opacity(config);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
+        CURRENT_COMMAND_ACCEPTS_SHELL_INPUT
+            .store(load_command_accepts_shell_input(config), Ordering::Relaxed);
 
         let runtime_config = ghostty_runtime_config_s {
             userdata: ptr::null_mut(),
@@ -706,6 +726,11 @@ pub fn ghostty_background_opacity() -> f64 {
         .get()
         .map(|state| state.background_opacity)
         .unwrap_or(1.0)
+}
+
+pub fn terminal_command_accepts_shell_input() -> bool {
+    init_ghostty();
+    CURRENT_COMMAND_ACCEPTS_SHELL_INPUT.load(Ordering::Relaxed)
 }
 
 fn load_background_opacity(config: ghostty_config_t) -> f64 {
@@ -1108,6 +1133,8 @@ unsafe extern "C" fn ghostty_action_cb(
         GHOSTTY_ACTION_RELOAD_CONFIG => {
             let config = load_ghostty_config();
             CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
+            CURRENT_COMMAND_ACCEPTS_SHELL_INPUT
+                .store(load_command_accepts_shell_input(config), Ordering::Relaxed);
             match target.tag {
                 GHOSTTY_TARGET_APP => unsafe {
                     ghostty_app_update_config(app, config);

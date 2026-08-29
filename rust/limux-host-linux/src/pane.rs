@@ -1480,7 +1480,7 @@ fn add_terminal_tab_inner(
     );
     let mut initial_input = None;
     if let Some(command) = workspace_autostart_command.as_deref() {
-        if crate::ghostty_config::terminal_command_accepts_shell_input() {
+        if terminal::terminal_command_accepts_shell_input() {
             eprintln!(
                 "limux: running workspace autostart workspace={} surface={}:{}",
                 internals.callbacks.workspace_id, internals.pane_id, tab_id

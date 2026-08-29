@@ -136,9 +136,13 @@ stored as part of the workspace session and runs inside the terminal, so
 interactive commands such as `ssh user@server` work without modifying `.bashrc`.
 Open **Edit Autostart…** and save an empty command to disable it.
 
-Autostart applies to interactive shell terminals. If Ghostty is configured to
-launch a non-shell command such as `command = direct:/usr/bin/vim`, Limux skips
-autostart for that terminal so it does not inject keystrokes into the program.
+Limux writes the command to a private, self-deleting `/bin/sh` script and asks
+the interactive terminal shell to source it. Autostart is enabled only when
+Ghostty's finalized configuration launches a recognized shell with no arguments
+other than interactive/login flags. Non-shell commands such as
+`command = direct:/usr/bin/vim` and non-interactive wrappers such as
+`command = direct:/bin/bash -lc "exec /usr/bin/vim"` skip autostart, so Limux
+does not inject keystrokes into the launched program.
 
 ## Agent integrations
 

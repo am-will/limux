@@ -7,7 +7,7 @@ fn ghostty_config_contents() -> Option<String> {
     std::fs::read_to_string(&path).ok()
 }
 
-fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
+pub(crate) fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
     for line in contents.lines().rev() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(key) {
@@ -20,12 +20,9 @@ fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-pub fn terminal_command_accepts_shell_input() -> bool {
-    let configured_command =
-        ghostty_config_contents().and_then(|contents| read_ghostty_value(&contents, "command"));
-
+pub(crate) fn terminal_command_accepts_shell_input(configured_command: Option<&str>) -> bool {
     match configured_command {
-        Some(command) => command_launches_interactive_shell(&command),
+        Some(command) => command_launches_interactive_shell(command),
         None => std::env::var_os("SHELL")
             .map(|shell| command_launches_interactive_shell(&shell.to_string_lossy()))
             // Ghostty falls back to the user's passwd shell when SHELL is
@@ -41,8 +38,8 @@ fn command_launches_interactive_shell(command: &str) -> bool {
         .or_else(|| command.strip_prefix("shell:"))
         .unwrap_or(command)
         .trim_start();
-    let executable = command
-        .split_ascii_whitespace()
+    let mut arguments = command.split_ascii_whitespace();
+    let executable = arguments
         .next()
         .unwrap_or_default()
         .trim_matches(['\'', '"']);
@@ -51,10 +48,19 @@ fn command_launches_interactive_shell(command: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
 
-    matches!(
+    let supported_shell = matches!(
         name,
         "sh" | "bash" | "dash" | "zsh" | "fish" | "ksh" | "mksh" | "nu" | "elvish" | "xonsh"
-    )
+    );
+
+    supported_shell && arguments.all(is_interactive_shell_argument)
+}
+
+fn is_interactive_shell_argument(argument: &str) -> bool {
+    matches!(argument, "-i" | "--interactive" | "-l" | "--login")
+        || argument.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty() && flags.chars().all(|flag| matches!(flag, 'i' | 'l'))
+        })
 }
 
 /// Read background-opacity from the Ghostty config file.
@@ -80,7 +86,10 @@ pub fn read_font_size() -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_launches_interactive_shell, read_ghostty_value};
+    use super::{
+        command_launches_interactive_shell, read_ghostty_value,
+        terminal_command_accepts_shell_input,
+    };
 
     #[test]
     fn last_ghostty_value_wins() {
@@ -97,6 +106,9 @@ mod tests {
             "direct:/usr/bin/vim",
             "/usr/bin/nvim file.txt",
             "shell:tmux new-session",
+            "direct:/bin/bash -lc exec-vim",
+            "shell:/usr/bin/zsh -c nvim",
+            "/bin/fish script.fish",
             "",
         ] {
             assert!(!command_launches_interactive_shell(command), "{command}");
@@ -108,11 +120,17 @@ mod tests {
         for command in [
             "/bin/bash",
             "direct:/usr/bin/zsh -l",
+            "direct:/usr/bin/zsh -il",
             "shell:fish --login",
             "'sh'",
             "nu",
         ] {
             assert!(command_launches_interactive_shell(command), "{command}");
         }
+    }
+
+    #[test]
+    fn absent_command_uses_shell_fallback() {
+        assert!(terminal_command_accepts_shell_input(None));
     }
 }
