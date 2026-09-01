@@ -306,6 +306,31 @@ else
     fail "application runtime closure" "libwebkitgtk-6.0.so.4 would be excluded"
 fi
 
+# ----- T8: WebKitGTK process path is made relative to AppRun cwd -----
+
+echo "T8: AppImage relocates WebKitGTK process path"
+
+WEBKIT_APPDIR="$HEREDOC_TMP/webkit-appdir"
+WEBKIT_LIBRARY="$WEBKIT_APPDIR/usr/lib/libwebkitgtk-6.0.so.4"
+WEBKITGTK_RUNTIME_DIR="/usr/lib/x86_64-linux-gnu/webkitgtk-6.0"
+WEBKITGTK_PROCESS_DIR="$WEBKITGTK_RUNTIME_DIR"
+mkdir -p "$(dirname "$WEBKIT_LIBRARY")"
+printf '%s\0%s\0' \
+    "$WEBKITGTK_PROCESS_DIR" \
+    "$WEBKITGTK_RUNTIME_DIR/injected-bundle/" \
+    > "$WEBKIT_LIBRARY"
+chmod 755 "$WEBKIT_LIBRARY"
+
+patch_appimage_webkit_paths "$WEBKIT_APPDIR"
+
+if grep -aFq "$WEBKITGTK_PROCESS_DIR" "$WEBKIT_LIBRARY"; then
+    fail "WebKitGTK path relocation" "compiled-in process path remains"
+elif ! grep -aFq "usr/lib/webkitgtk-6.0" "$WEBKIT_LIBRARY"; then
+    fail "WebKitGTK path relocation" "relative process path is missing"
+else
+    pass "rewrites compiled-in process and injected-bundle paths"
+fi
+
 # ----- Summary -----
 
 echo ""
