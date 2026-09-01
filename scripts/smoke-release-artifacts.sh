@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/appimage-webkit.sh"
+
 VERSION="${1:-}"
 MODE="${2:-all}"
 DIST_DIR="${3:-$ROOT_DIR/dist}"
@@ -98,6 +101,18 @@ verify_tree() {
     fi
 }
 
+verify_appimage_library_boundary() {
+    local library_dir="$1"
+    local library
+
+    while IFS= read -r -d '' library; do
+        if is_appimage_system_library "$library"; then
+            echo "ERROR: AppImage bundles host library: $(basename "$library")" >&2
+            exit 1
+        fi
+    done < <(find "$library_dir" -maxdepth 1 \( -type f -o -type l \) -print0)
+}
+
 smoke_linux() {
     local tarball="$DIST_DIR/limux-$VERSION-linux-$ARCH.tar.gz"
     local deb="$DIST_DIR/limux_${VERSION}_${DEB_ARCH}.deb"
@@ -145,6 +160,7 @@ smoke_linux() {
         cd "$appimage_extract_root"
         "$appimage" --appimage-extract >/dev/null
     )
+    verify_appimage_library_boundary "$appimage_root/usr/lib"
     verify_tree "$appimage_root/usr" "$appimage_root/usr/bin/limux" "$appimage_root/usr/lib" "AppImage"
 
     echo "Linux release artifact smoke: OK"
