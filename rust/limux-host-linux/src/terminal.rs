@@ -669,7 +669,15 @@ fn load_command_accepts_shell_input(config: ghostty_config_t) -> bool {
     let command = contents
         .as_deref()
         .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "command"));
-    crate::ghostty_config::terminal_command_accepts_shell_input(command.as_deref())
+    let initial_command = contents
+        .as_deref()
+        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "initial-command"))
+        .filter(|command| !command.trim().is_empty());
+
+    crate::ghostty_config::terminal_commands_accept_posix_source(
+        command.as_deref(),
+        initial_command.as_deref(),
+    )
 }
 
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.

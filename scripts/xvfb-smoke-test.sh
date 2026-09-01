@@ -87,6 +87,7 @@ export XDG_CONFIG_HOME="$DEMO_DIR/config"
 export XDG_RUNTIME_DIR="$DEMO_DIR/runtime"
 mkdir -p "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
+mkdir -p "$DEMO_DIR/autostart-cwd"
 cat > "$XDG_DATA_HOME/limux/session.json" <<SMOKE_SESSION
 {
   "version": 1,
@@ -100,7 +101,7 @@ cat > "$XDG_DATA_HOME/limux/session.json" <<SMOKE_SESSION
       "favorite": false,
       "cwd": "$DEMO_DIR",
       "folder_path": "$DEMO_DIR",
-      "autostart_command": "echo native-autostart-visible; if [ -t 0 ] && [ -t 1 ]; then printf native-autostart-pty > $DEMO_DIR/autostart-proof; fi",
+      "autostart_command": "cd $DEMO_DIR/autostart-cwd; export LIMUX_AUTOSTART_STATE=preserved; echo native-autostart-visible; if [ -t 0 ] && [ -t 1 ]; then printf native-autostart-pty > $DEMO_DIR/autostart-proof; fi",
       "layout": {
         "kind": "pane",
         "pane_id": 1,
@@ -292,6 +293,20 @@ fi
 ! grep -Fq "echo native-autostart-visible" "$LOG_DIR/stage1-autostart-screen.txt" \
   || { echo "FAIL: workspace autostart command was visibly typed into the terminal"; exit 1; }
 echo "native workspace autostart: OK"
+
+SHELL_STATE_COMMAND="printf '%s|%s' \"\$PWD\" \"\$LIMUX_AUTOSTART_STATE\" > '$DEMO_DIR/autostart-shell-state'"
+"$LIMUX_CLI" send --workspace limux "$SHELL_STATE_COMMAND" \
+  >"$LOG_DIR/stage1-autostart-state-send.txt"
+"$LIMUX_CLI" send-key --workspace limux Enter \
+  >"$LOG_DIR/stage1-autostart-state-enter.txt"
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/autostart-shell-state" ] && break
+  sleep 0.1
+done
+[ "$(cat "$DEMO_DIR/autostart-shell-state" 2>/dev/null)" \
+    = "$DEMO_DIR/autostart-cwd|preserved" ] \
+  || { echo "FAIL: workspace autostart did not preserve parent-shell state"; exit 1; }
+echo "native workspace autostart shell state: OK"
 
 SCREEN_PROOF="limux-screen-proof-$$"
 SCREEN_COMMAND="clear; printf '%s\\n' '$SCREEN_PROOF'; printf screen-ok > '$DEMO_DIR/screen-command-proof'"
@@ -621,6 +636,31 @@ grep -Fq "skipping workspace autostart for non-shell terminal command" \
   || { echo "FAIL: shell-wrapper autostart suppression was not diagnosed"; exit 1; }
 stop_host
 echo "stage 10: OK (shell-wrapped command started without autostart input)"
+
+# --- 14. Stage 11: first-surface initial-command receives no input --------
+echo
+echo "== stage 11: non-shell initial-command suppresses autostart input =="
+printf 'command = direct:/bin/bash\ninitial-command = direct:%s\n' "$DIRECT_COMMAND" \
+  > "$XDG_CONFIG_HOME/ghostty/config.ghostty"
+rm -f "$DEMO_DIR/autostart-proof" "$DEMO_DIR/direct-command-started" \
+  "$DEMO_DIR/direct-command-input"
+start_host host-initial-command
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/direct-command-started" ] && break
+  sleep 0.1
+done
+[ -f "$DEMO_DIR/direct-command-started" ] \
+  || { echo "FAIL: configured initial-command did not start"; exit 1; }
+sleep 3
+[ ! -e "$DEMO_DIR/direct-command-input" ] \
+  || { echo "FAIL: configured initial-command received injected terminal input"; exit 1; }
+[ ! -e "$DEMO_DIR/autostart-proof" ] \
+  || { echo "FAIL: workspace autostart ran for a configured non-shell initial-command"; exit 1; }
+grep -Fq "skipping workspace autostart for non-shell terminal command" \
+  "$LOG_DIR/host-initial-command.stderr" \
+  || { echo "FAIL: initial-command autostart suppression was not diagnosed"; exit 1; }
+stop_host
+echo "stage 11: OK (initial-command started without autostart input)"
 
 kill -TERM -- "-$WESTON_PID"
 for _ in $(seq 1 50); do

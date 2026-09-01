@@ -1610,6 +1610,10 @@ fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
             "workspace-autostart-{}-{suffix}.sh",
             std::process::id()
         ));
+        let Some(script) = workspace_autostart_script(command, &path) else {
+            eprintln!("limux: workspace autostart path is not valid UTF-8");
+            return None;
+        };
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1617,7 +1621,6 @@ fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
             .open(&path);
         match file {
             Ok(mut file) => {
-                let script = workspace_autostart_script(command);
                 if let Err(error) = file.write_all(script.as_bytes()) {
                     let _ = std::fs::remove_file(&path);
                     eprintln!("limux: failed to write workspace autostart script: {error}");
@@ -1637,16 +1640,20 @@ fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
     None
 }
 
-fn workspace_autostart_script(command: &str) -> String {
-    format!("#!/bin/sh\nrm -f -- \"$0\"\n{command}\n")
+fn workspace_autostart_script(command: &str, script_path: &Path) -> Option<String> {
+    let script_path = script_path.to_str()?;
+    Some(format!(
+        "#!/bin/sh\nrm -f -- {}\n{command}\n",
+        shell_quote(script_path)
+    ))
 }
 
 fn workspace_autostart_initial_input(script_path: &Path) -> Option<String> {
     let script_path = script_path.to_str()?;
     // Only the private script path enters terminal input. The configured
     // autostart text stays out of shell history and scrollback, while Ghostty's
-    // configured shell/custom command remains untouched.
-    Some(format!("{}\n", shell_quote(script_path)))
+    // configured interactive shell remains untouched.
+    Some(format!(". {}\n", shell_quote(script_path)))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -4151,11 +4158,17 @@ mod tests {
                 "/run/user/1000/limux/workspace-autostart-42-0.sh"
             ))
             .as_deref(),
-            Some("/run/user/1000/limux/workspace-autostart-42-0.sh\n")
+            Some(". /run/user/1000/limux/workspace-autostart-42-0.sh\n")
         );
         assert_eq!(
-            workspace_autostart_script("echo ready"),
-            "#!/bin/sh\nrm -f -- \"$0\"\necho ready\n"
+            workspace_autostart_script(
+                "echo ready",
+                std::path::Path::new("/run/user/1000/limux/workspace-autostart-42-0.sh")
+            )
+            .as_deref(),
+            Some(
+                "#!/bin/sh\nrm -f -- /run/user/1000/limux/workspace-autostart-42-0.sh\necho ready\n"
+            )
         );
     }
 

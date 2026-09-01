@@ -20,7 +20,7 @@ pub(crate) fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn terminal_command_accepts_shell_input(configured_command: Option<&str>) -> bool {
+pub(crate) fn terminal_command_accepts_posix_source(configured_command: Option<&str>) -> bool {
     match configured_command {
         Some(command) => command_launches_interactive_shell(command),
         None => std::env::var_os("SHELL")
@@ -29,6 +29,16 @@ pub(crate) fn terminal_command_accepts_shell_input(configured_command: Option<&s
             // absent, so the default command remains an interactive shell.
             .unwrap_or(true),
     }
+}
+
+pub(crate) fn terminal_commands_accept_posix_source(
+    command: Option<&str>,
+    initial_command: Option<&str>,
+) -> bool {
+    terminal_command_accepts_posix_source(command)
+        && initial_command
+            .map(|command| terminal_command_accepts_posix_source(Some(command)))
+            .unwrap_or(true)
 }
 
 fn command_launches_interactive_shell(command: &str) -> bool {
@@ -48,10 +58,7 @@ fn command_launches_interactive_shell(command: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
 
-    let supported_shell = matches!(
-        name,
-        "sh" | "bash" | "dash" | "zsh" | "fish" | "ksh" | "mksh" | "nu" | "elvish" | "xonsh"
-    );
+    let supported_shell = matches!(name, "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh");
 
     supported_shell && arguments.all(is_interactive_shell_argument)
 }
@@ -88,7 +95,7 @@ pub fn read_font_size() -> f32 {
 mod tests {
     use super::{
         command_launches_interactive_shell, read_ghostty_value,
-        terminal_command_accepts_shell_input,
+        terminal_command_accepts_posix_source, terminal_commands_accept_posix_source,
     };
 
     #[test]
@@ -109,6 +116,10 @@ mod tests {
             "direct:/bin/bash -lc exec-vim",
             "shell:/usr/bin/zsh -c nvim",
             "/bin/fish script.fish",
+            "fish --login",
+            "nu",
+            "elvish",
+            "xonsh",
             "",
         ] {
             assert!(!command_launches_interactive_shell(command), "{command}");
@@ -121,9 +132,8 @@ mod tests {
             "/bin/bash",
             "direct:/usr/bin/zsh -l",
             "direct:/usr/bin/zsh -il",
-            "shell:fish --login",
             "'sh'",
-            "nu",
+            "ksh -il",
         ] {
             assert!(command_launches_interactive_shell(command), "{command}");
         }
@@ -131,6 +141,18 @@ mod tests {
 
     #[test]
     fn absent_command_uses_shell_fallback() {
-        assert!(terminal_command_accepts_shell_input(None));
+        assert!(terminal_command_accepts_posix_source(None));
+    }
+
+    #[test]
+    fn initial_command_must_also_be_an_interactive_posix_shell() {
+        assert!(terminal_commands_accept_posix_source(
+            Some("direct:/bin/bash"),
+            Some("direct:/bin/zsh -l")
+        ));
+        assert!(!terminal_commands_accept_posix_source(
+            Some("direct:/bin/bash"),
+            Some("direct:/usr/bin/vim")
+        ));
     }
 }
