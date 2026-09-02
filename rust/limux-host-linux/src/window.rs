@@ -3258,6 +3258,18 @@ fn show_workspace_autostart_dialog(state: &State, workspace_id: &str) {
     let dialog_for_cancel = dialog.clone();
     cancel_button.connect_clicked(move |_| dialog_for_cancel.close());
 
+    let dialog_for_key = dialog.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, _modifier| {
+        if keyval == gtk::gdk::Key::Escape {
+            dialog_for_key.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    dialog.add_controller(key_controller);
+
     let state_for_save = state.clone();
     let workspace_id_for_save = workspace_id.to_string();
     let dialog_for_save = dialog.clone();
