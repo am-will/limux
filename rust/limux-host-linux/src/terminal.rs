@@ -36,6 +36,7 @@ unsafe impl Sync for GhosttyState {}
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
+static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
 static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
 
@@ -654,6 +655,31 @@ fn load_ghostty_config() -> ghostty_config_t {
     }
 }
 
+fn load_command_accepts_shell_input(config: ghostty_config_t) -> bool {
+    let serialized = unsafe { ghostty_config_serialize(config) };
+    let contents = if serialized.ptr.is_null() {
+        None
+    } else {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(serialized.ptr.cast::<u8>(), serialized.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    };
+    unsafe { ghostty_string_free(serialized) };
+
+    let command = contents
+        .as_deref()
+        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "command"));
+    let initial_command = contents
+        .as_deref()
+        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "initial-command"))
+        .filter(|command| !command.trim().is_empty());
+
+    crate::ghostty_config::terminal_commands_accept_posix_source(
+        command.as_deref(),
+        initial_command.as_deref(),
+    )
+}
+
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
 pub fn init_ghostty() {
     GHOSTTY.get_or_init(|| {
@@ -664,6 +690,8 @@ pub fn init_ghostty() {
         let config = load_ghostty_config();
         let background_opacity = load_background_opacity(config);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
+        CURRENT_COMMAND_ACCEPTS_SHELL_INPUT
+            .store(load_command_accepts_shell_input(config), Ordering::Relaxed);
 
         let runtime_config = ghostty_runtime_config_s {
             userdata: ptr::null_mut(),
@@ -706,6 +734,11 @@ pub fn ghostty_background_opacity() -> f64 {
         .get()
         .map(|state| state.background_opacity)
         .unwrap_or(1.0)
+}
+
+pub fn terminal_command_accepts_shell_input() -> bool {
+    init_ghostty();
+    CURRENT_COMMAND_ACCEPTS_SHELL_INPUT.load(Ordering::Relaxed)
 }
 
 fn load_background_opacity(config: ghostty_config_t) -> f64 {
@@ -1108,6 +1141,8 @@ unsafe extern "C" fn ghostty_action_cb(
         GHOSTTY_ACTION_RELOAD_CONFIG => {
             let config = load_ghostty_config();
             CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
+            CURRENT_COMMAND_ACCEPTS_SHELL_INPUT
+                .store(load_command_accepts_shell_input(config), Ordering::Relaxed);
             match target.tag {
                 GHOSTTY_TARGET_APP => unsafe {
                     ghostty_app_update_config(app, config);
@@ -1421,6 +1456,7 @@ pub struct TerminalOptions {
     pub copy_selection_to_clipboard: Rc<dyn Fn() -> bool>,
     pub saved_font_size: Option<f32>,
     pub startup_command: Option<String>,
+    pub initial_input: Option<String>,
     /// Extra environment variables to expose to the spawned shell
     /// (e.g. `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, `LIMUX_PANE_ID`, `LIMUX_SOCKET`).
     ///
@@ -1438,6 +1474,7 @@ impl Default for TerminalOptions {
             copy_selection_to_clipboard: Rc::new(|| true),
             saved_font_size: None,
             startup_command: None,
+            initial_input: None,
             extra_env: Vec::new(),
         }
     }
@@ -1498,6 +1535,7 @@ pub fn create_terminal(
     let wd = working_directory.map(|s| s.to_string());
     let saved_font_size = options.saved_font_size;
     let startup_command = options.startup_command;
+    let initial_input = options.initial_input;
     let hover_focus = options.hover_focus;
     let copy_selection_to_clipboard = options.copy_selection_to_clipboard;
     let extra_env = options.extra_env;
@@ -1738,6 +1776,13 @@ pub fn create_terminal(
                     "limux: starting restored terminal command={}",
                     command.to_string_lossy()
                 );
+            }
+
+            let c_initial_input = initial_input
+                .as_ref()
+                .and_then(|input| CString::new(input.as_str()).ok());
+            if let Some(ref input) = c_initial_input {
+                config.initial_input = input.as_ptr();
             }
 
             let surface = unsafe { ghostty_surface_new(app, &config) };

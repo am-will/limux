@@ -585,6 +585,7 @@ pub(crate) fn build_split_node_from_layout(
     shortcuts: &Rc<crate::shortcut_config::ResolvedShortcutConfig>,
     ws_id: &str,
     working_directory: Option<&str>,
+    autostart_command: &Rc<RefCell<Option<String>>>,
     layout: &LayoutNodeState,
 ) -> SplitNode {
     match layout {
@@ -594,8 +595,12 @@ pub(crate) fn build_split_node_from_layout(
                 shortcuts,
                 ws_id,
                 working_directory,
-                Some(pane_state),
-                false,
+                autostart_command.clone(),
+                crate::window::PaneCreationOptions {
+                    initial_state: Some(pane_state),
+                    skip_default_tab: false,
+                    suppress_initial_autostart: false,
+                },
             );
             SplitNode::Leaf {
                 pane_widget: pane.upcast(),
@@ -616,6 +621,7 @@ pub(crate) fn build_split_node_from_layout(
                     shortcuts,
                     ws_id,
                     working_directory,
+                    autostart_command,
                     &split_state.start,
                 )),
                 right: Box::new(build_split_node_from_layout(
@@ -623,6 +629,7 @@ pub(crate) fn build_split_node_from_layout(
                     shortcuts,
                     ws_id,
                     working_directory,
+                    autostart_command,
                     &split_state.end,
                 )),
             }

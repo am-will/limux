@@ -60,6 +60,8 @@ pub struct WorkspaceState {
     pub cwd: Option<String>,
     #[serde(default)]
     pub folder_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart_command: Option<String>,
     pub layout: LayoutNodeState,
 }
 
@@ -439,6 +441,7 @@ impl AppSessionState {
                     favorite: workspace.favorite,
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
+                    autostart_command: None,
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
@@ -982,6 +985,7 @@ mod tests {
                 favorite: true,
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
+                autostart_command: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/canonical"))),
             }],
             ..AppSessionState::default()
@@ -1083,6 +1087,7 @@ mod tests {
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
+                autostart_command: Some("ssh user@server".to_string()),
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
@@ -1099,6 +1104,10 @@ mod tests {
             Some("22222222-2222-4222-8222-222222222222")
         );
         assert_eq!(decoded.workspaces[0].name, "workspace");
+        assert_eq!(
+            decoded.workspaces[0].autostart_command.as_deref(),
+            Some("ssh user@server")
+        );
     }
 
     #[test]
@@ -1602,6 +1611,7 @@ mod tests {
                 favorite: false,
                 cwd: None,
                 folder_path: None,
+                autostart_command: None,
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),

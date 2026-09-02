@@ -5,6 +5,10 @@
 //! All on one line. Tabs left-justified, icons right-justified.
 
 use std::cell::{Cell, RefCell};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -234,6 +238,8 @@ type PaneWorkspaceLookupCallback = dyn Fn(&gtk::Widget) -> Option<String>;
 
 pub struct PaneCallbacks {
     pub workspace_id: String,
+    pub autostart_command: Rc<RefCell<Option<String>>>,
+    pub suppress_next_autostart: Cell<bool>,
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneBellCallback>,
@@ -1456,15 +1462,36 @@ fn add_terminal_tab_inner(
     {
         extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
     }
-    let startup_command = options
+    let restored_agent_command = options
         .as_ref()
         .and_then(|value| value.agent.as_ref())
         .and_then(|agent| agent.resume_command());
-    if let Some(command) = startup_command.as_deref() {
+    if let Some(command) = restored_agent_command.as_deref() {
         eprintln!(
             "limux: restoring agent terminal surface={}:{} command={}",
             internals.pane_id, tab_id, command
         );
+    }
+    let suppress_autostart = internals.callbacks.suppress_next_autostart.replace(false);
+    let (startup_command, workspace_autostart_command) = select_terminal_commands(
+        restored_agent_command,
+        internals.callbacks.autostart_command.borrow().clone(),
+        suppress_autostart,
+    );
+    let mut initial_input = None;
+    if let Some(command) = workspace_autostart_command.as_deref() {
+        if terminal::terminal_command_accepts_shell_input() {
+            eprintln!(
+                "limux: running workspace autostart workspace={} surface={}:{}",
+                internals.callbacks.workspace_id, internals.pane_id, tab_id
+            );
+            initial_input = prepare_workspace_autostart(command);
+        } else {
+            eprintln!(
+                "limux: skipping workspace autostart for non-shell terminal command workspace={} surface={}:{}",
+                internals.callbacks.workspace_id, internals.pane_id, tab_id
+            );
+        }
     }
 
     let term = terminal::create_terminal(
@@ -1474,6 +1501,7 @@ fn add_terminal_tab_inner(
             copy_selection_to_clipboard,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
             startup_command,
+            initial_input,
             extra_env,
         },
         term_callbacks,
@@ -1537,6 +1565,105 @@ fn add_terminal_tab_inner(
     term.handle.focus_surface();
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
+    }
+}
+
+fn select_terminal_commands(
+    restored_agent_command: Option<String>,
+    autostart_command: Option<String>,
+    suppress_autostart: bool,
+) -> (Option<String>, Option<String>) {
+    if restored_agent_command.is_some() {
+        return (restored_agent_command, None);
+    }
+    if suppress_autostart {
+        return (None, None);
+    }
+    (None, autostart_command)
+}
+
+fn prepare_workspace_autostart(command: &str) -> Option<String> {
+    if command.contains('\0') {
+        eprintln!("limux: workspace autostart contains a NUL byte; refusing to run it");
+        return None;
+    }
+
+    let script_path = create_workspace_autostart_script(command)?;
+    workspace_autostart_initial_input(&script_path)
+}
+
+fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    if runtime_dir.is_empty() {
+        eprintln!("limux: XDG_RUNTIME_DIR is unset; workspace autostart was not started");
+        return None;
+    }
+
+    let dir = PathBuf::from(runtime_dir).join("limux");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("limux: failed to create autostart runtime directory: {error}");
+        return None;
+    }
+
+    for suffix in 0..100_u8 {
+        let path = dir.join(format!(
+            "workspace-autostart-{}-{suffix}.sh",
+            std::process::id()
+        ));
+        let Some(script) = workspace_autostart_script(command, &path) else {
+            eprintln!("limux: workspace autostart path is not valid UTF-8");
+            return None;
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path);
+        match file {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(script.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    eprintln!("limux: failed to write workspace autostart script: {error}");
+                    return None;
+                }
+                return Some(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                eprintln!("limux: failed to create workspace autostart script: {error}");
+                return None;
+            }
+        }
+    }
+
+    eprintln!("limux: failed to allocate a unique workspace autostart script path");
+    None
+}
+
+fn workspace_autostart_script(command: &str, script_path: &Path) -> Option<String> {
+    let script_path = script_path.to_str()?;
+    Some(format!(
+        "#!/bin/sh\nrm -f -- {}\n{command}\n",
+        shell_quote(script_path)
+    ))
+}
+
+fn workspace_autostart_initial_input(script_path: &Path) -> Option<String> {
+    let script_path = script_path.to_str()?;
+    // Only the private script path enters terminal input. The configured
+    // autostart text stays out of shell history and scrollback, while Ghostty's
+    // configured interactive shell remains untouched.
+    Some(format!(". {}\n", shell_quote(script_path)))
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
@@ -3991,8 +4118,9 @@ mod tests {
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
         effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
         normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolved_link_destination, surface_hint_matches, ContentDropZone, TabDragPayload,
-        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        resolved_link_destination, select_terminal_commands, surface_hint_matches,
+        workspace_autostart_initial_input, workspace_autostart_script, ContentDropZone,
+        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -4002,6 +4130,47 @@ mod tests {
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
     use crate::{app_config::LinkOpenDestination, terminal::LinkOpenRequest};
+
+    #[test]
+    fn explicit_terminal_command_can_suppress_workspace_autostart() {
+        assert_eq!(
+            select_terminal_commands(None, Some("ssh user@server".to_string()), true),
+            (None, None)
+        );
+        assert_eq!(
+            select_terminal_commands(None, Some("ssh user@server".to_string()), false),
+            (None, Some("ssh user@server".to_string()))
+        );
+        assert_eq!(
+            select_terminal_commands(
+                Some("codex resume abc".to_string()),
+                Some("ssh user@server".to_string()),
+                true,
+            ),
+            (Some("codex resume abc".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn workspace_autostart_uses_hidden_initial_input() {
+        assert_eq!(
+            workspace_autostart_initial_input(std::path::Path::new(
+                "/run/user/1000/limux/workspace-autostart-42-0.sh"
+            ))
+            .as_deref(),
+            Some(". /run/user/1000/limux/workspace-autostart-42-0.sh\n")
+        );
+        assert_eq!(
+            workspace_autostart_script(
+                "echo ready",
+                std::path::Path::new("/run/user/1000/limux/workspace-autostart-42-0.sh")
+            )
+            .as_deref(),
+            Some(
+                "#!/bin/sh\nrm -f -- /run/user/1000/limux/workspace-autostart-42-0.sh\necho ready\n"
+            )
+        );
+    }
 
     #[test]
     fn terminal_title_truncation_preserves_utf8_boundaries() {
