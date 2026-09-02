@@ -1,8 +1,9 @@
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const SESSION_VERSION: u32 = 1;
@@ -344,7 +345,15 @@ pub fn save_session_atomic_in(dir: &Path, state: &AppSessionState) -> io::Result
     let normalized = normalize_session(state.clone());
     let json = serde_json::to_vec_pretty(&normalized)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    fs::write(&temp_path, json)?;
+    let mut temp_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    temp_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    temp_file.write_all(&json)?;
+    drop(temp_file);
     fs::rename(&temp_path, &path)?;
     Ok(path)
 }
@@ -1080,6 +1089,11 @@ mod tests {
     #[test]
     fn save_session_atomic_writes_canonical_file() {
         let dir = tempdir().expect("tempdir");
+        let canonical_path = canonical_session_path_in(dir.path());
+        let temp_path = temp_session_path(&canonical_path);
+        fs::write(&temp_path, "stale session").expect("write stale session");
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o644))
+            .expect("set stale session permissions");
         let state = AppSessionState {
             workspaces: vec![WorkspaceState {
                 id: Some("22222222-2222-4222-8222-222222222222".to_string()),
@@ -1094,7 +1108,15 @@ mod tests {
         };
 
         let path = save_session_atomic_in(dir.path(), &state).expect("save canonical session");
-        assert_eq!(path, canonical_session_path_in(dir.path()));
+        assert_eq!(path, canonical_path);
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("session metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let raw = fs::read_to_string(path).expect("read canonical session");
         let decoded: AppSessionState =
             serde_json::from_str(&raw).expect("decode canonical session");
