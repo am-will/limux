@@ -3258,6 +3258,18 @@ fn show_workspace_autostart_dialog(state: &State, workspace_id: &str) {
     let dialog_for_cancel = dialog.clone();
     cancel_button.connect_clicked(move |_| dialog_for_cancel.close());
 
+    let dialog_for_key = dialog.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, _modifier| {
+        if workspace_autostart_dialog_dismisses(keyval) {
+            dialog_for_key.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    dialog.add_controller(key_controller);
+
     let state_for_save = state.clone();
     let workspace_id_for_save = workspace_id.to_string();
     let dialog_for_save = dialog.clone();
@@ -3285,6 +3297,10 @@ fn show_workspace_autostart_dialog(state: &State, workspace_id: &str) {
     entry.grab_focus();
     entry.set_position(-1);
     dialog.present();
+}
+
+fn workspace_autostart_dialog_dismisses(keyval: gtk::gdk::Key) -> bool {
+    keyval == gtk::gdk::Key::Escape
 }
 
 fn clamp_workspace_insert_index_for_pinning(
@@ -6502,11 +6518,12 @@ mod tests {
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_notification_message, workspace_path_visible,
-        Direction, EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
-        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        validate_workspace_folder_input_with_dirs, workspace_autostart_dialog_dismisses,
+        workspace_drop_layout_path, workspace_folder_path_from_input,
+        workspace_notification_message, workspace_path_visible, Direction, EditableCaptureContext,
+        NeighborScore, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource,
+        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
@@ -6546,6 +6563,12 @@ mod tests {
             Some("ssh user@server")
         );
         assert_eq!(normalize_autostart_command("  \t "), None);
+    }
+
+    #[test]
+    fn workspace_autostart_dialog_dismisses_only_escape() {
+        assert!(workspace_autostart_dialog_dismisses(gdk::Key::Escape));
+        assert!(!workspace_autostart_dialog_dismisses(gdk::Key::Return));
     }
 
     #[test]
