@@ -3911,6 +3911,19 @@ fn show_workspace_path_dialog(state: &State) {
         dialog_for_cancel.close();
     });
 
+    // ESC key handler to close the dialog
+    let dialog_for_key = dialog.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, _modifier| {
+        if keyval == gtk::gdk::Key::Escape {
+            dialog_for_key.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    dialog.add_controller(key_controller);
+
     dialog.present();
 }
 
