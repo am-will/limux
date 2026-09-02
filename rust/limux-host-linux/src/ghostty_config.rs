@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+
 const DEFAULT_FONT_SIZE: f32 = 12.0;
 
 fn ghostty_config_contents() -> Option<String> {
@@ -21,9 +23,20 @@ pub(crate) fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
 }
 
 pub(crate) fn terminal_command_accepts_posix_source(configured_command: Option<&str>) -> bool {
+    let fallback_shell = std::env::var_os("SHELL");
+    terminal_command_accepts_posix_source_with_fallback(
+        configured_command,
+        fallback_shell.as_deref(),
+    )
+}
+
+fn terminal_command_accepts_posix_source_with_fallback(
+    configured_command: Option<&str>,
+    fallback_shell: Option<&OsStr>,
+) -> bool {
     match configured_command {
         Some(command) => command_launches_interactive_shell(command),
-        None => std::env::var_os("SHELL")
+        None => fallback_shell
             .map(|shell| command_launches_interactive_shell(&shell.to_string_lossy()))
             // Ghostty falls back to the user's passwd shell when SHELL is
             // absent, so the default command remains an interactive shell.
@@ -95,8 +108,9 @@ pub fn read_font_size() -> f32 {
 mod tests {
     use super::{
         command_launches_interactive_shell, read_ghostty_value,
-        terminal_command_accepts_posix_source, terminal_commands_accept_posix_source,
+        terminal_command_accepts_posix_source_with_fallback, terminal_commands_accept_posix_source,
     };
+    use std::ffi::OsStr;
 
     #[test]
     fn last_ghostty_value_wins() {
@@ -141,7 +155,17 @@ mod tests {
 
     #[test]
     fn absent_command_uses_shell_fallback() {
-        assert!(terminal_command_accepts_posix_source(None));
+        assert!(terminal_command_accepts_posix_source_with_fallback(
+            None,
+            Some(OsStr::new("/bin/zsh"))
+        ));
+        assert!(!terminal_command_accepts_posix_source_with_fallback(
+            None,
+            Some(OsStr::new("/usr/bin/fish"))
+        ));
+        assert!(terminal_command_accepts_posix_source_with_fallback(
+            None, None
+        ));
     }
 
     #[test]
