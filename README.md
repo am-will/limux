@@ -126,6 +126,7 @@ Run the canonical local quality gate before committing:
 ```
 
 Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
+The [contributing guide](CONTRIBUTING.md) documents the CPU-only Rust formatting workflow.
 Release procedure lives in [`docs/releasing.md`](docs/releasing.md).
 
 ## Workspace autostart
