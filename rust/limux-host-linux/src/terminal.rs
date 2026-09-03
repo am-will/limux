@@ -20,6 +20,11 @@ use crate::app_config::LinkOpenDestination;
 use crate::link_uri;
 use crate::shortcut_config::NormalizedShortcut;
 
+mod clipboard;
+use clipboard::{
+    ghostty_confirm_read_clipboard_cb, ghostty_read_clipboard_cb, ghostty_write_clipboard_cb,
+};
+
 // ---------------------------------------------------------------------------
 // Global Ghostty app singleton
 // ---------------------------------------------------------------------------
@@ -1208,59 +1213,6 @@ fn clipboard_completion_text_ptr(text: *const c_char) -> *const c_char {
     }
 }
 
-fn surface_is_registered(surface: ghostty_surface_t) -> bool {
-    SURFACE_MAP.with(|map| map.borrow().contains_key(&(surface as usize)))
-}
-
-unsafe fn complete_clipboard_request(
-    surface: ghostty_surface_t,
-    text: *const c_char,
-    state: *mut c_void,
-    confirmed: bool,
-) {
-    if !surface_is_registered(surface) {
-        return;
-    }
-
-    unsafe {
-        ghostty_surface_complete_clipboard_request(
-            surface,
-            clipboard_completion_text_ptr(text),
-            state,
-            confirmed,
-        );
-    }
-}
-
-unsafe extern "C" fn ghostty_read_clipboard_cb(
-    userdata: *mut c_void,
-    clipboard_type: c_int,
-    state: *mut c_void,
-) -> bool {
-    let surface_ptr = match unsafe { clipboard_surface_from_userdata(userdata) } {
-        Some(surface) => surface,
-        None => return false,
-    };
-
-    let Some(display) = gtk::gdk::Display::default() else {
-        return false;
-    };
-    let clipboard = clipboard_from_type(&display, clipboard_type);
-    if !clipboard_has_text(&clipboard) {
-        return false;
-    }
-
-    clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |result| {
-        let text = result.ok().flatten().map(|s| s.to_string());
-        let cstr = clipboard_read_text_cstring(text.as_deref());
-        unsafe {
-            complete_clipboard_request(surface_ptr, cstr.as_ptr(), state, true);
-        }
-    });
-
-    true
-}
-
 fn clipboard_from_type(display: &gtk::gdk::Display, clipboard_type: c_int) -> gtk::gdk::Clipboard {
     if clipboard_type == GHOSTTY_CLIPBOARD_SELECTION {
         display.primary_clipboard()
@@ -1300,80 +1252,6 @@ fn clipboard_formats_include_text<'a>(
         mime.eq_ignore_ascii_case("text/plain")
             || mime.eq_ignore_ascii_case("text/plain;charset=utf-8")
     })
-}
-
-unsafe extern "C" fn ghostty_confirm_read_clipboard_cb(
-    userdata: *mut c_void,
-    text: *const c_char,
-    state: *mut c_void,
-    _request_type: c_int,
-) {
-    let surface_ptr = match unsafe { clipboard_surface_from_userdata(userdata) } {
-        Some(surface) => surface,
-        None => return,
-    };
-    unsafe {
-        complete_clipboard_request(surface_ptr, text, state, true);
-    }
-}
-
-unsafe extern "C" fn ghostty_write_clipboard_cb(
-    userdata: *mut c_void,
-    clipboard_type: c_int,
-    contents: *const ghostty_clipboard_content_s,
-    count: usize,
-    _confirm: bool,
-) {
-    if count == 0 || contents.is_null() {
-        return;
-    }
-
-    let content = unsafe { &*contents };
-    if content.data.is_null() {
-        return;
-    }
-    let text = unsafe { std::ffi::CStr::from_ptr(content.data) }
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-
-    if let Some(context) = unsafe { clipboard_context_from_userdata(userdata) } {
-        if context.url_probe_active.get() {
-            *context.url_probe.borrow_mut() = Some(text);
-            return;
-        }
-    }
-
-    let display = match gtk::gdk::Display::default() {
-        Some(d) => d,
-        None => return,
-    };
-
-    let copy_selection_to_clipboard = unsafe { clipboard_context_from_userdata(userdata) }
-        .map(|context| (context.copy_selection_to_clipboard)())
-        .unwrap_or(true);
-    let policy = clipboard_write_policy(clipboard_type, copy_selection_to_clipboard);
-
-    if policy.write_clipboard {
-        display.clipboard().set_text(&text);
-    }
-    if policy.write_primary {
-        display.primary_clipboard().set_text(&text);
-    }
-    if !policy.show_toast {
-        return;
-    }
-
-    // Show "Copied to clipboard" toast on the surface's overlay
-    let surface_key = match unsafe { clipboard_surface_from_userdata(userdata) } {
-        Some(surface) => surface as usize,
-        None => return,
-    };
-    SURFACE_MAP.with(|map| {
-        if let Some(entry) = map.borrow().get(&surface_key) {
-            show_clipboard_toast(&entry.toast_overlay);
-        }
-    });
 }
 
 fn clipboard_write_policy(
@@ -1503,6 +1381,8 @@ fn free_terminal_surface(
         entry.link_popover.popdown();
         unregister_surface_identity(entry.identity);
     }
+
+    clipboard::cancel_surface_requests(surface_key);
 
     // Ghostty can invoke callbacks while its worker threads stop. Keep callback
     // userdata and widgets alive until deinitialization finishes.
