@@ -598,7 +598,11 @@ fn handle_method(
             (ControlCommand::CloseWorkspace { target, reply }, rx)
         }
         "surface.send_text" | "send-text" | "send" => {
-            let Some(text) = optional_string(params, &["text"]) else {
+            let Some(text) = params
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
                 return error_response(
                     id,
                     BridgeError::invalid_params("surface.send_text requires text"),
@@ -615,7 +619,7 @@ fn handle_method(
                 ControlCommand::SendText {
                     target,
                     surface_hint: optional_string(params, &["surface_id"]),
-                    text,
+                    text: text.to_string(),
                     reply,
                 },
                 rx,
@@ -851,6 +855,43 @@ mod tests {
             .expect("v1 request should parse");
         assert_eq!(request.method, "workspace.create");
         assert_eq!(request.params["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn send_text_preserves_whitespace_for_every_alias() {
+        for method in ["surface.send_text", "send-text", "send"] {
+            for text in ["  alpha\nbeta\t \n", "\n\t  ", "  λ 🦀 \n"] {
+                let response = dispatch_request(
+                    &json!({ "id": 1, "method": method, "params": { "text": text } }).to_string(),
+                    &|command| match command {
+                        ControlCommand::SendText {
+                            text: actual,
+                            reply,
+                            ..
+                        } => {
+                            assert_eq!(actual, text);
+                            reply.send(Ok(json!({}))).unwrap();
+                        }
+                        other => panic!("unexpected command: {other:?}"),
+                    },
+                );
+                assert_eq!(response.error, None);
+            }
+        }
+    }
+
+    #[test]
+    fn send_text_rejects_missing_empty_and_non_string_text() {
+        for params in [json!({}), json!({ "text": "" }), json!({ "text": 1 })] {
+            let response = dispatch_request(
+                &json!({ "method": "surface.send_text", "params": params }).to_string(),
+                &|command| panic!("invalid text should not dispatch: {command:?}"),
+            );
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(INVALID_PARAMS_CODE)
+            );
+        }
     }
 
     #[test]
