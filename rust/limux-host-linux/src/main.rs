@@ -7,6 +7,7 @@ mod keybind_editor;
 mod layout_state;
 mod link_uri;
 mod pane;
+mod session_store;
 mod settings_editor;
 mod shortcut_config;
 mod split_tree;

@@ -333,15 +333,15 @@ pub fn load_session_from_dir(dir: &Path) -> LoadedSession {
     }
 }
 
-pub fn save_session_atomic(state: &AppSessionState) -> io::Result<PathBuf> {
-    save_session_atomic_in(&persistence_dir(), state)
-}
-
 pub fn save_session_atomic_in(dir: &Path, state: &AppSessionState) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = canonical_session_path_in(dir);
+    save_session_atomic_to(&path, state)
+}
+
+pub(crate) fn save_session_atomic_to(path: &Path, state: &AppSessionState) -> io::Result<PathBuf> {
     // Write to a sibling temp file first so a crash never leaves a truncated canonical session.
-    let temp_path = temp_session_path(&path);
+    let temp_path = temp_session_path(path);
     let normalized = normalize_session(state.clone());
     let json = serde_json::to_vec_pretty(&normalized)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -357,8 +357,8 @@ pub fn save_session_atomic_in(dir: &Path, state: &AppSessionState) -> io::Result
         .open(&temp_path)?;
     temp_file.write_all(&json)?;
     drop(temp_file);
-    fs::rename(&temp_path, &path)?;
-    Ok(path)
+    fs::rename(&temp_path, path)?;
+    Ok(path.to_path_buf())
 }
 
 pub fn clamp_split_ratio(ratio: f64) -> f64 {
