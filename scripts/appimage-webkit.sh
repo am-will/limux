@@ -106,7 +106,7 @@ shared_library_dependencies() {
         | sort -u
 }
 
-binary_replace_string() {
+binary_replace_c_string() {
     local file="$1"
     local old="$2"
     local new="$3"
@@ -127,10 +127,12 @@ old = sys.argv[2].encode()
 new = sys.argv[3].encode()
 
 data = path.read_bytes()
-replacement = new + (b"\0" * (len(old) - len(new)))
-patched = data.replace(old, replacement)
-if patched != data:
-    path.write_bytes(patched)
+needle = old + b"\0"
+replacement = new + (b"\0" * (len(needle) - len(new)))
+count = data.count(needle)
+if count:
+    path.write_bytes(data.replace(needle, replacement))
+print(count)
 PY
 }
 
@@ -182,14 +184,28 @@ patch_appimage_webkit_paths() {
     local relative_runtime="usr/lib/webkitgtk-6.0/"
     local relative_bundle="usr/lib/webkitgtk-6.0/injected-bundle/"
     local file
+    local replacements
+    local process_path_patched=0
 
     while IFS= read -r file; do
         # Distro WebKitGTK embeds absolute paths and does not reliably honor
         # WEBKIT_EXEC_PATH outside developer builds.
-        binary_replace_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}/injected-bundle/" "$relative_bundle"
-        binary_replace_string "$file" "${WEBKITGTK_PROCESS_DIR%/}/" "$relative_runtime"
-        binary_replace_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}/" "$relative_runtime"
+        binary_replace_c_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}/injected-bundle/" "$relative_bundle" >/dev/null
+
+        replacements="$(binary_replace_c_string "$file" "${WEBKITGTK_PROCESS_DIR%/}" "${relative_runtime%/}")"
+        if [ "$replacements" -gt 0 ]; then
+            process_path_patched=1
+        fi
+
+        if [ "$WEBKITGTK_RUNTIME_DIR" != "$WEBKITGTK_PROCESS_DIR" ]; then
+            binary_replace_c_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}" "${relative_runtime%/}" >/dev/null
+        fi
     done < <(find "$appdir/usr/lib" -type f \( -perm -0100 -o -name '*.so*' \) | sort)
+
+    if [ "$process_path_patched" != 1 ]; then
+        echo "ERROR: bundled WebKitGTK process path was not found: ${WEBKITGTK_PROCESS_DIR%/}" >&2
+        exit 1
+    fi
 }
 
 copy_appimage_webkit_runtime() {

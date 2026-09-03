@@ -113,6 +113,35 @@ verify_appimage_library_boundary() {
     done < <(find "$library_dir" -maxdepth 1 \( -type f -o -type l \) -print0)
 }
 
+verify_appimage_webkit_paths() {
+    local app_root="$1"
+    local compiled_runtime
+    local library
+    local found=0
+
+    if ! compiled_runtime="$(resolve_webkitgtk_runtime_dir)"; then
+        echo "ERROR: WebKitGTK runtime directory is unavailable during AppImage verification" >&2
+        exit 1
+    fi
+
+    while IFS= read -r -d '' library; do
+        found=1
+        if grep -aFq "${compiled_runtime%/}" "$library"; then
+            echo "ERROR: AppImage WebKitGTK library retains host process path: $library" >&2
+            exit 1
+        fi
+        if ! grep -aFq "usr/lib/webkitgtk-6.0" "$library"; then
+            echo "ERROR: AppImage WebKitGTK library lacks relocated process path: $library" >&2
+            exit 1
+        fi
+    done < <(find "$app_root/usr/lib" -maxdepth 1 -type f -name 'libwebkitgtk-6.0.so*' -print0)
+
+    if [ "$found" != 1 ]; then
+        echo "ERROR: AppImage does not contain bundled WebKitGTK library" >&2
+        exit 1
+    fi
+}
+
 smoke_linux() {
     local tarball="$DIST_DIR/limux-$VERSION-linux-$ARCH.tar.gz"
     local deb="$DIST_DIR/limux_${VERSION}_${DEB_ARCH}.deb"
@@ -161,6 +190,7 @@ smoke_linux() {
         "$appimage" --appimage-extract >/dev/null
     )
     verify_appimage_library_boundary "$appimage_root/usr/lib"
+    verify_appimage_webkit_paths "$appimage_root"
     verify_tree "$appimage_root/usr" "$appimage_root/usr/bin/limux" "$appimage_root/usr/lib" "AppImage"
 
     echo "Linux release artifact smoke: OK"
