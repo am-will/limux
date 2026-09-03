@@ -2019,7 +2019,7 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
         bail!("agent-team: --agents is empty");
     }
 
-    let cwd = parse_opt(args, "--cwd")
+    let requested_cwd = parse_opt(args, "--cwd")
         .or_else(|| {
             env::current_dir()
                 .ok()
@@ -2031,6 +2031,16 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
     // the agents manually) — still splits the panes + writes AGENTS.md.
     let no_launch = args.iter().any(|a| a == "--no-launch");
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    let cwd = if dry_run {
+        std::path::absolute(&requested_cwd)
+    } else {
+        fs::canonicalize(&requested_cwd)
+    }
+    .context("agent-team: could not resolve cwd")?;
+    if !dry_run && !cwd.is_dir() {
+        bail!("agent-team: cwd must be a directory");
+    }
+    let cwd = cwd.to_string_lossy().into_owned();
 
     // Resolve the agent list up front so --dry-run can build a deterministic
     // peer table without touching the host.
@@ -2189,9 +2199,10 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
             Value::String(direction.to_string()),
         );
         params.insert("type".to_string(), Value::String("terminal".to_string()));
-        if !no_launch {
-            params.insert("command".to_string(), Value::String(launch.clone()));
-        }
+        params.insert(
+            "command".to_string(),
+            Value::String(instructions.pane_command((!no_launch).then_some(launch.as_str()))),
+        );
 
         let created = client
             .call("pane.create", Value::Object(params))
@@ -2207,7 +2218,8 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
         peers.push((name.to_string(), pane_id, surface_id, launch.clone()));
     }
 
-    // 5. Publish the instructions without replacing files created in the meantime.
+    // 5. Publish all peer IDs before releasing the gated startup commands.
+    // Dropping the stage on any earlier error prevents every agent from launching.
     let body = build_agents_md(
         &peers,
         &cwd,
@@ -4078,7 +4090,7 @@ mod agent_team_tests {
         ];
         let mut client = Client::new(dir.path().join("absent.sock"));
         let error = run_agent_team(&mut client, &args).await.unwrap_err();
-        assert!(error.to_string().contains("failed to stage instructions"));
+        assert!(error.to_string().contains("could not resolve cwd"));
         assert_eq!(client.seq, 0);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }

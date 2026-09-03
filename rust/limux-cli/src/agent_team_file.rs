@@ -10,6 +10,7 @@ use tempfile::NamedTempFile;
 pub(crate) struct PendingInstructions {
     path: PathBuf,
     staged: NamedTempFile,
+    marker: String,
 }
 
 impl PendingInstructions {
@@ -27,16 +28,41 @@ impl PendingInstructions {
         let parent = path.parent().context("instructions path has no parent")?;
         let staged = NamedTempFile::new_in(parent)
             .with_context(|| format!("failed to stage instructions in {}", parent.display()))?;
+        let marker = format!(
+            "<!-- limux-agent-team:{} -->",
+            staged.path().file_name().unwrap().to_string_lossy()
+        );
         Ok(Self {
             path: path.to_path_buf(),
             staged,
+            marker,
         })
+    }
+
+    pub(crate) fn pane_command(&self, launch: Option<&str>) -> String {
+        let cwd = quote(&self.path.parent().unwrap().to_string_lossy());
+        let command = match launch {
+            Some(launch) => format!(
+                "cd {cwd} || exit 1; remaining=1200; \
+                 while [ -e {staged} ]; do \
+                 [ \"$remaining\" -gt 0 ] || exit 1; \
+                 remaining=$((remaining - 1)); sleep 0.05; done; \
+                 [ -f AGENTS.md ] && grep -Fqx -- {marker} AGENTS.md && exec {launch}",
+                staged = quote(&self.staged.path().to_string_lossy()),
+                marker = quote(&self.marker),
+            ),
+            None => format!("cd {cwd} && exec \"${{SHELL:-/bin/sh}}\""),
+        };
+        format!("/bin/sh -c {}", quote(&command))
     }
 
     pub(crate) fn publish(mut self, body: &str) -> Result<()> {
         self.staged
             .write_all(body.as_bytes())
             .with_context(|| format!("failed to write instructions for {}", self.path.display()))?;
+        // This per-run marker prevents a failed launch from consuming another
+        // invocation's instructions. Removing the staging name releases waiters.
+        writeln!(self.staged, "\n{}", self.marker)?;
         self.staged
             .persist_noclobber(&self.path)
             .map_err(|error| error.error)
@@ -50,64 +76,10 @@ impl PendingInstructions {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn existing_instructions_are_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("AGENTS.md");
-        let original = "# Project instructions\nKeep my local policies.\n";
-        fs::write(&path, original).unwrap();
-        assert!(PendingInstructions::new(&path).is_err());
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
-    }
-
-    #[test]
-    fn concurrent_creation_is_not_overwritten() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("AGENTS.md");
-        let pending = PendingInstructions::new(&path).unwrap();
-        fs::write(&path, "Created while panes were starting").unwrap();
-        assert!(pending.publish("Generated protocol").is_err());
-        assert_eq!(
-            fs::read_to_string(path).unwrap(),
-            "Created while panes were starting"
-        );
-    }
-
-    #[test]
-    fn published_instructions_are_preserved_on_repeat() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("AGENTS.md");
-        PendingInstructions::new(&path)
-            .unwrap()
-            .publish("Generated protocol with edited policies")
-            .unwrap();
-        assert!(PendingInstructions::new(&path).is_err());
-        assert_eq!(
-            fs::read_to_string(path).unwrap(),
-            "Generated protocol with edited policies"
-        );
-    }
-
-    #[test]
-    fn abandoned_stage_leaves_no_instructions_or_temporary_files() {
-        let dir = tempfile::tempdir().unwrap();
-        drop(PendingInstructions::new(&dir.path().join("AGENTS.md")).unwrap());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dangling_symlink_is_not_followed_or_replaced() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("AGENTS.md");
-        let target = dir.path().join("missing-target");
-        std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert!(PendingInstructions::new(&path).is_err());
-        assert_eq!(fs::read_link(path).unwrap(), target);
-        assert!(!target.exists());
-    }
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
+
+#[cfg(test)]
+#[path = "agent_team_file_tests.rs"]
+mod tests;
