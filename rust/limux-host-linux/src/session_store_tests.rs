@@ -322,6 +322,84 @@ fn busy_lock_has_a_bounded_wait() {
 }
 
 #[test]
+fn startup_lock_failure_can_retry_without_losing_independent_remote_edits() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let owner = lock_directory(dir.path()).unwrap();
+    assert_eq!(
+        SessionStore::load_from_dir(dir.path())
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let (mut local_store, loaded) = SessionStore::load_for_retry_from_dir(dir.path()).unwrap();
+    local_store.restored(loaded.state.clone());
+    drop(owner);
+
+    let (mut remote_store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let mut remote = base;
+    remote.workspaces[0].name = "remote change after startup".into();
+    saved(&mut remote_store, &remote);
+    let mut local = loaded.state;
+    local.workspaces[1].name = "local change after startup".into();
+    saved(&mut local_store, &local);
+    saved(&mut local_store, &local);
+    let result = disk(dir.path());
+    assert_eq!(result.workspaces[0].name, "remote change after startup");
+    assert_eq!(result.workspaces[1].name, "local change after startup");
+}
+
+#[test]
+fn startup_retry_does_not_adopt_concurrent_same_workspace_edit_as_ancestry() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let owner = lock_directory(dir.path()).unwrap();
+    let (mut local_store, loaded) = SessionStore::load_for_retry_from_dir(dir.path()).unwrap();
+    local_store.restored(loaded.state.clone());
+    drop(owner);
+
+    let (mut remote_store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let mut remote = base;
+    remote.workspaces[0].name = "remote".into();
+    saved(&mut remote_store, &remote);
+    let mut local = loaded.state;
+    local.workspaces[0].name = "local".into();
+    let SaveOutcome::Conflict { recovery, .. } = local_store.save(&local).unwrap() else {
+        panic!("expected conflict after startup retry")
+    };
+    assert_eq!(disk(dir.path()), remote);
+    let recovered: AppSessionState = serde_json::from_slice(&fs::read(recovery).unwrap()).unwrap();
+    assert_eq!(recovered, local);
+}
+
+#[test]
+fn startup_retry_rejects_unreadable_corrupt_or_ambiguous_snapshots() {
+    let dir = tempdir().unwrap();
+    let mut base = initial(dir.path());
+    let path = layout_state::canonical_session_path_in(dir.path());
+    fs::write(&path, "invalid json").unwrap();
+    assert!(SessionStore::load_for_retry_from_dir(dir.path()).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "invalid json");
+
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(SessionStore::load_for_retry_from_dir(dir.path()).is_err());
+    assert!(path.is_dir());
+    fs::remove_dir(&path).unwrap();
+
+    base.workspaces[1].id = base.workspaces[0].id.clone();
+    layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
+    assert!(SessionStore::load_for_retry_from_dir(dir.path()).is_err());
+    assert_eq!(disk(dir.path()), base);
+
+    base.workspaces[1].id = None;
+    layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
+    assert!(SessionStore::load_for_retry_from_dir(dir.path()).is_err());
+    assert_eq!(disk(dir.path()), base);
+}
+
+#[test]
 fn identity_migration_is_shared_by_independent_loaders() {
     let dir = tempdir().unwrap();
     let mut initial = initial(dir.path());

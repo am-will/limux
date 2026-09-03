@@ -53,14 +53,43 @@ impl SessionStore {
         if changed {
             layout_state::save_session_atomic_in(directory, &loaded.state)?;
         }
-        let store = Self {
+        let store = Self::from_snapshot(directory, &loaded.state);
+        Ok((store, loaded))
+    }
+
+    /// Keep a strictly read startup snapshot when a temporary writer lock or
+    /// write-permission failure prevents normal loading. No migration is safe
+    /// without the lock, so this requires already stable workspace identities.
+    pub(crate) fn load_for_retry() -> io::Result<(Self, LoadedSession)> {
+        Self::load_for_retry_from_dir(&layout_state::persistence_dir())
+    }
+
+    fn load_for_retry_from_dir(directory: &Path) -> io::Result<(Self, LoadedSession)> {
+        let loaded = read_session(directory)?;
+        let mut ids = BTreeSet::new();
+        if loaded.state.workspaces.iter().any(|workspace| {
+            workspace
+                .id
+                .as_deref()
+                .is_none_or(|id| uuid::Uuid::parse_str(id).is_err() || !ids.insert(id.to_string()))
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Session workspace identities require migration before saving. Restart after resolving the storage error.",
+            ));
+        }
+        let store = Self::from_snapshot(directory, &loaded.state);
+        Ok((store, loaded))
+    }
+
+    fn from_snapshot(directory: &Path, snapshot: &AppSessionState) -> Self {
+        Self {
             directory: directory.to_path_buf(),
             recovery: directory.join(format!("session-recovery-{}.json", uuid::Uuid::new_v4())),
-            local: loaded.state.clone(),
-            ancestry: loaded.state.clone(),
+            local: snapshot.clone(),
+            ancestry: snapshot.clone(),
             first_save: true,
-        };
-        Ok((store, loaded))
+        }
     }
 
     pub(crate) fn restored(&mut self, local: AppSessionState) {

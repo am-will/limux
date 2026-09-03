@@ -85,7 +85,7 @@ pub(crate) struct AppState {
     sidebar_expanded_width: i32,
     persistence_suspended: bool,
     save_queued: bool,
-    session_store: Option<crate::session_store::SessionStore>,
+    session_store: Result<crate::session_store::SessionStore, String>,
     session_save_notice: Option<String>,
     session_close_dialog_open: bool,
     close_after_recovery: bool,
@@ -877,9 +877,8 @@ fn try_save_session(state: &State) -> Result<crate::session_store::SaveOutcome, 
         .borrow_mut()
         .session_store
         .as_mut()
-        .ok_or_else(|| {
-            "Session storage could not be opened. The window remains open to preserve your work."
-                .to_string()
+        .map_err(|error| {
+            format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")
         })?
         .save(&session)
         .map_err(|error| error.to_string())
@@ -1019,7 +1018,7 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     apply_sidebar_state_immediately(state, &loaded.state.sidebar);
 
     let restored = snapshot_session_state(state);
-    if let Some(store) = state.borrow_mut().session_store.as_mut() {
+    if let Ok(store) = state.borrow_mut().session_store.as_mut() {
         store.restored(restored);
     }
     suspend_persistence(state, false);
@@ -1719,7 +1718,7 @@ pub fn build_window(app: &adw::Application) {
         sidebar_expanded_width: SIDEBAR_WIDTH,
         persistence_suspended: false,
         save_queued: false,
-        session_store: None,
+        session_store: Err("Session storage has not been initialized".to_string()),
         session_save_notice: None,
         session_close_dialog_open: false,
         close_after_recovery: false,
@@ -1898,12 +1897,25 @@ pub fn build_window(app: &adw::Application) {
 
     match crate::session_store::SessionStore::load() {
         Ok((store, loaded)) => {
-            state.borrow_mut().session_store = Some(store);
+            state.borrow_mut().session_store = Ok(store);
             apply_loaded_session(&state, loaded);
         }
         Err(error) => {
             eprintln!("limux: failed to open session storage: {error}");
-            apply_loaded_session(&state, layout_state::load_session());
+            match crate::session_store::SessionStore::load_for_retry() {
+                Ok((store, loaded)) => {
+                    // This is the snapshot we actually show, not a new disk
+                    // baseline adopted after the user has begun making edits.
+                    state.borrow_mut().session_store = Ok(store);
+                    apply_loaded_session(&state, loaded);
+                }
+                Err(retry_error) => {
+                    state.borrow_mut().session_store = Err(format!(
+                        "{error}. A safe startup snapshot could not be read: {retry_error}"
+                    ));
+                    apply_loaded_session(&state, layout_state::load_session());
+                }
+            }
         }
     }
 
