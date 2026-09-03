@@ -602,6 +602,7 @@ fn handle_method(
                 .get("text")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
+                .map(str::to_owned)
             else {
                 return error_response(
                     id,
@@ -619,7 +620,7 @@ fn handle_method(
                 ControlCommand::SendText {
                     target,
                     surface_hint: optional_string(params, &["surface_id"]),
-                    text: text.to_string(),
+                    text,
                     reply,
                 },
                 rx,
