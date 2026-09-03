@@ -334,6 +334,30 @@ fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>,
     (Some(surface.pane_id), Some(surface.surface_id))
 }
 
+/// Resolve all terminal control operations through the same workspace-local target.
+/// Explicit surfaces must resolve exactly; otherwise use focus only within the
+/// requested workspace before falling back to that workspace's first terminal.
+fn control_terminal_target(
+    state: &State,
+    workspace_index: usize,
+    surface_hint: Option<&str>,
+) -> Option<(serde_json::Value, crate::terminal::TerminalHandle)> {
+    let app_state = state.borrow();
+    let workspace = &app_state.workspaces[workspace_index];
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+    let surface_hint = surface_hint.or(focused_surface_id.as_deref());
+    let (surface_id, handle) = pane::terminal_handle_for_root(&workspace.root, surface_hint)?;
+    Some((
+        serde_json::json!({
+            "workspace_id": workspace.id.as_str(),
+            "workspace_ref": workspace_ref(&workspace.id),
+            "surface_id": surface_id.as_str(),
+            "surface_ref": surface_ref(&surface_id),
+        }),
+        handle,
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum PaneCreateDirection {
@@ -4598,27 +4622,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let target = {
-                let app_state = state.borrow();
-                let workspace = &app_state.workspaces[index];
-                let (_focused_pane_id, focused_surface_id) =
-                    focused_ids_for_workspace(state, &workspace.id);
-                let resolved_surface_hint =
-                    surface_hint.as_deref().or(focused_surface_id.as_deref());
-                pane::terminal_handle_for_root(&workspace.root, resolved_surface_hint).map(
-                    |(surface_id, handle)| {
-                        (
-                            serde_json::json!({
-                                "workspace_id": workspace.id.as_str(),
-                                "workspace_ref": workspace_ref(&workspace.id),
-                                "surface_id": surface_id.as_str(),
-                                "surface_ref": surface_ref(&surface_id),
-                            }),
-                            handle,
-                        )
-                    },
-                )
-            };
+            let target = control_terminal_target(state, index, surface_hint.as_deref());
 
             let Some((mut payload, handle)) = target else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -4650,23 +4654,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let target = {
-                let app_state = state.borrow();
-                let workspace = &app_state.workspaces[index];
-                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
-                    |(surface_id, handle)| {
-                        (
-                            serde_json::json!({
-                                "workspace_id": workspace.id.as_str(),
-                                "workspace_ref": workspace_ref(&workspace.id),
-                                "surface_id": surface_id.as_str(),
-                                "surface_ref": surface_ref(&surface_id),
-                            }),
-                            handle,
-                        )
-                    },
-                )
-            };
+            let target = control_terminal_target(state, index, surface_hint.as_deref());
 
             let Some((mut payload, handle)) = target else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -4704,23 +4692,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let target = {
-                let app_state = state.borrow();
-                let workspace = &app_state.workspaces[index];
-                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
-                    |(surface_id, handle)| {
-                        (
-                            serde_json::json!({
-                                "workspace_id": workspace.id.as_str(),
-                                "workspace_ref": workspace_ref(&workspace.id),
-                                "surface_id": surface_id.as_str(),
-                                "surface_ref": surface_ref(&surface_id),
-                            }),
-                            handle,
-                        )
-                    },
-                )
-            };
+            let target = control_terminal_target(state, index, surface_hint.as_deref());
 
             let Some((mut payload, handle)) = target else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(

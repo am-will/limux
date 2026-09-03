@@ -493,6 +493,68 @@ ENV_SURFACE="$(sed -n '3p' "$SELF_SPLIT_ENV")"
 }
 echo "stage 6: OK (self-split command ran with fresh LIMUX_* env)"
 
+# Keep text, key, and screen operations on the newly focused split, even when
+# the caller has no explicit surface. The first pane must not receive Enter.
+echo
+echo "== stage 6b: consistent terminal control targets =="
+ROUTING_PROOF="$DEMO_DIR/routing-proof"
+ROUTING_COMMAND="printf '%s' \"\$LIMUX_SURFACE_ID\" > '$ROUTING_PROOF'; printf 'routing-visible\\n'"
+"$LIMUX_CLI" --json --id-format both send --workspace limux "$ROUTING_COMMAND" >"$LOG_DIR/stage6b-send.json"
+"$LIMUX_CLI" --json --id-format both send-key --workspace limux Enter >"$LOG_DIR/stage6b-key.json"
+for _ in $(seq 1 50); do
+  [ -f "$ROUTING_PROOF" ] && break
+  sleep 0.1
+done
+[ -f "$ROUTING_PROOF" ] && [ "$(cat "$ROUTING_PROOF")" = "$RESPONSE_SURFACE" ] \
+  || { echo "FAIL: implicit send and Enter did not execute in the focused split"; exit 1; }
+for _ in $(seq 1 50); do
+  "$LIMUX_CLI" --json --id-format both read-screen --workspace limux >"$LOG_DIR/stage6b-read.json"
+  jq -e '.text | contains("routing-visible")' "$LOG_DIR/stage6b-read.json" >/dev/null && break
+  sleep 0.1
+done
+for operation in send key read; do
+  jq -e --arg surface "$RESPONSE_SURFACE" '.surface_id == $surface' \
+    "$LOG_DIR/stage6b-$operation.json" >/dev/null \
+    || { echo "FAIL: $operation targeted a different surface from the focused split"; exit 1; }
+done
+jq -e '.text | contains("routing-visible")' "$LOG_DIR/stage6b-read.json" >/dev/null \
+  || { echo "FAIL: focused terminal output was not readable"; exit 1; }
+
+# An explicit invalid target must fail instead of falling back to focus.
+for operation in send send-key read-screen; do
+  case "$operation" in
+    send) routing_args=("should-not-be-sent") ;;
+    send-key) routing_args=(Enter) ;;
+    read-screen) routing_args=() ;;
+  esac
+  if "$LIMUX_CLI" "$operation" --workspace limux --surface missing-surface \
+      "${routing_args[@]}" >"$LOG_DIR/stage6b-invalid-$operation.txt" 2>&1; then
+    echo "FAIL: $operation accepted a missing explicit surface"
+    exit 1
+  fi
+done
+# Focusing another workspace must not redirect an explicitly scoped request.
+"$LIMUX_CLI" --json --id-format both new-workspace --cwd "$DEMO_DIR" >"$LOG_DIR/stage6b-other-workspace.json"
+OTHER_WORKSPACE="$(jq -r '.workspace_id' "$LOG_DIR/stage6b-other-workspace.json")"
+"$LIMUX_CLI" select-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6b-other-select.txt"
+"$LIMUX_CLI" --json --id-format both send --workspace limux : >"$LOG_DIR/stage6b-background-send.json"
+"$LIMUX_CLI" --json --id-format both send-key --workspace limux Enter >"$LOG_DIR/stage6b-background-key.json"
+"$LIMUX_CLI" --json --id-format both read-screen --workspace limux >"$LOG_DIR/stage6b-background-read.json"
+BACKGROUND_SURFACE="$(jq -r '.surface_id' "$LOG_DIR/stage6b-background-send.json")"
+for operation in send key read; do
+  jq -e --arg workspace "$WORKSPACE_ID" --arg surface "$BACKGROUND_SURFACE" \
+    '.workspace_id == $workspace and .surface_id == $surface' \
+    "$LOG_DIR/stage6b-background-$operation.json" >/dev/null \
+    || { echo "FAIL: background $operation escaped the requested workspace"; exit 1; }
+done
+if "$LIMUX_CLI" send-key --workspace "$OTHER_WORKSPACE" --surface "$BACKGROUND_SURFACE" Enter \
+    >"$LOG_DIR/stage6b-foreign-surface.txt" 2>&1; then
+  echo "FAIL: explicit surface from another workspace was accepted"
+  exit 1
+fi
+"$LIMUX_CLI" close-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6b-other-close.txt"
+echo "stage 6b: OK (text, Enter, and screen read share the focused target)"
+
 # --- 10. Stage 7: hook translators end-to-end -----------------------------
 echo
 echo "== stage 7: claude-hook event translation =="
