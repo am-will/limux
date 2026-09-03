@@ -190,6 +190,11 @@ limux send --workspace "$LIMUX_WORKSPACE_ID" --surface "<peer-surface-id>" \
 
 See the auto-generated `AGENTS.md` (written into the shared cwd) for
 the full protocol spec, peer table, and editable Policies section.
+`agent-team` refuses to replace an existing `AGENTS.md`, including one from a
+previous team, before creating any panes. Preserve or move existing instructions
+before running it again, then merge any project policies you want to keep.
+`limux --json agent-team --dry-run` previews the protocol in `agents_md_preview`
+without writing files or contacting the host.
 
 Checked-in hook templates live in [`hooks/`](hooks/). They mirror
 `limux hooks setup` for Codex, Claude Code, and Gemini CLI; OpenCode is
