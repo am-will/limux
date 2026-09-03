@@ -2222,9 +2222,7 @@ pub fn terminal_handle_for_root(
     root: &gtk::Widget,
     surface_hint: Option<&str>,
 ) -> Option<(String, terminal::TerminalHandle)> {
-    let requested = surface_hint
-        .map(normalize_surface_hint)
-        .filter(|value| !value.is_empty());
+    let requested = surface_hint.map(normalize_surface_hint);
 
     if let Some(requested) = requested {
         for internals in pane_internals_for_root(root) {
@@ -4133,7 +4131,7 @@ mod tests {
 
     #[test]
     fn explicit_missing_terminal_does_not_fall_back_to_active_tab() {
-        for target in ["missing", "5:agent", ""] {
+        for target in ["missing", "5:agent", "", "   ", "surface:", " surface:   "] {
             assert_eq!(
                 select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
                 None,

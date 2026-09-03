@@ -308,6 +308,25 @@ fn optional_handle(
     Ok(None)
 }
 
+/// A supplied terminal target must remain explicit, including malformed empty
+/// handles. Dropping it would redirect input to the active or first terminal.
+fn optional_surface_handle(
+    params: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<String>, BridgeError> {
+    for key in keys {
+        if params.get(*key).is_none_or(Value::is_null) {
+            continue;
+        }
+        let handle = optional_ref_handle(params, &[*key], "surface:")?;
+        return handle
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| Some(value.trim().to_string()))
+            .ok_or_else(|| BridgeError::invalid_params(format!("{key} must not be empty")));
+    }
+    Ok(None)
+}
+
 fn optional_ref_handle(
     params: &Map<String, Value>,
     keys: &[&str],
@@ -533,8 +552,7 @@ fn handle_method(
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
-            let surface_hint = match optional_ref_handle(params, &["surface_id", "id"], "surface:")
-            {
+            let surface_hint = match optional_surface_handle(params, &["surface_id", "id"]) {
                 Ok(surface_hint) => surface_hint,
                 Err(error) => return error_response(id, error),
             };
@@ -610,11 +628,15 @@ fn handle_method(
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
+            let surface_hint = match optional_surface_handle(params, &["surface_id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::SendText {
                     target,
-                    surface_hint: optional_string(params, &["surface_id"]),
+                    surface_hint,
                     text,
                     reply,
                 },
@@ -632,11 +654,15 @@ fn handle_method(
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
+            let surface_hint = match optional_surface_handle(params, &["surface_id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::SendKey {
                     target,
-                    surface_hint: optional_string(params, &["surface_id"]),
+                    surface_hint,
                     key,
                     reply,
                 },
@@ -1051,6 +1077,80 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn terminal_routes_reject_empty_explicit_targets_before_dispatch() {
+        for method in [
+            "surface.send_text",
+            "send-text",
+            "send",
+            "surface.send_key",
+            "send-key",
+            "surface.read_text",
+            "read-screen",
+            "capture-pane",
+        ] {
+            for target in ["", "   ", "surface:", " surface:   "] {
+                let request = json!({ "id": 1, "method": method, "params": { "surface_id": target, "text": "must not be sent", "key": "Enter" } });
+                let response = dispatch_request(&request.to_string(), &|command| {
+                    panic!("invalid target dispatched: {command:?}")
+                });
+                assert_eq!(
+                    response.error.as_ref().map(|error| error.code),
+                    Some(INVALID_PARAMS_CODE),
+                    "{method} target {target:?}"
+                );
+            }
+        }
+        let response = dispatch_request(
+            r#"{"id":1,"method":"capture-pane","params":{"id":"surface:"}}"#,
+            &|command| panic!("empty alias dispatched: {command:?}"),
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn terminal_routes_preserve_omitted_and_nonempty_explicit_targets() {
+        for method in ["surface.send_text", "surface.send_key", "surface.read_text"] {
+            for (target, expected) in [
+                (None, None),
+                (Some("surface:4:target"), Some("4:target")),
+                (Some("missing-surface"), Some("missing-surface")),
+            ] {
+                let mut params = json!({ "text": "test", "key": "Enter" });
+                if let Some(target) = target {
+                    params["surface_id"] = json!(target);
+                }
+                let request = json!({ "id": 1, "method": method, "params": params });
+                let response = dispatch_request(&request.to_string(), &|command| {
+                    let (surface_hint, reply) = match command {
+                        ControlCommand::SendText {
+                            surface_hint,
+                            reply,
+                            ..
+                        }
+                        | ControlCommand::SendKey {
+                            surface_hint,
+                            reply,
+                            ..
+                        }
+                        | ControlCommand::ReadSurfaceText {
+                            surface_hint,
+                            reply,
+                            ..
+                        } => (surface_hint, reply),
+                        other => panic!("unexpected command: {other:?}"),
+                    };
+                    assert_eq!(surface_hint.as_deref(), expected, "{method}");
+                    let _ = reply.send(Ok(json!({})));
+                });
+                assert_eq!(response.error, None);
+            }
+        }
     }
 
     #[test]

@@ -335,8 +335,9 @@ fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>,
 }
 
 /// Resolve all terminal control operations through the same workspace-local target.
-/// Explicit surfaces must resolve exactly; otherwise use focus only within the
-/// requested workspace before falling back to that workspace's first terminal.
+/// Explicit surfaces must resolve exactly. With no explicit surface, use the
+/// requested workspace's focused surface; a focused browser is not a terminal
+/// target. Fall back to the first terminal only when no surface has focus.
 fn control_terminal_target(
     state: &State,
     workspace_index: usize,
