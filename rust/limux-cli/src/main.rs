@@ -391,6 +391,21 @@ fn parse_opt(args: &[String], name: &str) -> Option<String> {
     })
 }
 
+fn parse_terminal_surface(args: &[String]) -> Result<Option<String>> {
+    let Some(surface) = parse_opt(args, "--surface") else {
+        if parse_flag(args, "--surface") {
+            bail!("--surface requires a non-empty target");
+        }
+        return Ok(None);
+    };
+    let normalized = surface.trim();
+    let normalized = normalized.strip_prefix("surface:").unwrap_or(normalized);
+    if normalized.trim().is_empty() {
+        bail!("--surface requires a non-empty target");
+    }
+    Ok(Some(surface))
+}
+
 fn parse_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
@@ -804,7 +819,7 @@ async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
         .filter(|s| !s.is_empty());
-    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let surface = parse_terminal_surface(args)?;
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
 
@@ -827,7 +842,7 @@ async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
         .filter(|s| !s.is_empty());
-    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let surface = parse_terminal_surface(args)?;
     let key = trailing_title(args).ok_or_else(|| anyhow!("send-key requires key"))?;
 
     let mut params = Map::new();
@@ -2518,7 +2533,7 @@ async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> 
     }
 
     let workspace = parse_opt(args, "--workspace");
-    let surface = parse_opt(args, "--surface");
+    let surface = parse_terminal_surface(args)?;
     let mut params = Map::new();
     if let Some(workspace) = workspace {
         params.insert("workspace_id".to_string(), Value::String(workspace));
@@ -3773,6 +3788,42 @@ mod cli_arg_tests {
                 }
                 CommandOutput::Json(_) => panic!("version should be plain text"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_commands_reject_empty_explicit_surface_before_connecting() {
+        for command in ["send", "send-key", "read-screen"] {
+            for target in ["", "   ", "surface:", " surface:   "] {
+                let mut client = Client::new(PathBuf::from("/does/not/exist.sock"));
+                let mut command_args = args(&[command, "--surface", target]);
+                if command == "send" {
+                    command_args.push("must not be sent".into());
+                }
+                if command == "send-key" {
+                    command_args.push("Enter".into());
+                }
+                let error = execute_command(&mut client, &default_opts(command_args))
+                    .await
+                    .expect_err("invalid target must fail locally");
+                assert_eq!(
+                    error.to_string(),
+                    "--surface requires a non-empty target",
+                    "{command} {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_surface_option_preserves_omission_and_valid_handles() {
+        assert_eq!(parse_terminal_surface(&args(&["payload"])).unwrap(), None);
+        assert!(parse_terminal_surface(&args(&["--surface"])).is_err());
+        for target in ["tab-id", "4:tab-id", "surface:4:tab-id"] {
+            assert_eq!(
+                parse_terminal_surface(&args(&["--surface", target])).unwrap(),
+                Some(target.to_string())
+            );
         }
     }
 

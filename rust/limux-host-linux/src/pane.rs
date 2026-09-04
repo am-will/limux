@@ -865,62 +865,59 @@ fn surface_hint_matches(surface_id: &str, tab_id: &str, surface_hint: &str) -> b
     !requested.is_empty() && (requested == tab_id || requested == surface_id)
 }
 
+fn select_terminal_tab<'a>(
+    pane_id: u32,
+    terminal_tab_ids: impl IntoIterator<Item = &'a str>,
+    active_tab: Option<&str>,
+    surface_hint: Option<&str>,
+) -> Option<&'a str> {
+    let mut fallback = None;
+    for tab_id in terminal_tab_ids {
+        if let Some(surface_hint) = surface_hint {
+            if surface_hint_matches(&composite_surface_id(pane_id, tab_id), tab_id, surface_hint) {
+                return Some(tab_id);
+            }
+            // An explicit target must not fall back to the active tab.
+            continue;
+        }
+        if active_tab == Some(tab_id) {
+            return Some(tab_id);
+        }
+        fallback.get_or_insert(tab_id);
+    }
+    fallback
+}
+
 pub fn terminal_handle_for_surface(
     pane_widget: &gtk::Widget,
     surface_hint: Option<&str>,
 ) -> Option<(String, terminal::TerminalHandle)> {
     let internals = find_pane_internals(pane_widget)?;
-    let pane_id = internals.pane_id;
     let tab_state = internals.tab_state.borrow();
-    let requested = surface_hint
-        .map(normalize_surface_hint)
-        .filter(|value| !value.is_empty());
-    let active_tab = tab_state.active_tab.as_deref();
-    let mut fallback = None;
-
-    for entry in &tab_state.tabs {
-        let TabKind::Terminal { state } = &entry.kind else {
-            continue;
-        };
-
-        let full_surface_id = composite_surface_id(pane_id, &entry.id);
-
-        if requested.is_some_and(|value| value == entry.id || value == full_surface_id) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-
-        if active_tab == Some(entry.id.as_str()) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-
-        if fallback.is_none() {
-            fallback = Some((full_surface_id, state.handle.clone()));
-        }
-    }
-
-    fallback
+    let terminal_tab_ids = tab_state.tabs.iter().filter_map(|entry| {
+        matches!(entry.kind, TabKind::Terminal { .. }).then_some(entry.id.as_str())
+    });
+    let tab_id = select_terminal_tab(
+        internals.pane_id,
+        terminal_tab_ids,
+        tab_state.active_tab.as_deref(),
+        surface_hint,
+    )?;
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+    let TabKind::Terminal { state } = &entry.kind else {
+        return None;
+    };
+    Some((
+        composite_surface_id(internals.pane_id, tab_id),
+        state.handle.clone(),
+    ))
 }
 
 pub fn exact_terminal_handle_for_surface(
     pane_widget: &gtk::Widget,
     surface_hint: &str,
 ) -> Option<(String, terminal::TerminalHandle)> {
-    let internals = find_pane_internals(pane_widget)?;
-    let pane_id = internals.pane_id;
-    let tab_state = internals.tab_state.borrow();
-
-    for entry in &tab_state.tabs {
-        let TabKind::Terminal { state } = &entry.kind else {
-            continue;
-        };
-
-        let full_surface_id = composite_surface_id(pane_id, &entry.id);
-        if surface_hint_matches(&full_surface_id, &entry.id, surface_hint) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-    }
-
-    None
+    terminal_handle_for_surface(pane_widget, Some(surface_hint))
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,23 +2222,13 @@ pub fn terminal_handle_for_root(
     root: &gtk::Widget,
     surface_hint: Option<&str>,
 ) -> Option<(String, terminal::TerminalHandle)> {
-    let requested = surface_hint
-        .map(normalize_surface_hint)
-        .filter(|value| !value.is_empty());
+    let requested = surface_hint.map(normalize_surface_hint);
 
     if let Some(requested) = requested {
         for internals in pane_internals_for_root(root) {
             let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-            if let Some((surface_id, handle)) =
-                terminal_handle_for_surface(&pane_widget, Some(requested))
-            {
-                if surface_id == requested
-                    || surface_id
-                        .strip_prefix("surface:")
-                        .is_some_and(|value| value == requested)
-                {
-                    return Some((surface_id, handle));
-                }
+            if let Some(target) = exact_terminal_handle_for_surface(&pane_widget, requested) {
+                return Some(target);
             }
         }
         return None;
@@ -4118,11 +4105,12 @@ mod tests {
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
         effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
         normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolved_link_destination, select_terminal_commands, surface_hint_matches,
-        workspace_autostart_initial_input, workspace_autostart_script, ContentDropZone,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
-        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
-        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
+        resolved_link_destination, select_terminal_commands, select_terminal_tab,
+        surface_hint_matches, workspace_autostart_initial_input, workspace_autostart_script,
+        ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
+        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
+        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
+        TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
@@ -4130,6 +4118,39 @@ mod tests {
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
     use crate::{app_config::LinkOpenDestination, terminal::LinkOpenRequest};
+
+    #[test]
+    fn explicit_terminal_target_can_follow_the_active_tab() {
+        for target in ["agent", "4:agent", "surface:4:agent"] {
+            assert_eq!(
+                select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
+                Some("agent"),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_missing_terminal_does_not_fall_back_to_active_tab() {
+        for target in ["missing", "5:agent", "", "   ", "surface:", " surface:   "] {
+            assert_eq!(
+                select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_terminal_target_prefers_active_terminal_then_first_terminal() {
+        assert_eq!(
+            select_terminal_tab(4, ["shell", "agent"], Some("agent"), None),
+            Some("agent"),
+        );
+        assert_eq!(
+            select_terminal_tab(4, ["shell", "agent"], Some("browser"), None),
+            Some("shell"),
+        );
+        assert_eq!(select_terminal_tab(4, [], None, None), None);
+    }
 
     #[test]
     fn explicit_terminal_command_can_suppress_workspace_autostart() {
