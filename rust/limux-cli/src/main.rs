@@ -1194,30 +1194,27 @@ fn persist_agent_hook_session(
         return Ok(());
     };
 
-    let existing = store.lookup(&session_id)?;
-    let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
-        .map(str::to_string)
-        .or_else(|| existing.as_ref().and_then(|record| record.cwd.clone()));
-    let pid = hook_str(payload, &["pid"])
-        .and_then(|value| value.parse::<u32>().ok())
-        .or_else(|| agent_ancestor_pid(agent))
-        .or_else(|| existing.as_ref().and_then(|record| record.pid));
-    let launch_command = agent_hooks::launch_record_from_env(agent, cwd.as_deref()).or_else(|| {
-        existing
-            .as_ref()
-            .and_then(|record| record.launch_command.clone())
-    });
+    let result = store.update(&session_id, |existing| {
+        let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
+            .map(str::to_string)
+            .or_else(|| existing.and_then(|record| record.cwd.clone()));
+        let pid = hook_str(payload, &["pid"])
+            .and_then(|value| value.parse::<u32>().ok())
+            .or_else(|| agent_ancestor_pid(agent))
+            .or_else(|| existing.and_then(|record| record.pid));
+        let launch_command = agent_hooks::launch_record_from_env(agent, cwd.as_deref())
+            .or_else(|| existing.and_then(|record| record.launch_command.clone()));
 
-    let record = agent_hooks::AgentHookSessionRecord {
-        session_id,
-        workspace_id,
-        surface_id,
-        cwd,
-        pid,
-        launch_command,
-        updated_at: agent_hooks::now_seconds(),
-    };
-    let result = store.upsert(record);
+        agent_hooks::AgentHookSessionRecord {
+            session_id: session_id.clone(),
+            workspace_id,
+            surface_id,
+            cwd,
+            pid,
+            launch_command,
+            updated_at: agent_hooks::now_seconds(),
+        }
+    });
     if result.is_ok() {
         write_agent_hook_debug(
             agent,
