@@ -85,6 +85,10 @@ pub(crate) struct AppState {
     sidebar_expanded_width: i32,
     persistence_suspended: bool,
     save_queued: bool,
+    session_store: Result<crate::session_store::SessionStore, String>,
+    session_save_notice: Option<String>,
+    session_close_dialog_open: bool,
+    close_after_recovery: bool,
     workspace_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
@@ -892,10 +896,111 @@ fn request_session_save(state: &State) {
     }
 }
 
-fn save_session_now(state: &State) {
+fn try_save_session(state: &State) -> Result<crate::session_store::SaveOutcome, String> {
     let session = snapshot_session_state(state);
-    if let Err(err) = layout_state::save_session_atomic(&session) {
-        eprintln!("limux: failed to save session state: {err}");
+    state
+        .borrow_mut()
+        .session_store
+        .as_mut()
+        .map_err(|error| {
+            format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")
+        })?
+        .save(&session)
+        .map_err(|error| error.to_string())
+}
+
+fn session_conflict_detail(recovery: &Path, workspaces: &[String]) -> String {
+    format!("Another Limux window changed the same workspace(s): {}. The shared session was not overwritten. This window's complete session was saved to {}.", workspaces.join(", "), recovery.display())
+}
+
+fn report_session_save_notice(state: &State, detail: String) {
+    if state.borrow().session_save_notice.as_ref() == Some(&detail) {
+        return;
+    }
+    state.borrow_mut().session_save_notice = Some(detail.clone());
+    eprintln!("limux: {detail}");
+    show_runtime_error(state, "Session could not be merged", &detail);
+}
+
+fn save_session_now(state: &State) {
+    match try_save_session(state) {
+        Ok(crate::session_store::SaveOutcome::Saved) => {
+            state.borrow_mut().session_save_notice = None
+        }
+        Ok(crate::session_store::SaveOutcome::Conflict {
+            recovery,
+            workspaces,
+        }) => {
+            report_session_save_notice(state, session_conflict_detail(&recovery, &workspaces));
+        }
+        Err(error) => report_session_save_notice(state, format!("Failed to save session: {error}")),
+    }
+}
+
+fn prepare_session_close(state: &State) -> bool {
+    if std::mem::take(&mut state.borrow_mut().close_after_recovery) {
+        return true;
+    }
+    if state.borrow().session_close_dialog_open {
+        return false;
+    }
+    match try_save_session(state) {
+        Ok(crate::session_store::SaveOutcome::Saved) => true,
+        Err(error) => {
+            let window = state.borrow().window.clone();
+            let dialog = gtk::AlertDialog::builder().modal(true)
+                .message("Close without saving this session?")
+                .detail(format!("The session could not be saved: {error}. Closing will discard this window's unsaved session changes."))
+                .buttons(["Cancel", "Close without Saving"]).cancel_button(0).default_button(0).build();
+            state.borrow_mut().session_close_dialog_open = true;
+            let state = state.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |answer| {
+                state.borrow_mut().session_close_dialog_open = false;
+                if answer == Ok(1) {
+                    state.borrow_mut().close_after_recovery = true;
+                    let window = state.borrow().window.clone();
+                    window.close();
+                }
+            });
+            false
+        }
+        Ok(crate::session_store::SaveOutcome::Conflict {
+            recovery,
+            workspaces,
+        }) => {
+            let detail = session_conflict_detail(&recovery, &workspaces);
+            let window = state.borrow().window.clone();
+            let dialog = gtk::AlertDialog::builder()
+                .modal(true)
+                .message("Close with a saved recovery session?")
+                .detail(&detail)
+                .buttons(["Cancel", "Close after Saving Recovery"])
+                .cancel_button(0)
+                .default_button(0)
+                .build();
+            state.borrow_mut().session_close_dialog_open = true;
+            let state = state.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |answer| {
+                state.borrow_mut().session_close_dialog_open = false;
+                if answer != Ok(1) {
+                    return;
+                }
+                // Control-socket commands can still change the session while the
+                // dialog is open. Capture the latest state before allowing close.
+                match try_save_session(&state) {
+                    Ok(_) => {
+                        state.borrow_mut().close_after_recovery = true;
+                        let window = state.borrow().window.clone();
+                        window.close();
+                    }
+                    Err(error) => report_session_save_notice(
+                        &state,
+                        format!("Failed to save recovery session: {error}"),
+                    ),
+                }
+            });
+            false
+        }
     }
 }
 
@@ -937,6 +1042,10 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     }
     apply_sidebar_state_immediately(state, &loaded.state.sidebar);
 
+    let restored = snapshot_session_state(state);
+    if let Ok(store) = state.borrow_mut().session_store.as_mut() {
+        store.restored(restored);
+    }
     suspend_persistence(state, false);
 
     save_session_now(state);
@@ -1634,6 +1743,10 @@ pub fn build_window(app: &adw::Application) {
         sidebar_expanded_width: SIDEBAR_WIDTH,
         persistence_suspended: false,
         save_queued: false,
+        session_store: Err("Session storage has not been initialized".to_string()),
+        session_save_notice: None,
+        session_close_dialog_open: false,
+        close_after_recovery: false,
         workspace_dragging: None,
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
@@ -1787,7 +1900,9 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         window.connect_close_request(move |_| {
-            save_session_now(&state);
+            if !prepare_session_close(&state) {
+                return glib::Propagation::Stop;
+            }
             stop_session_saves_for_shutdown(&state);
             let split_containers: Vec<_> = state
                 .borrow()
@@ -1805,7 +1920,29 @@ pub fn build_window(app: &adw::Application) {
         });
     }
 
-    apply_loaded_session(&state, layout_state::load_session());
+    match crate::session_store::SessionStore::load() {
+        Ok((store, loaded)) => {
+            state.borrow_mut().session_store = Ok(store);
+            apply_loaded_session(&state, loaded);
+        }
+        Err(error) => {
+            eprintln!("limux: failed to open session storage: {error}");
+            match crate::session_store::SessionStore::load_for_retry() {
+                Ok((store, loaded)) => {
+                    // This is the snapshot we actually show, not a new disk
+                    // baseline adopted after the user has begun making edits.
+                    state.borrow_mut().session_store = Ok(store);
+                    apply_loaded_session(&state, loaded);
+                }
+                Err(retry_error) => {
+                    state.borrow_mut().session_store = Err(format!(
+                        "{error}. A safe startup snapshot could not be read: {retry_error}"
+                    ));
+                    apply_loaded_session(&state, layout_state::load_session());
+                }
+            }
+        }
+    }
 
     crate::control_bridge::start(dispatch_control_command);
 
