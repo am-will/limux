@@ -287,7 +287,11 @@ fn merge_session(
     } else {
         workspace_order(disk)
     };
-    order.extend(workspace_order(local));
+    order.extend(if local_reordered {
+        workspace_order(disk)
+    } else {
+        workspace_order(local)
+    });
     let mut workspaces = Vec::new();
     for id in order {
         if let Some(workspace) = merged.remove(&id) {

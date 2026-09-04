@@ -270,6 +270,28 @@ fn merge_keeps_selected_workspace_by_identity_and_local_reordering() {
 }
 
 #[test]
+fn local_reorder_preserves_remote_addition_order() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (mut remote_store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let (mut local_store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let mut remote = base.clone();
+    remote.workspaces.extend([workspace(40), workspace(30)]);
+    saved(&mut remote_store, &remote);
+    let mut local = base;
+    local.workspaces.swap(0, 1);
+    saved(&mut local_store, &local);
+    assert_eq!(
+        disk(dir.path())
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["workspace-2", "workspace-1", "workspace-40", "workspace-30"]
+    );
+}
+
+#[test]
 fn concurrent_workspace_reorders_do_not_silently_overwrite_each_other() {
     let dir = tempdir().unwrap();
     let mut base = initial(dir.path());
