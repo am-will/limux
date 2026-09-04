@@ -48,6 +48,32 @@ fn dropped_or_failed_publication_never_launches_a_waiting_agent() {
 }
 
 #[test]
+fn launch_uses_parent_shell_function_after_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("user's project");
+    fs::create_dir(&cwd).unwrap();
+    let pending = PendingInstructions::new(&cwd.join("AGENTS.md")).unwrap();
+    let command = format!(
+        "parent_shell_agent() {{ printf 'launched:%s\\n' \"$PWD\"; }}; {}",
+        pending.pane_command(Some("parent_shell_agent"))
+    );
+    let child = spawn(&command, dir.path());
+
+    pending.publish("Team instructions").unwrap();
+
+    let output = finish(child);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("launched:{}\n", cwd.display())
+    );
+}
+
+#[test]
 fn no_launch_uses_the_inherited_shell_in_the_requested_directory() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("user's project");

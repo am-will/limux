@@ -41,19 +41,24 @@ impl PendingInstructions {
 
     pub(crate) fn pane_command(&self, launch: Option<&str>) -> String {
         let cwd = quote(&self.path.parent().unwrap().to_string_lossy());
-        let command = match launch {
-            Some(launch) => format!(
-                "cd {cwd} || exit 1; remaining=1200; \
+        if let Some(launch) = launch {
+            let command = format!(
+                "remaining=1200; \
                  while [ -e {staged} ]; do \
                  [ \"$remaining\" -gt 0 ] || exit 1; \
                  remaining=$((remaining - 1)); sleep 0.05; done; \
-                 [ -f AGENTS.md ] && grep -Fqx -- {marker} AGENTS.md && exec {launch}",
+                 [ -f {path} ] && grep -Fqx -- {marker} {path}",
                 staged = quote(&self.staged.path().to_string_lossy()),
                 marker = quote(&self.marker),
-            ),
-            None => format!("cd {cwd} && exec \"${{SHELL:-/bin/sh}}\""),
-        };
-        format!("/bin/sh -c {}", quote(&command))
+                path = quote(&self.path.to_string_lossy()),
+            );
+            return format!("/bin/sh -c {} && cd {cwd} && {launch}", quote(&command));
+        }
+
+        format!(
+            "/bin/sh -c {}",
+            quote(&format!("cd {cwd} && exec \"${{SHELL:-/bin/sh}}\""))
+        )
     }
 
     pub(crate) fn publish(mut self, body: &str) -> Result<()> {
