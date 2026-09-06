@@ -160,6 +160,8 @@ smoke_linux() {
     mkdir -p "$SMOKE_ROOT/tar" "$deb_root"
     tar -xzf "$tarball" -C "$SMOKE_ROOT/tar"
     verify_tree "$tar_root" "$tar_root/limux" "$tar_root/lib" "tarball"
+    uv run "$ROOT_DIR/scripts/smoke-packaged-runtime.py" \
+        "$tar_root" "$tar_root/limux" --library-dir "$tar_root/lib"
 
     dpkg-deb -x "$deb" "$deb_root"
     actual="$(dpkg-deb -f "$deb" Version)"
@@ -168,6 +170,8 @@ smoke_linux() {
         exit 1
     fi
     verify_tree "$deb_root/usr" "$deb_root/usr/bin/limux" "$deb_root/usr/lib/limux" "Debian package"
+    uv run "$ROOT_DIR/scripts/smoke-packaged-runtime.py" \
+        "$deb_root/usr" "$deb_root/usr/bin/limux" --library-dir "$deb_root/usr/lib/limux"
 
     if [ ! -x "$appimage" ]; then
         echo "ERROR: AppImage is not executable: $appimage" >&2
@@ -192,6 +196,8 @@ smoke_linux() {
     verify_appimage_library_boundary "$appimage_root/usr/lib"
     verify_appimage_webkit_paths "$appimage_root"
     verify_tree "$appimage_root/usr" "$appimage_root/usr/bin/limux" "$appimage_root/usr/lib" "AppImage"
+    uv run "$ROOT_DIR/scripts/smoke-packaged-runtime.py" \
+        "$appimage_root" "$appimage_root/usr/bin/limux" --appimage
 
     echo "Linux release artifact smoke: OK"
 }
@@ -218,6 +224,8 @@ smoke_rpm() {
         rpm2cpio "$rpm" | cpio -idm --quiet
     )
     verify_tree "$rpm_root/usr" "$rpm_root/usr/bin/limux" "$rpm_root/usr/lib/limux" "RPM package"
+    uv run "$ROOT_DIR/scripts/smoke-packaged-runtime.py" \
+        "$rpm_root/usr" "$rpm_root/usr/bin/limux" --library-dir "$rpm_root/usr/lib/limux"
 
     echo "RPM release artifact smoke: OK"
 }
