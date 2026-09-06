@@ -3269,12 +3269,17 @@ fn next_active_workspace_index(
 }
 
 fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::ListBoxRow) {
+    let preferred_pane_id = find_leaf_focused_pane(state)
+        .filter(|(id, _)| id == workspace_id)
+        .and_then(|(_, pane)| pane::active_surface_summary(&pane).map(|surface| surface.pane_id));
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     menu_box.set_margin_top(4);
     menu_box.set_margin_bottom(4);
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
 
+    let new_tab_btn = gtk::Button::with_label("New tab from workspace directory");
+    new_tab_btn.add_css_class("flat");
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
     let has_autostart = {
@@ -3295,6 +3300,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
+    menu_box.append(&new_tab_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&autostart_btn);
     menu_box.append(&delete_btn);
@@ -3304,6 +3310,56 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     popover.set_parent(row);
     popover.set_position(gtk::PositionType::Right);
 
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
+        new_tab_btn.connect_clicked(move |_| {
+            pop.popdown();
+            let (index, directory, row, sidebar_list, target_pane) = {
+                let app_state = state.borrow();
+                let Some(index) = app_state
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == ws_id)
+                else {
+                    return;
+                };
+                let workspace = &app_state.workspaces[index];
+                let target_pane = preferred_pane_id
+                    .and_then(|id| pane::pane_widget_for_root(&workspace.root, id))
+                    .or_else(|| {
+                        let first = first_leaf_pane(&workspace.root);
+                        pane::active_surface_summary(&first).and_then(|surface| {
+                            pane::pane_widget_for_root(&workspace.root, surface.pane_id)
+                        })
+                    })
+                    .or_else(|| {
+                        let first = pane::pane_summaries_for_root(&workspace.root)
+                            .first()?
+                            .pane_id;
+                        pane::pane_widget_for_root(&workspace.root, first)
+                    });
+                let Some(target_pane) = target_pane else {
+                    return;
+                };
+                let directory = workspace
+                    .folder_path
+                    .clone()
+                    .or_else(|| workspace.cwd.borrow().clone());
+                (
+                    index,
+                    directory,
+                    workspace.sidebar_row.clone(),
+                    app_state.sidebar_list.clone(),
+                    target_pane,
+                )
+            };
+            switch_workspace(&state, index);
+            sidebar_list.select_row(Some(&row));
+            pane::add_terminal_tab_to_pane_in_directory(&target_pane, directory.as_deref());
+        });
+    }
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
@@ -4517,6 +4573,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 SplitPaneOptions {
                     initial_state: None,
                     skip_default_tab: false,
+                    inherit_active_directory: false,
                     new_pane_first: resolved.placement.new_pane_first,
                     persist: true,
                     suppress_initial_autostart: request.command.is_some(),
@@ -5058,6 +5115,7 @@ pub(crate) fn create_pane_for_workspace(
                 SplitPaneOptions {
                     initial_state: None,
                     skip_default_tab: false,
+                    inherit_active_directory: true,
                     new_pane_first: false,
                     persist: true,
                     suppress_initial_autostart: false,
@@ -5549,6 +5607,7 @@ fn toggle_sidebar(state: &State) {
 struct SplitPaneOptions {
     initial_state: Option<PaneState>,
     skip_default_tab: bool,
+    inherit_active_directory: bool,
     new_pane_first: bool,
     persist: bool,
     suppress_initial_autostart: bool,
@@ -5585,10 +5644,17 @@ fn split_pane(
         autostart_command,
         PaneCreationOptions {
             initial_state: options.initial_state.as_ref(),
-            skip_default_tab: options.skip_default_tab,
+            skip_default_tab: options.skip_default_tab || options.inherit_active_directory,
             suppress_initial_autostart: options.suppress_initial_autostart,
         },
     );
+    if options.inherit_active_directory {
+        let directory = pane::active_tab_working_directory(pane_widget).or(wd);
+        pane::add_terminal_tab_to_pane_in_directory(
+            &new_pane.clone().upcast(),
+            directory.as_deref(),
+        );
+    }
 
     // Mutate the data model and trigger async widget tree rebuild.
     // The existing pane's GLArea will be unrealized then re-realized
@@ -5622,6 +5688,7 @@ fn open_url_in_browser_tab(state: &State, ws_id: &str, pane_widget: &gtk::Widget
                 SplitPaneOptions {
                     initial_state: Some(PaneState::browser_only(Some(url))),
                     skip_default_tab: false,
+                    inherit_active_directory: false,
                     new_pane_first: false,
                     persist: true,
                     suppress_initial_autostart: false,
@@ -5714,6 +5781,7 @@ fn handle_split_with_tab(
         SplitPaneOptions {
             initial_state: None,
             skip_default_tab: true,
+            inherit_active_directory: false,
             new_pane_first,
             persist: false,
             suppress_initial_autostart: false,
@@ -5911,6 +5979,7 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
             SplitPaneOptions {
                 initial_state: Some(PaneState::browser_only(uri.as_deref())),
                 skip_default_tab: false,
+                inherit_active_directory: false,
                 new_pane_first: false,
                 persist: true,
                 suppress_initial_autostart: false,
@@ -5949,6 +6018,7 @@ fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
             SplitPaneOptions {
                 initial_state: None,
                 skip_default_tab: false,
+                inherit_active_directory: true,
                 new_pane_first: false,
                 persist: true,
                 suppress_initial_autostart: false,

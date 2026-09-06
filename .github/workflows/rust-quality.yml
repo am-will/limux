@@ -119,7 +119,10 @@ jobs:
             libwebkitgtk-6.0-dev \
             pkg-config \
             util-linux \
-            weston
+            weston \
+            xauth \
+            xdotool \
+            xvfb
 
       - name: Build libghostty for embedding
         run: |
@@ -130,3 +133,6 @@ jobs:
         env:
           LIMUX_SMOKE_PROFILE: debug
         run: ./scripts/xvfb-smoke-test.sh
+
+      - name: Check terminal directory inheritance
+        run: ./scripts/tests/test-terminal-cwd.sh

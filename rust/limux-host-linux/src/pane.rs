@@ -604,11 +604,11 @@ pub fn create_pane(
     }
 
     {
-        let internals = internals.clone();
-        let wd = ws_wd.clone();
+        let pane_widget = outer.downgrade();
         new_term_btn.connect_clicked(move |_| {
-            let dir = wd.borrow().clone();
-            add_terminal_tab_inner(&internals, dir.as_deref(), None);
+            if let Some(pane_widget) = pane_widget.upgrade() {
+                add_terminal_tab_to_pane(&pane_widget.upcast());
+            }
         });
     }
     {
@@ -1821,8 +1821,15 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
 #[allow(dead_code)]
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
     if let Some(internals) = find_pane_internals(pane_widget) {
-        let dir = internals.working_directory.borrow().clone();
+        let dir = active_tab_working_directory(pane_widget)
+            .or_else(|| internals.working_directory.borrow().clone());
         add_terminal_tab_inner(&internals, dir.as_deref(), None);
+    }
+}
+
+pub fn add_terminal_tab_to_pane_in_directory(pane_widget: &gtk::Widget, directory: Option<&str>) {
+    if let Some(internals) = find_pane_internals(pane_widget) {
+        add_terminal_tab_inner(&internals, directory, None);
     }
 }
 
@@ -1989,6 +1996,11 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
         TabKind::Terminal { state } => state.cwd.borrow().clone(),
         TabKind::Browser { .. } | TabKind::Keybinds => None,
     }
+}
+
+pub fn active_tab_working_directory(pane_widget: &gtk::Widget) -> Option<String> {
+    let tab_id = active_tab_in_pane(pane_widget)?;
+    tab_working_directory(pane_widget, &tab_id)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
