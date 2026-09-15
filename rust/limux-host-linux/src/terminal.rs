@@ -234,6 +234,7 @@ pub struct TerminalHandle {
     clipboard_context_cell: Rc<Cell<*mut ClipboardContext>>,
     shutting_down: Rc<Cell<bool>>,
     gl_area: gtk::GLArea,
+    link_popover: gtk::Popover,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     callbacks: Rc<RefCell<TerminalCallbacks>>,
@@ -284,6 +285,13 @@ impl TerminalHandle {
                 }
             }
         }
+
+        // The hover preview is parented to the GL area so it can follow the
+        // terminal during reparenting. Permanent shutdown must detach it as
+        // well as hide it, otherwise GTK keeps a child attached while the
+        // GLArea is finalized.
+        self.link_popover.popdown();
+        self.link_popover.unparent();
 
         *self.callbacks.borrow_mut() = TerminalCallbacks::disconnected();
     }
@@ -1505,6 +1513,7 @@ pub fn create_terminal(
         clipboard_context_cell: clipboard_context_cell.clone(),
         shutting_down: shutting_down.clone(),
         gl_area: gl_area.clone(),
+        link_popover: link_popover.clone(),
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),
@@ -2877,6 +2886,19 @@ mod tests {
         crate::prepare_ghostty_runtime();
         gtk::init().expect("GTK display required");
         init_ghostty();
+
+        // Shutdown before realization must detach the preview too. This path
+        // has no surface entry, so cleanup cannot rely on SURFACE_MAP.
+        let unrealized = create_terminal(
+            Some("/tmp"),
+            TerminalOptions::default(),
+            TerminalCallbacks::disconnected(),
+        );
+        assert!(unrealized.handle.link_popover.parent().is_some());
+        unrealized.handle.shutdown();
+        assert!(unrealized.handle.link_popover.parent().is_none());
+        unrealized.handle.shutdown();
+
         let terminal = create_terminal(
             Some("/tmp"),
             TerminalOptions {
@@ -2896,6 +2918,7 @@ mod tests {
             .build();
         window.present();
         assert!(terminal.handle.surface_cell.borrow().is_some());
+        assert!(terminal.handle.link_popover.parent().is_some());
         let terminal_context = terminal.handle.gl_area.context().expect("terminal context");
         assert_eq!(terminal_context.api(), gtk::gdk::GLAPI::GL);
         terminal_context.make_current();
@@ -2921,6 +2944,7 @@ mod tests {
 
         assert_eq!(gtk::gdk::GLContext::current(), Some(terminal_context));
         assert!(terminal.handle.surface_cell.borrow().is_none());
+        assert!(terminal.handle.link_popover.parent().is_none());
         terminal.handle.shutdown(); // A second close must remain harmless.
         window.close();
 
