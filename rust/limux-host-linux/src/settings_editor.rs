@@ -307,6 +307,20 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     keep_workspace_open_row.set_activatable_widget(Some(&keep_workspace_open_switch));
     group.add(&keep_workspace_open_row);
 
+    let prompt_workspace_folder_row = adw::ActionRow::builder()
+        .title("Ask for folder on new workspace")
+        .subtitle("Prompt for a folder address when creating a new workspace")
+        .build();
+    prompt_workspace_folder_row.set_title_lines(1);
+    prompt_workspace_folder_row.set_subtitle_lines(2);
+    let prompt_workspace_folder_switch = gtk::Switch::new();
+    prompt_workspace_folder_switch
+        .set_active(input.config.borrow().workspace.prompt_for_folder_on_create);
+    prompt_workspace_folder_switch.set_valign(gtk::Align::Center);
+    prompt_workspace_folder_row.add_suffix(&prompt_workspace_folder_switch);
+    prompt_workspace_folder_row.set_activatable_widget(Some(&prompt_workspace_folder_switch));
+    group.add(&prompt_workspace_folder_row);
+
     let auto_copy_row = adw::ActionRow::builder()
         .title("Copy selection automatically")
         .subtitle("Copy selected terminal text to the regular clipboard")
@@ -486,6 +500,16 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             let keep_open = switch.is_active();
             apply_config_change(&config, &*on_changed, move |c| {
                 c.workspace.keep_open_after_last_terminal_closes = keep_open;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        prompt_workspace_folder_switch.connect_active_notify(move |switch| {
+            let prompt_for_folder = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.workspace.prompt_for_folder_on_create = prompt_for_folder;
             });
         });
     }

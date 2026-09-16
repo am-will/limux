@@ -5239,8 +5239,28 @@ fn install_workspace_row_interactions(
     }
 }
 
-fn add_workspace(state: &State, _working_directory: Option<&str>) {
-    show_workspace_path_dialog(state);
+fn add_workspace(state: &State, working_directory: Option<&str>) {
+    let prompt_for_folder = {
+        let s = state.borrow();
+        s.workspaces.is_empty() || s.config.borrow().workspace.prompt_for_folder_on_create
+    };
+    if prompt_for_folder {
+        show_workspace_path_dialog(state);
+        return;
+    }
+
+    let folder = working_directory
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let folder_path = folder.to_string_lossy().to_string();
+    let name = folder
+        .file_name()
+        .map(|segment| segment.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| folder_path.clone());
+    create_workspace_with_folder(state, &name, &folder_path);
 }
 
 fn active_window(state: &State) -> Option<gtk::Window> {

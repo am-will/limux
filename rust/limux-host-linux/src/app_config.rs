@@ -86,6 +86,7 @@ pub struct AppConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceConfig {
     pub keep_open_after_last_terminal_closes: bool,
+    pub prompt_for_folder_on_create: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -414,6 +415,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|workspace| workspace.get("keep_open_after_last_terminal_closes"))
         .and_then(Value::as_bool)
         .unwrap_or_default();
+    let prompt_for_folder_on_create = workspace
+        .and_then(|workspace| workspace.get("prompt_for_folder_on_create"))
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -478,6 +483,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         workspace: WorkspaceConfig {
             keep_open_after_last_terminal_closes,
+            prompt_for_folder_on_create,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -538,6 +544,9 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "keep_open_after_last_terminal_closes": config
                 .workspace
                 .keep_open_after_last_terminal_closes,
+            "prompt_for_folder_on_create": config
+                .workspace
+                .prompt_for_folder_on_create,
         }),
     );
     root.insert(
@@ -681,7 +690,8 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "hover_terminal_focus": false
         },
         "workspace": {
-            "keep_open_after_last_terminal_closes": false
+            "keep_open_after_last_terminal_closes": false,
+            "prompt_for_folder_on_create": false
         },
         "notifications": {
             "enabled": true,
