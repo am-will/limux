@@ -916,6 +916,51 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
     true
 }
 
+/// Realize a tab's content child in the stack during the startup eager-restore
+/// sweep without changing the logical active tab, stealing keyboard focus,
+/// clearing unread state, or triggering session saves.
+pub fn realize_tab_in_pane_quietly(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+    if internals.content_stack.child_by_name(tab_id).is_some() {
+        internals.content_stack.set_visible_child_name(tab_id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Every tab id in `pane_widget`, in tab-strip order.
+///
+/// The startup eager-restore sweep needs this because a background tab has no
+/// terminal surface yet and therefore cannot be discovered from the surface
+/// registry — only the tab state knows it exists.
+pub fn tab_ids_in_pane(pane_widget: &gtk::Widget) -> Vec<String> {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return Vec::new();
+    };
+    let ids = internals
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    ids
+}
+
+/// The currently active tab id in `pane_widget`, if any.
+///
+/// Captured before the sweep so the user's original tab selection can be put
+/// back afterwards; a warm-up that leaves a different tab focused is
+/// indistinguishable from the layout corruption it exists to prevent.
+pub fn active_tab_id_in_pane(pane_widget: &gtk::Widget) -> Option<String> {
+    let internals = find_pane_internals(pane_widget)?;
+    let active = internals.tab_state.borrow().active_tab.clone();
+    active
+}
+
 /// Set a custom title, or clear it when the title is empty.
 pub fn rename_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str, title: &str) -> bool {
     let Some(internals) = find_pane_internals(pane_widget) else {

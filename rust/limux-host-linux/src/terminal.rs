@@ -45,7 +45,12 @@ static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIG
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
 static GHOSTTY_WAKEUP: LazyLock<wakeup::Wakeup> = LazyLock::new(wakeup::Wakeup::default);
+static SUPPRESS_REALIZE_FOCUS: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
+
+pub fn set_suppress_realize_focus(suppress: bool) {
+    SUPPRESS_REALIZE_FOCUS.store(suppress, Ordering::Relaxed);
+}
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -1957,10 +1962,12 @@ pub fn create_terminal(
             display_realized.adopt_realized();
             *surface_cell.borrow_mut() = Some(surface);
 
+            let suppress_focus =
+                suppress_initial_focus || SUPPRESS_REALIZE_FOCUS.load(Ordering::Relaxed);
             unsafe {
-                ghostty_surface_set_focus(surface, !suppress_initial_focus || gl_area.has_focus());
+                ghostty_surface_set_focus(surface, !suppress_focus || gl_area.has_focus());
             }
-            if !suppress_initial_focus {
+            if !suppress_focus {
                 request_terminal_focus(gl_area, &had_focus);
             }
         });
