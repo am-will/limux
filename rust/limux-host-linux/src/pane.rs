@@ -286,6 +286,16 @@ pub struct PaneCallbacks {
 struct TerminalTabState {
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
+    /// The agent this tab was created/restored with.
+    ///
+    /// `snapshot_pane_state` previously always wrote `agent: None`, so the
+    /// agent binding on disk survived only as long as an external hook file
+    /// (`*-hook-sessions.json`) happened to describe the surface. Any tab
+    /// whose agent was started manually — or restored by an out-of-band
+    /// injector — was therefore serialized back to `"agent": null` on the
+    /// very first save after launch, permanently losing the session. Holding
+    /// the state here makes `session.json` self-sufficient.
+    agent: Rc<RefCell<Option<RestorableAgentState>>>,
 }
 
 #[derive(Clone)]
@@ -1682,6 +1692,9 @@ fn add_terminal_tab_inner(
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
+                    agent: Rc::new(RefCell::new(
+                        options.as_ref().and_then(|value| value.agent.clone()),
+                    )),
                 },
             },
         });
@@ -2097,7 +2110,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
             let content = match &entry.kind {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
-                    agent: None,
+                    agent: state.agent.borrow().clone(),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
