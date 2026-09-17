@@ -233,6 +233,16 @@ impl SplitTreeContainer {
         self.tree.borrow().is_leaf()
     }
 
+    /// All pane widgets in this workspace, left-to-right / top-to-bottom.
+    ///
+    /// Used by the startup eager-restore sweep, which must reach panes that
+    /// are nested inside splits and not just the leading pane.
+    pub(crate) fn panes(&self) -> Vec<gtk::Widget> {
+        let mut panes = Vec::new();
+        self.tree.borrow().collect_panes(&mut panes);
+        panes
+    }
+
     pub(crate) fn retire_panes(&self) {
         let mut panes = Vec::new();
         self.tree.borrow().collect_panes(&mut panes);

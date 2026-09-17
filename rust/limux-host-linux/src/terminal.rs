@@ -43,7 +43,12 @@ static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIG
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
 static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
+static SUPPRESS_REALIZE_FOCUS: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
+
+pub fn set_suppress_realize_focus(suppress: bool) {
+    SUPPRESS_REALIZE_FOCUS.store(suppress, Ordering::Relaxed);
+}
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -1918,12 +1923,14 @@ pub fn create_terminal(
             display_realized.adopt_realized();
             *surface_cell.borrow_mut() = Some(surface);
 
-            unsafe {
-                ghostty_surface_set_focus(surface, true);
-            }
+            if !SUPPRESS_REALIZE_FOCUS.load(Ordering::Relaxed) {
+                unsafe {
+                    ghostty_surface_set_focus(surface, true);
+                }
 
-            // Grab GTK focus so key events reach this widget.
-            request_terminal_focus(gl_area, &had_focus);
+                // Grab GTK focus so key events reach this widget.
+                request_terminal_focus(gl_area, &had_focus);
+            }
         });
         track_signal(&signal_handlers, &gl_area, handler);
     }
