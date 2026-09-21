@@ -314,3 +314,9 @@ The terminal rendering is handled entirely by Ghostty's embedded library (`libgh
 ## License
 
 MIT
+
+### SSH connections
+
+Use **Connect via SSH…** in the sidebar to open an SSH host in a new workspace.
+See [SSH workspace launch](docs/ssh.md) for configuration discovery, validation,
+and the scope of this first SSH slice.

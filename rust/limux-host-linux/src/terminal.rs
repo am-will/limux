@@ -74,6 +74,9 @@ const LINK_PREVIEW_CURSOR_Y_GAP: i32 = 14;
 
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
+    // Embedded Ghostty borrows config.command; keep its allocation alive until
+    // after ghostty_surface_free, just like the callback userdata below.
+    _startup_command: Option<CString>,
     identity: SurfaceIdentity,
     gl_area: gtk::GLArea,
     toast_overlay: gtk::Overlay,
@@ -1737,6 +1740,7 @@ pub fn create_terminal(
                 map.borrow_mut().insert(
                     surface_key,
                     SurfaceEntry {
+                        _startup_command: c_startup_command,
                         identity: surface_identity,
                         gl_area: gl.clone(),
                         toast_overlay: overlay_for_map.clone(),

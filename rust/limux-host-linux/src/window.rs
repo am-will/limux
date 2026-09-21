@@ -2033,6 +2033,9 @@ pub fn build_window(app: &adw::Application) {
     sidebar.append(&sidebar_drag_area);
     sidebar.append(&sidebar_header_handle);
     sidebar.append(&sidebar_scroll);
+    let ssh_button = gtk::Button::with_label("Connect via SSH…");
+    ssh_button.set_tooltip_text(Some("Open an SSH connection in a new workspace"));
+    sidebar.append(&ssh_button);
 
     let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
 
@@ -2090,6 +2093,17 @@ pub fn build_window(app: &adw::Application) {
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
+
+    {
+        let state = state.clone();
+        ssh_button.connect_clicked(move |_| {
+            let state = state.clone();
+            let parent = state.borrow().window.clone();
+            crate::ssh_dialog::show(&parent, move |target| {
+                connect_ssh_target(&state, target);
+            });
+        });
+    }
 
     install_sidebar_resize(&state, &main_split, &sidebar, &sidebar_shell);
 
@@ -4720,6 +4734,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             initial_state: None,
             skip_default_tab: true,
             suppress_initial_autostart: false,
+            initial_command: None,
         },
     );
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
@@ -6067,7 +6082,29 @@ fn handle_control_command(state: &State, command: ControlCommand) {
     }
 }
 
+fn connect_ssh_target(state: &State, target: crate::ssh_hosts::SshTarget) {
+    let workspace = WorkspaceState {
+        id: None,
+        name: format!("SSH: {}", target.destination()),
+        favorite: false,
+        cwd: None,
+        folder_path: None,
+        autostart_command: None,
+        layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+    };
+    add_workspace_with_initial_command(state, &workspace, Some(target.command()));
+    request_session_save(state);
+}
+
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
+    add_workspace_with_initial_command(state, workspace, None);
+}
+
+fn add_workspace_with_initial_command(
+    state: &State,
+    workspace: &WorkspaceState,
+    initial_command: Option<String>,
+) {
     let shortcuts = {
         let s = state.borrow();
         s.shortcuts.clone()
@@ -6092,14 +6129,35 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         .as_deref()
         .or(workspace.cwd.as_deref());
     let autostart_command = Rc::new(RefCell::new(workspace.autostart_command.clone()));
-    let (root, split_container) = build_workspace_root(
-        state,
-        &shortcuts,
-        &id,
-        working_dir,
-        &autostart_command,
-        &workspace.layout,
-    );
+    let (root, split_container) = if let Some(command) = initial_command {
+        let pane = create_pane_for_workspace(
+            state,
+            &shortcuts,
+            &id,
+            working_dir,
+            autostart_command.clone(),
+            PaneCreationOptions {
+                initial_state: None,
+                skip_default_tab: false,
+                suppress_initial_autostart: true,
+                initial_command: Some(command),
+            },
+        );
+        let container = SplitTreeContainer::new(state, pane.upcast());
+        (
+            container.widget().clone().upcast::<gtk::Widget>(),
+            container,
+        )
+    } else {
+        build_workspace_root(
+            state,
+            &shortcuts,
+            &id,
+            working_dir,
+            &autostart_command,
+            &workspace.layout,
+        )
+    };
     stack.add_named(&root, Some(&stack_name));
 
     let show_workspace_path = state
@@ -6193,6 +6251,7 @@ pub(crate) struct PaneCreationOptions<'a> {
     pub(crate) initial_state: Option<&'a PaneState>,
     pub(crate) skip_default_tab: bool,
     pub(crate) suppress_initial_autostart: bool,
+    pub(crate) initial_command: Option<String>,
 }
 
 pub(crate) fn create_pane_for_workspace(
@@ -6231,6 +6290,7 @@ pub(crate) fn create_pane_for_workspace(
         workspace_id: ws_id.to_string(),
         autostart_command,
         suppress_next_autostart: Cell::new(options.suppress_initial_autostart),
+        initial_command: RefCell::new(options.initial_command),
         on_split: Box::new(move |pane_widget, orientation| {
             split_pane(
                 &state_for_split,
@@ -6789,6 +6849,7 @@ fn split_pane(
             initial_state: options.initial_state.as_ref(),
             skip_default_tab: options.skip_default_tab || options.inherit_active_directory,
             suppress_initial_autostart: options.suppress_initial_autostart,
+            initial_command: None,
         },
     );
     if options.inherit_active_directory {
@@ -8943,3 +9004,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ssh_launch_tests.rs"]
+mod ssh_launch_tests;
