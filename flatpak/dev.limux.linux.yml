@@ -1,0 +1,95 @@
+# Flatpak manifest for Limux — GPU-accelerated terminal workspace manager.
+#
+# Build layout mirrors the source AUR recipe (PKGBUILD-source.template) but
+# rooted at /app instead of /usr. The GTK4 CLI dispatcher installs as
+# /app/bin/limux, the GTK host as /app/libexec/limux/limux-host, and the Zig
+# libghostty engine as /app/lib/limux/libghostty-internal.so. limux-host-linux
+# resolves Ghostty resources relative to the executable (see
+# rust/limux-host-linux/src/main.rs set_ghostty_runtime_env_for_exe), so the
+# /app/share/limux tree below is found without hardcoded /usr paths.
+#
+# See flatpak/README.md for the two open items before this is Flathub-ready:
+# offline vendoring of Ghostty's own Zig build dependencies, and a build test
+# on a machine with a display.
+app-id: dev.limux.linux
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.ziglang
+command: limux
+
+finish-args:
+  # Native Wayland with an X11 fallback for the GTK4/libadwaita shell.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # Ghostty renders terminals with OpenGL; the GPU node is required.
+  - --device=dri
+  # Terminals run arbitrary user commands and the built-in browser (WebKitGTK)
+  # needs the network; both are core features.
+  - --share=network
+  # WebKitGTK spawns sandboxed helper processes that reach the host through the
+  # XDG portals.
+  - --talk-name=org.freedesktop.portal.Documents
+  - --talk-name=org.freedesktop.portal.Flatpak
+  # A terminal workspace manager is only useful with access to the user's
+  # projects. --filesystem=host is deliberately broad: a terminal that runs
+  # arbitrary shell commands cannot meaningfully be confined to a subtree.
+  - --filesystem=host
+  - --talk-name=org.freedesktop.Notifications
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/ziglang
+  env:
+    CARGO_HOME: /run/build/limux/cargo
+    # Ghostty's zig build writes its package cache here; see README for the
+    # offline-vendoring note.
+    ZIG_GLOBAL_CACHE_DIR: /run/build/limux/zig-cache
+
+modules:
+  - name: limux
+    buildsystem: simple
+    build-options:
+      env:
+        # Override the rpath baked in by .cargo/config.toml (/usr/local/lib/limux)
+        # so the host binary finds libghostty-internal.so under /app, and keep
+        # --export-dynamic which the Ghostty FFI symbol lookup relies on.
+        RUSTFLAGS: -C link-arg=-Wl,-rpath,/app/lib/limux -C link-arg=-Wl,--export-dynamic
+    build-commands:
+      # 1. Build the Zig libghostty engine (ReleaseFast, baseline CPU, no
+      #    gtk4-layer-shell), exactly as the AUR recipe does.
+      - cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline -fno-sys=gtk4-layer-shell
+      # 2. Build the Rust workspace fully offline against the vendored crates.
+      - cargo build --release --locked --offline
+      # 3. Install, mirroring package() from PKGBUILD-source.template at /app.
+      - install -Dm755 target/release/limux-cli /app/bin/limux
+      - install -Dm755 target/release/limux /app/libexec/limux/limux-host
+      - install -Dm644 ghostty/zig-out/lib/libghostty-internal.so /app/lib/limux/libghostty-internal.so
+      - install -dm755 /app/share/limux/ghostty
+      - cp -a ghostty/zig-out/share/ghostty/. /app/share/limux/ghostty/
+      - install -Dm644 ghostty/zig-out/share/terminfo/x/xterm-ghostty /app/share/limux/terminfo/x/xterm-ghostty
+      - install -Dm644 rust/limux-host-linux/dev.limux.linux.desktop /app/share/applications/dev.limux.linux.desktop
+      # Flathub requires the icon to be named after the app-id; upstream ships
+      # Icon=limux, so point it at the app-id-named icon installed below.
+      - desktop-file-edit --set-icon=dev.limux.linux /app/share/applications/dev.limux.linux.desktop
+      - install -Dm644 rust/limux-host-linux/dev.limux.linux.metainfo.xml /app/share/metainfo/dev.limux.linux.metainfo.xml
+      - |
+        for size in 16 32 128 256 512; do
+          install -Dm644 "rust/limux-host-linux/icons/app/$size.png" \
+            "/app/share/icons/hicolor/${size}x${size}/apps/dev.limux.linux.png"
+        done
+      - install -Dm644 LICENSE /app/share/licenses/limux/LICENSE
+    sources:
+      - type: git
+        url: https://github.com/am-will/limux.git
+        tag: v0.1.30
+        commit: f8727a56237d055cad0c14a3eff3fcb986e03093
+      - type: git
+        url: https://github.com/bvolpato/ghostty.git
+        commit: 1a89efa4d75e04702c375d32edf6bbdc5328fcd2
+        dest: ghostty
+      # Offline Rust crate sources, generated from Cargo.lock with
+      # flatpak-cargo-generator (see flatpak/README.md).
+      - cargo-sources.json
