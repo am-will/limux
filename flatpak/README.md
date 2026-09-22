@@ -22,9 +22,13 @@ source AUR package (`PKGBUILD-source.template`) but rooted at `/app`.
 ## Building
 
 ```bash
-flatpak install -y flathub org.gnome.Platform//48 org.gnome.Sdk//48 \
-  org.freedesktop.Sdk.Extension.rust-stable//24.08 \
-  org.freedesktop.Sdk.Extension.ziglang//24.08
+flatpak install -y flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
+  org.freedesktop.Sdk.Extension.rust-stable//25.08 \
+  org.freedesktop.Sdk.Extension.ziglang//25.08
+# Until Ghostty's Zig deps are vendored (open item 1), the zig build step needs
+# the network, so add: --install-deps-from=flathub is not enough — build the
+# `limux` module with a `--share=network` build-arg (or set it in the manifest
+# for a local build).
 flatpak-builder --user --install --force-clean build-dir flatpak/dev.limux.linux.yml
 flatpak run dev.limux.linux
 ```
@@ -59,20 +63,25 @@ executable (`set_ghostty_runtime_env_for_exe` in
 
 ## Verification status
 
-Run through `org.flatpak.Builder` 1.4.9 (GNOME 48 / freedesktop 24.08 SDK,
-`rust-stable` and `ziglang` 24.08 extensions — the latter ships Zig 0.16.0,
-which is what Ghostty requires):
+Built end to end with `org.flatpak.Builder` 1.4.9 on **GNOME 49** (freedesktop
+25.08 SDK; `ziglang` ships Zig 0.16.0 as Ghostty needs, `rust-stable` ships
+rustc 1.98) and launched on a Wayland session:
 
 - All sources resolve: the two git sources fetch and `cargo-sources.json`
   vendors all 147 crates offline.
 - `disable-submodules: true` on the limux source is required — without it the
   repo's `ghostty` submodule and the pinned `ghostty` git source both claim the
-  same directory and the build dies on a `.git` collision. (Fixed here.)
-- The build then reaches the `zig build` step for libghostty.
+  same directory and the build dies on a `.git` collision.
+- **GNOME 49 is the minimum runtime.** The GTK4 crates (`gdk4` 0.11,
+  `cairo-rs`/`gdk-pixbuf` 0.22) require rustc ≥ 1.92; GNOME 48's `rust-stable`
+  extension only ships 1.89, so the Rust build fails there.
+- libghostty (Zig) and the Rust workspace both compile; the app installs and
+  runs — `flatpak run dev.limux.linux` maps a GTK window titled
+  "Limux v0.1.30" and initialises its control socket.
 
-Not yet completed end to end: the full compile and GUI launch were not finished
-in the environment used (the disk filled before the Rust link stage). The
-remaining gaps are below.
+One caveat on the verifying build: it enabled network for the module
+(`--share=network`) so the `zig build` step could fetch Ghostty's Zig packages.
+That is not Flathub-compliant — see open item 1.
 
 ## Open items before this is Flathub-ready
 
