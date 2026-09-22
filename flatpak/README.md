@@ -55,8 +55,7 @@ executable (`set_ghostty_runtime_env_for_exe` in
 - `--device=dri` — Ghostty renders terminals with OpenGL.
 - `--share=network` — terminals run networked commands and the built-in browser
   (WebKitGTK) needs the network.
-- `--talk-name=org.freedesktop.portal.*` — WebKitGTK's sandboxed helper
-  processes reach the host through the XDG portals.
+- `--talk-name=org.freedesktop.Notifications` — desktop notifications.
 - `--filesystem=host` — deliberately broad: a terminal that runs arbitrary shell
   commands cannot be meaningfully confined to a subtree. Narrow it if a future
   design sandboxes the shells.
@@ -92,7 +91,8 @@ That is not Flathub-compliant — see open item 1.
    `ZIG_GLOBAL_CACHE_DIR` and shipped as an additional source, or expressed as
    `type: archive` sources). Until then, build locally with a network-enabled
    build (`--share=network` build-arg on the module).
-2. **Finish an end-to-end build + GUI launch.** Structure, source resolution,
-   the submodule fix, and crate checksums are validated; a full compile and a
-   `flatpak run dev.limux.linux` on a Wayland/X11 session still need to confirm
-   the runtime resource resolution and WebKitGTK portal wiring.
+2. **`--filesystem=host` scope** and the app-id/domain (`limux.dev`) that
+   metainfo/lint expect are maintainer calls — see the PR description.
+3. **metainfo screenshots + release entries.** `flatpak-builder-lint` wants at
+   least one `<screenshot>` and a `<releases>` entry in the metainfo before
+   Flathub submission; upstream owns that file.

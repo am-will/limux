@@ -33,10 +33,6 @@ finish-args:
   # Terminals run arbitrary user commands and the built-in browser (WebKitGTK)
   # needs the network; both are core features.
   - --share=network
-  # WebKitGTK spawns sandboxed helper processes that reach the host through the
-  # XDG portals.
-  - --talk-name=org.freedesktop.portal.Documents
-  - --talk-name=org.freedesktop.portal.Flatpak
   # A terminal workspace manager is only useful with access to the user's
   # projects. --filesystem=host is deliberately broad: a terminal that runs
   # arbitrary shell commands cannot meaningfully be confined to a subtree.
