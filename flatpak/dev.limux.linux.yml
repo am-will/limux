@@ -13,7 +13,10 @@
 # on a machine with a display.
 app-id: dev.limux.linux
 runtime: org.gnome.Platform
-runtime-version: '48'
+# GNOME 49 (freedesktop 25.08) is the minimum: its rust-stable extension ships
+# rustc 1.98, and the GTK4 Rust crates (gdk4 0.11 / cairo-rs 0.22 / gdk-pixbuf
+# 0.22) require rustc >= 1.92, which the 24.08 (GNOME 48) SDK does not provide.
+runtime-version: '49'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
