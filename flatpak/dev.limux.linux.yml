@@ -86,6 +86,9 @@ modules:
         url: https://github.com/am-will/limux.git
         tag: v0.1.30
         commit: f8727a56237d055cad0c14a3eff3fcb986e03093
+        # The repo declares `ghostty` as a submodule; skip it so the pinned
+        # ghostty source below owns that directory without a .git collision.
+        disable-submodules: true
       - type: git
         url: https://github.com/bvolpato/ghostty.git
         commit: 1a89efa4d75e04702c375d32edf6bbdc5328fcd2

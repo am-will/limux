@@ -57,6 +57,23 @@ executable (`set_ghostty_runtime_env_for_exe` in
   commands cannot be meaningfully confined to a subtree. Narrow it if a future
   design sandboxes the shells.
 
+## Verification status
+
+Run through `org.flatpak.Builder` 1.4.9 (GNOME 48 / freedesktop 24.08 SDK,
+`rust-stable` and `ziglang` 24.08 extensions — the latter ships Zig 0.16.0,
+which is what Ghostty requires):
+
+- All sources resolve: the two git sources fetch and `cargo-sources.json`
+  vendors all 147 crates offline.
+- `disable-submodules: true` on the limux source is required — without it the
+  repo's `ghostty` submodule and the pinned `ghostty` git source both claim the
+  same directory and the build dies on a `.git` collision. (Fixed here.)
+- The build then reaches the `zig build` step for libghostty.
+
+Not yet completed end to end: the full compile and GUI launch were not finished
+in the environment used (the disk filled before the Rust link stage). The
+remaining gaps are below.
+
 ## Open items before this is Flathub-ready
 
 1. **Offline vendoring of Ghostty's Zig build dependencies.** The Rust side is
@@ -66,8 +83,7 @@ executable (`set_ghostty_runtime_env_for_exe` in
    `ZIG_GLOBAL_CACHE_DIR` and shipped as an additional source, or expressed as
    `type: archive` sources). Until then, build locally with a network-enabled
    build (`--share=network` build-arg on the module).
-2. **Build test on a machine with a display.** The manifest's structure,
-   install layout, and crate checksums are validated, but it has not yet been
-   run through `flatpak-builder` end to end or launched as a GUI. Needs a
-   Wayland/X11 session to confirm the runtime resource resolution and WebKitGTK
-   portal wiring.
+2. **Finish an end-to-end build + GUI launch.** Structure, source resolution,
+   the submodule fix, and crate checksums are validated; a full compile and a
+   `flatpak run dev.limux.linux` on a Wayland/X11 session still need to confirm
+   the runtime resource resolution and WebKitGTK portal wiring.
