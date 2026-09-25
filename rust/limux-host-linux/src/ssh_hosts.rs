@@ -125,7 +125,9 @@ fn config_words(value: &str) -> Option<Vec<String>> {
             match c {
                 '\\' => escaped = true,
                 '"' => quoted = !quoted,
-                '#' if !quoted => break,
+                // OpenSSH treats an embedded '#' as part of the alias.
+                // Preserve it so validation skips the whole unsupported token.
+                '#' if !quoted && word.is_empty() => break,
                 c if c.is_whitespace() && !quoted => {
                     if !word.is_empty() {
                         words.push(std::mem::take(&mut word));
@@ -158,6 +160,36 @@ pub fn load_hosts() -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_comments_start_only_at_token_boundaries() {
+        for (input, expected) in [
+            ("foo#bar other # comment", vec!["foo#bar", "other"]),
+            ("foo#bar\t# comment", vec!["foo#bar"]),
+            ("# comment", vec![]),
+            ("foo # comment", vec!["foo"]),
+            (r#""foo#bar" other"#, vec!["foo#bar", "other"]),
+        ] {
+            assert_eq!(
+                config_words(input),
+                Some(expected.into_iter().map(str::to_string).collect()),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_hash_aliases_without_offering_a_different_destination() {
+        for directive in [
+            "Host foo#bar other",
+            "Host=foo#bar other",
+            r#"Host "foo#bar" other"#,
+        ] {
+            let config = format!("{directive}\n  HostName example.invalid\nHost good # comment\n");
+            assert_eq!(parse_ssh_config(&config), ["other", "good"], "{directive}");
+        }
+        assert!(SshTarget::parse("foo#bar", "").is_err());
+    }
 
     #[test]
     fn discovers_all_literal_aliases_without_resolving_options() {
