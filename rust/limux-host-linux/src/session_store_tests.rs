@@ -575,3 +575,26 @@ fn load_gives_fresh_ids_to_duplicate_tab_ids_from_older_sessions() {
     let (_store, reloaded) = SessionStore::load_from_dir(dir.path()).unwrap();
     assert_eq!(reloaded.state, loaded.state);
 }
+
+#[test]
+fn load_persists_ids_minted_for_empty_panes() {
+    // Normalization gives an empty pane (only a hand-edited file has one) a fresh tab
+    // id; unless that id reaches the disk, every later read mints another one and each
+    // save looks like a remote edit.
+    let dir = tempdir().unwrap();
+    let mut state = initial(dir.path());
+    state.workspaces[1].layout = LayoutNodeState::Pane(PaneState {
+        pane_id: Some(2),
+        active_tab_id: None,
+        tabs: Vec::new(),
+    });
+    fs::write(
+        layout_state::canonical_session_path_in(dir.path()),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+
+    let (_store, loaded) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+    assert_eq!(disk(dir.path()), loaded.state);
+}

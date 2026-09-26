@@ -706,23 +706,22 @@ pub(crate) fn dedup_tab_ids(state: &mut AppSessionState) -> bool {
         match layout {
             LayoutNodeState::Pane(pane) => {
                 let mut changed = false;
+                let mut active_kept = false;
                 let mut active_renamed_to = None;
                 for tab in &mut pane.tabs {
+                    let active = pane.active_tab_id.as_deref() == Some(tab.id.as_str());
                     if seen.insert(tab.id.clone()) {
+                        active_kept |= active;
                         continue;
                     }
                     let id = new_tab_id();
                     seen.insert(id.clone());
-                    if pane.active_tab_id.as_deref() == Some(tab.id.as_str()) {
-                        active_renamed_to.get_or_insert_with(|| id.clone());
+                    if active && active_renamed_to.is_none() {
+                        active_renamed_to = Some(id.clone());
                     }
                     tab.id = id;
                     changed = true;
                 }
-                let active_kept = pane
-                    .tabs
-                    .iter()
-                    .any(|tab| pane.active_tab_id.as_deref() == Some(tab.id.as_str()));
                 if let Some(renamed) = active_renamed_to.filter(|_| !active_kept) {
                     pane.active_tab_id = Some(renamed);
                 }
