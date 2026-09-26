@@ -163,6 +163,7 @@ pub fn send_committed_text(surface: ghostty_surface_t, text: &str) {
         text: c_text.as_ptr(),
         unshifted_codepoint: 0,
         composing: false,
+        key: GHOSTTY_KEY_UNIDENTIFIED,
     };
 
     unsafe {
