@@ -1,12 +1,12 @@
 <svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+  <!-- Filled outlines only: GTK 4.22+ fills every shape of a symbolic icon, so strokes render as solid disks. -->
   <!-- outer circle -->
-  <circle cx="8" cy="8" r="6.5" fill="none" stroke="#bebebe" stroke-width="1.2"/>
-  <!-- vertical meridian (ellipse for 3D look) -->
-  <ellipse cx="8" cy="8" rx="3" ry="6.5" fill="none" stroke="#bebebe" stroke-width="0.9"/>
-  <!-- horizontal equator -->
-  <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="#bebebe" stroke-width="0.9"/>
+  <path fill="#bebebe" fill-rule="evenodd" d="M8 0.9A7.1 7.1 0 1 1 8 15.1A7.1 7.1 0 1 1 8 0.9ZM8 2.1A5.9 5.9 0 1 0 8 13.9A5.9 5.9 0 1 0 8 2.1Z"/>
+  <!-- meridian -->
+  <path fill="#bebebe" fill-rule="evenodd" d="M8 1.05A3.45 6.95 0 1 1 8 14.95A3.45 6.95 0 1 1 8 1.05ZM8 1.95A2.55 6.05 0 1 0 8 14.05A2.55 6.05 0 1 0 8 1.95Z"/>
+  <!-- equator -->
+  <path fill="#bebebe" d="M1.5 7.55H14.5V8.45H1.5Z"/>
   <!-- latitude lines -->
-  <ellipse cx="8" cy="5" rx="5.5" ry="0" fill="none" stroke="#bebebe" stroke-width="0"/>
-  <path d="M3 5.2 Q8 3.5 13 5.2" fill="none" stroke="#bebebe" stroke-width="0.7"/>
-  <path d="M3 10.8 Q8 12.5 13 10.8" fill="none" stroke="#bebebe" stroke-width="0.7"/>
+  <path fill="#bebebe" d="M3 4.85Q8 3.15 13 4.85V5.55Q8 3.85 3 5.55Z"/>
+  <path fill="#bebebe" d="M3 10.45Q8 12.15 13 10.45V11.15Q8 12.85 3 11.15Z"/>
 </svg>
