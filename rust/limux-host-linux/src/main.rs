@@ -11,6 +11,8 @@ mod session_store;
 mod settings_editor;
 mod shortcut_config;
 mod split_tree;
+mod ssh_dialog;
+mod ssh_hosts;
 mod terminal;
 mod window;
 

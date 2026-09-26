@@ -240,6 +240,8 @@ pub struct PaneCallbacks {
     pub workspace_id: String,
     pub autostart_command: Rc<RefCell<Option<String>>>,
     pub suppress_next_autostart: Cell<bool>,
+    /// Consumed by the first terminal; never serialized or inherited.
+    pub initial_command: RefCell<Option<String>>,
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneBellCallback>,
@@ -1527,7 +1529,12 @@ fn add_terminal_tab_inner(
     }
     let suppress_autostart = internals.callbacks.suppress_next_autostart.replace(false);
     let (startup_command, workspace_autostart_command) = select_terminal_commands(
-        restored_agent_command,
+        internals
+            .callbacks
+            .initial_command
+            .borrow_mut()
+            .take()
+            .or(restored_agent_command),
         internals.callbacks.autostart_command.borrow().clone(),
         suppress_autostart,
     );

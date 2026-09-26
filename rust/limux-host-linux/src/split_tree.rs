@@ -670,6 +670,7 @@ pub(crate) fn build_split_node_from_layout(
                     initial_state: Some(pane_state),
                     skip_default_tab: false,
                     suppress_initial_autostart: false,
+                    initial_command: None,
                 },
             );
             SplitNode::Leaf {
