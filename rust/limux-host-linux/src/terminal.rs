@@ -2638,6 +2638,7 @@ fn translate_key_event(
         text: ptr::null(),
         unshifted_codepoint: unshifted,
         composing: false,
+        key: ghostty_key_for_keyval(keyval),
     }
 }
 
@@ -2645,23 +2646,53 @@ fn ghostty_keycode_with_keyval_remap(keyval: gtk::gdk::Key, keycode: u32) -> u32
     const XKB_KEYCODE_ESCAPE: u32 = 9;
     const XKB_KEYCODE_CAPS_LOCK: u32 = 66;
 
-    // Embedded Ghostty derives its key from the XKB keycode and cannot see GTK's
-    // translated keyval. With Num Lock off, keypad 1 is KP_End but its physical
-    // keycode still resolves to Numpad1. Forward the navigation key instead.
     match keyval {
         gtk::gdk::Key::Escape => XKB_KEYCODE_ESCAPE,
         gtk::gdk::Key::Caps_Lock => XKB_KEYCODE_CAPS_LOCK,
-        gtk::gdk::Key::KP_Home => 110,
-        gtk::gdk::Key::KP_Up => 111,
-        gtk::gdk::Key::KP_Page_Up => 112,
-        gtk::gdk::Key::KP_Left => 113,
-        gtk::gdk::Key::KP_Right => 114,
-        gtk::gdk::Key::KP_End => 115,
-        gtk::gdk::Key::KP_Down => 116,
-        gtk::gdk::Key::KP_Page_Down => 117,
-        gtk::gdk::Key::KP_Insert => 118,
-        gtk::gdk::Key::KP_Delete => 119,
         _ => keycode,
+    }
+}
+
+/// Keypad keyvals as Ghostty keys, matching Ghostty's GTK apprt.
+///
+/// Embedded Ghostty derives its key from the XKB keycode, so with Num Lock off
+/// keypad 1 (`KP_End`) would still resolve to `numpad_1`. Passing the keyval's
+/// key keeps keypad identity (`numpad_end`) for `kp_*` keybinds and Kitty
+/// keyboard sequences while still producing navigation.
+fn ghostty_key_for_keyval(keyval: gtk::gdk::Key) -> c_int {
+    use gtk::gdk::Key;
+
+    match keyval {
+        Key::KP_0 => GHOSTTY_KEY_NUMPAD_0,
+        Key::KP_1 => GHOSTTY_KEY_NUMPAD_1,
+        Key::KP_2 => GHOSTTY_KEY_NUMPAD_2,
+        Key::KP_3 => GHOSTTY_KEY_NUMPAD_3,
+        Key::KP_4 => GHOSTTY_KEY_NUMPAD_4,
+        Key::KP_5 => GHOSTTY_KEY_NUMPAD_5,
+        Key::KP_6 => GHOSTTY_KEY_NUMPAD_6,
+        Key::KP_7 => GHOSTTY_KEY_NUMPAD_7,
+        Key::KP_8 => GHOSTTY_KEY_NUMPAD_8,
+        Key::KP_9 => GHOSTTY_KEY_NUMPAD_9,
+        Key::KP_Decimal => GHOSTTY_KEY_NUMPAD_DECIMAL,
+        Key::KP_Divide => GHOSTTY_KEY_NUMPAD_DIVIDE,
+        Key::KP_Multiply => GHOSTTY_KEY_NUMPAD_MULTIPLY,
+        Key::KP_Subtract => GHOSTTY_KEY_NUMPAD_SUBTRACT,
+        Key::KP_Add => GHOSTTY_KEY_NUMPAD_ADD,
+        Key::KP_Enter => GHOSTTY_KEY_NUMPAD_ENTER,
+        Key::KP_Equal => GHOSTTY_KEY_NUMPAD_EQUAL,
+        Key::KP_Separator => GHOSTTY_KEY_NUMPAD_SEPARATOR,
+        Key::KP_Left => GHOSTTY_KEY_NUMPAD_LEFT,
+        Key::KP_Right => GHOSTTY_KEY_NUMPAD_RIGHT,
+        Key::KP_Up => GHOSTTY_KEY_NUMPAD_UP,
+        Key::KP_Down => GHOSTTY_KEY_NUMPAD_DOWN,
+        Key::KP_Page_Up => GHOSTTY_KEY_NUMPAD_PAGE_UP,
+        Key::KP_Page_Down => GHOSTTY_KEY_NUMPAD_PAGE_DOWN,
+        Key::KP_Home => GHOSTTY_KEY_NUMPAD_HOME,
+        Key::KP_End => GHOSTTY_KEY_NUMPAD_END,
+        Key::KP_Insert => GHOSTTY_KEY_NUMPAD_INSERT,
+        Key::KP_Delete => GHOSTTY_KEY_NUMPAD_DELETE,
+        Key::KP_Begin => GHOSTTY_KEY_NUMPAD_BEGIN,
+        _ => GHOSTTY_KEY_UNIDENTIFIED,
     }
 }
 
@@ -3237,19 +3268,24 @@ mod tests {
     }
 
     #[test]
-    fn keypad_navigation_follows_num_lock_keyval() {
+    fn keypad_navigation_keeps_keypad_identity() {
         let modifiers = gtk::gdk::ModifierType::empty();
-        for (keyval, physical, navigation) in [
-            (gtk::gdk::Key::KP_Home, 79, 110),
-            (gtk::gdk::Key::KP_Up, 80, 111),
-            (gtk::gdk::Key::KP_Page_Up, 81, 112),
-            (gtk::gdk::Key::KP_Left, 83, 113),
-            (gtk::gdk::Key::KP_Right, 85, 114),
-            (gtk::gdk::Key::KP_End, 87, 115),
-            (gtk::gdk::Key::KP_Down, 88, 116),
-            (gtk::gdk::Key::KP_Page_Down, 89, 117),
-            (gtk::gdk::Key::KP_Insert, 90, 118),
-            (gtk::gdk::Key::KP_Delete, 91, 119),
+        for (keyval, physical, key) in [
+            (gtk::gdk::Key::KP_Home, 79, GHOSTTY_KEY_NUMPAD_HOME),
+            (gtk::gdk::Key::KP_Up, 80, GHOSTTY_KEY_NUMPAD_UP),
+            (gtk::gdk::Key::KP_Page_Up, 81, GHOSTTY_KEY_NUMPAD_PAGE_UP),
+            (gtk::gdk::Key::KP_Left, 83, GHOSTTY_KEY_NUMPAD_LEFT),
+            (gtk::gdk::Key::KP_Begin, 84, GHOSTTY_KEY_NUMPAD_BEGIN),
+            (gtk::gdk::Key::KP_Right, 85, GHOSTTY_KEY_NUMPAD_RIGHT),
+            (gtk::gdk::Key::KP_End, 87, GHOSTTY_KEY_NUMPAD_END),
+            (gtk::gdk::Key::KP_Down, 88, GHOSTTY_KEY_NUMPAD_DOWN),
+            (
+                gtk::gdk::Key::KP_Page_Down,
+                89,
+                GHOSTTY_KEY_NUMPAD_PAGE_DOWN,
+            ),
+            (gtk::gdk::Key::KP_Insert, 90, GHOSTTY_KEY_NUMPAD_INSERT),
+            (gtk::gdk::Key::KP_Delete, 91, GHOSTTY_KEY_NUMPAD_DELETE),
         ] {
             let event = translate_key_event(
                 GHOSTTY_ACTION_PRESS,
@@ -3259,7 +3295,8 @@ mod tests {
                 physical,
                 modifiers,
             );
-            assert_eq!(event.keycode, navigation, "{keyval:?}");
+            assert_eq!(event.keycode, physical, "{keyval:?}");
+            assert_eq!(event.key, key, "{keyval:?}");
         }
 
         let digit = translate_key_event(
@@ -3271,6 +3308,18 @@ mod tests {
             modifiers,
         );
         assert_eq!(digit.keycode, 87);
+        assert_eq!(digit.key, GHOSTTY_KEY_NUMPAD_1);
+
+        let regular_end = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            gtk::gdk::Key::End,
+            115,
+            modifiers,
+        );
+        assert_eq!(regular_end.keycode, 115);
+        assert_eq!(regular_end.key, GHOSTTY_KEY_UNIDENTIFIED);
     }
 
     #[test]

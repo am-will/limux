@@ -224,6 +224,47 @@ pub const GHOSTTY_KEY_ARROW_DOWN: c_int = 75;
 pub const GHOSTTY_KEY_ARROW_LEFT: c_int = 76;
 pub const GHOSTTY_KEY_ARROW_RIGHT: c_int = 77;
 pub const GHOSTTY_KEY_ARROW_UP: c_int = 78;
+// Numpad Section
+pub const GHOSTTY_KEY_NUMPAD_0: c_int = 80;
+pub const GHOSTTY_KEY_NUMPAD_1: c_int = 81;
+pub const GHOSTTY_KEY_NUMPAD_2: c_int = 82;
+pub const GHOSTTY_KEY_NUMPAD_3: c_int = 83;
+pub const GHOSTTY_KEY_NUMPAD_4: c_int = 84;
+pub const GHOSTTY_KEY_NUMPAD_5: c_int = 85;
+pub const GHOSTTY_KEY_NUMPAD_6: c_int = 86;
+pub const GHOSTTY_KEY_NUMPAD_7: c_int = 87;
+pub const GHOSTTY_KEY_NUMPAD_8: c_int = 88;
+pub const GHOSTTY_KEY_NUMPAD_9: c_int = 89;
+pub const GHOSTTY_KEY_NUMPAD_ADD: c_int = 90;
+pub const GHOSTTY_KEY_NUMPAD_BACKSPACE: c_int = 91;
+pub const GHOSTTY_KEY_NUMPAD_CLEAR: c_int = 92;
+pub const GHOSTTY_KEY_NUMPAD_CLEAR_ENTRY: c_int = 93;
+pub const GHOSTTY_KEY_NUMPAD_COMMA: c_int = 94;
+pub const GHOSTTY_KEY_NUMPAD_DECIMAL: c_int = 95;
+pub const GHOSTTY_KEY_NUMPAD_DIVIDE: c_int = 96;
+pub const GHOSTTY_KEY_NUMPAD_ENTER: c_int = 97;
+pub const GHOSTTY_KEY_NUMPAD_EQUAL: c_int = 98;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_ADD: c_int = 99;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_CLEAR: c_int = 100;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_RECALL: c_int = 101;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_STORE: c_int = 102;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_SUBTRACT: c_int = 103;
+pub const GHOSTTY_KEY_NUMPAD_MULTIPLY: c_int = 104;
+pub const GHOSTTY_KEY_NUMPAD_PAREN_LEFT: c_int = 105;
+pub const GHOSTTY_KEY_NUMPAD_PAREN_RIGHT: c_int = 106;
+pub const GHOSTTY_KEY_NUMPAD_SUBTRACT: c_int = 107;
+pub const GHOSTTY_KEY_NUMPAD_SEPARATOR: c_int = 108;
+pub const GHOSTTY_KEY_NUMPAD_UP: c_int = 109;
+pub const GHOSTTY_KEY_NUMPAD_DOWN: c_int = 110;
+pub const GHOSTTY_KEY_NUMPAD_RIGHT: c_int = 111;
+pub const GHOSTTY_KEY_NUMPAD_LEFT: c_int = 112;
+pub const GHOSTTY_KEY_NUMPAD_BEGIN: c_int = 113;
+pub const GHOSTTY_KEY_NUMPAD_HOME: c_int = 114;
+pub const GHOSTTY_KEY_NUMPAD_END: c_int = 115;
+pub const GHOSTTY_KEY_NUMPAD_INSERT: c_int = 116;
+pub const GHOSTTY_KEY_NUMPAD_DELETE: c_int = 117;
+pub const GHOSTTY_KEY_NUMPAD_PAGE_UP: c_int = 118;
+pub const GHOSTTY_KEY_NUMPAD_PAGE_DOWN: c_int = 119;
 // Function Keys
 pub const GHOSTTY_KEY_ESCAPE: c_int = 120;
 pub const GHOSTTY_KEY_F1: c_int = 121;
@@ -294,6 +335,7 @@ pub struct ghostty_input_key_s {
     pub text: *const c_char,
     pub unshifted_codepoint: u32,
     pub composing: bool,
+    pub key: c_int, // ghostty_input_key_e, GHOSTTY_KEY_UNIDENTIFIED = derive from keycode
 }
 
 pub type ghostty_io_write_cb = unsafe extern "C" fn(*mut c_void, *const c_char, usize);
