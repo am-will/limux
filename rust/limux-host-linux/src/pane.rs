@@ -22,7 +22,7 @@ use webkit6::prelude::*;
 use crate::app_config::{AppConfig, LinkOpenDestination};
 use crate::keybind_editor;
 use crate::layout_state::{
-    PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
+    new_tab_id, PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
 };
 use crate::link_uri;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
@@ -1074,10 +1074,6 @@ impl TabState {
     }
 }
 
-fn next_tab_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Icon button helper
 // ---------------------------------------------------------------------------
@@ -1467,7 +1463,7 @@ fn add_terminal_tab_inner(
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(next_tab_id);
+        .unwrap_or_else(new_tab_id);
     let (tab_btn, title_label, unread_dot) = build_tab_button("Terminal", &tab_id, internals);
 
     let term_cwd = Rc::new(RefCell::new(
@@ -1731,7 +1727,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(next_tab_id);
+        .unwrap_or_else(new_tab_id);
     let saved_uri = Rc::new(RefCell::new(
         options
             .as_ref()
@@ -1810,7 +1806,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
         .options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(next_tab_id);
+        .unwrap_or_else(new_tab_id);
 
     let (tab_btn, title_label, unread_dot) = build_tab_button("Keybinds", &tab_id, internals);
 

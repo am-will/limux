@@ -236,7 +236,7 @@ impl Default for AppSessionState {
 
 impl PaneState {
     pub fn fallback(working_directory: Option<&str>) -> Self {
-        let tab = TabState::terminal(default_tab_id("terminal"), working_directory);
+        let tab = TabState::terminal(new_tab_id(), working_directory);
         Self {
             pane_id: None,
             active_tab_id: Some(tab.id.clone()),
@@ -245,7 +245,7 @@ impl PaneState {
     }
 
     pub fn browser_only(uri: Option<&str>) -> Self {
-        let tab = TabState::browser(default_tab_id("browser"), uri);
+        let tab = TabState::browser(new_tab_id(), uri);
         Self {
             pane_id: None,
             active_tab_id: Some(tab.id.clone()),
@@ -446,7 +446,7 @@ impl AppSessionState {
                     .folder_path
                     .as_deref()
                     .or(workspace.cwd.as_deref());
-                let tab = TabState::terminal(default_tab_id("legacy-terminal"), working_directory);
+                let tab = TabState::terminal(new_tab_id(), working_directory);
                 WorkspaceState {
                     id: None,
                     name: workspace.name,
@@ -692,8 +692,53 @@ fn default_split_ratio() -> f64 {
     DEFAULT_SPLIT_RATIO
 }
 
-fn default_tab_id(prefix: &str) -> String {
-    format!("{prefix}-0")
+/// Tab ids must be unique across the whole session: a tab can move between panes and
+/// workspaces, and panes look tabs up by id (issue #201).
+pub(crate) fn new_tab_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Give a fresh id to every tab whose id already appeared earlier in the session, keeping
+/// the pane's active tab. Sessions saved before tab ids were unique start every workspace
+/// at "terminal-0". Returns whether any id changed.
+pub(crate) fn dedup_tab_ids(state: &mut AppSessionState) -> bool {
+    fn dedup(layout: &mut LayoutNodeState, seen: &mut std::collections::HashSet<String>) -> bool {
+        match layout {
+            LayoutNodeState::Pane(pane) => {
+                let mut changed = false;
+                let mut active_kept = false;
+                let mut active_renamed_to = None;
+                for tab in &mut pane.tabs {
+                    let active = pane.active_tab_id.as_deref() == Some(tab.id.as_str());
+                    if seen.insert(tab.id.clone()) {
+                        active_kept |= active;
+                        continue;
+                    }
+                    let id = new_tab_id();
+                    seen.insert(id.clone());
+                    if active && active_renamed_to.is_none() {
+                        active_renamed_to = Some(id.clone());
+                    }
+                    tab.id = id;
+                    changed = true;
+                }
+                if let Some(renamed) = active_renamed_to.filter(|_| !active_kept) {
+                    pane.active_tab_id = Some(renamed);
+                }
+                changed
+            }
+            LayoutNodeState::Split(split) => {
+                let start = dedup(&mut split.start, seen);
+                dedup(&mut split.end, seen) || start
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut changed = false;
+    for workspace in &mut state.workspaces {
+        changed |= dedup(&mut workspace.layout, &mut seen);
+    }
+    changed
 }
 
 fn build_resume_command(
@@ -1621,11 +1666,56 @@ mod tests {
     }
 
     #[test]
+    fn default_panes_get_unique_tab_ids() {
+        // A workspace's first tab can be moved into another workspace's pane
+        // (issue #201), so default tab ids must not collide across panes.
+        let ids = [
+            PaneState::fallback(None).tabs[0].id.clone(),
+            PaneState::fallback(None).tabs[0].id.clone(),
+            PaneState::browser_only(None).tabs[0].id.clone(),
+            PaneState::browser_only(None).tabs[0].id.clone(),
+        ]
+        .into_iter()
+        .chain(
+            AppSessionState::from_legacy(vec![
+                LegacySavedWorkspace {
+                    name: "a".into(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: None,
+                },
+                LegacySavedWorkspace {
+                    name: "b".into(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: None,
+                },
+            ])
+            .workspaces
+            .into_iter()
+            .map(|workspace| match workspace.layout {
+                LayoutNodeState::Pane(pane) => pane.tabs[0].id.clone(),
+                LayoutNodeState::Split(_) => panic!("legacy workspace must be a single pane"),
+            }),
+        )
+        .collect::<Vec<_>>();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "duplicate default tab ids: {ids:?}"
+        );
+    }
+
+    #[test]
     fn browser_only_pane_creates_a_single_browser_tab() {
         let pane = PaneState::browser_only(Some("https://example.com"));
 
         assert_eq!(pane.tabs.len(), 1);
-        assert_eq!(pane.active_tab_id.as_deref(), Some("browser-0"));
+        assert_eq!(
+            pane.active_tab_id.as_deref(),
+            Some(pane.tabs[0].id.as_str())
+        );
         match &pane.tabs[0].content {
             TabContentState::Browser { uri } => {
                 assert_eq!(uri.as_deref(), Some("https://example.com"));

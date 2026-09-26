@@ -2295,7 +2295,10 @@ pub fn build_window(app: &adw::Application) {
                     state.borrow_mut().session_store = Err(format!(
                         "{error}. A safe startup snapshot could not be read: {retry_error}"
                     ));
-                    apply_loaded_session(&state, layout_state::load_session());
+                    // No store, nothing is saved: dedup in memory only.
+                    let mut loaded = layout_state::load_session();
+                    layout_state::dedup_tab_ids(&mut loaded.state);
+                    apply_loaded_session(&state, loaded);
                 }
             }
         }
@@ -9008,3 +9011,7 @@ mod tests {
 #[cfg(test)]
 #[path = "ssh_launch_tests.rs"]
 mod ssh_launch_tests;
+
+#[cfg(test)]
+#[path = "tab_move_tests.rs"]
+mod tab_move_tests;

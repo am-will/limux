@@ -49,6 +49,12 @@ impl SessionStore {
                 changed = true;
             }
         }
+        changed |= layout_state::dedup_tab_ids(&mut loaded.state);
+        // Normalization mints a fresh tab id for an empty pane, so two reads of such a
+        // file differ. Persist it too, or every save would see a remote edit.
+        if !changed {
+            changed = read_session(directory)?.state != loaded.state;
+        }
         // Migrate identity once, under the writer lock, before another window loads.
         if changed {
             layout_state::save_session_atomic_in(directory, &loaded.state)?;
