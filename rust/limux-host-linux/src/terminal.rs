@@ -1415,6 +1415,90 @@ fn free_terminal_surface(
     drop(entry);
 }
 
+/// Hide `widget`, then run `detach` once its window has painted a frame
+/// without it.
+///
+/// Unrealizing a GLArea whose last frame the renderer still holds makes GTK
+/// copy that frame back to the CPU (`gdk_gl_texture_release`). On NVIDIA the
+/// copy can segfault inside the driver, and when GTK shares the frame as a
+/// dmabuf it also leaks the copy. After one frame without the widget,
+/// unrealize just deletes the textures. An unrealized widget is in no frame
+/// and is detached at once. An unmapped one still waits: the last frame may
+/// show it from before an ancestor was hidden or its workspace switched away.
+pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() + 'static) {
+    let Some(clock) = widget.frame_clock() else {
+        detach();
+        return;
+    };
+    widget.set_visible(false);
+
+    let detach = Rc::new(RefCell::new(Some(detach)));
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+    let timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    let finish = {
+        let clock = clock.clone();
+        let handler = handler.clone();
+        let timeout = timeout.clone();
+        move || {
+            let id = handler.borrow_mut().take();
+            if let Some(id) = id {
+                clock.disconnect(id);
+            }
+            let source = timeout.borrow_mut().take();
+            if let Some(source) = source {
+                source.remove();
+            }
+            let detach = detach.borrow_mut().take();
+            if let Some(detach) = detach {
+                detach();
+            }
+        }
+    };
+    // A frame already under way may have been painted before the hide.
+    let hidden_at = clock.frame_counter();
+    let on_paint = finish.clone();
+    let id = clock.connect_after_paint(move |clock| {
+        if clock.frame_counter() > hidden_at {
+            on_paint();
+        }
+    });
+    *handler.borrow_mut() = Some(id);
+    // Hiding an unmapped widget queues no frame of its own.
+    clock.request_phase(gtk::gdk::FrameClockPhase::AFTER_PAINT);
+    // A minimized window stops painting after at most one more frame. Below
+    // the redraw priority: when a busy main loop makes both due at once, the
+    // pending paint goes first.
+    let source =
+        glib::timeout_add_local_full(Duration::from_millis(100), glib::Priority::DEFAULT_IDLE, {
+            let timeout = timeout.clone();
+            move || {
+                // Firing: the source ends on its own, nothing is left to remove.
+                timeout.borrow_mut().take();
+                finish();
+                glib::ControlFlow::Break
+            }
+        });
+    *timeout.borrow_mut() = Some(source);
+}
+
+/// Remove `widget` from its `gtk::Stack` once its window has painted a frame
+/// without it (see [`detach_after_repaint`]).
+pub(crate) fn remove_from_stack_after_repaint(widget: &gtk::Widget) {
+    let child = widget.clone();
+    detach_after_repaint(widget, move || remove_from_stack(&child));
+}
+
+/// Remove `widget` from the `gtk::Stack` it is in, if any. The stack is looked
+/// up when this runs: a tab moved between panes changes stacks meanwhile.
+pub(crate) fn remove_from_stack(widget: &gtk::Widget) {
+    if let Some(stack) = widget
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Stack>().ok())
+    {
+        stack.remove(widget);
+    }
+}
+
 /// Create a new Ghostty-powered terminal widget.
 /// Returns an Overlay (GLArea + toast layer) for embedding in the pane.
 pub fn create_terminal(
@@ -2934,6 +3018,130 @@ mod tests {
         // makes every context-menu item below it need two clicks.
         assert!(!popover.is_autohide());
         assert_eq!(button.popover().as_ref(), Some(&popover));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn detach_after_repaint_waits_for_a_frame_without_the_widget() {
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+
+        // A widget in no frame is detached at once.
+        let loose = gtk::Label::new(None);
+        let detached = Rc::new(Cell::new(false));
+        detach_after_repaint(loose.upcast_ref(), {
+            let detached = detached.clone();
+            move || detached.set(true)
+        });
+        assert!(detached.get());
+
+        let shown = gtk::Label::new(Some("frame"));
+        let window = gtk::Window::builder().child(&shown).build();
+        window.present();
+        let clock = shown
+            .frame_clock()
+            .expect("presented widget has a frame clock");
+        let wait_for_paint_of = |widget: &gtk::Widget| {
+            let painted = Rc::new(Cell::new(false));
+            let id = clock.connect_after_paint({
+                let painted = painted.clone();
+                let widget = widget.clone();
+                move |_| painted.set(painted.get() || widget.is_mapped())
+            });
+            while !painted.get() {
+                context.iteration(true);
+            }
+            clock.disconnect(id);
+        };
+        let detach_and_wait = |widget: &gtk::Widget| {
+            let hidden_at = clock.frame_counter();
+            let detached_at = Rc::new(Cell::new(None));
+            detach_after_repaint(widget, {
+                let clock = clock.clone();
+                let detached_at = detached_at.clone();
+                move || detached_at.set(Some(clock.frame_counter()))
+            });
+            assert!(!widget.is_visible());
+            assert_eq!(detached_at.get(), None);
+            while detached_at.get().is_none() {
+                context.iteration(true);
+            }
+            (hidden_at, detached_at.get().unwrap())
+        };
+
+        wait_for_paint_of(shown.upcast_ref());
+        let (hidden_at, detached_at) = detach_and_wait(shown.upcast_ref());
+        assert!(
+            detached_at > hidden_at,
+            "detached before a frame without the widget was painted"
+        );
+
+        // Unmapped because its parent was just hidden, it is still in the last
+        // frame, so it waits for a newer one too.
+        let inner = gtk::Label::new(Some("inner"));
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        outer.append(&inner);
+        window.set_child(Some(&outer));
+        wait_for_paint_of(inner.upcast_ref());
+        outer.set_visible(false);
+        assert!(!inner.is_mapped());
+        let (hidden_at, detached_at) = detach_and_wait(inner.upcast_ref());
+        assert!(
+            detached_at > hidden_at,
+            "detached an unmapped widget the last frame still showed"
+        );
+
+        // Hidden mid-frame, the frame under way may already hold the widget,
+        // so detaching waits for the next one. The tick keeps frames coming.
+        let midframe = gtk::Label::new(Some("mid-frame"));
+        window.set_child(Some(&midframe));
+        let hidden_at = Rc::new(Cell::new(None));
+        let detached_at = Rc::new(Cell::new(None));
+        let tick = window.add_tick_callback({
+            let hidden_at = hidden_at.clone();
+            let detached_at = detached_at.clone();
+            move |_, clock| {
+                if hidden_at.get().is_none() && midframe.is_mapped() {
+                    hidden_at.set(Some(clock.frame_counter()));
+                    let detached_at = detached_at.clone();
+                    let clock = clock.clone();
+                    detach_after_repaint(midframe.upcast_ref(), move || {
+                        detached_at.set(Some(clock.frame_counter()))
+                    });
+                }
+                glib::ControlFlow::Continue
+            }
+        });
+        while detached_at.get().is_none() {
+            context.iteration(true);
+        }
+        tick.remove();
+        assert!(
+            detached_at.get() > hidden_at.get(),
+            "detached in the frame it was hidden in"
+        );
+
+        // A main loop kept busy past the fallback delay still paints the
+        // frame without the widget before detaching it.
+        let busy = gtk::Label::new(Some("busy"));
+        window.set_child(Some(&busy));
+        wait_for_paint_of(busy.upcast_ref());
+        let hidden_at = clock.frame_counter();
+        let detached_at = Rc::new(Cell::new(None));
+        detach_after_repaint(busy.upcast_ref(), {
+            let clock = clock.clone();
+            let detached_at = detached_at.clone();
+            move || detached_at.set(Some(clock.frame_counter()))
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        while detached_at.get().is_none() {
+            context.iteration(true);
+        }
+        assert!(
+            detached_at.get().unwrap() > hidden_at,
+            "the fallback detached before a pending paint"
+        );
+        window.close();
     }
 
     #[test]

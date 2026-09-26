@@ -147,6 +147,7 @@ pub(crate) struct SplitTreeContainer {
     tree: RefCell<SplitNode>,
     bin: gtk::Box,
     rebuild_source: RefCell<Option<glib::SourceId>>,
+    teardown_pending: Cell<bool>,
     last_focused: RefCell<Option<gtk::Widget>>,
     zoomed_pane: RefCell<Option<gtk::Widget>>,
     state: State,
@@ -166,6 +167,7 @@ impl SplitTreeContainer {
             }),
             bin,
             rebuild_source: RefCell::new(None),
+            teardown_pending: Cell::new(false),
             last_focused: RefCell::new(None),
             zoomed_pane: RefCell::new(None),
             state: state.clone(),
@@ -186,6 +188,7 @@ impl SplitTreeContainer {
             tree: RefCell::new(node),
             bin,
             rebuild_source: RefCell::new(None),
+            teardown_pending: Cell::new(false),
             last_focused: RefCell::new(None),
             zoomed_pane: RefCell::new(None),
             state: state.clone(),
@@ -328,22 +331,38 @@ impl SplitTreeContainer {
 
     /// Tear down the old widget tree and schedule a rebuild on the next idle
     /// tick. The one-tick separation between unrealize (teardown) and realize
-    /// (rebuild) is what prevents GLArea breakage.
+    /// (rebuild) is what prevents GLArea breakage. The teardown itself waits
+    /// for a frame without the old tree (see `terminal::detach_after_repaint`).
     fn trigger_rebuild(self: &Rc<Self>) {
         // Cancel any pending rebuild
         if let Some(source) = self.rebuild_source.take() {
             source.remove();
         }
-
-        // Clear the bin — tears down the old widget tree.
-        // unrealize cascades to all GLAreas in the subtree.
-        while let Some(child) = self.bin.first_child() {
-            self.bin.remove(&child);
+        // A teardown still waiting for its frame rebuilds from the latest tree.
+        if self.teardown_pending.get() {
+            return;
         }
+        let Some(old) = self.bin.first_child() else {
+            self.schedule_rebuild();
+            return;
+        };
 
-        // Rebuild on the next idle tick. The tick separation between
-        // unrealize (above) and realize (rebuild) is critical.
-        self.schedule_rebuild();
+        // Clearing the bin tears down the old widget tree: unrealize cascades
+        // to all GLAreas in the subtree.
+        self.teardown_pending.set(true);
+        let bin = self.bin.clone();
+        let container = Rc::downgrade(self);
+        crate::terminal::detach_after_repaint(&old.clone(), move || {
+            bin.remove(&old);
+            // A lone or zoomed pane is the old root itself; the rebuild reuses it.
+            old.set_visible(true);
+            if let Some(container) = container.upgrade() {
+                container.teardown_pending.set(false);
+                // Rebuild on the next idle tick. The tick separation between
+                // unrealize (above) and realize (rebuild) is critical.
+                container.schedule_rebuild();
+            }
+        });
     }
 
     /// Schedule the actual rebuild on the next idle tick.
@@ -352,9 +371,12 @@ impl SplitTreeContainer {
             return;
         }
         let container = Rc::clone(self);
-        let source = glib::idle_add_local_once(move || {
+        // Ahead of control requests: until the rebuild, the bin holds no pane
+        // for them to find.
+        let source = glib::idle_add_local_full(glib::Priority::HIGH, move || {
             container.rebuild_source.replace(None);
             container.do_rebuild();
+            glib::ControlFlow::Break
         });
         self.rebuild_source.replace(Some(source));
     }
