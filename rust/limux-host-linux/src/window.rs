@@ -6477,13 +6477,13 @@ fn close_workspace_by_id_internal(
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
-    s.stack.remove(&ws.root);
     s.sidebar_list.remove(&ws.sidebar_row);
     s.indicator_box.remove(&ws.indicator_button);
 
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
+        crate::terminal::remove_from_stack_after_repaint(&ws.root);
         apply_top_bar_mode(state);
         if persist {
             request_session_save(state);
@@ -6504,6 +6504,10 @@ fn close_workspace_by_id_internal(
     s.active_idx = new_idx;
     sync_indicator_active_state(&s);
 
+    // Show the new active workspace before hiding the old one: GtkStack maps
+    // its first child the instant the visible child is hidden, so showing
+    // the replacement first keeps that first child from flashing on screen
+    // (see `terminal::detach_after_repaint`).
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
     s.stack.set_visible_child_name(&stack_name);
 
@@ -6511,6 +6515,7 @@ fn close_workspace_by_id_internal(
     let sidebar_list = s.sidebar_list.clone();
     drop(s);
 
+    crate::terminal::remove_from_stack_after_repaint(&ws.root);
     sidebar_list.select_row(Some(&row));
     apply_top_bar_mode(state);
     if persist {

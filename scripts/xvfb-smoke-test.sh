@@ -385,9 +385,13 @@ if [ "$GRAPHICS" = hardware ] && ! grep -Fq 'terminal GL: ' "$LOG_DIR/terminal-g
   exit 1
 fi
 for regression in \
+  pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
+  pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \
+  pane::tests::closing_the_active_tab_maps_only_its_replacement \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
   settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
   terminal::tests::submenu_popovers_never_grab \
+  terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted; do
   cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture
