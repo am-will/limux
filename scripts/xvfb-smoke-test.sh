@@ -388,7 +388,8 @@ for regression in \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
   settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
   terminal::tests::submenu_popovers_never_grab \
-  window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted; do
+  window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
+  window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique; do
   cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture
 done

@@ -9008,3 +9008,7 @@ mod tests {
 #[cfg(test)]
 #[path = "ssh_launch_tests.rs"]
 mod ssh_launch_tests;
+
+#[cfg(test)]
+#[path = "tab_move_tests.rs"]
+mod tab_move_tests;

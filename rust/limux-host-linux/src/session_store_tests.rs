@@ -514,3 +514,64 @@ fn remote_favorite_stays_above_locally_reordered_workspaces() {
     assert!(result.workspaces[0].favorite);
     assert_eq!(result.workspaces[1].name, "workspace-2");
 }
+
+#[test]
+fn load_gives_fresh_ids_to_duplicate_tab_ids_from_older_sessions() {
+    // Sessions saved before issue #201 start every workspace at "terminal-0",
+    // and a pane that hit the bug holds that id twice.
+    let dir = tempdir().unwrap();
+    let mut first = workspace(1);
+    first.layout = LayoutNodeState::Pane(PaneState {
+        pane_id: Some(1),
+        active_tab_id: Some("terminal-0".into()),
+        tabs: vec![
+            TabState::terminal("terminal-0", Some("/tmp")),
+            TabState::terminal("terminal-0", Some("/tmp")),
+        ],
+    });
+    let mut second = workspace(2);
+    second.layout = LayoutNodeState::Pane(PaneState {
+        pane_id: Some(2),
+        active_tab_id: Some("terminal-0".into()),
+        tabs: vec![
+            TabState::terminal("tab-2", Some("/tmp")),
+            TabState::terminal("terminal-0", Some("/tmp")),
+        ],
+    });
+    let state = AppSessionState {
+        workspaces: vec![first, second],
+        ..AppSessionState::default()
+    };
+    layout_state::save_session_atomic_in(dir.path(), &state).unwrap();
+
+    let (_store, loaded) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+    let panes: Vec<_> = loaded
+        .state
+        .workspaces
+        .iter()
+        .map(|workspace| match &workspace.layout {
+            LayoutNodeState::Pane(pane) => pane.clone(),
+            LayoutNodeState::Split(_) => panic!("expected a single pane"),
+        })
+        .collect();
+    let ids: Vec<_> = panes
+        .iter()
+        .flat_map(|pane| pane.tabs.iter().map(|tab| tab.id.clone()))
+        .collect();
+    let unique: BTreeSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "duplicate tab ids: {ids:?}");
+    // The first occurrence keeps its id, so its agent hook records still match.
+    assert_eq!(panes[0].tabs[0].id, "terminal-0");
+    assert_eq!(panes[0].active_tab_id.as_deref(), Some("terminal-0"));
+    assert_eq!(panes[1].tabs[0].id, "tab-2");
+    // The renamed active tab stays the active one.
+    assert_eq!(
+        panes[1].active_tab_id.as_deref(),
+        Some(panes[1].tabs[1].id.as_str())
+    );
+    // Migrated once under the lock, so every later load sees the same ids.
+    assert_eq!(disk(dir.path()), loaded.state);
+    let (_store, reloaded) = SessionStore::load_from_dir(dir.path()).unwrap();
+    assert_eq!(reloaded.state, loaded.state);
+}

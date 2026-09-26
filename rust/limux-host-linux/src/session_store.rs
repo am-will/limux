@@ -49,6 +49,7 @@ impl SessionStore {
                 changed = true;
             }
         }
+        changed |= layout_state::dedup_tab_ids(&mut loaded.state);
         // Migrate identity once, under the writer lock, before another window loads.
         if changed {
             layout_state::save_session_atomic_in(directory, &loaded.state)?;
