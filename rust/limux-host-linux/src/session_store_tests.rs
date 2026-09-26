@@ -538,8 +538,24 @@ fn load_gives_fresh_ids_to_duplicate_tab_ids_from_older_sessions() {
             TabState::terminal("terminal-0", Some("/tmp")),
         ],
     });
+    let mut third = workspace(3);
+    third.layout = LayoutNodeState::Pane(PaneState {
+        pane_id: Some(3),
+        active_tab_id: Some("browser-0".into()),
+        tabs: vec![TabState::browser("browser-0", None)],
+    });
+    // Two renamed duplicates in one pane: the selection must follow the active one.
+    let mut fourth = workspace(4);
+    fourth.layout = LayoutNodeState::Pane(PaneState {
+        pane_id: Some(4),
+        active_tab_id: Some("browser-0".into()),
+        tabs: vec![
+            TabState::terminal("terminal-0", Some("/tmp")),
+            TabState::browser("browser-0", None),
+        ],
+    });
     let state = AppSessionState {
-        workspaces: vec![first, second],
+        workspaces: vec![first, second, third, fourth],
         ..AppSessionState::default()
     };
     layout_state::save_session_atomic_in(dir.path(), &state).unwrap();
@@ -569,6 +585,11 @@ fn load_gives_fresh_ids_to_duplicate_tab_ids_from_older_sessions() {
     assert_eq!(
         panes[1].active_tab_id.as_deref(),
         Some(panes[1].tabs[1].id.as_str())
+    );
+    assert_eq!(panes[2].tabs[0].id, "browser-0");
+    assert_eq!(
+        panes[3].active_tab_id.as_deref(),
+        Some(panes[3].tabs[1].id.as_str())
     );
     // Migrated once under the lock, so every later load sees the same ids.
     assert_eq!(disk(dir.path()), loaded.state);
