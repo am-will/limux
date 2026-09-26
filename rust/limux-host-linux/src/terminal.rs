@@ -2628,7 +2628,7 @@ fn translate_key_event(
     let consumed = key_event
         .map(translate_consumed_mods)
         .unwrap_or_else(|| fallback_consumed_mods(keyval, modifier));
-    let keycode = ghostty_keycode_with_caps_escape_remap(keyval, keycode);
+    let keycode = ghostty_keycode_with_keyval_remap(keyval, keycode);
 
     ghostty_input_key_s {
         action,
@@ -2641,17 +2641,27 @@ fn translate_key_event(
     }
 }
 
-fn ghostty_keycode_with_caps_escape_remap(keyval: gtk::gdk::Key, keycode: u32) -> u32 {
+fn ghostty_keycode_with_keyval_remap(keyval: gtk::gdk::Key, keycode: u32) -> u32 {
     const XKB_KEYCODE_ESCAPE: u32 = 9;
     const XKB_KEYCODE_CAPS_LOCK: u32 = 66;
 
-    // Embedded Ghostty derives its key from the XKB keycode and cannot see GTK's remapped keyval.
-    if keyval == gtk::gdk::Key::Escape {
-        XKB_KEYCODE_ESCAPE
-    } else if keyval == gtk::gdk::Key::Caps_Lock {
-        XKB_KEYCODE_CAPS_LOCK
-    } else {
-        keycode
+    // Embedded Ghostty derives its key from the XKB keycode and cannot see GTK's
+    // translated keyval. With Num Lock off, keypad 1 is KP_End but its physical
+    // keycode still resolves to Numpad1. Forward the navigation key instead.
+    match keyval {
+        gtk::gdk::Key::Escape => XKB_KEYCODE_ESCAPE,
+        gtk::gdk::Key::Caps_Lock => XKB_KEYCODE_CAPS_LOCK,
+        gtk::gdk::Key::KP_Home => 110,
+        gtk::gdk::Key::KP_Up => 111,
+        gtk::gdk::Key::KP_Page_Up => 112,
+        gtk::gdk::Key::KP_Left => 113,
+        gtk::gdk::Key::KP_Right => 114,
+        gtk::gdk::Key::KP_End => 115,
+        gtk::gdk::Key::KP_Down => 116,
+        gtk::gdk::Key::KP_Page_Down => 117,
+        gtk::gdk::Key::KP_Insert => 118,
+        gtk::gdk::Key::KP_Delete => 119,
+        _ => keycode,
     }
 }
 
@@ -3224,6 +3234,43 @@ mod tests {
         assert_eq!(caps_as_escape.keycode, 9);
         assert_eq!(escape_as_caps.keycode, 66);
         assert_eq!(writing_key.keycode, 38);
+    }
+
+    #[test]
+    fn keypad_navigation_follows_num_lock_keyval() {
+        let modifiers = gtk::gdk::ModifierType::empty();
+        for (keyval, physical, navigation) in [
+            (gtk::gdk::Key::KP_Home, 79, 110),
+            (gtk::gdk::Key::KP_Up, 80, 111),
+            (gtk::gdk::Key::KP_Page_Up, 81, 112),
+            (gtk::gdk::Key::KP_Left, 83, 113),
+            (gtk::gdk::Key::KP_Right, 85, 114),
+            (gtk::gdk::Key::KP_End, 87, 115),
+            (gtk::gdk::Key::KP_Down, 88, 116),
+            (gtk::gdk::Key::KP_Page_Down, 89, 117),
+            (gtk::gdk::Key::KP_Insert, 90, 118),
+            (gtk::gdk::Key::KP_Delete, 91, 119),
+        ] {
+            let event = translate_key_event(
+                GHOSTTY_ACTION_PRESS,
+                None,
+                None,
+                keyval,
+                physical,
+                modifiers,
+            );
+            assert_eq!(event.keycode, navigation, "{keyval:?}");
+        }
+
+        let digit = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            gtk::gdk::Key::KP_1,
+            87,
+            modifiers,
+        );
+        assert_eq!(digit.keycode, 87);
     }
 
     #[test]
