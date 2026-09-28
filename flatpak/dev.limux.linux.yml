@@ -8,9 +8,9 @@
 # rust/limux-host-linux/src/main.rs set_ghostty_runtime_env_for_exe), so the
 # /app/share/limux tree below is found without hardcoded /usr paths.
 #
-# See flatpak/README.md for the two open items before this is Flathub-ready:
-# offline vendoring of Ghostty's own Zig build dependencies, and a build test
-# on a machine with a display.
+# See flatpak/README.md for the remaining items: host-shell execution (terminals
+# still run the sandbox /bin/sh), offline vendoring of Ghostty's own Zig build
+# dependencies, and metainfo screenshots + <releases> entries.
 app-id: dev.limux.linux
 runtime: org.gnome.Platform
 # GNOME 49 (freedesktop 25.08) is the minimum: its rust-stable extension ships
@@ -37,6 +37,12 @@ finish-args:
   # projects. --filesystem=host is deliberately broad: a terminal that runs
   # arbitrary shell commands cannot meaningfully be confined to a subtree.
   - --filesystem=host
+  # The control socket lives at $XDG_RUNTIME_DIR/limux/limux.sock. --filesystem=host
+  # does NOT cover $XDG_RUNTIME_DIR (the sandbox gets a private tmpfs there), so the
+  # app's socket would be invisible to a host limux CLI. Bind-mount the host's
+  # runtime subdir so the socket lands on the host and `limux <command>` on the host
+  # reaches this app — see flatpak/README.md ("Driving the app from a terminal").
+  - --filesystem=xdg-run/limux:create
   - --talk-name=org.freedesktop.Notifications
 
 build-options:
@@ -59,6 +65,11 @@ modules:
     build-commands:
       # 1. Build the Zig libghostty engine (ReleaseFast, baseline CPU, no
       #    gtk4-layer-shell), exactly as the AUR recipe does.
+      #    NOTE: -Dflatpak=true (Ghostty's native HostCommand path) does NOT
+      #    compile here — it pulls in `@import("gio_c")`, which Ghostty's build
+      #    only wires up for exe steps, not the `-Dapp-runtime=none` lib we build
+      #    (SharedDeps.zig:667 guards the gio_c translate behind `step.kind !=
+      #    .lib`). Running terminals on the host shell is tracked as open item 1.
       - cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline -fno-sys=gtk4-layer-shell
       # 2. Build the Rust workspace fully offline against the vendored crates.
       - cargo build --release --locked --offline
@@ -79,6 +90,11 @@ modules:
           install -Dm644 "rust/limux-host-linux/icons/app/$size.png" \
             "/app/share/icons/hicolor/${size}x${size}/apps/dev.limux.linux.png"
         done
+      # The browser/split-pane toolbar buttons load these -symbolic action icons
+      # by name; without them GTK falls back to the broken-image glyph. Mirrors
+      # the scalable/actions install from PKGBUILD-source.template.
+      - install -dm755 /app/share/icons/hicolor/scalable/actions
+      - install -m644 rust/limux-host-linux/icons/*.svg -t /app/share/icons/hicolor/scalable/actions/
       - install -Dm644 LICENSE /app/share/licenses/limux/LICENSE
     sources:
       - type: git
