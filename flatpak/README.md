@@ -41,7 +41,8 @@ flatpak run dev.limux.linux
 | `target/release/limux` (GTK host) | `/app/libexec/limux/limux-host` |
 | `ghostty/zig-out/lib/libghostty-internal.so` | `/app/lib/limux/libghostty-internal.so` |
 | Ghostty resources / terminfo | `/app/share/limux/{ghostty,terminfo}` |
-| desktop / metainfo / icons | `/app/share/{applications,metainfo,icons}` |
+| desktop / metainfo / app icons | `/app/share/{applications,metainfo,icons/hicolor/*/apps}` |
+| `-symbolic` pane/browser action icons | `/app/share/icons/hicolor/scalable/actions` |
 
 `limux-host-linux` resolves the Ghostty resource dir relative to its own
 executable (`set_ghostty_runtime_env_for_exe` in
@@ -56,9 +57,66 @@ executable (`set_ghostty_runtime_env_for_exe` in
 - `--share=network` — terminals run networked commands and the built-in browser
   (WebKitGTK) needs the network.
 - `--talk-name=org.freedesktop.Notifications` — desktop notifications.
+- `--filesystem=xdg-run/limux` — exposes the control socket to the host. `--filesystem=host`
+  does *not* cover `$XDG_RUNTIME_DIR` (the sandbox replaces it with a private tmpfs), so
+  without this the app's `limux.sock` is invisible to a host `limux` CLI. See below.
 - `--filesystem=host` — deliberately broad: a terminal that runs arbitrary shell
   commands cannot be meaningfully confined to a subtree. Narrow it if a future
   design sandboxes the shells.
+
+## Host shell (open limitation)
+
+Terminals currently run the **runtime's** `/bin/sh` inside the sandbox, not the
+host shell, so host tools (`git`, `cargo`, the project toolchain) are missing from
+`PATH` — the reviewer's `PATH=/app/bin:/usr/bin` observation. This is not yet fixed.
+
+Ghostty already implements host-shell spawning: built with `-Dflatpak=true` and
+running in a sandbox it spawns the shell through the
+`org.freedesktop.Flatpak.Development.HostCommand` portal
+(`ghostty/src/os/flatpak.zig`, `FlatpakHostCommand` in `ghostty/src/termio/Exec.zig`),
+resolving the host login shell and `HOME` from the host `passwd`. But that flag does
+**not compile in Limux's build**: `flatpak.zig` does `@import("gio_c")`, and Ghostty's
+build only wires up the `gio_c` module for *exe* steps — the `if (step.kind != .lib)`
+guard at `SharedDeps.zig:667` skips it for the `-Dapp-runtime=none` **library** we
+build, so the `zig build` step fails with `no module named 'gio_c'`. (Upstream
+Ghostty's own Flatpak builds the full GTK exe, where the module is present.)
+
+Two candidate fixes, both bigger than a manifest tweak (see open item 4):
+
+- **Patch Ghostty's build** to also provide `gio_c` (and link `gio-2.0`, not `gtk4`)
+  for `lib` steps under `-Dflatpak`. Uses Ghostty's native portal path, but modifies
+  the vendored/pinned `ghostty` source and pulls in the `translate_c` build dep
+  (worsening the offline-vendoring item).
+- **Wrap the shell on the Limux side** in `flatpak-spawn --host` (present in the
+  runtime at `/usr/bin/flatpak-spawn`) when running sandboxed. No Ghostty change, but
+  Limux must resolve the host login shell and forward env (`TERM`, the `LIMUX_*`
+  control vars), cwd, and the PTY itself — partly reimplementing the portal logic.
+
+## Driving the app from a terminal (control socket)
+
+Limux's whole point is that a coding agent in a terminal can drive the GUI over a
+Unix control socket. The host binds it at `$XDG_RUNTIME_DIR/limux/limux.sock`
+(`resolve_socket_path` / `SocketMode::Runtime`). Under Flatpak, `$XDG_RUNTIME_DIR`
+inside the sandbox is a private tmpfs, so the socket is invisible to the host until
+`--filesystem=xdg-run/limux` (above) bind-mounts the host's `$XDG_RUNTIME_DIR/limux`
+into the sandbox at the same path. With that mount there are two supported CLI routes:
+
+1. **Host-installed `limux`** (from the AUR/source package) resolves the same
+   `$XDG_RUNTIME_DIR/limux/limux.sock` and reaches the Flatpak app directly.
+2. **In-sandbox CLI** — `flatpak run --command=limux dev.limux.linux <args>` runs
+   `/app/bin/limux` against the same socket.
+
+Socket round-trip smoke test (run after `flatpak run dev.limux.linux` is up):
+
+```bash
+# From the host, using a host-installed limux:
+limux list-workspaces
+# Or entirely inside the sandbox, no host install required:
+flatpak run --command=limux dev.limux.linux list-workspaces
+```
+
+Either should print the running app's workspaces (a JSON/text list, not a connection
+error), confirming the host↔app socket path end to end.
 
 ## Verification status
 
@@ -96,3 +154,8 @@ That is not Flathub-compliant — see open item 1.
 3. **metainfo screenshots + release entries.** `flatpak-builder-lint` wants at
    least one `<screenshot>` and a `<releases>` entry in the metainfo before
    Flathub submission; upstream owns that file.
+4. **Host-shell execution.** Terminals run the sandbox `/bin/sh`, so host tools
+   are off `PATH`. Ghostty's native `-Dflatpak=true` path doesn't compile in the
+   `-Dapp-runtime=none` lib build (missing `gio_c` module — see "Host shell"
+   above). Needs either a Ghostty build-system patch or a `flatpak-spawn --host`
+   wrapper on the Limux side.
