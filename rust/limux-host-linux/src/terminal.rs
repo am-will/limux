@@ -92,7 +92,8 @@ struct SurfaceEntry {
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
     on_bell: Option<Box<BellCallback>>,
     on_open_url: Option<Rc<OpenUrlCallback>>,
-    on_close: Option<Box<VoidCallback>>,
+    on_close: Option<Box<dyn Fn(Option<u32>)>>,
+    exit_reported: Cell<bool>,
     clipboard_context: *mut ClipboardContext,
     // Hover URL preview for OSC 8 hyperlinks. The popover is a child of
     // `gl_area` so it inherits libadwaita's popover styling — matching the
@@ -328,6 +329,13 @@ impl TerminalHandle {
         self.link_popover.unparent();
 
         *self.callbacks.borrow_mut() = TerminalCallbacks::disconnected();
+    }
+
+    /// A replacement in a hidden tab must start without mapping or focusing it.
+    pub fn realize_for_reconnect(&self) {
+        if !self.shutting_down.get() && self.gl_area.root().is_some() {
+            self.gl_area.realize();
+        }
     }
 
     pub fn focus_surface(&self) -> bool {
@@ -1148,12 +1156,15 @@ unsafe extern "C" fn ghostty_action_cb(
         }
         GHOSTTY_ACTION_SHOW_CHILD_EXITED => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
+                let exit_code = unsafe { action.action.child_exited }.exit_code;
                 let surface_key = unsafe { target.target.surface } as usize;
                 glib::idle_add_local_once(move || {
                     SURFACE_MAP.with(|map| {
                         if let Some(entry) = map.borrow().get(&surface_key) {
                             if let Some(cb) = &entry.on_close {
-                                cb();
+                                if !entry.exit_reported.replace(true) {
+                                    cb(Some(exit_code));
+                                }
                             }
                         }
                     });
@@ -1301,7 +1312,9 @@ unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_al
         SURFACE_MAP.with(|map| {
             if let Some(entry) = map.borrow().get(&surface_key) {
                 if let Some(cb) = &entry.on_close {
-                    cb();
+                    if !entry.exit_reported.replace(true) {
+                        cb(None);
+                    }
                 }
             }
         });
@@ -1318,7 +1331,7 @@ pub struct TerminalCallbacks {
     pub on_pwd_changed: Box<PwdChangedCallback>,
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
     pub on_bell: Box<BellCallback>,
-    pub on_close: Box<VoidCallback>,
+    pub on_close: Box<dyn Fn(Option<u32>)>,
     pub on_open_url: Box<OpenUrlCallback>,
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
@@ -1337,7 +1350,7 @@ impl TerminalCallbacks {
             on_pwd_changed: Box::new(|_| {}),
             on_desktop_notification: Box::new(|_, _, _| {}),
             on_bell: Box::new(|_| {}),
-            on_close: Box::new(|| {}),
+            on_close: Box::new(|_| {}),
             on_open_url: Box::new(|_, _| {}),
             on_open_browser_here: Box::new(|| {}),
             on_split_right: Box::new(|| {}),
@@ -1908,11 +1921,12 @@ pub fn create_terminal(
                                 (callbacks.on_open_url)(url, destination);
                             }
                         })),
+                        exit_reported: Cell::new(false),
                         on_close: Some(Box::new({
                             let cb = callbacks.clone();
-                            move || {
+                            move |code| {
                                 let callbacks = cb.borrow();
-                                (callbacks.on_close)();
+                                (callbacks.on_close)(code);
                             }
                         })),
                         clipboard_context,

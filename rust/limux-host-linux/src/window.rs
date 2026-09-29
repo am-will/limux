@@ -2297,8 +2297,8 @@ pub fn build_window(app: &adw::Application) {
         ssh_button.connect_clicked(move |_| {
             let state = state.clone();
             let parent = state.borrow().window.clone();
-            crate::ssh_dialog::show(&parent, move |target| {
-                connect_ssh_target(&state, target);
+            crate::ssh_dialog::show(&parent, move |target, persistence| {
+                connect_ssh_target(&state, target, persistence);
             });
         });
     }
@@ -6509,7 +6509,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
     }
 }
 
-fn connect_ssh_target(state: &State, target: crate::ssh_hosts::SshTarget) {
+fn connect_ssh_target(
+    state: &State,
+    target: crate::ssh_hosts::SshTarget,
+    persistence: Option<bool>,
+) {
+    let connection = persistence
+        .map(|reconnect| crate::ssh_session::SshConnection::new(target.clone(), reconnect));
     let workspace = WorkspaceState {
         id: None,
         name: format!("SSH: {}", target.destination()),
@@ -6519,9 +6525,18 @@ fn connect_ssh_target(state: &State, target: crate::ssh_hosts::SshTarget) {
         autostart_command: None,
         color: None,
         group_id: None,
-        layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+        layout: LayoutNodeState::Pane(
+            connection
+                .clone()
+                .map(PaneState::ssh)
+                .unwrap_or_else(|| PaneState::fallback(None)),
+        ),
     };
-    add_workspace_with_initial_command(state, &workspace, Some(target.command()));
+    add_workspace_with_initial_command(
+        state,
+        &workspace,
+        connection.is_none().then(|| target.command()),
+    );
     request_session_save(state);
 }
 
@@ -7453,6 +7468,11 @@ fn split_pane(
         return None;
     }
 
+    let inherited_ssh = if options.initial_state.is_none() && !options.skip_default_tab {
+        pane::active_terminal_ssh_for_widget(pane_widget).map(|ssh| PaneState::ssh(ssh.new_tab()))
+    } else {
+        None
+    };
     let new_pane = create_pane_for_workspace(
         state,
         &shortcuts,
@@ -7460,13 +7480,13 @@ fn split_pane(
         wd.as_deref(),
         autostart_command,
         PaneCreationOptions {
-            initial_state: options.initial_state.as_ref(),
+            initial_state: options.initial_state.as_ref().or(inherited_ssh.as_ref()),
             skip_default_tab: options.skip_default_tab || options.inherit_active_directory,
             suppress_initial_autostart: options.suppress_initial_autostart,
             initial_command: None,
         },
     );
-    if options.inherit_active_directory {
+    if options.inherit_active_directory && inherited_ssh.is_none() {
         let directory = pane::active_tab_working_directory(pane_widget).or(wd);
         pane::add_terminal_tab_to_pane_in_directory(
             &new_pane.clone().upcast(),

@@ -413,6 +413,7 @@ for regression in \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
+  window::ssh_launch_tests::persistent_ssh_restores_retries_moves_and_closes \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
   window::tab_move_tests::a_tab_moved_to_another_workspace_answers_to_its_original_ids \
   window::tab_move_tests::an_unscoped_surface_hint_is_resolved_once_across_workspaces \

@@ -288,6 +288,10 @@ pub struct PaneCallbacks {
 
 #[derive(Clone)]
 struct TerminalTabState {
+    ssh: Option<crate::ssh_session::SshConnection>,
+    retry_attempt: u32,
+    spawned_at: std::time::Instant,
+    generation: Rc<()>,
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
 }
@@ -1269,6 +1273,7 @@ struct TerminalTabOptions<'a> {
     pinned: bool,
     cwd: Option<&'a str>,
     agent: Option<RestorableAgentState>,
+    ssh: Option<crate::ssh_session::SshConnection>,
 }
 
 struct BrowserTabOptions<'a> {
@@ -1302,7 +1307,7 @@ fn restore_tabs_from_state(
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
-            TabContentState::Terminal { cwd, agent } => add_terminal_tab_inner(
+            TabContentState::Terminal { cwd, agent, ssh } => add_terminal_tab_inner(
                 internals,
                 cwd.as_deref().or(working_directory),
                 Some(TerminalTabOptions {
@@ -1311,6 +1316,7 @@ fn restore_tabs_from_state(
                     pinned: saved_tab.pinned,
                     cwd: cwd.as_deref().or(working_directory),
                     agent: agent.clone(),
+                    ssh: ssh.as_deref().cloned(),
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
@@ -1385,18 +1391,14 @@ fn make_terminal_callbacks(
     let state_for_title = internals.tab_state.clone();
     let callbacks_for_bell = internals.callbacks.clone();
     let callbacks_for_pwd = internals.callbacks.clone();
-    let callbacks_for_close = internals.callbacks.clone();
     let callbacks_for_browser_here = internals.callbacks.clone();
     let callbacks_for_open_url = internals.callbacks.clone();
     let callbacks_for_split_right = internals.callbacks.clone();
     let callbacks_for_split_down = internals.callbacks.clone();
     let callbacks_for_keybinds = internals.callbacks.clone();
     let callbacks_for_identity = internals.callbacks.clone();
-    let tab_strip = internals.tab_strip.clone();
-    let content_stack = internals.content_stack.clone();
-    let tab_state = internals.tab_state.clone();
-    let pane_outer = internals.pane_outer.clone();
     let term_cwd_for_pwd = term_cwd.clone();
+    let tid_for_pwd = tab_id.to_string();
     let tid_for_close = tab_id.to_string();
     let tid_for_notification = tab_id.to_string();
     let pane_id = internals.pane_id;
@@ -1433,6 +1435,15 @@ fn make_terminal_callbacks(
             title_label.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
+            if terminal_tab_owner(&tid_for_pwd).is_some_and(|pane| {
+                pane.tab_state.borrow().tabs.iter().any(|entry| {
+                    entry.id == tid_for_pwd
+                        && matches!(&entry.kind, TabKind::Terminal { state } if state.ssh.is_some())
+                })
+            }) {
+                return;
+            }
+
             *term_cwd_for_pwd.borrow_mut() = Some(pwd.to_string());
             (callbacks_for_pwd.on_pwd_changed)(pwd);
             (callbacks_for_pwd.on_state_changed)();
@@ -1450,24 +1461,19 @@ fn make_terminal_callbacks(
                 (callbacks_for_bell.on_bell)(source_focused, pane_id, &tab_id);
             }
         }),
-        on_close: Box::new(move || {
-            let tab_strip = tab_strip.clone();
-            let content_stack = content_stack.clone();
-            let tab_state = tab_state.clone();
-            let callbacks = callbacks_for_close.clone();
-            let pane_outer = pane_outer.clone();
+        on_close: Box::new(move |code| {
             let tab_id = tid_for_close.clone();
-            glib::idle_add_local_once(move || {
-                remove_tab(
-                    &tab_strip,
-                    &content_stack,
-                    &tab_state,
-                    &tab_id,
-                    &callbacks,
-                    &pane_outer,
-                    PaneEmptyReason::ClosedLastTab,
-                );
+            let generation = terminal_tab_owner(&tab_id).and_then(|pane| {
+                let tabs = pane.tab_state.borrow();
+                let entry = tabs.tabs.iter().find(|entry| entry.id == tab_id)?;
+                match &entry.kind {
+                    TabKind::Terminal { state } => Some(state.generation.clone()),
+                    _ => None,
+                }
             });
+            if let Some(generation) = generation {
+                glib::idle_add_local_once(move || handle_terminal_exit(&tab_id, code, &generation));
+            }
         }),
         on_open_url: Box::new({
             let pane_outer = internals.pane_outer.clone();
@@ -1631,29 +1637,7 @@ fn open_url_in_external_browser(url: &str) {
     }
 }
 
-fn add_terminal_tab_inner(
-    internals: &Rc<PaneInternals>,
-    working_directory: Option<&str>,
-    options: Option<TerminalTabOptions<'_>>,
-) {
-    let tab_id = options
-        .as_ref()
-        .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(new_tab_id);
-    let (tab_btn, title_label, unread_dot, activity) =
-        build_tab_button("Terminal", &tab_id, internals);
-
-    let term_cwd = Rc::new(RefCell::new(
-        options
-            .as_ref()
-            .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
-            .or_else(|| working_directory.map(|cwd| cwd.to_string())),
-    ));
-    let term_callbacks = make_terminal_callbacks(internals, &tab_id, &title_label, &term_cwd);
-
-    // Build the env the spawned shell will see. Encodes this terminal's
-    // identity so CLI calls (e.g. `limux identify`, `limux send`) auto-target
-    // the current surface without flags. Mirrors cmux's env auto-wiring.
+fn build_terminal_env(internals: &Rc<PaneInternals>, tab_id: &str) -> Vec<(String, String)> {
     let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
     let workspace_id_for_env = (internals.callbacks.workspace_for_pane)(&pane_widget);
     let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
@@ -1663,7 +1647,7 @@ fn add_terminal_tab_inner(
     }
     extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env));
     extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
-    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
+    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.to_string()));
     extra_env.extend(crate::terminal_child_environment_overrides());
     if let Some(sock) = limux_control::socket_path::resolve_socket_path(
         None,
@@ -1673,6 +1657,252 @@ fn add_terminal_tab_inner(
     {
         extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
     }
+    extra_env
+}
+
+/// Build a fresh terminal widget (callbacks + env + surface) for `tab_id`.
+///
+/// This is the reusable half of tab creation: it does not touch the tab strip,
+/// the content stack, or `TabState`, so it can serve both the initial spawn
+/// ([`add_terminal_tab_inner`]) and an in-place auto-reconnect respawn
+/// ([`respawn_terminal_tab`]). Passing `startup_command = Some(cmd)` execs that
+/// command as the child (e.g. an SSH reconnect line).
+fn build_terminal_widget(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    title_label: &gtk::Label,
+    term_cwd: &Rc<RefCell<Option<String>>>,
+    working_directory: Option<&str>,
+    startup_command: Option<String>,
+    initial_input: Option<String>,
+) -> terminal::TerminalWidget {
+    let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd);
+    let extra_env = build_terminal_env(internals, tab_id);
+    terminal::create_terminal(
+        working_directory,
+        terminal::TerminalOptions {
+            track_output_activity: (internals.callbacks.current_config)().borrow().interface.show_tab_activity,
+            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
+            startup_command,
+            initial_input,
+            extra_env,
+        },
+        term_callbacks,
+    )
+}
+
+/// Remove a terminal tab through the shared [`remove_tab`] path. Idempotent:
+/// calling it for an already-removed tab is a no-op.
+fn remove_terminal_tab(internals: &Rc<PaneInternals>, tab_id: &str) {
+    remove_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        tab_id,
+        &internals.callbacks,
+        &internals.pane_outer,
+        PaneEmptyReason::ClosedLastTab,
+    );
+}
+
+// Resolve by tab identity on each callback: tabs can move during backoff.
+fn terminal_tab_owner(tab_id: &str) -> Option<Rc<PaneInternals>> {
+    PANE_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .values()
+            .filter_map(|pane| pane.upgrade())
+            .find(|pane| {
+                pane.tab_state
+                    .borrow()
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.id == tab_id)
+            })
+    })
+}
+
+fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
+    let Some(internals) = terminal_tab_owner(tab_id) else {
+        return;
+    };
+    let retry = {
+        let mut tabs = internals.tab_state.borrow_mut();
+        let Some(entry) = tabs.find_tab_mut(tab_id) else {
+            return;
+        };
+        let TabKind::Terminal { state } = &mut entry.kind else {
+            return;
+        };
+        // Closing and restoring a workspace can reuse this tab ID before the
+        // idle callback runs. An old surface must not act on its replacement.
+        if !Rc::ptr_eq(&state.generation, generation) {
+            return;
+        }
+        if let Some(ssh) = &state.ssh {
+            if crate::ssh_session::should_reconnect(code, ssh.auto_reconnect) {
+                if state.spawned_at.elapsed() >= std::time::Duration::from_secs(60) {
+                    state.retry_attempt = 0;
+                }
+                state.retry_attempt = state.retry_attempt.saturating_add(1);
+                entry.title_label.set_tooltip_text(Some(
+                    "SSH disconnected; reconnecting. Close the tab to stop.",
+                ));
+                Some((
+                    state.generation.clone(),
+                    crate::ssh_session::retry_delay(state.retry_attempt),
+                ))
+            } else if code.is_some_and(|code| code != 0) {
+                // Retain errors and the saved target (e.g. tmux is not installed).
+                entry.title_label.set_tooltip_text(Some(
+                    "SSH exited with an error. Restore the workspace to retry, or close this tab.",
+                ));
+                return;
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some((generation, delay)) = retry {
+        let tab_id = tab_id.to_string();
+        glib::timeout_add_local_once(delay, move || respawn_terminal_tab(&tab_id, &generation));
+    } else {
+        remove_terminal_tab(&internals, tab_id);
+    }
+}
+
+fn respawn_terminal_tab(tab_id: &str, generation: &Rc<()>) {
+    let Some(internals) = terminal_tab_owner(tab_id) else {
+        return;
+    };
+    let (content, handle) = {
+        let tabs = internals.tab_state.borrow();
+        let Some(entry) = tabs.tabs.iter().find(|entry| entry.id == tab_id) else {
+            return;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return;
+        };
+        if !Rc::ptr_eq(&state.generation, generation) {
+            return;
+        }
+        (entry.content.clone(), state.handle.clone())
+    };
+    handle.shutdown();
+    let tab_id = tab_id.to_string();
+    let generation = generation.clone();
+    terminal::detach_after_repaint(&content, move || {
+        finish_terminal_respawn(&tab_id, &generation)
+    });
+}
+
+fn finish_terminal_respawn(tab_id: &str, generation: &Rc<()>) {
+    let Some(internals) = terminal_tab_owner(tab_id) else {
+        return;
+    };
+    let (label, cwd, command, old_widget, active, focused) = {
+        let tabs = internals.tab_state.borrow();
+        let Some(entry) = tabs.tabs.iter().find(|entry| entry.id == tab_id) else {
+            return;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return;
+        };
+        if !Rc::ptr_eq(&state.generation, generation) {
+            return;
+        }
+        let Some(ssh) = &state.ssh else {
+            return;
+        };
+        (
+            entry.title_label.clone(),
+            state.cwd.clone(),
+            ssh.command(),
+            entry.content.clone(),
+            tabs.active_tab.as_deref() == Some(tab_id),
+            entry
+                .content
+                .root()
+                .and_then(|root| root.focus())
+                .is_some_and(|focus| focus == entry.content || focus.is_ancestor(&entry.content)),
+        )
+    };
+    let directory = cwd.borrow().clone();
+    let term = build_terminal_widget(
+        &internals,
+        tab_id,
+        &label,
+        &cwd,
+        directory.as_deref(),
+        Some(command),
+        None,
+    );
+    // GTK removal may emit callbacks; never hold the tab-state borrow here.
+    internals.content_stack.remove(&old_widget);
+    internals.content_stack.add_named(&term.root, Some(tab_id));
+    {
+        let mut tabs = internals.tab_state.borrow_mut();
+        let Some(entry) = tabs.find_tab_mut(tab_id) else {
+            return;
+        };
+        entry.content = term.root;
+        if let TabKind::Terminal { state } = &mut entry.kind {
+            state.handle = term.handle.clone();
+            state.spawned_at = std::time::Instant::now();
+            state.generation = Rc::new(());
+        }
+    }
+    term.handle.realize_for_reconnect();
+    label.set_tooltip_text(None);
+    if active {
+        internals.content_stack.set_visible_child_name(tab_id);
+    }
+    if focused {
+        term.handle.focus_surface();
+    }
+}
+
+fn active_terminal_ssh(internals: &Rc<PaneInternals>) -> Option<crate::ssh_session::SshConnection> {
+    let tabs = internals.tab_state.borrow();
+    let entry = tabs
+        .tabs
+        .iter()
+        .find(|entry| Some(entry.id.as_str()) == tabs.active_tab.as_deref())?;
+    match &entry.kind {
+        TabKind::Terminal { state } => state.ssh.clone(),
+        _ => None,
+    }
+}
+
+pub fn active_terminal_ssh_for_widget(
+    widget: &gtk::Widget,
+) -> Option<crate::ssh_session::SshConnection> {
+    active_terminal_ssh(&find_pane_internals(widget)?)
+}
+
+fn add_terminal_tab_inner(
+    internals: &Rc<PaneInternals>,
+    working_directory: Option<&str>,
+    options: Option<TerminalTabOptions<'_>>,
+) {
+    let tab_id = options
+        .as_ref()
+        .and_then(|value| value.id.map(|id| id.to_string()))
+        .unwrap_or_else(new_tab_id);
+    let (tab_btn, title_label, unread_dot, activity) = build_tab_button("Terminal", &tab_id, internals);
+
+    let term_cwd = Rc::new(RefCell::new(
+        options
+            .as_ref()
+            .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
+            .or_else(|| working_directory.map(|cwd| cwd.to_string())),
+    ));
+    let ssh = match options.as_ref() {
+        Some(options) => options.ssh.clone(),
+        None => active_terminal_ssh(internals).map(|ssh| ssh.new_tab()),
+    };
     let restored_agent_command = options
         .as_ref()
         .and_then(|value| value.agent.as_ref())
@@ -1690,6 +1920,7 @@ fn add_terminal_tab_inner(
             .initial_command
             .borrow_mut()
             .take()
+            .or_else(|| ssh.as_ref().map(|ssh| ssh.command()))
             .or(restored_agent_command),
         internals.callbacks.autostart_command.borrow().clone(),
         suppress_autostart,
@@ -1710,19 +1941,14 @@ fn add_terminal_tab_inner(
         }
     }
 
-    let term = terminal::create_terminal(
+    let term = build_terminal_widget(
+        internals,
+        &tab_id,
+        &title_label,
+        &term_cwd,
         working_directory,
-        terminal::TerminalOptions {
-            track_output_activity: (internals.callbacks.current_config)()
-                .borrow()
-                .interface
-                .show_tab_activity,
-            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
-            startup_command,
-            initial_input,
-            extra_env,
-        },
-        term_callbacks,
+        startup_command,
+        initial_input,
     );
     let widget = term.root.clone();
     activity.watch_content(&widget);
@@ -1745,6 +1971,10 @@ fn add_terminal_tab_inner(
             unread: false,
             kind: TabKind::Terminal {
                 state: TerminalTabState {
+                    ssh,
+                    retry_attempt: 0,
+                    spawned_at: std::time::Instant::now(),
+                    generation: Rc::new(()),
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
                 },
@@ -2166,6 +2396,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
                     agent: None,
+                    ssh: state.ssh.clone().map(Box::new),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),

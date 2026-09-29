@@ -14,6 +14,7 @@ mod shortcut_config;
 mod split_tree;
 mod ssh_dialog;
 mod ssh_hosts;
+mod ssh_session;
 mod tab_activity;
 mod terminal;
 mod window;

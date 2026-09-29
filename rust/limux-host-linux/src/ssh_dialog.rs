@@ -5,7 +5,10 @@ use gtk4 as gtk;
 
 use crate::ssh_hosts::{self, SshTarget};
 
-pub fn show(parent: &libadwaita::ApplicationWindow, connect: impl Fn(SshTarget) + 'static) {
+pub fn show(
+    parent: &libadwaita::ApplicationWindow,
+    connect: impl Fn(SshTarget, Option<bool>) + 'static,
+) {
     let dialog = gtk::Window::builder()
         .title("Connect via SSH")
         .transient_for(parent)
@@ -66,6 +69,18 @@ pub fn show(parent: &libadwaita::ApplicationWindow, connect: impl Fn(SshTarget) 
         .build();
     hint.add_css_class("dim-label");
     content.append(&hint);
+    let persist =
+        gtk::CheckButton::with_label("Keep remote sessions with tmux and restore on startup");
+    let reconnect = gtk::CheckButton::with_label("Reconnect automatically after SSH errors");
+    reconnect.set_active(true);
+    reconnect.set_sensitive(false);
+    let reconnect_toggle = reconnect.clone();
+    persist.connect_toggled(move |button| reconnect_toggle.set_sensitive(button.is_active()));
+    content.append(&persist);
+    content.append(&reconnect);
+    let persistence_hint = gtk::Label::new(Some("Requires tmux on the remote host. Saved sessions reconnect when Limux starts. Close the tab to stop retries; remote sessions remain running."));
+    persistence_hint.set_wrap(true);
+    content.append(&persistence_hint);
     content.append(&status);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -91,7 +106,7 @@ pub fn show(parent: &libadwaita::ApplicationWindow, connect: impl Fn(SshTarget) 
                 if let Some(dialog) = weak_dialog.upgrade() {
                     dialog.close();
                 }
-                connect(target);
+                connect(target, persist.is_active().then(|| reconnect.is_active()));
             }
             Err(err) => status.set_text(&err),
         },
