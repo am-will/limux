@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::time::timeout;
 
 pub const MAX_REQUEST_LEN: usize = 1024 * 1024;
-pub const MAX_CONNECTIONS: usize = 64;
+pub const MAX_CONNECTIONS: usize = 256;
 pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub async fn read_request_frame_async<R: AsyncBufRead + Unpin>(

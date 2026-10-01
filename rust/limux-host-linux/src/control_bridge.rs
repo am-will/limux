@@ -1207,10 +1207,15 @@ pub fn start(dispatch: fn(ControlCommand)) {
                             .spawn(move || {
                                 let _slot = slot;
                                 if let Err(error) = handle_client(stream, dispatch.as_ref()) {
-                                    eprintln!(
-                                        "limux: control connection error for pid={} uid={}: {error}",
-                                        peer.pid, peer.uid
-                                    );
+                                    if !matches!(
+                                        error.kind(),
+                                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                                    ) {
+                                        eprintln!(
+                                            "limux: control connection error for pid={} uid={}: {error}",
+                                            peer.pid, peer.uid
+                                        );
+                                    }
                                 }
                             })
                             .ok();
