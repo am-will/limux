@@ -4231,14 +4231,21 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     }
     {
         // With the focus still on an item, the unparent would leak the popover
-        // (see `terminal::unset_focus_within`); give it back to the row.
-        let row = row.downgrade();
+        // (see `terminal::unset_focus_within`); give it back to whatever had it
+        // before the menu opened, usually a terminal, rather than to the row,
+        // which Delete removes right after.
+        let previous_focus = row
+            .root()
+            .and_then(|root| root.focus())
+            .map(|w| w.downgrade());
         popover.connect_closed(move |p| {
-            if crate::terminal::focus_is_within(p.upcast_ref()) {
+            if crate::terminal::focus_is_within(p.upcast_ref())
+                && !previous_focus
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .is_some_and(|w| w.grab_focus())
+            {
                 crate::terminal::unset_focus_within(p.upcast_ref());
-                if let Some(row) = row.upgrade() {
-                    row.grab_focus();
-                }
             }
             p.unparent();
         });
