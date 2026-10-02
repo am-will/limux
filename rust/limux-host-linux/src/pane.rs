@@ -927,13 +927,25 @@ fn composite_surface_id(pane_id: u32, tab_id: &str) -> String {
     format!("{pane_id}:{tab_id}")
 }
 
-fn surface_hint_matches(surface_id: &str, tab_id: &str, surface_hint: &str) -> bool {
-    let requested = normalize_surface_hint(surface_hint);
-    !requested.is_empty() && (requested == tab_id || requested == surface_id)
+/// The tab a surface id or hint names: `<tab>`, `<pane>:<tab>`, either with a
+/// `surface:` prefix. The pane part is ignored: a shell keeps the surface id it
+/// started with after its tab moves to another pane, and tab ids are unique
+/// across panes.
+fn surface_tab(raw: &str) -> Option<&str> {
+    let surface = normalize_surface_hint(raw);
+    let tab = match surface.split_once(':') {
+        Some((pane, tab)) if pane.parse::<u32>().is_ok() => tab,
+        _ => surface,
+    };
+    (!tab.is_empty()).then_some(tab)
+}
+
+/// Whether `surface_hint` names the tab of `surface`, a tab id or a surface id.
+pub(crate) fn surface_hint_matches(surface: &str, surface_hint: &str) -> bool {
+    surface_tab(surface_hint).is_some_and(|tab| surface_tab(surface) == Some(tab))
 }
 
 fn select_terminal_tab<'a>(
-    pane_id: u32,
     terminal_tab_ids: impl IntoIterator<Item = &'a str>,
     active_tab: Option<&str>,
     surface_hint: Option<&str>,
@@ -941,7 +953,7 @@ fn select_terminal_tab<'a>(
     let mut fallback = None;
     for tab_id in terminal_tab_ids {
         if let Some(surface_hint) = surface_hint {
-            if surface_hint_matches(&composite_surface_id(pane_id, tab_id), tab_id, surface_hint) {
+            if surface_hint_matches(tab_id, surface_hint) {
                 return Some(tab_id);
             }
             // An explicit target must not fall back to the active tab.
@@ -965,7 +977,6 @@ pub fn terminal_handle_for_surface(
         matches!(entry.kind, TabKind::Terminal { .. }).then_some(entry.id.as_str())
     });
     let tab_id = select_terminal_tab(
-        internals.pane_id,
         terminal_tab_ids,
         tab_state.active_tab.as_deref(),
         surface_hint,
@@ -2178,8 +2189,7 @@ pub fn tab_target_for_workspace(workspace_id: &str, surface_hint: &str) -> TabTa
         let pane_id = internals.pane_id;
         let tab_state = internals.tab_state.borrow();
         for entry in &tab_state.tabs {
-            let surface_id = composite_surface_id(pane_id, &entry.id);
-            if surface_hint_matches(&surface_id, &entry.id, surface_hint) {
+            if surface_hint_matches(&entry.id, surface_hint) {
                 if target.is_some() {
                     return TabTargetResolution::Ambiguous;
                 }
@@ -4358,9 +4368,10 @@ mod tests {
 
     #[test]
     fn explicit_terminal_target_can_follow_the_active_tab() {
-        for target in ["agent", "4:agent", "surface:4:agent"] {
+        // `5:agent` is the surface id a moved tab's shell keeps.
+        for target in ["agent", "4:agent", "surface:4:agent", "5:agent"] {
             assert_eq!(
-                select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
+                select_terminal_tab(["shell", "agent"], Some("shell"), Some(target)),
                 Some("agent"),
             );
         }
@@ -4368,9 +4379,16 @@ mod tests {
 
     #[test]
     fn explicit_missing_terminal_does_not_fall_back_to_active_tab() {
-        for target in ["missing", "5:agent", "", "   ", "surface:", " surface:   "] {
+        for target in [
+            "missing",
+            "5:missing",
+            "",
+            "   ",
+            "surface:",
+            " surface:   ",
+        ] {
             assert_eq!(
-                select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
+                select_terminal_tab(["shell", "agent"], Some("shell"), Some(target)),
                 None,
             );
         }
@@ -4379,14 +4397,14 @@ mod tests {
     #[test]
     fn implicit_terminal_target_prefers_active_terminal_then_first_terminal() {
         assert_eq!(
-            select_terminal_tab(4, ["shell", "agent"], Some("agent"), None),
+            select_terminal_tab(["shell", "agent"], Some("agent"), None),
             Some("agent"),
         );
         assert_eq!(
-            select_terminal_tab(4, ["shell", "agent"], Some("browser"), None),
+            select_terminal_tab(["shell", "agent"], Some("browser"), None),
             Some("shell"),
         );
-        assert_eq!(select_terminal_tab(4, [], None, None), None);
+        assert_eq!(select_terminal_tab([], None, None), None);
     }
 
     #[test]
@@ -4543,15 +4561,17 @@ mod tests {
     }
 
     #[test]
-    fn surface_hint_matches_only_exact_surface_or_tab_id() {
-        assert!(surface_hint_matches(
-            "42:tab-a",
-            "tab-a",
-            "surface:42:tab-a"
-        ));
-        assert!(surface_hint_matches("42:tab-a", "tab-a", "tab-a"));
-        assert!(!surface_hint_matches("42:tab-a", "tab-a", "42:tab-b"));
-        assert!(!surface_hint_matches("42:tab-a", "tab-a", ""));
+    fn surface_hint_matches_its_tab_from_any_pane() {
+        for surface in ["tab-a", "42:tab-a"] {
+            assert!(surface_hint_matches(surface, "surface:42:tab-a"));
+            assert!(surface_hint_matches(surface, "tab-a"));
+            // A shell keeps the surface id it started with after its tab moves.
+            assert!(surface_hint_matches(surface, "7:tab-a"));
+            assert!(surface_hint_matches(surface, "surface:7:tab-a"));
+            assert!(!surface_hint_matches(surface, "42:tab-b"));
+            assert!(!surface_hint_matches(surface, "pane:tab-a"));
+            assert!(!surface_hint_matches(surface, ""));
+        }
     }
 
     #[test]

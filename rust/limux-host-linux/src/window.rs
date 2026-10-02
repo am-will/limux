@@ -518,12 +518,6 @@ fn pane_create_split_placement(direction: PaneCreateDirection) -> PaneCreateSpli
     }
 }
 
-fn normalize_surface_handle(raw: &str) -> &str {
-    raw.trim()
-        .strip_prefix("surface:")
-        .unwrap_or_else(|| raw.trim())
-}
-
 fn resolve_pane_create_source_id(
     surface_id: Option<&str>,
     pane_id: Option<u32>,
@@ -537,10 +531,9 @@ fn resolve_pane_create_source_id(
     }
 
     if let Some(surface_id) = surface_id {
-        let requested = normalize_surface_handle(surface_id);
         return surface_to_pane
             .iter()
-            .find(|(known_surface_id, _)| *known_surface_id == requested)
+            .find(|(known_surface_id, _)| pane::surface_hint_matches(known_surface_id, surface_id))
             .map(|(_, pane_id)| *pane_id)
             .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
     }
@@ -812,10 +805,11 @@ fn surface_health_payload(
     workspace: &Workspace,
     surface_hint: Option<&str>,
 ) -> Result<serde_json::Value, BridgeError> {
-    let requested = surface_hint.map(normalize_surface_handle);
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
-        .filter(|surface| requested.is_none_or(|requested| surface.surface_id == requested))
+        .filter(|surface| {
+            surface_hint.is_none_or(|hint| pane::surface_hint_matches(&surface.surface_id, hint))
+        })
         .enumerate()
         .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
         .collect::<Vec<_>>();
@@ -8197,6 +8191,18 @@ mod tests {
         assert_eq!(
             resolve_pane_create_source_id(
                 Some("surface:20:bbb"),
+                Some(10),
+                Some(30),
+                true,
+                &panes,
+                &surfaces,
+            ),
+            Ok(20)
+        );
+        // A moved tab's shell still names the pane it started in.
+        assert_eq!(
+            resolve_pane_create_source_id(
+                Some("surface:10:bbb"),
                 Some(10),
                 Some(30),
                 true,
