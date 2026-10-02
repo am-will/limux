@@ -185,10 +185,10 @@ fn send_pane_create_response_after_command(
         move || {
             attempts += 1;
 
-            if let Some((matched_surface_id, handle)) =
-                pane::exact_terminal_handle_for_surface(&pane_widget, &surface_id)
+            if let Some((_, handle)) =
+                pane::terminal_handle_for_surface(&pane_widget, Some(&surface_id))
             {
-                if matched_surface_id == surface_id && !command_sent {
+                if !command_sent {
                     command_sent = handle.send_text(&command);
                 }
                 if command_sent && handle.send_key("Enter") {
@@ -417,7 +417,8 @@ fn focus_control_surface(state: &State, index: usize, pane: &gtk::Widget, tab_id
 }
 
 /// Resolve all terminal control operations through the same workspace-local target.
-/// Explicit surfaces must resolve exactly. With no explicit surface, use the
+/// An explicit surface must name an existing terminal tab, whatever pane its
+/// surface id names, and never falls back. With no explicit surface, use the
 /// requested workspace's focused surface; a focused browser is not a terminal
 /// target. Fall back to the first terminal only when no surface has focus.
 fn control_terminal_target(
@@ -524,16 +525,16 @@ fn resolve_pane_create_source_id(
     focused_pane_id: Option<u32>,
     target_workspace_is_active: bool,
     pane_ids: &[u32],
-    surface_to_pane: &[(&str, u32)],
+    tab_to_pane: &[(&str, u32)],
 ) -> Result<u32, PaneCreateTargetError> {
     if pane_ids.is_empty() {
         return Err(PaneCreateTargetError::NoPanes);
     }
 
     if let Some(surface_id) = surface_id {
-        return surface_to_pane
+        return tab_to_pane
             .iter()
-            .find(|(known_surface_id, _)| pane::surface_hint_matches(known_surface_id, surface_id))
+            .find(|(tab_id, _)| pane::surface_hint_matches(tab_id, surface_id))
             .map(|(_, pane_id)| *pane_id)
             .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
     }
@@ -594,9 +595,9 @@ pub(crate) fn resolve_pane_create_target(
         .map(|summary| summary.pane_id)
         .collect::<Vec<_>>();
     let surface_summaries = pane::surface_summaries_for_root(&workspace_root);
-    let surface_to_pane = surface_summaries
+    let tab_to_pane = surface_summaries
         .iter()
-        .map(|surface| (surface.surface_id.as_str(), surface.pane_id))
+        .map(|surface| (surface.tab_id.as_str(), surface.pane_id))
         .collect::<Vec<_>>();
     let focused_pane_id = target_workspace_is_active
         .then(|| focused_ids_for_workspace(state, &workspace_id).0)
@@ -608,7 +609,7 @@ pub(crate) fn resolve_pane_create_target(
         focused_pane_id,
         target_workspace_is_active,
         &pane_ids,
-        &surface_to_pane,
+        &tab_to_pane,
     )?;
     let pane_widget = pane::pane_widget_for_root(&workspace_root, pane_id)
         .ok_or(PaneCreateTargetError::InvalidPaneId(pane_id))?;
@@ -808,7 +809,7 @@ fn surface_health_payload(
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
         .filter(|surface| {
-            surface_hint.is_none_or(|hint| pane::surface_hint_matches(&surface.surface_id, hint))
+            surface_hint.is_none_or(|hint| pane::surface_hint_matches(&surface.tab_id, hint))
         })
         .enumerate()
         .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
@@ -8186,7 +8187,7 @@ mod tests {
     #[test]
     fn pane_create_source_prefers_surface_then_pane_then_active_focus_then_first_leaf() {
         let panes = [10, 20, 30];
-        let surfaces = [("10:aaa", 10), ("20:bbb", 20)];
+        let surfaces = [("aaa", 10), ("bbb", 20)];
 
         assert_eq!(
             resolve_pane_create_source_id(
@@ -8228,7 +8229,7 @@ mod tests {
     #[test]
     fn pane_create_source_reports_invalid_surface_pane_and_empty_workspace() {
         let panes = [10, 20];
-        let surfaces = [("10:aaa", 10)];
+        let surfaces = [("aaa", 10)];
 
         assert_eq!(
             resolve_pane_create_source_id(

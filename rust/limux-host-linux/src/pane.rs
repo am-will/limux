@@ -927,22 +927,17 @@ fn composite_surface_id(pane_id: u32, tab_id: &str) -> String {
     format!("{pane_id}:{tab_id}")
 }
 
-/// The tab a surface id or hint names: `<tab>`, `<pane>:<tab>`, either with a
-/// `surface:` prefix. The pane part is ignored: a shell keeps the surface id it
-/// started with after its tab moves to another pane, and tab ids are unique
-/// across panes.
-fn surface_tab(raw: &str) -> Option<&str> {
-    let surface = normalize_surface_hint(raw);
-    let tab = match surface.split_once(':') {
-        Some((pane, tab)) if pane.parse::<u32>().is_ok() => tab,
-        _ => surface,
-    };
-    (!tab.is_empty()).then_some(tab)
-}
-
-/// Whether `surface_hint` names the tab of `surface`, a tab id or a surface id.
-pub(crate) fn surface_hint_matches(surface: &str, surface_hint: &str) -> bool {
-    surface_tab(surface_hint).is_some_and(|tab| surface_tab(surface) == Some(tab))
+/// Whether `surface_hint` names the tab `tab_id`: the tab id itself or a
+/// surface id `<pane>:<tab id>`, either with a `surface:` prefix. The pane part
+/// is ignored: a shell keeps the surface id it started with after its tab moves
+/// to another pane, and tab ids are unique across panes. The tab id is never
+/// parsed, since a restored one is kept as saved.
+pub(crate) fn surface_hint_matches(tab_id: &str, surface_hint: &str) -> bool {
+    let hint = normalize_surface_hint(surface_hint);
+    hint == tab_id
+        || hint.split_once(':').is_some_and(|(pane, tab)| {
+            !pane.is_empty() && pane.bytes().all(|byte| byte.is_ascii_digit()) && tab == tab_id
+        })
 }
 
 fn select_terminal_tab<'a>(
@@ -989,13 +984,6 @@ pub fn terminal_handle_for_surface(
         composite_surface_id(internals.pane_id, tab_id),
         state.handle.clone(),
     ))
-}
-
-pub fn exact_terminal_handle_for_surface(
-    pane_widget: &gtk::Widget,
-    surface_hint: &str,
-) -> Option<(String, terminal::TerminalHandle)> {
-    terminal_handle_for_surface(pane_widget, Some(surface_hint))
 }
 
 // ---------------------------------------------------------------------------
@@ -2143,6 +2131,7 @@ pub struct PaneSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceSummary {
     pub pane_id: u32,
+    pub tab_id: String,
     pub surface_id: String,
     pub title: String,
     pub kind: String,
@@ -2322,6 +2311,7 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
             };
             surfaces.push(SurfaceSummary {
                 pane_id,
+                tab_id: entry.id.clone(),
                 surface_id: composite_surface_id(pane_id, &entry.id),
                 title: entry.title_label.label().to_string(),
                 kind,
@@ -2357,6 +2347,7 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
     };
     Some(SurfaceSummary {
         pane_id,
+        tab_id: entry.id.clone(),
         surface_id: composite_surface_id(pane_id, &entry.id),
         title: entry.title_label.label().to_string(),
         kind,
@@ -2370,12 +2361,10 @@ pub fn terminal_handle_for_root(
     root: &gtk::Widget,
     surface_hint: Option<&str>,
 ) -> Option<(String, terminal::TerminalHandle)> {
-    let requested = surface_hint.map(normalize_surface_hint);
-
-    if let Some(requested) = requested {
+    if let Some(surface_hint) = surface_hint {
         for internals in pane_internals_for_root(root) {
             let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-            if let Some(target) = exact_terminal_handle_for_surface(&pane_widget, requested) {
+            if let Some(target) = terminal_handle_for_surface(&pane_widget, Some(surface_hint)) {
                 return Some(target);
             }
         }
@@ -4562,16 +4551,26 @@ mod tests {
 
     #[test]
     fn surface_hint_matches_its_tab_from_any_pane() {
-        for surface in ["tab-a", "42:tab-a"] {
-            assert!(surface_hint_matches(surface, "surface:42:tab-a"));
-            assert!(surface_hint_matches(surface, "tab-a"));
-            // A shell keeps the surface id it started with after its tab moves.
-            assert!(surface_hint_matches(surface, "7:tab-a"));
-            assert!(surface_hint_matches(surface, "surface:7:tab-a"));
-            assert!(!surface_hint_matches(surface, "42:tab-b"));
-            assert!(!surface_hint_matches(surface, "pane:tab-a"));
-            assert!(!surface_hint_matches(surface, ""));
-        }
+        assert!(surface_hint_matches("tab-a", "surface:42:tab-a"));
+        assert!(surface_hint_matches("tab-a", "tab-a"));
+        // A shell keeps the surface id it started with after its tab moves.
+        assert!(surface_hint_matches("tab-a", "7:tab-a"));
+        assert!(surface_hint_matches("tab-a", "surface:7:tab-a"));
+        assert!(!surface_hint_matches("tab-a", "42:tab-b"));
+        assert!(!surface_hint_matches("tab-a", "pane:tab-a"));
+        assert!(!surface_hint_matches("tab-a", "+7:tab-a"));
+        assert!(!surface_hint_matches("tab-a", ""));
+        assert!(!surface_hint_matches("tab-a", "surface:"));
+    }
+
+    #[test]
+    fn surface_hint_matches_a_restored_tab_id_with_a_colon() {
+        // Restored tab ids are kept as saved, whatever they contain.
+        assert!(surface_hint_matches("0:main", "0:main"));
+        assert!(surface_hint_matches("0:main", "5:0:main"));
+        assert!(surface_hint_matches("0:main", "surface:5:0:main"));
+        assert!(!surface_hint_matches("0:main", "main"));
+        assert!(!surface_hint_matches("1:x", "2:x"));
     }
 
     #[test]
