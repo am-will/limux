@@ -6641,14 +6641,8 @@ fn focus_workspace_entrypoint(root: &gtk::Widget) {
     }
 }
 
-/// A pane that has not been closed: `pane::retire_pane` drops its internals
-/// but leaves the widget in the old tree until the next frame.
-fn is_live_pane(widget: &gtk::Widget) -> bool {
-    pane::is_pane_widget(widget) && pane::pane_leading_box(widget).is_some()
-}
-
 fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
-    if is_live_pane(widget) {
+    if pane::is_live_pane(widget) {
         return widget.clone();
     }
 
@@ -6661,7 +6655,7 @@ fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
     let mut child = widget.first_child();
     while let Some(current) = child {
         let candidate = first_leaf_pane(&current);
-        if is_live_pane(&candidate) {
+        if pane::is_live_pane(&candidate) {
             return candidate;
         }
         child = current.next_sibling();
@@ -6900,6 +6894,7 @@ fn split_pane(
         options.new_pane_first,
         layout_state::DEFAULT_SPLIT_RATIO,
     ) {
+        pane::retire_pane(new_pane.upcast_ref());
         return None;
     }
 
@@ -7031,39 +7026,24 @@ fn handle_split_with_tab(
 /// Find the focused pane widget (a gtk::Box with class limux-pane-toolbar child)
 /// by walking up from the currently focused widget.
 fn find_leaf_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
-    let (ws_id, root, stack) = {
+    let (ws_id, stack) = {
         let s = state.borrow();
         let ws = s.active_workspace()?;
-        (ws.id.clone(), ws.root.clone(), s.stack.clone())
+        (ws.id.clone(), s.stack.clone())
     };
 
     // Get the window's focus widget and walk up to find a pane Box
     let window = stack.root()?.downcast::<gtk::Window>().ok()?;
     let focus = gtk::prelude::GtkWindowExt::focus(&window)?;
 
+    // A closed pane keeps the focus until its teardown frame: skip it.
     let mut widget: Option<gtk::Widget> = Some(focus);
     while let Some(w) = widget {
-        if let Some(bx) = w.downcast_ref::<gtk::Box>() {
-            let mut child = bx.first_child();
-            while let Some(c) = child {
-                if c.has_css_class("limux-pane-header") {
-                    return Some((ws_id, w));
-                }
-                // Header may be wrapped in a WindowHandle for window dragging.
-                if let Some(handle) = c.downcast_ref::<gtk::WindowHandle>() {
-                    if let Some(inner) = handle.child() {
-                        if inner.has_css_class("limux-pane-header") {
-                            return Some((ws_id, w));
-                        }
-                    }
-                }
-                child = c.next_sibling();
-            }
+        if pane::is_live_pane(&w) {
+            return Some((ws_id, w));
         }
         widget = w.parent();
     }
-
-    let _ = root;
     None
 }
 
@@ -7072,13 +7052,11 @@ fn find_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
         return Some(found);
     }
 
-    let (ws_id, root) = {
-        let s = state.borrow();
-        let ws = s.active_workspace()?;
-        (ws.id.clone(), ws.root.clone())
-    };
-
-    Some((ws_id, first_leaf_pane(&root)))
+    // The widget tree may still hold closed panes or be mid-rebuild; the
+    // model does not.
+    let s = state.borrow();
+    let ws = s.active_workspace()?;
+    Some((ws.id.clone(), ws.split_container.shown_pane()))
 }
 
 fn focused_shortcut_target(state: &State) -> pane::FocusedShortcutTarget {
@@ -7409,16 +7387,17 @@ fn pane_in_direction(
                     } else {
                         paned.start_child()
                     };
-                    if let Some(sibling) = sibling {
-                        return Some(
+                    // A closed pane stays in the old tree until its teardown
+                    // frame and must not be returned.
+                    return sibling
+                        .map(|sibling| {
                             best_directional_leaf_pane(pane_widget, &sibling, &root, direction)
                                 .unwrap_or_else(|| {
                                     let prefer_start = !must_be_start;
                                     find_leaf_pane(&sibling, target_orientation, prefer_start)
-                                }),
-                        );
-                    }
-                    return None;
+                                })
+                        })
+                        .filter(pane::is_live_pane);
                 }
             }
         }
@@ -7507,7 +7486,9 @@ fn neighbor_score_better(candidate: NeighborScore, best: NeighborScore) -> bool 
 
 fn collect_leaf_panes(widget: &gtk::Widget, panes: &mut Vec<gtk::Widget>) {
     if pane::is_pane_widget(widget) {
-        panes.push(widget.clone());
+        if pane::is_live_pane(widget) {
+            panes.push(widget.clone());
+        }
         return;
     }
 

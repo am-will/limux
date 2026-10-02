@@ -241,6 +241,17 @@ impl SplitTreeContainer {
         }
     }
 
+    /// The pane on screen once the pending rebuild lands: the zoomed one, or
+    /// the model's first leaf.
+    pub(crate) fn shown_pane(&self) -> gtk::Widget {
+        if let Some(zoomed) = self.zoomed_pane.borrow().as_ref() {
+            return zoomed.clone();
+        }
+        let mut panes = Vec::new();
+        self.tree.borrow().collect_panes(&mut panes);
+        panes.swap_remove(0)
+    }
+
     pub(crate) fn contains(&self, target: &gtk::Widget) -> bool {
         self.tree.borrow().contains_pane(target)
     }

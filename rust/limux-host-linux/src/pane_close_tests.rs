@@ -466,6 +466,16 @@ fn zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane() {
     pump_for(std::time::Duration::from_millis(300));
     drop(lead);
 
+    // Directional lookups skip it too.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    assert!(
+        pane_in_direction(&state, &first, Direction::Left).is_none(),
+        "found the closed pane"
+    );
+    drop(lead);
+    pump_for(std::time::Duration::from_millis(300));
+
     // A split of the closed pane itself builds nothing.
     let lead = split_before(&state, &ws_id, &first);
     remove_pane(&state, &ws_id, &lead);
