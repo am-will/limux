@@ -247,10 +247,11 @@ fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Opt
     }
 }
 
-/// The workspace a request naming `surface_hint` acts on. A shell keeps the
-/// LIMUX_WORKSPACE_ID it started with after its tab moves to another workspace,
-/// which may be gone by then, so a surface the requested workspace does not
-/// hold is looked up in the others, as notifications do.
+/// The workspace a request naming `surface_hint` acts on. A request scoped to a
+/// workspace stays there. An unscoped one, which the CLI sends for a named
+/// surface since a shell keeps the LIMUX_WORKSPACE_ID it started with after its
+/// tab moves to another workspace, looks for the surface in the active
+/// workspace, then in the others, as notifications do.
 fn workspace_index_for_surface(
     state: &State,
     target: &WorkspaceTarget,
@@ -266,7 +267,7 @@ fn workspace_index_for_surface(
             app_state.active_idx,
         )
     };
-    let Some(surface_hint) = surface_hint else {
+    let (Some(surface_hint), WorkspaceTarget::Active) = (surface_hint, target) else {
         return requested;
     };
     match resolve_surface_tab_target(state, requested.unwrap_or(active), surface_hint) {
