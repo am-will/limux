@@ -241,9 +241,15 @@ impl SplitTreeContainer {
         }
     }
 
+    pub(crate) fn contains(&self, target: &gtk::Widget) -> bool {
+        self.tree.borrow().contains_pane(target)
+    }
+
     pub(crate) fn toggle_zoom(self: &Rc<Self>, target: &gtk::Widget) -> bool {
         if self.zoomed_pane.borrow().is_some() {
             self.restore_zoom();
+            false
+        } else if !self.contains(target) {
             false
         } else {
             self.zoom_pane(target);
@@ -292,7 +298,7 @@ impl SplitTreeContainer {
         new_pane_first: bool,
         ratio: f64,
     ) -> bool {
-        if !pane_has_room_to_split(target, orientation) {
+        if !self.contains(target) || !pane_has_room_to_split(target, orientation) {
             return false;
         }
 

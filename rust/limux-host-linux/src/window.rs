@@ -6641,15 +6641,15 @@ fn focus_workspace_entrypoint(root: &gtk::Widget) {
     }
 }
 
-fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
-    if pane::is_pane_widget(widget) {
-        return widget.clone();
-    }
+/// A pane that has not been closed: `pane::retire_pane` drops its internals
+/// but leaves the widget in the old tree until the next frame.
+fn is_live_pane(widget: &gtk::Widget) -> bool {
+    pane::is_pane_widget(widget) && pane::pane_leading_box(widget).is_some()
+}
 
-    if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
-        if let Some(child) = paned.start_child().or_else(|| paned.end_child()) {
-            return first_leaf_pane(&child);
-        }
+fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
+    if is_live_pane(widget) {
+        return widget.clone();
     }
 
     if let Some(stack) = widget.downcast_ref::<gtk::Stack>() {
@@ -6661,7 +6661,7 @@ fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
     let mut child = widget.first_child();
     while let Some(current) = child {
         let candidate = first_leaf_pane(&current);
-        if pane::is_pane_widget(&candidate) {
+        if is_live_pane(&candidate) {
             return candidate;
         }
         child = current.next_sibling();
@@ -6865,7 +6865,7 @@ fn split_pane(
     };
     let container = container?;
     let autostart_command = autostart_command?;
-    if !container.can_split(pane_widget, orientation) {
+    if !container.contains(pane_widget) || !container.can_split(pane_widget, orientation) {
         return None;
     }
 
