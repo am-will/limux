@@ -102,6 +102,11 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Install uv for X11 input regression
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.11.15"
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -121,6 +126,7 @@ jobs:
             weston \
             xauth \
             xdotool \
+            xinput \
             xvfb
 
       - name: Build libghostty for embedding
@@ -130,6 +136,9 @@ jobs:
         env:
           LIMUX_SMOKE_PROFILE: debug
         run: ./scripts/xvfb-smoke-test.sh
+
+      - name: Check X11 input-seat removal
+        run: uv run scripts/tests/test-input-seat-removal.py
 
       - name: Check terminal directory inheritance
         run: ./scripts/tests/test-terminal-cwd.sh

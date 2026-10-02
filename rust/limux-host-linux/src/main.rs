@@ -3,6 +3,7 @@ mod browser_link;
 mod control_bridge;
 mod ghostty_config;
 mod ime;
+mod input_seats;
 mod keybind_editor;
 mod layout_state;
 mod link_uri;
@@ -15,10 +16,13 @@ mod ssh_dialog;
 mod ssh_hosts;
 mod terminal;
 mod window;
+mod x11_cursor_errors;
 
 use adw::prelude::*;
 use libadwaita as adw;
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 pub(crate) const APP_ID: &str = "dev.limux.linux";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -241,7 +245,14 @@ fn main() {
         .flags(adw::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
+    let input_seat_bridge = Rc::new(OnceCell::new());
+    let input_seat_bridge_for_activate = Rc::clone(&input_seat_bridge);
     app.connect_activate(move |app| {
+        if input_seat_bridge_for_activate.get().is_none() {
+            let bridge = gtk4::gdk::Display::default()
+                .and_then(|display| input_seats::InputSeatRemovalBridge::install(&display));
+            let _ = input_seat_bridge_for_activate.set(bridge);
+        }
         window::build_window(app);
     });
     app.run();
