@@ -396,3 +396,37 @@ fn closed_tabs_panes_and_workspaces_free_their_widgets() {
     let window = state.borrow().window.clone();
     window.close();
 }
+
+// The workspace menu's items held their own popover, a cycle that kept it and
+// its row parent chain alive after every use. The headless compositor has no
+// seat, so the popover is never presented nor closed: detach it by hand, as
+// its `closed` handler would, and require that nothing else retains it.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn workspace_context_menu_never_retains_its_popover() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.WorkspaceMenuTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let row = state.borrow().workspaces[0].sidebar_row.clone();
+    pump_for(std::time::Duration::from_millis(200));
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Rename").emit_clicked();
+    let refs = vec![menu.clone().upcast::<gtk::Widget>().downgrade()];
+    menu.unparent();
+    drop(menu);
+    assert_freed("workspace context menu", &refs);
+}

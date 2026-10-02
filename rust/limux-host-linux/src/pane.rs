@@ -327,6 +327,8 @@ impl TerminalShortcutTarget {
 struct BrowserTabState {
     uri: Rc<RefCell<Option<String>>>,
     handles: BrowserHandles,
+    /// The callbacks of the pane the tab is in, re-pointed when it moves.
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
 }
 
 #[derive(Clone)]
@@ -1775,10 +1777,11 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             .as_ref()
             .and_then(|value| value.uri.map(|uri| uri.to_string())),
     ));
+    let callbacks = Rc::new(RefCell::new(internals.callbacks.clone()));
     let (widget, title, handles) = create_browser_widget(
         options.as_ref().and_then(|value| value.uri),
         saved_uri.clone(),
-        internals.callbacks.clone(),
+        callbacks.clone(),
     );
 
     let (tab_btn, title_label, unread_dot) = build_tab_button(&title, &tab_id, internals);
@@ -1803,6 +1806,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
                 state: BrowserTabState {
                     uri: saved_uri.clone(),
                     handles,
+                    callbacks,
                 },
             },
         });
@@ -3144,13 +3148,19 @@ fn rebuild_tab_strip(tab_strip: &gtk::Box, tab_state: &Rc<RefCell<TabState>>) {
 }
 
 fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInternals>) {
-    if let TabKind::Terminal { state } = &entry.kind {
-        state.handle.replace_callbacks(make_terminal_callbacks(
-            target,
-            &entry.id,
-            &entry.title_label,
-            &state.cwd,
-        ));
+    match &entry.kind {
+        TabKind::Terminal { state } => {
+            state.handle.replace_callbacks(make_terminal_callbacks(
+                target,
+                &entry.id,
+                &entry.title_label,
+                &state.cwd,
+            ));
+        }
+        TabKind::Browser { state } => {
+            *state.callbacks.borrow_mut() = target.callbacks.clone();
+        }
+        _ => {}
     }
     let (tab_button, unread_dot) =
         build_tab_button_from_label(&entry.title_label, &entry.id, target);
@@ -4063,7 +4073,7 @@ const LIMUX_BROWSER_EDITABLE_STATE_SCRIPT: &str = r#"
 fn create_browser_widget(
     initial_uri: Option<&str>,
     saved_uri: Rc<RefCell<Option<String>>>,
-    callbacks: Rc<PaneCallbacks>,
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
 ) -> (gtk::Widget, String, BrowserHandles) {
     use webkit6::prelude::*;
 
@@ -4178,6 +4188,7 @@ fn create_browser_widget(
                 }
                 restoring_flag.set(false);
                 *saved_uri.borrow_mut() = Some(uri_str);
+                let callbacks = callbacks.borrow().clone();
                 (callbacks.on_state_changed)();
             }
         });
@@ -4305,7 +4316,7 @@ fn is_localhost_input(input: &str) -> bool {
 fn create_browser_widget(
     initial_uri: Option<&str>,
     saved_uri: Rc<RefCell<Option<String>>>,
-    _callbacks: Rc<PaneCallbacks>,
+    _callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
 ) -> (gtk::Widget, String, BrowserHandles) {
     *saved_uri.borrow_mut() = initial_uri.map(|value| value.to_string());
     let placeholder = gtk::Box::builder()
@@ -5308,5 +5319,110 @@ mod tests {
         }
 
         window.close();
+    }
+
+    // A moved browser tab reports its URI changes to its new pane's callbacks,
+    // not to the pane it left.
+    #[cfg(feature = "webkit")]
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn moved_browser_tab_reports_to_its_new_pane() {
+        use super::{create_pane, find_pane_internals, glib, move_tab_to_pane, PaneCallbacks};
+        use crate::app_config::AppConfig;
+        use gtk4 as gtk;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        use webkit6::prelude::*;
+
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let callbacks = |changes: Rc<Cell<u32>>| {
+            let shortcuts = shortcuts.clone();
+            let config = Rc::new(RefCell::new(AppConfig::default()));
+            Rc::new(PaneCallbacks {
+                workspace_id: "test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(move || changes.set(changes.get() + 1)),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(move || config.clone()),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+        let (source_changes, target_changes) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let source = create_pane(
+            callbacks(source_changes.clone()),
+            shortcuts.clone(),
+            None,
+            None,
+            true,
+        );
+        let target = create_pane(
+            callbacks(target_changes.clone()),
+            shortcuts.clone(),
+            None,
+            None,
+            true,
+        );
+        super::add_browser_tab_to_pane(source.upcast_ref());
+        let moved_id = find_pane_internals(source.upcast_ref())
+            .unwrap()
+            .tab_state
+            .borrow()
+            .tabs[0]
+            .id
+            .clone();
+        assert!(move_tab_to_pane(
+            source.upcast_ref(),
+            &moved_id,
+            target.upcast_ref()
+        ));
+        // The tab's own first page load may already have been reported.
+        let source_before = source_changes.get();
+
+        let target_state = find_pane_internals(target.upcast_ref()).unwrap();
+        let content = target_state.tab_state.borrow().tabs[0].content.clone();
+        let mut widgets = vec![content];
+        let webview = std::iter::from_fn(|| {
+            let widget = widgets.pop()?;
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                widgets.push(current);
+            }
+            Some(widget)
+        })
+        .find_map(|widget| widget.downcast::<webkit6::WebView>().ok())
+        .expect("browser webview");
+        let target_before = target_changes.get();
+        webview.load_uri("data:text/plain,moved");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while target_changes.get() == target_before && std::time::Instant::now() < deadline {
+            context.iteration(false);
+        }
+        assert!(
+            target_changes.get() > target_before,
+            "the new pane never heard of it"
+        );
+        assert_eq!(
+            source_changes.get(),
+            source_before,
+            "the old pane heard of it"
+        );
     }
 }
