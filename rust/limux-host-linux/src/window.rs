@@ -247,6 +247,34 @@ fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Opt
     }
 }
 
+/// The workspace a request naming `surface_hint` acts on. A shell keeps the
+/// LIMUX_WORKSPACE_ID it started with after its tab moves to another workspace,
+/// which may be gone by then, so a surface the requested workspace does not
+/// hold is looked up in the others, as notifications do.
+fn workspace_index_for_surface(
+    state: &State,
+    target: &WorkspaceTarget,
+    surface_hint: Option<&str>,
+) -> Option<usize> {
+    let (requested, active) = {
+        let app_state = state.borrow();
+        if app_state.workspaces.is_empty() {
+            return None;
+        }
+        (
+            workspace_index_for_target(&app_state, target),
+            app_state.active_idx,
+        )
+    };
+    let Some(surface_hint) = surface_hint else {
+        return requested;
+    };
+    match resolve_surface_tab_target(state, requested.unwrap_or(active), surface_hint) {
+        (index, Some(_)) => Some(index),
+        (_, None) => requested,
+    }
+}
+
 fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> serde_json::Value {
     let cwd = workspace.cwd.borrow().clone().unwrap_or_default();
     serde_json::json!({
@@ -577,10 +605,10 @@ pub(crate) fn resolve_pane_create_target(
     pane_id: Option<u32>,
     direction: PaneCreateDirection,
 ) -> Result<ResolvedPaneCreateTarget, PaneCreateTargetError> {
+    let workspace_index = workspace_index_for_surface(state, target, surface_id);
     let (workspace_id, workspace_root, target_workspace_is_active) = {
         let app_state = state.borrow();
-        let workspace_index = workspace_index_for_target(&app_state, target)
-            .ok_or(PaneCreateTargetError::WorkspaceNotFound)?;
+        let workspace_index = workspace_index.ok_or(PaneCreateTargetError::WorkspaceNotFound)?;
         let workspace = &app_state.workspaces[workspace_index];
         (
             workspace.id.clone(),
@@ -5533,10 +5561,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -5709,10 +5734,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             text,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -5741,10 +5763,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -5816,7 +5835,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+            let Some(index) = workspace_index_for_surface(state, &target, surface_hint.as_deref())
+            else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "workspace not found",
                 )));
@@ -5853,7 +5873,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+            let Some(index) = workspace_index_for_surface(state, &target, surface_hint.as_deref())
+            else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "workspace not found",
                 )));
@@ -5918,7 +5939,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             title,
             reply,
         } => {
-            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+            let Some(index) = workspace_index_for_surface(state, &target, surface_hint.as_deref())
+            else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "workspace not found",
                 )));
@@ -5988,10 +6010,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             key,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -6030,10 +6049,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         } => {
             // Resolve the workspace target. `WorkspaceTarget::Active` maps to
             // the currently-focused workspace via workspace_index_for_target.
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(preferred_index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -6044,7 +6060,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let (index, tab_target) = surface_hint
                 .as_deref()
-                .map(|surface| resolve_notification_tab_target(state, preferred_index, surface))
+                .map(|surface| resolve_surface_tab_target(state, preferred_index, surface))
                 .unwrap_or((preferred_index, None));
 
             let (ws_id, root, workspace_is_active, window_active) = {
@@ -7627,7 +7643,7 @@ fn should_emit_desktop_notification(
     desktop_notifications_enabled && (!window_active || !workspace_is_active || !source_focused)
 }
 
-fn resolve_notification_tab_target(
+fn resolve_surface_tab_target(
     state: &State,
     preferred_index: usize,
     surface_hint: &str,
