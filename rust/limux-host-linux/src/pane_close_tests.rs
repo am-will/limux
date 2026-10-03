@@ -397,3 +397,118 @@ fn closed_tabs_panes_and_workspaces_free_their_widgets() {
     let window = state.borrow().window.clone();
     window.close();
 }
+
+fn registered_panes() -> Vec<gtk::Widget> {
+    (0..1000).filter_map(pane::find_pane_widget_by_id).collect()
+}
+
+/// Splits `first` with a new pane before it, shows both and focuses the new
+/// one, so closing it closes the first leaf of the tree.
+fn split_before(state: &State, ws_id: &str, first: &gtk::Widget) -> gtk::Widget {
+    let lead = split_pane(
+        state,
+        ws_id,
+        first,
+        gtk::Orientation::Horizontal,
+        SplitPaneOptions {
+            new_pane_first: true,
+            ..split_options()
+        },
+    )
+    .expect("split");
+    pump_until(std::time::Duration::from_secs(5), || {
+        shown(&lead) && shown(first)
+    });
+    assert!(shown(&lead) && shown(first), "split panes never showed");
+    assert!(pane::focus_active_tab_in_pane(&lead));
+    pump_for(std::time::Duration::from_millis(200));
+    lead
+}
+
+// A zoom or split within one frame of a pane close used to target the closed
+// pane: the old widget tree stays in the workspace until the next frame, and
+// its first leaf was found when the focus sat in no pane.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.PaneCloseZoomSplitTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+    let (ws_id, first, container) = {
+        let s = state.borrow();
+        let ws = s.active_workspace().unwrap();
+        let first = find_leaf_pane(&ws.root, gtk::Orientation::Horizontal, true);
+        (ws.id.clone(), first, ws.split_container.clone())
+    };
+    pump_until(wait, || shown(&first));
+
+    // Zoom right after the first leaf closed.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    toggle_focused_pane_zoom(&state);
+    pump_until(wait, || shown(&first));
+    assert!(shown(&first), "the zoom left the workspace blank");
+    assert!(!container.contains(&lead), "the closed pane is in the tree");
+    toggle_focused_pane_zoom(&state);
+    pump_for(std::time::Duration::from_millis(300));
+    drop(lead);
+
+    // Directional lookups skip it too.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    assert!(
+        pane_in_direction(&state, &first, Direction::Left).is_none(),
+        "found the closed pane"
+    );
+    drop(lead);
+    pump_for(std::time::Duration::from_millis(300));
+
+    // A split of the closed pane itself builds nothing.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    let before = registered_panes().len();
+    assert!(
+        split_pane(
+            &state,
+            &ws_id,
+            &lead,
+            gtk::Orientation::Horizontal,
+            split_options()
+        )
+        .is_none(),
+        "split a closed pane"
+    );
+    assert_eq!(registered_panes().len(), before, "an orphaned pane");
+    drop(lead);
+    pump_for(std::time::Duration::from_millis(300));
+
+    // Split right after the first leaf closed.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    let before = registered_panes().len();
+    split_focused_pane(&state, gtk::Orientation::Horizontal);
+    pump_for(std::time::Duration::from_millis(500));
+    let panes = registered_panes();
+    assert_eq!(panes.len(), before + 1, "the split built one pane");
+    assert!(
+        panes.iter().all(shown),
+        "a registered pane is not in the tree"
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+}

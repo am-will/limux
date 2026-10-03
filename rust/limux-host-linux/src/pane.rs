@@ -2075,6 +2075,12 @@ pub fn pane_leading_box(pane_widget: &gtk::Widget) -> Option<gtk::Box> {
     find_pane_internals(pane_widget).map(|internals| internals.leading_box.clone())
 }
 
+/// A pane that has not been closed: `retire_pane` drops its internals but
+/// leaves the widget in the old tree until the next frame.
+pub fn is_live_pane(widget: &gtk::Widget) -> bool {
+    find_pane_internals(widget).is_some()
+}
+
 pub fn is_pane_widget(widget: &gtk::Widget) -> bool {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return false;
