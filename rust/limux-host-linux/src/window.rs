@@ -188,10 +188,10 @@ fn send_pane_create_response_after_command(
         move || {
             attempts += 1;
 
-            if let Some((matched_surface_id, handle)) =
-                pane::exact_terminal_handle_for_surface(&pane_widget, &surface_id)
+            if let Some((_, handle)) =
+                pane::terminal_handle_for_surface(&pane_widget, Some(&surface_id))
             {
-                if matched_surface_id == surface_id && !command_sent {
+                if !command_sent {
                     command_sent = handle.send_text(&command);
                 }
                 if command_sent && handle.send_key("Enter") {
@@ -247,6 +247,35 @@ fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Opt
             .iter()
             .position(|workspace| workspace.name == *name),
         WorkspaceTarget::Index(index) => (*index < state.workspaces.len()).then_some(*index),
+    }
+}
+
+/// The workspace a request naming `surface_hint` acts on. A request scoped to a
+/// workspace stays there. An unscoped one, which the CLI sends for a named
+/// surface since a shell keeps the LIMUX_WORKSPACE_ID it started with after its
+/// tab moves to another workspace, looks for the surface in the active
+/// workspace, then in the others, as notifications do.
+fn workspace_index_for_surface(
+    state: &State,
+    target: &WorkspaceTarget,
+    surface_hint: Option<&str>,
+) -> Option<usize> {
+    let (requested, active) = {
+        let app_state = state.borrow();
+        if app_state.workspaces.is_empty() {
+            return None;
+        }
+        (
+            workspace_index_for_target(&app_state, target),
+            app_state.active_idx,
+        )
+    };
+    let (Some(surface_hint), WorkspaceTarget::Active) = (surface_hint, target) else {
+        return requested;
+    };
+    match resolve_surface_tab_target(state, requested.unwrap_or(active), surface_hint) {
+        (index, Some(_)) => Some(index),
+        (_, None) => requested,
     }
 }
 
@@ -422,7 +451,8 @@ fn focus_control_surface(state: &State, index: usize, pane: &gtk::Widget, tab_id
 }
 
 /// Resolve all terminal control operations through the same workspace-local target.
-/// Explicit surfaces must resolve exactly. With no explicit surface, use the
+/// An explicit surface must name an existing terminal tab, whatever pane its
+/// surface id names, and never falls back. With no explicit surface, use the
 /// requested workspace's focused surface; a focused browser is not a terminal
 /// target. Fall back to the first terminal only when no surface has focus.
 fn control_terminal_target(
@@ -523,29 +553,22 @@ fn pane_create_split_placement(direction: PaneCreateDirection) -> PaneCreateSpli
     }
 }
 
-fn normalize_surface_handle(raw: &str) -> &str {
-    raw.trim()
-        .strip_prefix("surface:")
-        .unwrap_or_else(|| raw.trim())
-}
-
 fn resolve_pane_create_source_id(
     surface_id: Option<&str>,
     pane_id: Option<u32>,
     focused_pane_id: Option<u32>,
     target_workspace_is_active: bool,
     pane_ids: &[u32],
-    surface_to_pane: &[(&str, u32)],
+    tab_to_pane: &[(&str, u32)],
 ) -> Result<u32, PaneCreateTargetError> {
     if pane_ids.is_empty() {
         return Err(PaneCreateTargetError::NoPanes);
     }
 
     if let Some(surface_id) = surface_id {
-        let requested = normalize_surface_handle(surface_id);
-        return surface_to_pane
+        return tab_to_pane
             .iter()
-            .find(|(known_surface_id, _)| *known_surface_id == requested)
+            .find(|(tab_id, _)| pane::surface_hint_matches(tab_id, surface_id))
             .map(|(_, pane_id)| *pane_id)
             .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
     }
@@ -588,10 +611,10 @@ pub(crate) fn resolve_pane_create_target(
     pane_id: Option<u32>,
     direction: PaneCreateDirection,
 ) -> Result<ResolvedPaneCreateTarget, PaneCreateTargetError> {
+    let workspace_index = workspace_index_for_surface(state, target, surface_id);
     let (workspace_id, workspace_root, target_workspace_is_active) = {
         let app_state = state.borrow();
-        let workspace_index = workspace_index_for_target(&app_state, target)
-            .ok_or(PaneCreateTargetError::WorkspaceNotFound)?;
+        let workspace_index = workspace_index.ok_or(PaneCreateTargetError::WorkspaceNotFound)?;
         let workspace = &app_state.workspaces[workspace_index];
         (
             workspace.id.clone(),
@@ -606,9 +629,9 @@ pub(crate) fn resolve_pane_create_target(
         .map(|summary| summary.pane_id)
         .collect::<Vec<_>>();
     let surface_summaries = pane::surface_summaries_for_root(&workspace_root);
-    let surface_to_pane = surface_summaries
+    let tab_to_pane = surface_summaries
         .iter()
-        .map(|surface| (surface.surface_id.as_str(), surface.pane_id))
+        .map(|surface| (surface.tab_id.as_str(), surface.pane_id))
         .collect::<Vec<_>>();
     let focused_pane_id = target_workspace_is_active
         .then(|| focused_ids_for_workspace(state, &workspace_id).0)
@@ -620,7 +643,7 @@ pub(crate) fn resolve_pane_create_target(
         focused_pane_id,
         target_workspace_is_active,
         &pane_ids,
-        &surface_to_pane,
+        &tab_to_pane,
     )?;
     let pane_widget = pane::pane_widget_for_root(&workspace_root, pane_id)
         .ok_or(PaneCreateTargetError::InvalidPaneId(pane_id))?;
@@ -817,10 +840,11 @@ fn surface_health_payload(
     workspace: &Workspace,
     surface_hint: Option<&str>,
 ) -> Result<serde_json::Value, BridgeError> {
-    let requested = surface_hint.map(normalize_surface_handle);
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
-        .filter(|surface| requested.is_none_or(|requested| surface.surface_id == requested))
+        .filter(|surface| {
+            surface_hint.is_none_or(|hint| pane::surface_hint_matches(&surface.tab_id, hint))
+        })
         .enumerate()
         .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
         .collect::<Vec<_>>();
@@ -5659,10 +5683,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -5859,10 +5880,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             text,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -5891,10 +5909,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -5966,7 +5981,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+            let Some(index) = workspace_index_for_surface(state, &target, surface_hint.as_deref())
+            else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "workspace not found",
                 )));
@@ -6003,7 +6019,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             surface_hint,
             reply,
         } => {
-            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+            let Some(index) = workspace_index_for_surface(state, &target, surface_hint.as_deref())
+            else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "workspace not found",
                 )));
@@ -6068,7 +6085,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             title,
             reply,
         } => {
-            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+            let Some(index) = workspace_index_for_surface(state, &target, surface_hint.as_deref())
+            else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "workspace not found",
                 )));
@@ -6138,10 +6156,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             key,
             reply,
         } => {
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -6180,10 +6195,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         } => {
             // Resolve the workspace target. `WorkspaceTarget::Active` maps to
             // the currently-focused workspace via workspace_index_for_target.
-            let resolved = {
-                let app_state = state.borrow();
-                workspace_index_for_target(&app_state, &target)
-            };
+            let resolved = workspace_index_for_surface(state, &target, surface_hint.as_deref());
 
             let Some(preferred_index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
@@ -6194,7 +6206,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let (index, tab_target) = surface_hint
                 .as_deref()
-                .map(|surface| resolve_notification_tab_target(state, preferred_index, surface))
+                .map(|surface| resolve_surface_tab_target(state, preferred_index, surface))
                 .unwrap_or((preferred_index, None));
 
             let (ws_id, root, workspace_is_active, window_active) = {
@@ -7780,7 +7792,7 @@ fn should_emit_desktop_notification(
     desktop_notifications_enabled && (!window_active || !workspace_is_active || !source_focused)
 }
 
-fn resolve_notification_tab_target(
+fn resolve_surface_tab_target(
     state: &State,
     preferred_index: usize,
     surface_hint: &str,
@@ -8340,11 +8352,23 @@ mod tests {
     #[test]
     fn pane_create_source_prefers_surface_then_pane_then_active_focus_then_first_leaf() {
         let panes = [10, 20, 30];
-        let surfaces = [("10:aaa", 10), ("20:bbb", 20)];
+        let surfaces = [("aaa", 10), ("bbb", 20)];
 
         assert_eq!(
             resolve_pane_create_source_id(
                 Some("surface:20:bbb"),
+                Some(10),
+                Some(30),
+                true,
+                &panes,
+                &surfaces,
+            ),
+            Ok(20)
+        );
+        // A moved tab's shell still names the pane it started in.
+        assert_eq!(
+            resolve_pane_create_source_id(
+                Some("surface:10:bbb"),
                 Some(10),
                 Some(30),
                 true,
@@ -8370,7 +8394,7 @@ mod tests {
     #[test]
     fn pane_create_source_reports_invalid_surface_pane_and_empty_workspace() {
         let panes = [10, 20];
-        let surfaces = [("10:aaa", 10)];
+        let surfaces = [("aaa", 10)];
 
         assert_eq!(
             resolve_pane_create_source_id(

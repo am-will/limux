@@ -846,10 +846,8 @@ fn render_list_text(command: &str, payload: &Value) -> String {
 }
 
 async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
     let surface = parse_terminal_surface(args)?;
+    let workspace = request_workspace(parse_opt(args, "--workspace"), surface.as_deref(), env_opt);
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
 
@@ -869,10 +867,8 @@ async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
 }
 
 async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
     let surface = parse_terminal_surface(args)?;
+    let workspace = request_workspace(parse_opt(args, "--workspace"), surface.as_deref(), env_opt);
     let key = trailing_title(args).ok_or_else(|| anyhow!("send-key requires key"))?;
 
     let mut params = Map::new();
@@ -2477,24 +2473,28 @@ fn lifecycle_scope(
     target: Option<(&str, &str, &str)>,
 ) -> Result<Map<String, Value>> {
     let mut params = Map::new();
-    let workspace = lifecycle_option(args, "--workspace")?.or_else(|| {
-        env::var("LIMUX_WORKSPACE_ID")
-            .ok()
-            .filter(|value| !value.is_empty())
-    });
-    if let Some(workspace) = workspace {
+    let explicit_workspace = lifecycle_option(args, "--workspace")?;
+    let target = match target {
+        Some((flag, key, env_key)) => {
+            // An explicit workspace must not inherit the caller's target from another workspace.
+            let value = lifecycle_option(args, flag)?.or_else(|| {
+                (!parse_flag(args, "--workspace"))
+                    .then(|| env::var(env_key).ok().filter(|value| !value.is_empty()))
+                    .flatten()
+            });
+            value.map(|value| (key, value))
+        }
+        None => None,
+    };
+    let surface = target
+        .as_ref()
+        .filter(|(key, _)| *key == "surface_id")
+        .map(|(_, value)| value.as_str());
+    if let Some(workspace) = request_workspace(explicit_workspace, surface, env_opt) {
         params.insert("workspace_id".to_string(), Value::String(workspace));
     }
-    if let Some((flag, key, env_key)) = target {
-        // An explicit workspace must not inherit the caller's target from another workspace.
-        let target = lifecycle_option(args, flag)?.or_else(|| {
-            (!parse_flag(args, "--workspace"))
-                .then(|| env::var(env_key).ok().filter(|value| !value.is_empty()))
-                .flatten()
-        });
-        if let Some(target) = target {
-            params.insert(key.to_string(), Value::String(target));
-        }
+    if let Some((key, value)) = target {
+        params.insert(key.to_string(), Value::String(value));
     }
     Ok(params)
 }
@@ -2573,13 +2573,33 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
+/// The workspace a request is scoped to: an explicit `--workspace`, else the
+/// caller's LIMUX_WORKSPACE_ID unless the request names a surface. A shell keeps
+/// that variable after its tab moves to another workspace, so a named surface is
+/// sent unscoped and the host looks for it in every workspace.
+fn request_workspace(
+    explicit: Option<String>,
+    surface: Option<&str>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    nonempty(explicit).or_else(|| {
+        surface
+            .is_none()
+            .then(|| nonempty(env_lookup("LIMUX_WORKSPACE_ID")))
+            .flatten()
+    })
+}
+
 fn build_new_pane_request(
     args: &[String],
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> (Option<String>, Value) {
-    let workspace =
-        nonempty(parse_opt(args, "--workspace").or_else(|| env_lookup("LIMUX_WORKSPACE_ID")));
     let surface = nonempty(parse_opt(args, "--surface").or_else(|| env_lookup("LIMUX_SURFACE_ID")));
+    let workspace = request_workspace(
+        parse_opt(args, "--workspace"),
+        surface.as_deref(),
+        &env_lookup,
+    );
     let pane = nonempty(parse_opt(args, "--pane").or_else(|| env_lookup("LIMUX_PANE_ID")));
     let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
     let pane_type = parse_opt(args, "--type").unwrap_or_else(|| "terminal".to_string());
@@ -4441,6 +4461,33 @@ mod agent_team_tests {
 }
 
 #[cfg(test)]
+mod request_workspace_tests {
+    use super::request_workspace;
+
+    fn env(name: &str) -> Option<String> {
+        (name == "LIMUX_WORKSPACE_ID").then(|| "ws-env".to_string())
+    }
+
+    #[test]
+    fn env_workspace_scopes_only_requests_without_a_surface() {
+        assert_eq!(
+            request_workspace(None, None, env).as_deref(),
+            Some("ws-env")
+        );
+        assert_eq!(request_workspace(None, Some("7:tab-a"), env), None);
+        assert_eq!(
+            request_workspace(Some("ws-flag".to_string()), Some("7:tab-a"), env).as_deref(),
+            Some("ws-flag")
+        );
+        assert_eq!(
+            request_workspace(Some(" ".to_string()), None, env).as_deref(),
+            Some("ws-env")
+        );
+        assert_eq!(request_workspace(None, None, |_| None), None);
+    }
+}
+
+#[cfg(test)]
 mod new_pane_tests {
     use super::*;
 
@@ -4501,7 +4548,8 @@ mod new_pane_tests {
     fn new_pane_serializes_env_defaults_and_command() {
         let (workspace, params) = build_new_pane_request(&args(&["--command", "claude"]), test_env);
 
-        assert_eq!(workspace.as_deref(), Some("workspace:agent"));
+        // The caller's surface leads; its workspace may be stale after a move.
+        assert_eq!(workspace, None);
         assert_eq!(
             params,
             json!({
