@@ -4231,9 +4231,11 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         new_tab_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             let (index, directory, row, sidebar_list, target_pane) = {
                 let app_state = state.borrow();
                 let Some(index) = app_state
@@ -4281,33 +4283,55 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         rename_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             begin_workspace_inline_rename(&state, &ws_id);
         });
     }
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         autostart_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             show_workspace_autostart_dialog(&state, &ws_id);
         });
     }
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         delete_btn.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             close_workspace_by_id(&state, &ws_id);
             request_session_save(&state);
         });
     }
     {
+        // With the focus still on an item, the unparent would leak the popover
+        // (see `terminal::unset_focus_within`); give it back to whatever had it
+        // before the menu opened, usually a terminal, rather than to the row,
+        // which Delete removes right after.
+        let previous_focus = row
+            .root()
+            .and_then(|root| root.focus())
+            .map(|w| w.downgrade());
         popover.connect_closed(move |p| {
+            if crate::terminal::focus_is_within(p.upcast_ref())
+                && !previous_focus
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .is_some_and(|w| w.grab_focus())
+            {
+                crate::terminal::unset_focus_within(p.upcast_ref());
+            }
             p.unparent();
         });
     }
