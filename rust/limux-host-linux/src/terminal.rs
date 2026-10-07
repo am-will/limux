@@ -741,12 +741,11 @@ pub fn init_ghostty() {
 
         let app = unsafe { ghostty_app_new(&runtime_config, config) };
 
-        // Ghostty's GTK apprt calls core_app.tick() on every GLib main
-        // loop iteration to drain the app mailbox (which includes
-        // redraw_surface messages from the renderer thread). The renderer
-        // thread pushes these messages but doesn't wake the app.
-        // We replicate this with a high-frequency timer (~8ms ≈ 120Hz).
-        glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
+        // Ghostty's App.Mailbox.pushObserved (App.zig:803) calls rt_app.wakeup()
+        // on every mailbox push (including redraw_surface from renderer/Thread.zig),
+        // which invokes ghostty_wakeup_cb coalesced on the GLib main loop.
+        // Keep a low-frequency 250ms (4Hz) timer strictly as a safety net.
+        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             unsafe { ghostty_app_tick(app) };
             glib::ControlFlow::Continue
         });
@@ -1648,7 +1647,10 @@ pub fn create_terminal(
         let handler = gl_area.connect_map(move |gl_area| {
             gl_area.set_auto_render(true);
             if let Some(surface) = *surface_cell.borrow() {
-                unsafe { ghostty_surface_set_occlusion(surface, true) };
+                unsafe {
+                    ghostty_surface_set_occlusion(surface, true);
+                    ghostty_surface_set_focus(surface, gl_area.is_focus());
+                }
                 refresh_surface_display(surface, gl_area);
             } else {
                 gl_area.queue_render();
@@ -1662,7 +1664,10 @@ pub fn create_terminal(
         let handler = gl_area.connect_unmap(move |gl_area| {
             gl_area.set_auto_render(false);
             if let Some(surface) = *surface_cell.borrow() {
-                unsafe { ghostty_surface_set_occlusion(surface, false) };
+                unsafe {
+                    ghostty_surface_set_occlusion(surface, false);
+                    ghostty_surface_set_focus(surface, false);
+                }
             }
         });
         track_signal(&signal_handlers, &gl_area, handler);

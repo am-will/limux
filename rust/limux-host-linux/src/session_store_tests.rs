@@ -620,3 +620,24 @@ fn load_persists_ids_minted_for_empty_panes() {
 
     assert_eq!(disk(dir.path()), loaded.state);
 }
+
+#[test]
+fn noop_repeat_save_does_not_rewrite_unchanged_canonical_file() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (mut store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let canonical = layout_state::canonical_session_path_in(dir.path());
+
+    // First save writes/normalizes under first_save = true.
+    saved(&mut store, &base);
+    let ino_after_first = fs::metadata(&canonical).unwrap().ino();
+
+    // Subsequent save with identical state must be a no-op on disk (preserving inode).
+    saved(&mut store, &base);
+    let ino_after_noop = fs::metadata(&canonical).unwrap().ino();
+    assert_eq!(
+        ino_after_first, ino_after_noop,
+        "repeated no-op save must not replace canonical session.json inode"
+    );
+}

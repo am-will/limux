@@ -104,11 +104,22 @@ impl SessionStore {
 
     pub(crate) fn save(&mut self, local: &AppSessionState) -> io::Result<SaveOutcome> {
         let _lock = lock_directory(&self.directory)?;
-        let disk = read_session(&self.directory)?.state;
+        let loaded_disk = read_session(&self.directory)?;
         let local = layout_state::normalize_session(local.clone());
-        match merge_session(&self.local, &self.ancestry, &local, &disk, self.first_save) {
+        match merge_session(
+            &self.local,
+            &self.ancestry,
+            &local,
+            &loaded_disk.state,
+            self.first_save,
+        ) {
             Ok((merged, ancestry)) => {
-                layout_state::save_session_atomic_in(&self.directory, &merged)?;
+                if self.first_save
+                    || loaded_disk.source != layout_state::SessionLoadSource::Canonical
+                    || merged != loaded_disk.state
+                {
+                    layout_state::save_session_atomic_in(&self.directory, &merged)?;
+                }
                 self.local = local;
                 self.ancestry = ancestry;
                 self.first_save = false;
