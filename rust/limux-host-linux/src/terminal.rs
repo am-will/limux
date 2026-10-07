@@ -1641,7 +1641,10 @@ pub fn create_terminal(
         let handler = gl_area.connect_map(move |gl_area| {
             gl_area.set_auto_render(true);
             if let Some(surface) = *surface_cell.borrow() {
-                unsafe { ghostty_surface_set_occlusion(surface, true) };
+                unsafe {
+                    ghostty_surface_set_occlusion(surface, true);
+                    ghostty_surface_set_focus(surface, gl_area.is_focus());
+                }
                 refresh_surface_display(surface, gl_area);
             } else {
                 gl_area.queue_render();
@@ -1655,7 +1658,10 @@ pub fn create_terminal(
         let handler = gl_area.connect_unmap(move |gl_area| {
             gl_area.set_auto_render(false);
             if let Some(surface) = *surface_cell.borrow() {
-                unsafe { ghostty_surface_set_occlusion(surface, false) };
+                unsafe {
+                    ghostty_surface_set_occlusion(surface, false);
+                    ghostty_surface_set_focus(surface, false);
+                }
             }
         });
         track_signal(&signal_handlers, &gl_area, handler);
