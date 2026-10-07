@@ -3945,15 +3945,6 @@ fn update_indicator_label(button: &gtk::Button, name: &str) {
     }
 }
 
-fn sync_indicator_order(state: &mut AppState) {
-    while let Some(child) = state.indicator_box.first_child() {
-        state.indicator_box.remove(&child);
-    }
-    for ws in &state.workspaces {
-        state.indicator_box.append(&ws.indicator_button);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Sidebar row
 // ---------------------------------------------------------------------------
@@ -4532,14 +4523,24 @@ fn clamp_workspace_insert_index_for_pinning(
     }
 }
 
-fn sync_sidebar_row_order(state: &mut AppState) {
-    while let Some(child) = state.sidebar_list.first_child() {
-        state.sidebar_list.remove(&child);
+fn sync_sidebar_row_order(
+    sidebar_list: &gtk::ListBox,
+    indicator_box: &gtk::Box,
+    rows: &[gtk::ListBoxRow],
+    indicators: &[gtk::Button],
+) {
+    while let Some(child) = sidebar_list.first_child() {
+        sidebar_list.remove(&child);
     }
-    for workspace in &state.workspaces {
-        state.sidebar_list.append(&workspace.sidebar_row);
+    for row in rows {
+        sidebar_list.append(row);
     }
-    sync_indicator_order(state);
+    while let Some(child) = indicator_box.first_child() {
+        indicator_box.remove(&child);
+    }
+    for button in indicators {
+        indicator_box.append(button);
+    }
 }
 
 fn set_workspace_favorite_visual(workspace: &Workspace) {
@@ -4733,7 +4734,7 @@ fn reorder_workspace_by_id(
     target_id: &str,
     drop_below: bool,
 ) -> bool {
-    let (sidebar_list, row_to_select) = {
+    let (sidebar_list, indicator_box, rows, indicators, row_to_select) = {
         let mut s = state.borrow_mut();
         let Some(source_idx) = s
             .workspaces
@@ -4793,13 +4794,32 @@ fn reorder_workspace_by_id(
             }
         }
 
-        sync_sidebar_row_order(&mut s);
+        let rows: Vec<gtk::ListBoxRow> = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.sidebar_row.clone())
+            .collect();
+        let indicators: Vec<gtk::Button> = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.indicator_button.clone())
+            .collect();
         let row_to_select = s
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        (
+            s.sidebar_list.clone(),
+            s.indicator_box.clone(),
+            rows,
+            indicators,
+            row_to_select,
+        )
     };
+
+    // Mutate GTK container children after dropping `state.borrow_mut()` so
+    // synchronous `drag_source.connect_drag_end` callbacks do not panic.
+    sync_sidebar_row_order(&sidebar_list, &indicator_box, &rows, &indicators);
 
     if let Some(row) = row_to_select {
         sidebar_list.select_row(Some(&row));
@@ -4810,7 +4830,7 @@ fn reorder_workspace_by_id(
 }
 
 fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
-    let (sidebar_list, row_to_select) = {
+    let (sidebar_list, indicator_box, rows, indicators, row_to_select) = {
         let mut s = state.borrow_mut();
         let Some(idx) = s
             .workspaces
@@ -4843,13 +4863,30 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
             }
         }
 
-        sync_sidebar_row_order(&mut s);
+        let rows: Vec<gtk::ListBoxRow> = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.sidebar_row.clone())
+            .collect();
+        let indicators: Vec<gtk::Button> = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.indicator_button.clone())
+            .collect();
         let row_to_select = s
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        (
+            s.sidebar_list.clone(),
+            s.indicator_box.clone(),
+            rows,
+            indicators,
+            row_to_select,
+        )
     };
+
+    sync_sidebar_row_order(&sidebar_list, &indicator_box, &rows, &indicators);
 
     if let Some(row) = row_to_select {
         sidebar_list.select_row(Some(&row));
@@ -6719,12 +6756,14 @@ fn close_workspace_by_id_internal(
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
-    s.sidebar_list.remove(&ws.sidebar_row);
-    s.indicator_box.remove(&ws.indicator_button);
+    let sidebar_list = s.sidebar_list.clone();
+    let indicator_box = s.indicator_box.clone();
 
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
+        sidebar_list.remove(&ws.sidebar_row);
+        indicator_box.remove(&ws.indicator_button);
         split_container.retire_panes();
         crate::terminal::remove_from_stack_after_repaint(&ws.root);
         apply_top_bar_mode(state);
@@ -6750,8 +6789,10 @@ fn close_workspace_by_id_internal(
     let stack = s.stack.clone();
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
     let row = s.workspaces[new_idx].sidebar_row.clone();
-    let sidebar_list = s.sidebar_list.clone();
     drop(s);
+
+    sidebar_list.remove(&ws.sidebar_row);
+    indicator_box.remove(&ws.indicator_button);
 
     // Show the new active workspace before hiding the old one: GtkStack maps
     // its first child the instant the visible child is hidden, so showing
