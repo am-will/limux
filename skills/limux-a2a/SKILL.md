@@ -13,7 +13,6 @@ When asked to launch a peer from inside Limux, split first using the already-exp
 
 ```bash
 created="$(limux --json new-pane \
-  --workspace "$LIMUX_WORKSPACE_ID" \
   --pane "$LIMUX_PANE_ID" \
   --surface "$LIMUX_SURFACE_ID" \
   --direction right \
@@ -42,7 +41,7 @@ limux --json list-workspaces
 limux --json list-panels --workspace "$LIMUX_WORKSPACE_ID"
 ```
 
-Target exact peers with `--surface <surface-id>`. Add `--workspace <id-or-name>` when the peer is outside the current workspace.
+Target exact peers with `--surface <surface-id>`; it is found in any workspace, even after its tab moved. Do not add `--workspace` to a surface: it restricts the search to that workspace, and a moved tab's `LIMUX_WORKSPACE_ID` is stale.
 
 ## Spawn Panes
 
@@ -50,7 +49,6 @@ Launch tools directly with `new-pane --command`; do not create an empty shell an
 
 ```bash
 created="$(limux --json new-pane \
-  --workspace "$LIMUX_WORKSPACE_ID" \
   --pane "$LIMUX_PANE_ID" \
   --surface "$LIMUX_SURFACE_ID" \
   --direction right \
@@ -163,7 +161,7 @@ limux send-key --surface "$w1_surface" enter
 ## Human Attention
 
 ```bash
-limux notify --workspace "$LIMUX_WORKSPACE_ID" \
+limux notify \
   --subtitle "input needed" \
   --body "A pane is blocked and needs a decision" \
   "Limux task needs attention"

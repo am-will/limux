@@ -8,6 +8,7 @@ arch=('x86_64')
 url="https://github.com/am-will/limux"
 license=('MIT')
 depends=('fontconfig' 'glib2' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'pango' 'webkitgtk-6.0')
+optdepends=('wl-clipboard: Ctrl+V paste in shells & CLI tools on Wayland')
 makedepends=('git' 'libepoxy' 'rust' 'zig')
 conflicts=('limux-bin' 'limux-bin-debug')
 options=(!debug !lto)

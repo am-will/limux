@@ -84,6 +84,8 @@ sudo ./install.sh --uninstall
 sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 ```
 
+On Wayland, also install `wl-clipboard` (`apt install wl-clipboard`, `dnf install wl-clipboard` or `pacman -S wl-clipboard`). `Ctrl+Shift+V` is Limux's own paste, but plain `Ctrl+V` goes to the program running in the terminal, and some programs read the clipboard themselves (fish's `Ctrl+V`, for example). Without `wl-paste` they fall back to X11 tools like `xclip`, and depending on the compositor the X11 clipboard may not have what you copied in Limux, so `Ctrl+V` pastes something older than `Ctrl+Shift+V`.
+
 ## Build from source
 
 ### Prerequisites
@@ -187,13 +189,14 @@ limux new-pane --direction right --command claude
 # Live GTK self-spawn currently supports terminal panes only.
 
 # Explicit source targets are also accepted and serialized unchanged:
-limux new-pane --workspace "$LIMUX_WORKSPACE_ID" --surface "$LIMUX_SURFACE_ID" \
+limux new-pane --surface "$LIMUX_SURFACE_ID" \
   --pane "$LIMUX_PANE_ID" --direction down --command "codex"
 
 # Keep both agents in the same workspace on separate splits/tabs:
 limux identify --json
 limux list-panels --workspace "$LIMUX_WORKSPACE_ID"
-limux send --workspace "$LIMUX_WORKSPACE_ID" --surface "<peer-surface-id>" \
+# A named surface is found in any workspace; --workspace would restrict the search.
+limux send --surface "<peer-surface-id>" \
   $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
 ```
 
