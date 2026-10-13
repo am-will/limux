@@ -656,8 +656,12 @@ pub(crate) fn resolve_pane_create_target(
         target_workspace_is_active,
         &pane_ids,
     )?;
-    let pane_widget = pane::pane_widget_for_root(&workspace_root, pane_id)
-        .ok_or(PaneCreateTargetError::InvalidPaneId(pane_id))?;
+    // A pane detached by a zoom is out of the root.
+    let pane_widget =
+        pane::pane_widget_for_root(&workspace_root, pane_id).ok_or_else(|| match surface_id {
+            Some(surface_id) => PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()),
+            None => PaneCreateTargetError::InvalidPaneId(pane_id),
+        })?;
 
     Ok(ResolvedPaneCreateTarget {
         workspace_id,
@@ -851,7 +855,7 @@ fn surface_health_payload(
     state: &State,
     workspace: &Workspace,
     surface: Option<(u32, String)>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, BridgeError> {
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
         .filter(|summary| {
@@ -863,7 +867,11 @@ fn surface_health_payload(
         .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
         .collect::<Vec<_>>();
 
-    serde_json::json!({ "surfaces": surfaces })
+    // A pane detached by a zoom is out of the root.
+    if surface.is_some() && surfaces.is_empty() {
+        return Err(BridgeError::not_found("surface not found"));
+    }
+    Ok(serde_json::json!({ "surfaces": surfaces }))
 }
 
 #[derive(Clone)]
@@ -5706,7 +5714,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let app_state = state.borrow();
                 surface_health_payload(state, &app_state.workspaces[index], surface)
             };
-            let _ = reply.send(Ok(result));
+            let _ = reply.send(result);
         }
         ControlCommand::CreateWorkspace {
             name,

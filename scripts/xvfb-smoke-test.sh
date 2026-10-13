@@ -409,7 +409,8 @@ for regression in \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
   window::tab_move_tests::a_tab_moved_to_another_workspace_answers_to_its_original_ids \
-  window::tab_move_tests::an_unscoped_surface_hint_is_resolved_once_across_workspaces; do
+  window::tab_move_tests::an_unscoped_surface_hint_is_resolved_once_across_workspaces \
+  window::tab_move_tests::a_surface_hidden_by_a_zoom_is_reported_not_found; do
   timeout -k 5s 30s cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture
 done

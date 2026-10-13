@@ -296,3 +296,91 @@ fn an_unscoped_surface_hint_is_resolved_once_across_workspaces() {
     let window = state.borrow().window.clone();
     window.close();
 }
+
+// Zooming a pane detaches its siblings from the workspace root. A surface in a
+// detached pane is still found by its id, but health and pane.create, which
+// read the root, must answer that it is not found rather than an empty list or
+// a missing pane.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn a_surface_hidden_by_a_zoom_is_reported_not_found() {
+    use crate::layout_state::{SplitOrientation, SplitState, TabState};
+
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.ZoomedSurfaceHealthTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+
+    let pane = |id: &str| {
+        Box::new(LayoutNodeState::Pane(PaneState {
+            pane_id: None,
+            active_tab_id: Some(id.to_string()),
+            tabs: vec![TabState::terminal(id, None)],
+        }))
+    };
+    add_workspace_from_state(
+        &state,
+        &WorkspaceState {
+            id: None,
+            name: "zoomed".to_string(),
+            favorite: false,
+            cwd: None,
+            folder_path: None,
+            autostart_command: None,
+            color: None,
+            layout: LayoutNodeState::Split(SplitState {
+                orientation: SplitOrientation::Horizontal,
+                ratio: 0.5,
+                start: pane("left"),
+                end: pane("right"),
+            }),
+        },
+    );
+    let index = state.borrow().workspaces.len() - 1;
+    select_workspace_by_index(&state, index);
+    pump_until(std::time::Duration::from_millis(300), || false);
+
+    let (root, container) = {
+        let s = state.borrow();
+        let workspace = &s.workspaces[index];
+        (workspace.root.clone(), workspace.split_container.clone())
+    };
+    let left = find_leaf_pane(&root, gtk::Orientation::Horizontal, true);
+    assert!(container.toggle_zoom(&left));
+    pump_until(std::time::Duration::from_millis(300), || false);
+
+    let target = WorkspaceTarget::Index(index);
+    let (_, surface) = control_request_target(&state, &target, Some("right"), false).unwrap();
+    let health = {
+        let s = state.borrow();
+        surface_health_payload(&state, &s.workspaces[index], surface)
+    };
+    assert!(health.is_err(), "{health:?}");
+    let created = resolve_pane_create_target(
+        &state,
+        &target,
+        Some("right"),
+        None,
+        PaneCreateDirection::Right,
+    )
+    .err();
+    assert_eq!(
+        created,
+        Some(PaneCreateTargetError::InvalidSurfaceId("right".to_string()))
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+}

@@ -949,6 +949,9 @@ pub(crate) fn surface_hint_match(
     surface_hint: &str,
 ) -> Option<SurfaceHintMatch> {
     let hint = normalize_surface_hint(surface_hint);
+    if hint.is_empty() || tab_id.is_empty() {
+        return None;
+    }
     if hint == tab_id {
         return Some(SurfaceHintMatch::TabId);
     }
@@ -4649,6 +4652,13 @@ mod tests {
             resolve_surface_hint::<SurfaceHintMatch, u32>([]),
             HintResolution::NotFound
         );
+    }
+
+    #[test]
+    fn an_empty_hint_or_tab_id_matches_nothing() {
+        for hint in ["", "  ", "surface:", "7:", "surface:7:"] {
+            assert_eq!(surface_hint_match(7, "", hint), None, "{hint:?}");
+        }
     }
 
     #[test]
