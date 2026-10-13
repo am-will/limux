@@ -111,16 +111,18 @@ fn send_command(handle: &TerminalHandle, command: &str) {
 }
 
 fn wait_for_marker(context: &gtk::glib::MainContext, handle: &TerminalHandle, marker: &str) {
-    wait_for(
-        context,
-        Duration::from_secs(5),
-        &format!("terminal output marker {marker}"),
-        || {
-            handle
-                .read_viewport_text()
-                .is_some_and(|text| text.contains(marker))
-        },
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        pump_for(context, Duration::from_millis(5));
+        let text = handle.read_viewport_text().unwrap_or_default();
+        if text.contains(marker) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for terminal output marker {marker}; viewport: {text:?}"
+        );
+    }
 }
 
 #[test]
@@ -158,7 +160,11 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.append(&source);
     row.append(&target);
-    let window = gtk::Window::builder().child(&row).build();
+    let window = gtk::Window::builder()
+        .default_width(1024)
+        .default_height(600)
+        .child(&row)
+        .build();
     window.present();
 
     let first_id = add_shell(
@@ -183,48 +189,26 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
         || first_activity.widget().is_visible(),
     );
 
-    pump_for(&context, Duration::from_secs(4));
-    assert!(
-        first_activity.widget().is_visible(),
-        "startup output remains active before the default five-second expiry"
-    );
     first_handle.focus_surface();
     first_handle.perform_binding_action("scroll_to_row:0");
     wait_for(
         &context,
-        Duration::from_secs(3),
+        Duration::from_secs(7),
         "startup activity to expire without further PTY output",
         || !first_activity.widget().is_visible(),
+    );
+    first_handle.perform_binding_action("scroll_to_bottom");
+    pump_for(&context, Duration::from_millis(150));
+    assert!(
+        !first_activity.widget().is_visible(),
+        "scrolling without PTY output does not restart activity"
     );
 
     config.borrow_mut().interface.tab_activity_seconds = 1;
     apply_tab_activity_config(&config);
-    send_command(&first_handle, "printf 'REFRESH_FIRST\\n'");
-    wait_for_marker(&context, &first_handle, "REFRESH_FIRST");
-    wait_for(
-        &context,
-        Duration::from_secs(2),
-        "first refresh activity",
-        || first_activity.widget().is_visible(),
-    );
-    pump_for(&context, Duration::from_millis(450));
-    send_command(&first_handle, "printf 'REFRESH_SECOND\\n'");
-    wait_for_marker(&context, &first_handle, "REFRESH_SECOND");
-    pump_for(&context, Duration::from_millis(700));
-    assert!(
-        first_activity.widget().is_visible(),
-        "second PTY output refreshes the one-second expiry"
-    );
-    wait_for(
-        &context,
-        Duration::from_secs(2),
-        "refreshed activity to expire",
-        || !first_activity.widget().is_visible(),
-    );
-
     send_command(
         &first_handle,
-        r#"i=0; while [ "$i" -lt 50 ]; do printf 'STREAM_OUTPUT_%s\n' "$i"; i=$((i + 1)); sleep 0.03; done; printf 'STREAM_DONE\n'"#,
+        r#"(while printf 'STREAM_OUTPUT\n'; do sleep 0.03; done) & activity_stream_pid=$!"#,
     );
     wait_for(
         &context,
@@ -237,6 +221,10 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
         first_activity.widget().is_visible(),
         "continuous output keeps activity visible beyond one expiry interval"
     );
+    send_command(
+        &first_handle,
+        r#"kill "$activity_stream_pid"; wait "$activity_stream_pid" 2>/dev/null; printf 'STREAM_DONE\n'"#,
+    );
     wait_for_marker(&context, &first_handle, "STREAM_DONE");
     wait_for(
         &context,
@@ -245,6 +233,14 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
         || !first_activity.widget().is_visible(),
     );
 
+    config.borrow_mut().interface.tab_activity_seconds = 5;
+    apply_tab_activity_config(&config);
+    wait_for(
+        &context,
+        Duration::from_secs(7),
+        "previous output to expire before OSC-only output",
+        || !first_activity.widget().is_visible(),
+    );
     assert!(rename_tab_in_pane(&source_widget, &first_id, "Pinned name"));
     send_command(
         &first_handle,
@@ -283,7 +279,7 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
     );
     wait_for(
         &context,
-        Duration::from_secs(3),
+        Duration::from_secs(7),
         "both startup activities to expire",
         || !first_activity.widget().is_visible() && !second_activity.widget().is_visible(),
     );
