@@ -35,23 +35,40 @@ pub struct PaneIme {
     fallback_composing: Rc<Cell<bool>>,
 }
 
+impl PaneIme {
+    /// Bind only after GTK has created the widget's native surface.
+    pub fn attach(&self, gl_area: &gtk::GLArea) {
+        self.primary.set_client_widget(Some(gl_area));
+        self.fallback.set_client_widget(Some(gl_area));
+        if gl_area.has_focus() {
+            self.primary.focus_in();
+            self.fallback.focus_in();
+        }
+    }
+
+    /// Clear the client before unrealize removes its native surface. IBus
+    /// queues cursor-location work on focus_in, and focus_out does not cancel
+    /// that work. A detached context makes those callbacks return safely.
+    pub fn detach(&self) {
+        self.primary.focus_out();
+        self.fallback.focus_out();
+        self.primary.set_client_widget(gtk::Widget::NONE);
+        self.fallback.set_client_widget(gtk::Widget::NONE);
+    }
+}
+
 /// Build the two IM contexts for a terminal pane and wire their
 /// preedit / commit signals into a shared [`TerminalImeState`].
 ///
 /// The caller is responsible for routing keypresses through both
 /// contexts (see [`filter_key_event`]) and calling `focus_in` /
-/// `focus_out` / `set_client_widget(None)` on both at the right
-/// lifecycle points.
-pub fn create_pane_ime(
-    gl_area: &gtk::GLArea,
-    surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>,
-) -> PaneIme {
+/// `focus_out` on both. Call [`PaneIme::attach`] on realize and
+/// [`PaneIme::detach`] before unrealize and permanent shutdown.
+pub fn create_pane_ime(surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>) -> PaneIme {
     let primary = gtk::IMMulticontext::new();
-    primary.set_client_widget(Some(gl_area));
     primary.set_use_preedit(true);
 
     let fallback = gtk::IMContextSimple::new();
-    fallback.set_client_widget(Some(gl_area));
     fallback.set_use_preedit(true);
 
     let state = Rc::new(RefCell::new(TerminalImeState::default()));

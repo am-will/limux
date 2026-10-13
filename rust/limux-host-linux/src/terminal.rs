@@ -241,8 +241,7 @@ pub struct TerminalHandle {
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     callbacks: Rc<RefCell<TerminalCallbacks>>,
-    im_context: gtk::IMMulticontext,
-    im_fallback: gtk::IMContextSimple,
+    pane_ime: Rc<crate::ime::PaneIme>,
     signal_handlers: Rc<RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>>,
     controllers: Rc<RefCell<Vec<gtk::EventController>>>,
 }
@@ -293,8 +292,7 @@ impl TerminalHandle {
         for controller in self.controllers.borrow_mut().drain(..) {
             self.gl_area.remove_controller(&controller);
         }
-        self.im_context.set_client_widget(gtk::Widget::NONE);
-        self.im_fallback.set_client_widget(gtk::Widget::NONE);
+        self.pane_ime.detach();
 
         if let Some(surface) = self.surface_cell.borrow_mut().take() {
             free_terminal_surface(surface, &self.clipboard_context_cell, &self.gl_area);
@@ -1622,7 +1620,7 @@ pub fn create_terminal(
     search_bar.set_margin_end(8);
     overlay.add_overlay(&search_bar);
 
-    let pane_ime = Rc::new(crate::ime::create_pane_ime(&gl_area, &surface_cell));
+    let pane_ime = Rc::new(crate::ime::create_pane_ime(&surface_cell));
     // Aliases for the focus / lifecycle wiring further down. Cheap
     // GObject clones, not state copies.
     let im_context = pane_ime.primary.clone();
@@ -1637,8 +1635,7 @@ pub fn create_terminal(
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),
-        im_context: im_context.clone(),
-        im_fallback: im_fallback.clone(),
+        pane_ime: pane_ime.clone(),
         signal_handlers: signal_handlers.clone(),
         controllers: controllers.clone(),
     };
@@ -1728,10 +1725,12 @@ pub fn create_terminal(
         let extra_env = extra_env.clone();
         let shutting_down = shutting_down.clone();
         let display_realized = display_realized.clone();
+        let pane_ime = pane_ime.clone();
         let handler = gl_area.connect_realize(move |gl_area| {
             if shutting_down.get() {
                 return;
             }
+            pane_ime.attach(gl_area);
             gl_area.make_current();
             if let Some(err) = gl_area.error() {
                 eprintln!("limux: GLArea error after make_current: {err}");
@@ -2273,7 +2272,9 @@ pub fn create_terminal(
         let surface_cell = surface_cell.clone();
         let link_popover = link_popover.clone();
         let display_realized = display_realized.clone();
+        let pane_ime = pane_ime.clone();
         let handler = gl_area.connect_unrealize(move |gl_area| {
+            pane_ime.detach();
             link_popover.popdown();
             let Some(surface) = *surface_cell.borrow() else {
                 return;
@@ -3350,6 +3351,110 @@ mod tests {
             detached_at.get().unwrap() > hidden_at,
             "the fallback detached before a pending paint"
         );
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 display, IBus daemon and Ghostty resources"]
+    fn ime_context_follows_terminal_realize_lifecycle() {
+        crate::prepare_ghostty_runtime();
+        gtk::init().expect("GTK display required");
+        assert_eq!(
+            gtk::gdk::Display::default().unwrap().type_().name(),
+            "GdkX11Display"
+        );
+        init_ghostty();
+
+        let terminal = create_terminal(
+            Some("/tmp"),
+            TerminalOptions {
+                startup_command: Some("/bin/sh".to_string()),
+                ..TerminalOptions::default()
+            },
+            TerminalCallbacks::disconnected(),
+        );
+        let im = &terminal.handle.pane_ime.primary;
+        im.set_context_id(Some("ibus"));
+        assert_eq!(im.context_id().as_str(), "ibus");
+        let window = gtk::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&terminal.root)
+            .build();
+        window.present();
+        assert!(terminal.handle.surface_cell.borrow().is_some());
+
+        let drain_for = |duration| {
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        // IBus creates its remote input context asynchronously. Let that
+        // finish before focus_in queues its cursor-location idle callback.
+        drain_for(Duration::from_secs(1));
+        eprintln!("testing realized terminal with IBus input context");
+        im.focus_out();
+        im.focus_in();
+        im.focus_out();
+        window.set_child(gtk::Widget::NONE);
+        assert!(!terminal.handle.gl_area.is_realized());
+        assert!(terminal.handle.gl_area.native().is_none());
+        // IBus 1.5.29 dereferences a NULL GdkSurface here if the context
+        // still owns the now-unrooted GLArea. focus_out alone is insufficient.
+        drain_for(Duration::from_millis(100));
+
+        for iteration in 0..2 {
+            window.set_child(Some(&terminal.root));
+            assert!(terminal.handle.gl_area.is_realized());
+            terminal.handle.focus_surface();
+            im.focus_in();
+            im.set_cursor_location(&gtk::gdk::Rectangle::new(
+                100 + iteration,
+                1,
+                17 + iteration,
+                19,
+            ));
+            drain_for(Duration::from_millis(100));
+            im.focus_out();
+            im.focus_in();
+            window.set_child(gtk::Widget::NONE);
+            drain_for(Duration::from_millis(100));
+        }
+
+        window.set_child(Some(&terminal.root));
+        im.focus_in();
+        terminal.handle.shutdown();
+        im.set_cursor_location(&gtk::gdk::Rectangle::new(1, 1, 23, 29));
+        window.set_child(gtk::Widget::NONE);
+        drain_for(Duration::from_millis(100));
+        // A retained handle must stay shut down if its widget is reparented.
+        window.set_child(Some(&terminal.root));
+        assert!(terminal.handle.surface_cell.borrow().is_none());
+        im.focus_out();
+        im.focus_in();
+        im.set_cursor_location(&gtk::gdk::Rectangle::new(2, 2, 23, 29));
+        window.set_child(gtk::Widget::NONE);
+        drain_for(Duration::from_millis(100));
+        terminal.handle.shutdown();
+
+        let unshown = create_terminal(
+            Some("/tmp"),
+            TerminalOptions::default(),
+            TerminalCallbacks::disconnected(),
+        );
+        let im = &unshown.handle.pane_ime.primary;
+        im.set_context_id(Some("ibus"));
+        unshown.handle.shutdown();
+        window.set_child(Some(&unshown.root));
+        assert!(unshown.handle.surface_cell.borrow().is_none());
+        im.focus_in();
+        im.set_cursor_location(&gtk::gdk::Rectangle::new(1, 1, 31, 37));
+        drain_for(Duration::from_millis(100));
+        window.set_child(gtk::Widget::NONE);
+        drain_for(Duration::from_millis(100));
         window.close();
     }
 

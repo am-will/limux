@@ -116,6 +116,8 @@ jobs:
             libgtk-4-dev \
             libwebkitgtk-6.0-dev \
             metacity \
+            ibus \
+            ibus-gtk4 \
             pkg-config \
             util-linux \
             weston \
@@ -125,6 +127,9 @@ jobs:
 
       - name: Build libghostty for embedding
         run: ./scripts/build-ghostty.sh
+
+      - name: Check terminal IBus lifecycle
+        run: ./scripts/tests/test-terminal-ime-lifecycle.sh
 
       - name: Run live GTK host smoke test
         env:

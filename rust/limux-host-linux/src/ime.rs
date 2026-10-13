@@ -31,5 +31,5 @@ mod contexts;
 mod routing;
 mod state;
 
-pub use contexts::{create_pane_ime, filter_key_event, reset_after_consumed_compose};
+pub use contexts::{create_pane_ime, filter_key_event, reset_after_consumed_compose, PaneIme};
 pub use state::ImeFilterOutcome;
