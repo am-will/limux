@@ -410,7 +410,7 @@ impl TerminalHandle {
         // The CString must outlive the ghostty call below; `text` owns it until the
         // end of this function.
         if let Some(text) = text.as_ref() {
-            press.text = text.as_ptr();
+            press.input.text = text.as_ptr();
         }
 
         // Release carries no text, matching the GTK controller.
@@ -424,8 +424,8 @@ impl TerminalHandle {
         );
 
         unsafe {
-            ghostty_surface_key(surface, press);
-            ghostty_surface_key(surface, release);
+            ghostty_surface_key_with_key(surface, press.input, press.resolved_key);
+            ghostty_surface_key_with_key(surface, release.input, release.resolved_key);
         }
         drop(text);
         true
@@ -2016,10 +2016,12 @@ pub fn create_terminal(
                     .borrow_mut()
                     .take_event_text(fallback_text);
                 if let Some(ref ct) = c_text {
-                    event.text = ct.as_ptr();
+                    event.input.text = ct.as_ptr();
                 }
 
-                let consumed = unsafe { ghostty_surface_key(surface, event) };
+                let consumed = unsafe {
+                    ghostty_surface_key_with_key(surface, event.input, event.resolved_key)
+                };
                 if consumed && pane_ime_press.state.borrow().composing {
                     crate::ime::reset_after_consumed_compose(surface, &pane_ime_press);
                 }
@@ -2057,7 +2059,7 @@ pub fn create_terminal(
                     keycode,
                     modifier,
                 );
-                unsafe { ghostty_surface_key(surface, event) };
+                unsafe { ghostty_surface_key_with_key(surface, event.input, event.resolved_key) };
                 pane_ime_release.state.borrow_mut().finish_key_event();
             }
         });
@@ -2740,6 +2742,11 @@ fn build_terminal_context_menu(
 // Key translation
 // ---------------------------------------------------------------------------
 
+struct TranslatedKeyEvent {
+    input: ghostty_input_key_s,
+    resolved_key: c_int,
+}
+
 fn translate_key_event(
     action: c_int,
     widget: Option<&gtk::Widget>,
@@ -2747,7 +2754,7 @@ fn translate_key_event(
     keyval: gtk::gdk::Key,
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
-) -> ghostty_input_key_s {
+) -> TranslatedKeyEvent {
     let mut mods: c_int = GHOSTTY_MODS_NONE;
     if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
         mods |= GHOSTTY_MODS_SHIFT;
@@ -2772,15 +2779,17 @@ fn translate_key_event(
         .unwrap_or_else(|| fallback_consumed_mods(keyval, modifier));
     let keycode = ghostty_keycode_with_keyval_remap(keyval, keycode);
 
-    ghostty_input_key_s {
-        action,
-        mods,
-        consumed_mods: consumed,
-        keycode,
-        text: ptr::null(),
-        unshifted_codepoint: unshifted,
-        composing: false,
-        key: ghostty_key_for_keyval(keyval),
+    TranslatedKeyEvent {
+        input: ghostty_input_key_s {
+            action,
+            mods,
+            consumed_mods: consumed,
+            keycode,
+            text: ptr::null(),
+            unshifted_codepoint: unshifted,
+            composing: false,
+        },
+        resolved_key: ghostty_key_for_keyval(keyval),
     }
 }
 
@@ -3686,9 +3695,9 @@ mod tests {
             modifiers,
         );
 
-        assert_eq!(caps_as_escape.keycode, 9);
-        assert_eq!(escape_as_caps.keycode, 66);
-        assert_eq!(writing_key.keycode, 38);
+        assert_eq!(caps_as_escape.input.keycode, 9);
+        assert_eq!(escape_as_caps.input.keycode, 66);
+        assert_eq!(writing_key.input.keycode, 38);
     }
 
     #[test]
@@ -3719,8 +3728,8 @@ mod tests {
                 physical,
                 modifiers,
             );
-            assert_eq!(event.keycode, physical, "{keyval:?}");
-            assert_eq!(event.key, key, "{keyval:?}");
+            assert_eq!(event.input.keycode, physical, "{keyval:?}");
+            assert_eq!(event.resolved_key, key, "{keyval:?}");
         }
 
         let digit = translate_key_event(
@@ -3731,8 +3740,8 @@ mod tests {
             87,
             modifiers,
         );
-        assert_eq!(digit.keycode, 87);
-        assert_eq!(digit.key, GHOSTTY_KEY_NUMPAD_1);
+        assert_eq!(digit.input.keycode, 87);
+        assert_eq!(digit.resolved_key, GHOSTTY_KEY_NUMPAD_1);
 
         let regular_end = translate_key_event(
             GHOSTTY_ACTION_PRESS,
@@ -3742,8 +3751,8 @@ mod tests {
             115,
             modifiers,
         );
-        assert_eq!(regular_end.keycode, 115);
-        assert_eq!(regular_end.key, GHOSTTY_KEY_UNIDENTIFIED);
+        assert_eq!(regular_end.input.keycode, 115);
+        assert_eq!(regular_end.resolved_key, GHOSTTY_KEY_UNIDENTIFIED);
     }
 
     #[test]

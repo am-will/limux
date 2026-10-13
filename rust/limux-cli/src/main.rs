@@ -227,6 +227,7 @@ Common commands:
   new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]
       Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.
   rename-workspace [--workspace <id|ref>] <title>
+  set-workspace-color [--workspace <id|ref>] <red|orange|amber|green|teal|blue|purple|pink|none>
   rename-window [--workspace <id|ref>] <title>
   rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>
   read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]
@@ -2637,6 +2638,24 @@ async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> 
         .await
 }
 
+/// Build the `workspace.set_color` params; the host validates the colour name.
+fn build_set_workspace_color_params(
+    args: &[String],
+    env_value: impl Fn(&str) -> Option<String>,
+) -> Result<Value> {
+    let color = trailing_title(args)
+        .ok_or_else(|| anyhow!("set-workspace-color requires a color name or \"none\""))?;
+
+    let mut params = Map::new();
+    params.insert("color".to_string(), Value::String(color));
+    if let Some(workspace) =
+        parse_opt(args, "--workspace").or_else(|| env_value("LIMUX_WORKSPACE_ID"))
+    {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    Ok(Value::Object(params))
+}
+
 async fn run_rename_workspace_like(
     client: &mut Client,
     command: &str,
@@ -3746,6 +3765,15 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
+        "set-workspace-color" => {
+            let params = build_set_workspace_color_params(args, |name| env::var(name).ok())?;
+            let payload = client.call("workspace.set_color", params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
         "rename-tab" => {
             let payload = run_rename_tab(client, args).await?;
             if opts.json_output {
@@ -4427,6 +4455,46 @@ mod new_pane_tests {
             "LIMUX_PANE_ID" => Some("pane:11".to_string()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn set_workspace_color_uses_env_workspace_and_passes_color_through() {
+        let params = build_set_workspace_color_params(&args(&["blue"]), test_env).unwrap();
+
+        assert_eq!(
+            params,
+            json!({ "color": "blue", "workspace_id": "workspace:agent" })
+        );
+    }
+
+    #[test]
+    fn set_workspace_color_flag_overrides_env_workspace() {
+        let params = build_set_workspace_color_params(
+            &args(&["--workspace", "raw-workspace", "none"]),
+            test_env,
+        )
+        .unwrap();
+
+        assert_eq!(
+            params,
+            json!({ "color": "none", "workspace_id": "raw-workspace" })
+        );
+    }
+
+    #[test]
+    fn set_workspace_color_without_env_targets_the_active_workspace() {
+        let params = build_set_workspace_color_params(&args(&["teal"]), |_| None).unwrap();
+
+        assert_eq!(params, json!({ "color": "teal" }));
+    }
+
+    #[test]
+    fn set_workspace_color_requires_a_color() {
+        let error =
+            build_set_workspace_color_params(&args(&["--workspace", "raw-workspace"]), test_env)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("requires a color"));
     }
 
     #[test]

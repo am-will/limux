@@ -84,6 +84,8 @@ sudo ./install.sh --uninstall
 sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 ```
 
+On Wayland, also install `wl-clipboard` (`apt install wl-clipboard`, `dnf install wl-clipboard` or `pacman -S wl-clipboard`). `Ctrl+Shift+V` is Limux's own paste, but plain `Ctrl+V` goes to the program running in the terminal, and some programs read the clipboard themselves (fish's `Ctrl+V`, for example). Without `wl-paste` they fall back to X11 tools like `xclip`, and depending on the compositor the X11 clipboard may not have what you copied in Limux, so `Ctrl+V` pastes something older than `Ctrl+Shift+V`.
+
 ## Build from source
 
 ### Prerequisites
