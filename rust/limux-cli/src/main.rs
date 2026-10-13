@@ -899,11 +899,22 @@ fn notification_surface_target(
         .filter(|value| !value.is_empty())
 }
 
+/// The workspace and surface a notification names, as `request_workspace` scopes them.
+fn notification_scope(
+    args: &[String],
+    env_value: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    let surface = notification_surface_target(args, &env_value);
+    let workspace = request_workspace(
+        parse_opt(args, "--workspace"),
+        surface.as_deref(),
+        env_value,
+    );
+    (workspace, surface)
+}
+
 async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
-    let surface = notification_surface_target(args, |key| env::var(key).ok());
+    let (workspace, surface) = notification_scope(args, env_opt);
 
     // Title can be provided either via --title or as the trailing positional
     // (matching `limux send`'s ergonomics).
@@ -1060,10 +1071,7 @@ async fn run_agent_hook(
         })
         .unwrap_or_default();
 
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
-    let surface = notification_surface_target(args, |key| env::var(key).ok());
+    let (workspace, surface) = notification_scope(args, env_opt);
 
     let mut params = Map::new();
     params.insert("title".to_string(), Value::String(title));
@@ -2573,21 +2581,23 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
-/// The workspace a request is scoped to: an explicit `--workspace`, else the
-/// caller's LIMUX_WORKSPACE_ID unless the request names a surface. A shell keeps
-/// that variable after its tab moves to another workspace, so a named surface is
-/// sent unscoped and the host looks for it in every workspace.
+/// The workspace a request is scoped to: an explicit `--workspace`, where an
+/// empty one means unscoped, else the caller's LIMUX_WORKSPACE_ID unless the
+/// request names a surface. A shell keeps that variable after its tab moves to
+/// another workspace, so a named surface is sent unscoped and the host looks
+/// for it in every workspace.
 fn request_workspace(
     explicit: Option<String>,
     surface: Option<&str>,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    nonempty(explicit).or_else(|| {
-        surface
+    match explicit {
+        Some(explicit) => nonempty(Some(explicit)),
+        None => surface
             .is_none()
             .then(|| nonempty(env_lookup("LIMUX_WORKSPACE_ID")))
-            .flatten()
-    })
+            .flatten(),
+    }
 }
 
 fn build_new_pane_request(
@@ -4479,11 +4489,40 @@ mod request_workspace_tests {
             request_workspace(Some("ws-flag".to_string()), Some("7:tab-a"), env).as_deref(),
             Some("ws-flag")
         );
-        assert_eq!(
-            request_workspace(Some(" ".to_string()), None, env).as_deref(),
-            Some("ws-env")
-        );
         assert_eq!(request_workspace(None, None, |_| None), None);
+    }
+
+    #[test]
+    fn an_empty_explicit_workspace_means_unscoped() {
+        for explicit in ["", " "] {
+            assert_eq!(
+                request_workspace(Some(explicit.to_string()), None, env),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_notification_from_a_surface_is_unscoped() {
+        let env = |name: &str| match name {
+            "LIMUX_WORKSPACE_ID" => Some("ws-env".to_string()),
+            "LIMUX_TAB_ID" => Some("tab-a".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            super::notification_scope(&[], env),
+            (None, Some("tab-a".to_string()))
+        );
+        assert_eq!(
+            super::notification_scope(&["--workspace".to_string(), "ws-flag".to_string()], env),
+            (Some("ws-flag".to_string()), Some("tab-a".to_string()))
+        );
+        assert_eq!(
+            super::notification_scope(&[], |name: &str| {
+                (name == "LIMUX_WORKSPACE_ID").then(|| "ws-env".to_string())
+            }),
+            (Some("ws-env".to_string()), None)
+        );
     }
 }
 

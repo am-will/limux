@@ -933,8 +933,10 @@ pub(crate) enum SurfaceHintMatch {
     /// `<other pane>:<tab id>`: a shell keeps the surface id it started with
     /// after its tab moves to another pane.
     StalePane,
-    /// The tab id itself or its current surface id `<pane>:<tab id>`.
-    Exact,
+    /// The tab's current surface id `<pane>:<tab id>`.
+    SurfaceId,
+    /// The tab id itself, unique in the session.
+    TabId,
 }
 
 /// How `surface_hint`, with or without a `surface:` prefix, names the tab
@@ -947,14 +949,18 @@ pub(crate) fn surface_hint_match(
     surface_hint: &str,
 ) -> Option<SurfaceHintMatch> {
     let hint = normalize_surface_hint(surface_hint);
-    if hint == tab_id || hint == composite_surface_id(pane_id, tab_id) {
-        return Some(SurfaceHintMatch::Exact);
+    if hint == tab_id {
+        return Some(SurfaceHintMatch::TabId);
     }
-    hint.split_once(':')
-        .is_some_and(|(pane, tab)| {
-            !pane.is_empty() && pane.bytes().all(|byte| byte.is_ascii_digit()) && tab == tab_id
-        })
-        .then_some(SurfaceHintMatch::StalePane)
+    let pane = hint.strip_suffix(tab_id)?.strip_suffix(':')?;
+    if pane.is_empty() || !pane.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(if pane == pane_id.to_string() {
+        SurfaceHintMatch::SurfaceId
+    } else {
+        SurfaceHintMatch::StalePane
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2214,32 +2220,26 @@ fn pane_internals_for_workspace(workspace_id: &str) -> Vec<Rc<PaneInternals>> {
     panes
 }
 
-/// Every tab of the workspace `surface_hint` names, ranked by how it names it.
+/// Every tab of the workspace `surface_hint` names, ranked by how it names it;
+/// only terminal tabs when `terminals_only`.
 pub fn tab_candidates_for_workspace(
     workspace_id: &str,
     surface_hint: &str,
+    terminals_only: bool,
 ) -> Vec<(SurfaceHintMatch, u32, String)> {
     let mut candidates = Vec::new();
     for internals in pane_internals_for_workspace(workspace_id) {
         let pane_id = internals.pane_id;
         for entry in &internals.tab_state.borrow().tabs {
+            if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+                continue;
+            }
             if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
                 candidates.push((rank, pane_id, entry.id.clone()));
             }
         }
     }
     candidates
-}
-
-pub fn tab_target_for_workspace(
-    workspace_id: &str,
-    surface_hint: &str,
-) -> HintResolution<(u32, String)> {
-    resolve_surface_hint(
-        tab_candidates_for_workspace(workspace_id, surface_hint)
-            .into_iter()
-            .map(|(rank, pane_id, tab_id)| (rank, (pane_id, tab_id))),
-    )
 }
 
 pub fn mark_tab_unread_in_workspace(
@@ -2407,30 +2407,8 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
     })
 }
 
-pub fn terminal_handle_for_root(
-    root: &gtk::Widget,
-    surface_hint: Option<&str>,
-) -> Option<(String, terminal::TerminalHandle)> {
-    if let Some(surface_hint) = surface_hint {
-        let mut candidates = Vec::new();
-        for internals in pane_internals_for_root(root) {
-            let pane_id = internals.pane_id;
-            for entry in &internals.tab_state.borrow().tabs {
-                let TabKind::Terminal { state } = &entry.kind else {
-                    continue;
-                };
-                if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
-                    let surface_id = composite_surface_id(pane_id, &entry.id);
-                    candidates.push((rank, (surface_id, state.handle.clone())));
-                }
-            }
-        }
-        return match resolve_surface_hint(candidates) {
-            HintResolution::Unique(target) => Some(target),
-            HintResolution::NotFound | HintResolution::Ambiguous => None,
-        };
-    }
-
+/// The first terminal under `root`.
+pub fn terminal_handle_for_root(root: &gtk::Widget) -> Option<(String, terminal::TerminalHandle)> {
     pane_internals_for_root(root)
         .into_iter()
         .find_map(|internals| {
@@ -4611,10 +4589,10 @@ mod tests {
 
     #[test]
     fn surface_hint_matches_its_tab_from_any_pane() {
-        use SurfaceHintMatch::{Exact, StalePane};
+        use SurfaceHintMatch::{StalePane, SurfaceId, TabId};
         let m = |hint| surface_hint_match(42, "tab-a", hint);
-        assert_eq!(m("surface:42:tab-a"), Some(Exact));
-        assert_eq!(m("tab-a"), Some(Exact));
+        assert_eq!(m("surface:42:tab-a"), Some(SurfaceId));
+        assert_eq!(m("tab-a"), Some(TabId));
         // A shell keeps the surface id it started with after its tab moves.
         assert_eq!(m("7:tab-a"), Some(StalePane));
         assert_eq!(m("surface:7:tab-a"), Some(StalePane));
@@ -4625,9 +4603,13 @@ mod tests {
 
     #[test]
     fn surface_hint_matches_a_restored_tab_id_with_a_colon() {
-        use SurfaceHintMatch::{Exact, StalePane};
+        use SurfaceHintMatch::{StalePane, SurfaceId, TabId};
         // Restored tab ids are kept as saved, whatever they contain.
-        assert_eq!(surface_hint_match(20, "0:main", "0:main"), Some(Exact));
+        assert_eq!(surface_hint_match(20, "0:main", "0:main"), Some(TabId));
+        assert_eq!(
+            surface_hint_match(20, "0:main", "20:0:main"),
+            Some(SurfaceId)
+        );
         assert_eq!(
             surface_hint_match(20, "0:main", "5:0:main"),
             Some(StalePane)
@@ -4667,6 +4649,20 @@ mod tests {
             resolve_surface_hint::<SurfaceHintMatch, u32>([]),
             HintResolution::NotFound
         );
+    }
+
+    #[test]
+    fn a_tab_id_wins_over_another_tab_s_surface_id() {
+        // `main` in pane 10 has the surface id `10:main`, a restored tab's id.
+        let tabs = [(10, "main"), (20, "10:main")];
+        let resolve = |hint| {
+            resolve_surface_hint(tabs.iter().filter_map(|&(pane_id, tab_id)| {
+                surface_hint_match(pane_id, tab_id, hint).map(|rank| (rank, pane_id))
+            }))
+        };
+        assert_eq!(resolve("10:main"), HintResolution::Unique(20));
+        assert_eq!(resolve("main"), HintResolution::Unique(10));
+        assert_eq!(resolve("20:10:main"), HintResolution::Unique(20));
     }
 
     #[test]

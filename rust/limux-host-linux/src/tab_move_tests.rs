@@ -182,25 +182,116 @@ fn a_tab_moved_to_another_workspace_answers_to_its_original_ids() {
         "moving its only tab closes it"
     );
 
-    let index = workspace_index_for_surface(&state, &WorkspaceTarget::Active, Some(&surface_id));
-    assert_eq!(index, Some(target_index));
-    let (_, _, tab_id) = control_surface_target(&state, target_index, Some(&surface_id)).unwrap();
+    let (index, surface) =
+        control_request_target(&state, &WorkspaceTarget::Active, Some(&surface_id), false).unwrap();
+    assert_eq!(index, target_index);
+    let (_, _, tab_id) = control_surface_target(&state, index, surface.clone()).unwrap();
     assert_eq!(tab_id, moved_tab_id);
-    assert!(control_terminal_target(&state, target_index, Some(&surface_id)).is_some());
+    assert!(control_terminal_target(&state, index, surface).is_some());
 
     // An explicit workspace scopes the request, even to a miss.
     for (workspace, expected) in [
-        (source_workspace_id.as_str(), None),
-        (other_id.as_str(), index_of(&other_id)),
-        (target_workspace_id.as_str(), Some(target_index)),
+        (
+            source_workspace_id.as_str(),
+            Err(SurfaceTargetError::WorkspaceNotFound),
+        ),
+        (other_id.as_str(), Err(SurfaceTargetError::SurfaceNotFound)),
+        (target_workspace_id.as_str(), Ok(target_index)),
     ] {
-        let index = workspace_index_for_surface(
+        let index = control_request_target(
             &state,
             &WorkspaceTarget::Handle(workspace.to_string()),
             Some(&surface_id),
-        );
+            false,
+        )
+        .map(|(index, _)| index);
         assert_eq!(index, expected, "scoped to {workspace}");
     }
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+// A hint is resolved once, over the tabs the request can act on: a weaker match
+// elsewhere never wins a tie, and a tab the request cannot act on never steers it
+// to a workspace without a match.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn an_unscoped_surface_hint_is_resolved_once_across_workspaces() {
+    use crate::layout_state::{TabContentState, TabState};
+
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.SurfaceHintAcrossWorkspacesTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+
+    let keybinds = |id: &str| TabState {
+        id: id.to_string(),
+        custom_name: None,
+        pinned: false,
+        content: TabContentState::Keybinds {},
+    };
+    // `x` is a moved terminal; `0:x` and `5:x` are restored tab ids, so the hints
+    // `0:x` and `5:x` also name `x` through a stale pane.
+    let layouts = [
+        ("moved", TabState::terminal("x", None)),
+        ("keybinds", keybinds("0:x")),
+        ("left", TabState::terminal("5:x", None)),
+        ("right", TabState::terminal("5:x", None)),
+    ];
+    for (name, tab) in layouts {
+        add_workspace_from_state(
+            &state,
+            &WorkspaceState {
+                id: None,
+                name: name.to_string(),
+                favorite: false,
+                cwd: None,
+                folder_path: None,
+                autostart_command: None,
+                color: None,
+                layout: LayoutNodeState::Pane(PaneState {
+                    pane_id: None,
+                    active_tab_id: Some(tab.id.clone()),
+                    tabs: vec![tab],
+                }),
+            },
+        );
+    }
+    let moved_index = state
+        .borrow()
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.name == "moved")
+        .unwrap();
+    select_workspace_by_index(&state, moved_index);
+    pump_until(std::time::Duration::from_millis(300), || false);
+
+    let terminal_target = |hint: &str| {
+        let (index, surface) =
+            control_request_target(&state, &WorkspaceTarget::Active, Some(hint), true).ok()?;
+        let (payload, _) = control_terminal_target(&state, index, surface)?;
+        Some((index, payload["surface_id"].as_str()?.to_string()))
+    };
+
+    // `5:x` names two terminals exactly: the stale alias `x` must not win.
+    assert_eq!(terminal_target("5:x"), None);
+    // Only `x` is a terminal named by `0:x`.
+    let (index, surface_id) = terminal_target("0:x").expect("the moved terminal");
+    assert_eq!(index, moved_index);
+    assert!(surface_id.ends_with(":x"), "{surface_id}");
 
     let window = state.borrow().window.clone();
     window.close();
