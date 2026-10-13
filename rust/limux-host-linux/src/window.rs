@@ -4319,19 +4319,31 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     {
         // With the focus still on an item, the unparent would leak the popover
         // (see `terminal::unset_focus_within`); give it back to whatever had it
-        // before the menu opened, usually a terminal, rather than to the row,
-        // which Delete removes right after.
+        // before the menu opened, usually a terminal, never to the row or a
+        // widget inside it (Delete removes the row right after). Failing that,
+        // or if it left the window meanwhile, focus the active workspace.
         let previous_focus = row
             .root()
             .and_then(|root| root.focus())
+            .filter(|w| w != row.upcast_ref::<gtk::Widget>() && !w.is_ancestor(row))
             .map(|w| w.downgrade());
+        let state = state.clone();
         popover.connect_closed(move |p| {
             if crate::terminal::focus_is_within(p.upcast_ref())
                 && !previous_focus
                     .as_ref()
                     .and_then(|w| w.upgrade())
-                    .is_some_and(|w| w.grab_focus())
+                    .is_some_and(|w| w.root().is_some() && w.grab_focus())
             {
+                let active_root = state
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
+                if let Some(root) = active_root {
+                    focus_workspace_entrypoint(&root);
+                }
+            }
+            if crate::terminal::focus_is_within(p.upcast_ref()) {
                 crate::terminal::unset_focus_within(p.upcast_ref());
             }
             p.unparent();
