@@ -929,9 +929,69 @@ fn composite_surface_id(pane_id: u32, tab_id: &str) -> String {
     format!("{pane_id}:{tab_id}")
 }
 
-fn surface_hint_matches(surface_id: &str, tab_id: &str, surface_hint: &str) -> bool {
-    let requested = normalize_surface_hint(surface_hint);
-    !requested.is_empty() && (requested == tab_id || requested == surface_id)
+/// How a surface hint names a tab, weakest first.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SurfaceHintMatch {
+    /// `<other pane>:<tab id>`: a shell keeps the surface id it started with
+    /// after its tab moves to another pane.
+    StalePane,
+    /// The tab's current surface id `<pane>:<tab id>`.
+    SurfaceId,
+    /// The tab id itself, unique in the session.
+    TabId,
+}
+
+/// How `surface_hint`, with or without a `surface:` prefix, names the tab
+/// `tab_id` in pane `pane_id`. The tab id is never parsed, since a restored one
+/// is kept as saved, so a hint can name one tab exactly and another through a
+/// stale pane: resolve with [`resolve_surface_hint`], never on the first match.
+pub(crate) fn surface_hint_match(
+    pane_id: u32,
+    tab_id: &str,
+    surface_hint: &str,
+) -> Option<SurfaceHintMatch> {
+    let hint = normalize_surface_hint(surface_hint);
+    if hint.is_empty() || tab_id.is_empty() {
+        return None;
+    }
+    if hint == tab_id {
+        return Some(SurfaceHintMatch::TabId);
+    }
+    let pane = hint.strip_suffix(tab_id)?.strip_suffix(':')?;
+    if pane.is_empty() || !pane.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(if pane == pane_id.to_string() {
+        SurfaceHintMatch::SurfaceId
+    } else {
+        SurfaceHintMatch::StalePane
+    })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum HintResolution<T> {
+    NotFound,
+    Unique(T),
+    Ambiguous,
+}
+
+/// The candidate with the highest rank, unless another one shares it.
+pub(crate) fn resolve_surface_hint<R: Ord, T>(
+    candidates: impl IntoIterator<Item = (R, T)>,
+) -> HintResolution<T> {
+    let mut best: Option<(R, Option<T>)> = None;
+    for (rank, candidate) in candidates {
+        match &best {
+            Some((best_rank, _)) if rank < *best_rank => {}
+            Some((best_rank, _)) if rank == *best_rank => best = Some((rank, None)),
+            _ => best = Some((rank, Some(candidate))),
+        }
+    }
+    match best {
+        None => HintResolution::NotFound,
+        Some((_, Some(candidate))) => HintResolution::Unique(candidate),
+        Some((_, None)) => HintResolution::Ambiguous,
+    }
 }
 
 fn select_terminal_tab<'a>(
@@ -940,15 +1000,18 @@ fn select_terminal_tab<'a>(
     active_tab: Option<&str>,
     surface_hint: Option<&str>,
 ) -> Option<&'a str> {
+    if let Some(surface_hint) = surface_hint {
+        // An explicit target must not fall back to the active tab.
+        let candidates = terminal_tab_ids.into_iter().filter_map(|tab_id| {
+            surface_hint_match(pane_id, tab_id, surface_hint).map(|rank| (rank, tab_id))
+        });
+        return match resolve_surface_hint(candidates) {
+            HintResolution::Unique(tab_id) => Some(tab_id),
+            HintResolution::NotFound | HintResolution::Ambiguous => None,
+        };
+    }
     let mut fallback = None;
     for tab_id in terminal_tab_ids {
-        if let Some(surface_hint) = surface_hint {
-            if surface_hint_matches(&composite_surface_id(pane_id, tab_id), tab_id, surface_hint) {
-                return Some(tab_id);
-            }
-            // An explicit target must not fall back to the active tab.
-            continue;
-        }
         if active_tab == Some(tab_id) {
             return Some(tab_id);
         }
@@ -980,13 +1043,6 @@ pub fn terminal_handle_for_surface(
         composite_surface_id(internals.pane_id, tab_id),
         state.handle.clone(),
     ))
-}
-
-pub fn exact_terminal_handle_for_surface(
-    pane_widget: &gtk::Widget,
-    surface_hint: &str,
-) -> Option<(String, terminal::TerminalHandle)> {
-    terminal_handle_for_surface(pane_widget, Some(surface_hint))
 }
 
 // ---------------------------------------------------------------------------
@@ -2079,6 +2135,12 @@ pub fn pane_leading_box(pane_widget: &gtk::Widget) -> Option<gtk::Box> {
     find_pane_internals(pane_widget).map(|internals| internals.leading_box.clone())
 }
 
+/// A pane that has not been closed: `retire_pane` drops its internals but
+/// leaves the widget in the old tree until the next frame.
+pub fn is_live_pane(widget: &gtk::Widget) -> bool {
+    find_pane_internals(widget).is_some()
+}
+
 pub fn is_pane_widget(widget: &gtk::Widget) -> bool {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return false;
@@ -2136,6 +2198,7 @@ pub struct PaneSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceSummary {
     pub pane_id: u32,
+    pub tab_id: String,
     pub surface_id: String,
     pub title: String,
     pub kind: String,
@@ -2170,31 +2233,26 @@ fn pane_internals_for_workspace(workspace_id: &str) -> Vec<Rc<PaneInternals>> {
     panes
 }
 
-pub enum TabTargetResolution {
-    NotFound,
-    Unique(u32, String),
-    Ambiguous,
-}
-
-pub fn tab_target_for_workspace(workspace_id: &str, surface_hint: &str) -> TabTargetResolution {
-    let mut target = None;
+/// Every tab of the workspace `surface_hint` names, ranked by how it names it;
+/// only terminal tabs when `terminals_only`.
+pub fn tab_candidates_for_workspace(
+    workspace_id: &str,
+    surface_hint: &str,
+    terminals_only: bool,
+) -> Vec<(SurfaceHintMatch, u32, String)> {
+    let mut candidates = Vec::new();
     for internals in pane_internals_for_workspace(workspace_id) {
         let pane_id = internals.pane_id;
-        let tab_state = internals.tab_state.borrow();
-        for entry in &tab_state.tabs {
-            let surface_id = composite_surface_id(pane_id, &entry.id);
-            if surface_hint_matches(&surface_id, &entry.id, surface_hint) {
-                if target.is_some() {
-                    return TabTargetResolution::Ambiguous;
-                }
-                target = Some((pane_id, entry.id.clone()));
+        for entry in &internals.tab_state.borrow().tabs {
+            if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+                continue;
+            }
+            if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
+                candidates.push((rank, pane_id, entry.id.clone()));
             }
         }
     }
-    match target {
-        Some((pane_id, tab_id)) => TabTargetResolution::Unique(pane_id, tab_id),
-        None => TabTargetResolution::NotFound,
-    }
+    candidates
 }
 
 pub fn mark_tab_unread_in_workspace(
@@ -2316,6 +2374,7 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
             };
             surfaces.push(SurfaceSummary {
                 pane_id,
+                tab_id: entry.id.clone(),
                 surface_id: composite_surface_id(pane_id, &entry.id),
                 title: entry.title_label.label().to_string(),
                 kind,
@@ -2351,6 +2410,7 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
     };
     Some(SurfaceSummary {
         pane_id,
+        tab_id: entry.id.clone(),
         surface_id: composite_surface_id(pane_id, &entry.id),
         title: entry.title_label.label().to_string(),
         kind,
@@ -2360,22 +2420,8 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
     })
 }
 
-pub fn terminal_handle_for_root(
-    root: &gtk::Widget,
-    surface_hint: Option<&str>,
-) -> Option<(String, terminal::TerminalHandle)> {
-    let requested = surface_hint.map(normalize_surface_hint);
-
-    if let Some(requested) = requested {
-        for internals in pane_internals_for_root(root) {
-            let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-            if let Some(target) = exact_terminal_handle_for_surface(&pane_widget, requested) {
-                return Some(target);
-            }
-        }
-        return None;
-    }
-
+/// The first terminal under `root`.
+pub fn terminal_handle_for_root(root: &gtk::Widget) -> Option<(String, terminal::TerminalHandle)> {
     pane_internals_for_root(root)
         .into_iter()
         .find_map(|internals| {
@@ -4353,12 +4399,12 @@ mod tests {
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
         effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
         normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolved_link_destination, select_terminal_commands, select_terminal_tab,
-        surface_hint_matches, workspace_autostart_initial_input, workspace_autostart_script,
-        ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
-        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
-        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
-        TAB_RENAME_ENTRY_CSS_CLASSES,
+        resolve_surface_hint, resolved_link_destination, select_terminal_commands,
+        select_terminal_tab, surface_hint_match, workspace_autostart_initial_input,
+        workspace_autostart_script, ContentDropZone, HintResolution, SurfaceHintMatch,
+        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
+        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
@@ -4369,7 +4415,8 @@ mod tests {
 
     #[test]
     fn explicit_terminal_target_can_follow_the_active_tab() {
-        for target in ["agent", "4:agent", "surface:4:agent"] {
+        // `5:agent` is the surface id a moved tab's shell keeps.
+        for target in ["agent", "4:agent", "surface:4:agent", "5:agent"] {
             assert_eq!(
                 select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
                 Some("agent"),
@@ -4379,7 +4426,14 @@ mod tests {
 
     #[test]
     fn explicit_missing_terminal_does_not_fall_back_to_active_tab() {
-        for target in ["missing", "5:agent", "", "   ", "surface:", " surface:   "] {
+        for target in [
+            "missing",
+            "5:missing",
+            "",
+            "   ",
+            "surface:",
+            " surface:   ",
+        ] {
             assert_eq!(
                 select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
                 None,
@@ -4554,15 +4608,96 @@ mod tests {
     }
 
     #[test]
-    fn surface_hint_matches_only_exact_surface_or_tab_id() {
-        assert!(surface_hint_matches(
-            "42:tab-a",
-            "tab-a",
-            "surface:42:tab-a"
-        ));
-        assert!(surface_hint_matches("42:tab-a", "tab-a", "tab-a"));
-        assert!(!surface_hint_matches("42:tab-a", "tab-a", "42:tab-b"));
-        assert!(!surface_hint_matches("42:tab-a", "tab-a", ""));
+    fn surface_hint_matches_its_tab_from_any_pane() {
+        use SurfaceHintMatch::{StalePane, SurfaceId, TabId};
+        let m = |hint| surface_hint_match(42, "tab-a", hint);
+        assert_eq!(m("surface:42:tab-a"), Some(SurfaceId));
+        assert_eq!(m("tab-a"), Some(TabId));
+        // A shell keeps the surface id it started with after its tab moves.
+        assert_eq!(m("7:tab-a"), Some(StalePane));
+        assert_eq!(m("surface:7:tab-a"), Some(StalePane));
+        for hint in ["42:tab-b", "pane:tab-a", "+7:tab-a", "", "surface:"] {
+            assert_eq!(m(hint), None, "{hint}");
+        }
+    }
+
+    #[test]
+    fn surface_hint_matches_a_restored_tab_id_with_a_colon() {
+        use SurfaceHintMatch::{StalePane, SurfaceId, TabId};
+        // Restored tab ids are kept as saved, whatever they contain.
+        assert_eq!(surface_hint_match(20, "0:main", "0:main"), Some(TabId));
+        assert_eq!(
+            surface_hint_match(20, "0:main", "20:0:main"),
+            Some(SurfaceId)
+        );
+        assert_eq!(
+            surface_hint_match(20, "0:main", "5:0:main"),
+            Some(StalePane)
+        );
+        assert_eq!(
+            surface_hint_match(20, "0:main", "surface:5:0:main"),
+            Some(StalePane)
+        );
+        assert_eq!(surface_hint_match(20, "0:main", "main"), None);
+        assert_eq!(surface_hint_match(20, "1:x", "2:x"), None);
+        // `0:main` also names the tab `main` through a stale pane 0.
+        assert_eq!(surface_hint_match(10, "main", "0:main"), Some(StalePane));
+    }
+
+    #[test]
+    fn an_exact_tab_id_wins_over_a_stale_pane_alias() {
+        // `main` in pane 10, `0:main` in pane 20.
+        let tabs = [(10, "main"), (20, "0:main")];
+        let resolve = |hint| {
+            resolve_surface_hint(tabs.iter().filter_map(|&(pane_id, tab_id)| {
+                surface_hint_match(pane_id, tab_id, hint).map(|rank| (rank, pane_id))
+            }))
+        };
+        assert_eq!(resolve("0:main"), HintResolution::Unique(20));
+        assert_eq!(resolve("10:main"), HintResolution::Unique(10));
+        assert_eq!(resolve("20:0:main"), HintResolution::Unique(20));
+        assert_eq!(resolve("main"), HintResolution::Unique(10));
+        // Two stale aliases, nothing exact.
+        assert_eq!(
+            resolve_surface_hint([
+                (SurfaceHintMatch::StalePane, 1),
+                (SurfaceHintMatch::StalePane, 2),
+            ]),
+            HintResolution::Ambiguous
+        );
+        assert_eq!(
+            resolve_surface_hint::<SurfaceHintMatch, u32>([]),
+            HintResolution::NotFound
+        );
+    }
+
+    #[test]
+    fn an_empty_hint_or_tab_id_matches_nothing() {
+        for hint in ["", "  ", "surface:", "7:", "surface:7:"] {
+            assert_eq!(surface_hint_match(7, "", hint), None, "{hint:?}");
+        }
+    }
+
+    #[test]
+    fn a_tab_id_wins_over_another_tab_s_surface_id() {
+        // `main` in pane 10 has the surface id `10:main`, a restored tab's id.
+        let tabs = [(10, "main"), (20, "10:main")];
+        let resolve = |hint| {
+            resolve_surface_hint(tabs.iter().filter_map(|&(pane_id, tab_id)| {
+                surface_hint_match(pane_id, tab_id, hint).map(|rank| (rank, pane_id))
+            }))
+        };
+        assert_eq!(resolve("10:main"), HintResolution::Unique(20));
+        assert_eq!(resolve("main"), HintResolution::Unique(10));
+        assert_eq!(resolve("20:10:main"), HintResolution::Unique(20));
+    }
+
+    #[test]
+    fn explicit_terminal_target_prefers_the_exact_tab_in_a_pane() {
+        assert_eq!(
+            select_terminal_tab(20, ["main", "0:main"], Some("main"), Some("0:main")),
+            Some("0:main"),
+        );
     }
 
     #[test]

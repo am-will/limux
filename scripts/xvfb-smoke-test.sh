@@ -406,10 +406,14 @@ for regression in \
   terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
+  window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
-  window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique; do
+  window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
+  window::tab_move_tests::a_tab_moved_to_another_workspace_answers_to_its_original_ids \
+  window::tab_move_tests::an_unscoped_surface_hint_is_resolved_once_across_workspaces \
+  window::tab_move_tests::a_surface_hidden_by_a_zoom_is_reported_not_found; do
   timeout -k 5s 30s cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture
 done

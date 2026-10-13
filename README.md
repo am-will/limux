@@ -189,13 +189,14 @@ limux new-pane --direction right --command claude
 # Live GTK self-spawn currently supports terminal panes only.
 
 # Explicit source targets are also accepted and serialized unchanged:
-limux new-pane --workspace "$LIMUX_WORKSPACE_ID" --surface "$LIMUX_SURFACE_ID" \
+limux new-pane --surface "$LIMUX_SURFACE_ID" \
   --pane "$LIMUX_PANE_ID" --direction down --command "codex"
 
 # Keep both agents in the same workspace on separate splits/tabs:
 limux identify --json
 limux list-panels --workspace "$LIMUX_WORKSPACE_ID"
-limux send --workspace "$LIMUX_WORKSPACE_ID" --surface "<peer-surface-id>" \
+# A named surface is found in any workspace; --workspace would restrict the search.
+limux send --surface "<peer-surface-id>" \
   $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
 ```
 
