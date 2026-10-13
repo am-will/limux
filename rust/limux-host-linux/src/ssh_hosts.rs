@@ -4,8 +4,8 @@
 
 use std::collections::HashSet;
 
-/// A one-shot connection request, not persisted session state.
-#[derive(Debug, PartialEq, Eq)]
+/// A validated connection destination.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshTarget {
     destination: String,
     port: Option<u16>,
@@ -41,6 +41,10 @@ impl SshTarget {
 
     pub fn destination(&self) -> &str {
         &self.destination
+    }
+
+    pub fn port(&self) -> Option<u16> {
+        self.port
     }
 
     pub fn arguments(&self) -> Vec<String> {

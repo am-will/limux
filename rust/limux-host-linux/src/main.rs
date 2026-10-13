@@ -13,6 +13,7 @@ mod shortcut_config;
 mod split_tree;
 mod ssh_dialog;
 mod ssh_hosts;
+mod ssh_session;
 mod terminal;
 mod window;
 mod workspace_color;
