@@ -14,6 +14,7 @@ mod shortcut_config;
 mod split_tree;
 mod ssh_dialog;
 mod ssh_hosts;
+mod tab_activity;
 mod terminal;
 mod window;
 mod workspace_color;

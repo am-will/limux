@@ -11,6 +11,9 @@ pub const SETTINGS_FILE_NAME: &str = "settings.json";
 pub const DEFAULT_UI_SCALE: f32 = 1.0;
 pub const MIN_UI_SCALE: f32 = 0.8;
 pub const MAX_UI_SCALE: f32 = 2.0;
+pub const DEFAULT_TAB_ACTIVITY_SECONDS: u32 = 5;
+pub const MIN_TAB_ACTIVITY_SECONDS: u32 = 1;
+pub const MAX_TAB_ACTIVITY_SECONDS: u32 = 60;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ColorScheme {
@@ -138,6 +141,8 @@ pub struct InterfaceConfig {
     pub window_controls_side: WindowControlsSide,
     pub show_top_bar: bool,
     pub show_workspace_indicators: bool,
+    pub show_tab_activity: bool,
+    pub tab_activity_seconds: u32,
 }
 
 impl Default for InterfaceConfig {
@@ -146,6 +151,8 @@ impl Default for InterfaceConfig {
             window_controls_side: WindowControlsSide::default(),
             show_top_bar: true,
             show_workspace_indicators: true,
+            show_tab_activity: true,
+            tab_activity_seconds: DEFAULT_TAB_ACTIVITY_SECONDS,
         }
     }
 }
@@ -471,6 +478,21 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let show_tab_activity = interface_obj
+        .and_then(|interface| interface.get("show_tab_activity"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let tab_activity_seconds = interface_obj
+        .and_then(|interface| interface.get("tab_activity_seconds"))
+        .and_then(Value::as_u64)
+        .filter(|seconds| {
+            (u64::from(MIN_TAB_ACTIVITY_SECONDS)..=u64::from(MAX_TAB_ACTIVITY_SECONDS))
+                .contains(seconds)
+        })
+        .map(|seconds| seconds as u32)
+        .unwrap_or(DEFAULT_TAB_ACTIVITY_SECONDS);
+
     AppConfig {
         focus: FocusConfig {
             hover_terminal_focus,
@@ -496,6 +518,8 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             window_controls_side,
             show_top_bar,
             show_workspace_indicators,
+            show_tab_activity,
+            tab_activity_seconds,
         },
         links: LinkConfig { open_destination },
         font_size,
@@ -568,6 +592,8 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "window_controls_side": config.interface.window_controls_side.as_str(),
             "show_top_bar": config.interface.show_top_bar,
             "show_workspace_indicators": config.interface.show_workspace_indicators,
+            "show_tab_activity": config.interface.show_tab_activity,
+            "tab_activity_seconds": config.interface.tab_activity_seconds,
         }),
     );
     root.insert(
@@ -700,6 +726,13 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
         "clipboard": {
             "copy_selection_to_clipboard": true
         },
+        "interface": {
+            "window_controls_side": "right",
+            "show_top_bar": true,
+            "show_workspace_indicators": true,
+            "show_tab_activity": true,
+            "tab_activity_seconds": 5
+        },
         "links": {
             "open_destination": "default_browser"
         }
@@ -727,6 +760,8 @@ mod tests {
                     window_controls_side: side,
                     show_top_bar: false,
                     show_workspace_indicators: false,
+                    show_tab_activity: false,
+                    tab_activity_seconds: 12,
                 },
                 links: LinkConfig {
                     open_destination: LinkOpenDestination::BrowserTab,
@@ -748,12 +783,41 @@ mod tests {
             json!({"interface": {
                 "window_controls_side": "unknown",
                 "show_top_bar": "false",
-                "show_workspace_indicators": null
+                "show_workspace_indicators": null,
+                "show_tab_activity": null,
+                "tab_activity_seconds": 0
             }}),
         ] {
             assert_eq!(
                 parse_app_config_value(&root).interface,
                 InterfaceConfig::default()
+            );
+        }
+    }
+
+    #[test]
+    fn tab_activity_timeout_accepts_only_integer_values_in_range() {
+        for seconds in [1, DEFAULT_TAB_ACTIVITY_SECONDS, 60] {
+            let root = json!({ "interface": { "tab_activity_seconds": seconds } });
+            assert_eq!(
+                parse_app_config_value(&root).interface.tab_activity_seconds,
+                seconds
+            );
+        }
+
+        for invalid in [
+            json!(0),
+            json!(61),
+            json!(-1),
+            json!(5.5),
+            json!("5"),
+            json!(null),
+        ] {
+            let root = json!({ "interface": { "tab_activity_seconds": invalid } });
+            assert_eq!(
+                parse_app_config_value(&root).interface.tab_activity_seconds,
+                DEFAULT_TAB_ACTIVITY_SECONDS,
+                "invalid timeout should use the default: {root}"
             );
         }
     }
@@ -833,6 +897,8 @@ mod tests {
             parsed["clipboard"]["copy_selection_to_clipboard"],
             Value::Bool(true)
         );
+        assert_eq!(parsed["interface"]["show_tab_activity"], Value::Bool(true));
+        assert_eq!(parsed["interface"]["tab_activity_seconds"], Value::from(5));
         assert_eq!(
             parsed["links"]["open_destination"],
             Value::String("default_browser".to_string())

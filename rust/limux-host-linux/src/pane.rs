@@ -26,7 +26,11 @@ use crate::layout_state::{
 };
 use crate::link_uri;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
+use crate::tab_activity::TabActivity;
 use crate::terminal::{self, LinkOpenRequest, TerminalCallbacks};
+
+#[cfg(test)]
+mod activity_tests;
 
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -831,6 +835,41 @@ pub fn refresh_terminal_displays_in_root(root: &gtk::Widget) {
     }
 }
 
+pub fn apply_tab_activity_config(config: &Rc<RefCell<AppConfig>>) {
+    let interface = config.borrow().interface.clone();
+    let panes = PANE_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .values()
+            .filter_map(|weak| weak.upgrade())
+            .collect::<Vec<_>>()
+    });
+    for pane in panes {
+        if !Rc::ptr_eq(&(pane.callbacks.current_config)(), config) {
+            continue;
+        }
+        let tabs = pane
+            .tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .map(|entry| {
+                let terminal = match &entry.kind {
+                    TabKind::Terminal { state } => Some(state.handle.clone()),
+                    _ => None,
+                };
+                (entry.activity.clone(), terminal)
+            })
+            .collect::<Vec<_>>();
+        for (activity, terminal) in tabs {
+            if let Some(terminal) = terminal {
+                terminal.set_output_activity_enabled(interface.show_tab_activity);
+            }
+            activity.configure(&interface);
+        }
+    }
+}
+
 pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
     let Some(internals) = find_pane_internals(pane_widget) else {
         return false;
@@ -1106,6 +1145,7 @@ struct TabEntry {
     tab_button: gtk::Box,
     title_label: gtk::Label,
     unread_dot: gtk::Label,
+    activity: TabActivity,
     content: gtk::Widget,
     custom_name: Option<String>,
     automatic_title: Option<String>,
@@ -1361,6 +1401,23 @@ fn make_terminal_callbacks(
     let pane_id = internals.pane_id;
 
     TerminalCallbacks {
+        on_output_activity: Rc::new({
+            let tab_state = Rc::downgrade(&internals.tab_state);
+            let tab_id = tab_id.to_string();
+            move |at| {
+                let activity = tab_state.upgrade().and_then(|tab_state| {
+                    tab_state
+                        .borrow()
+                        .tabs
+                        .iter()
+                        .find(|entry| entry.id == tab_id)
+                        .map(|entry| entry.activity.clone())
+                });
+                if let Some(activity) = activity {
+                    activity.record_output(at);
+                }
+            }
+        }),
         on_title_changed: Box::new(move |title: &str| {
             if title.is_empty() {
                 return;
@@ -1582,7 +1639,8 @@ fn add_terminal_tab_inner(
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(new_tab_id);
-    let (tab_btn, title_label, unread_dot) = build_tab_button("Terminal", &tab_id, internals);
+    let (tab_btn, title_label, unread_dot, activity) =
+        build_tab_button("Terminal", &tab_id, internals);
 
     let term_cwd = Rc::new(RefCell::new(
         options
@@ -1654,6 +1712,10 @@ fn add_terminal_tab_inner(
     let term = terminal::create_terminal(
         working_directory,
         terminal::TerminalOptions {
+            track_output_activity: (internals.callbacks.current_config)()
+                .borrow()
+                .interface
+                .show_tab_activity,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
             startup_command,
             initial_input,
@@ -1671,6 +1733,7 @@ fn add_terminal_tab_inner(
             tab_button: tab_btn,
             title_label: title_label.clone(),
             unread_dot,
+            activity,
             content: widget,
             custom_name: options
                 .as_ref()
@@ -1840,7 +1903,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
         callbacks.clone(),
     );
 
-    let (tab_btn, title_label, unread_dot) = build_tab_button(&title, &tab_id, internals);
+    let (tab_btn, title_label, unread_dot, activity) = build_tab_button(&title, &tab_id, internals);
 
     internals.content_stack.add_named(&widget, Some(&tab_id));
 
@@ -1851,6 +1914,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             tab_button: tab_btn,
             title_label: title_label.clone(),
             unread_dot,
+            activity,
             content: widget,
             custom_name: options
                 .as_ref()
@@ -1911,7 +1975,8 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(new_tab_id);
 
-    let (tab_btn, title_label, unread_dot) = build_tab_button("Keybinds", &tab_id, internals);
+    let (tab_btn, title_label, unread_dot, activity) =
+        build_tab_button("Keybinds", &tab_id, internals);
 
     let widget = keybind_editor::build_keybind_editor(&input.shortcuts, input.on_capture);
     internals.content_stack.add_named(&widget, Some(&tab_id));
@@ -1923,6 +1988,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
             tab_button: tab_btn,
             title_label: title_label.clone(),
             unread_dot,
+            activity,
             content: widget,
             custom_name: input
                 .options
@@ -2516,16 +2582,19 @@ fn build_tab_button(
     title: &str,
     tab_id: &str,
     internals: &Rc<PaneInternals>,
-) -> (gtk::Box, gtk::Label, gtk::Label) {
+) -> (gtk::Box, gtk::Label, gtk::Label, TabActivity) {
     let label = new_tab_title_label(title);
-    let (tab_button, unread_dot) = build_tab_button_from_label(&label, tab_id, internals);
-    (tab_button, label, unread_dot)
+    let activity = TabActivity::new(&(internals.callbacks.current_config)().borrow().interface);
+    let (tab_button, unread_dot) =
+        build_tab_button_from_label(&label, tab_id, internals, &activity);
+    (tab_button, label, unread_dot, activity)
 }
 
 fn build_tab_button_from_label(
     label: &gtk::Label,
     tab_id: &str,
     internals: &Rc<PaneInternals>,
+    activity: &TabActivity,
 ) -> (gtk::Box, gtk::Label) {
     if let Some(parent) = label
         .parent()
@@ -2555,6 +2624,14 @@ fn build_tab_button_from_label(
     inner_box.set_can_target(false);
     inner_box.append(&pin_icon);
     inner_box.append(&unread_dot);
+    if let Some(parent) = activity
+        .widget()
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+    {
+        parent.remove(activity.widget());
+    }
+    inner_box.append(activity.widget());
     inner_box.append(label);
 
     let tab_btn = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -3194,8 +3271,16 @@ fn rebuild_tab_strip(tab_strip: &gtk::Box, tab_state: &Rc<RefCell<TabState>>) {
 }
 
 fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInternals>) {
+    let interface = (target.callbacks.current_config)()
+        .borrow()
+        .interface
+        .clone();
+    entry.activity.configure(&interface);
     match &entry.kind {
         TabKind::Terminal { state } => {
+            state
+                .handle
+                .set_output_activity_enabled(interface.show_tab_activity);
             state.handle.replace_callbacks(make_terminal_callbacks(
                 target,
                 &entry.id,
@@ -3209,7 +3294,7 @@ fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInternals>) {
         _ => {}
     }
     let (tab_button, unread_dot) =
-        build_tab_button_from_label(&entry.title_label, &entry.id, target);
+        build_tab_button_from_label(&entry.title_label, &entry.id, target, &entry.activity);
     entry.tab_button = tab_button;
     entry.unread_dot = unread_dot;
     if entry.pinned {

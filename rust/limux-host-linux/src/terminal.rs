@@ -12,7 +12,7 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use limux_ghostty_sys::*;
 
@@ -21,6 +21,7 @@ use crate::link_uri;
 use crate::shortcut_config::NormalizedShortcut;
 
 mod clipboard;
+mod output_activity;
 mod wakeup;
 use clipboard::{
     ghostty_confirm_read_clipboard_cb, ghostty_read_clipboard_cb, ghostty_write_clipboard_cb,
@@ -79,6 +80,8 @@ struct SurfaceEntry {
     // after ghostty_surface_free, just like the callback userdata below.
     _startup_command: Option<CString>,
     identity: SurfaceIdentity,
+    output_activity: std::sync::Arc<output_activity::OutputActivity>,
+    output_callbacks: Rc<RefCell<TerminalCallbacks>>,
     gl_area: gtk::GLArea,
     toast_overlay: gtk::Overlay,
     scrollbar: gtk::Scrollbar,
@@ -235,6 +238,7 @@ fn unregister_surface_identity(identity: SurfaceIdentity) {
 #[derive(Clone)]
 pub struct TerminalHandle {
     surface_cell: Rc<RefCell<Option<ghostty_surface_t>>>,
+    output_activity_enabled: Rc<Cell<bool>>,
     clipboard_context_cell: Rc<Cell<*mut ClipboardContext>>,
     shutting_down: Rc<Cell<bool>>,
     gl_area: gtk::GLArea,
@@ -258,6 +262,16 @@ pub struct TerminalHealth {
 }
 
 impl TerminalHandle {
+    pub fn set_output_activity_enabled(&self, enabled: bool) {
+        self.output_activity_enabled.set(enabled);
+        if let Some(surface) = *self.surface_cell.borrow() {
+            SURFACE_MAP.with(|map| {
+                if let Some(entry) = map.borrow().get(&(surface as usize)) {
+                    entry.output_activity.set_enabled(enabled);
+                }
+            });
+        }
+    }
     #[cfg(test)]
     pub(crate) fn build_context_menu_for_test(&self) -> gtk::Popover {
         let overlay = self
@@ -1299,6 +1313,7 @@ unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_al
 // ---------------------------------------------------------------------------
 
 pub struct TerminalCallbacks {
+    pub on_output_activity: Rc<dyn Fn(Instant)>,
     pub on_title_changed: Box<TitleChangedCallback>,
     pub on_pwd_changed: Box<PwdChangedCallback>,
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
@@ -1317,6 +1332,7 @@ pub struct TerminalCallbacks {
 impl TerminalCallbacks {
     fn disconnected() -> Self {
         Self {
+            on_output_activity: Rc::new(|_| {}),
             on_title_changed: Box::new(|_| {}),
             on_pwd_changed: Box::new(|_| {}),
             on_desktop_notification: Box::new(|_, _, _| {}),
@@ -1339,6 +1355,7 @@ impl TerminalCallbacks {
 
 #[derive(Default)]
 pub struct TerminalOptions {
+    pub track_output_activity: bool,
     pub saved_font_size: Option<f32>,
     pub startup_command: Option<String>,
     pub initial_input: Option<String>,
@@ -1527,6 +1544,7 @@ pub fn create_terminal(
     gl_area.set_can_focus(true);
     set_gtk_mouse_cursor(&gl_area, MouseCursorState::default());
     let wd = working_directory.map(|s| s.to_string());
+    let output_activity_enabled = Rc::new(Cell::new(options.track_output_activity));
     let saved_font_size = options.saved_font_size;
     let startup_command = options.startup_command;
     let initial_input = options.initial_input;
@@ -1605,6 +1623,7 @@ pub fn create_terminal(
 
     let handle = TerminalHandle {
         surface_cell: surface_cell.clone(),
+        output_activity_enabled: output_activity_enabled.clone(),
         clipboard_context_cell: clipboard_context_cell.clone(),
         shutting_down: shutting_down.clone(),
         gl_area: gl_area.clone(),
@@ -1703,6 +1722,7 @@ pub fn create_terminal(
         let shutting_down = shutting_down.clone();
         let display_realized = display_realized.clone();
         let pane_ime = pane_ime.clone();
+        let output_activity_enabled = output_activity_enabled.clone();
         let handler = gl_area.connect_realize(move |gl_area| {
             if shutting_down.get() {
                 return;
@@ -1728,6 +1748,10 @@ pub fn create_terminal(
 
             let app = ghostty_app();
             let mut config = unsafe { ghostty_surface_config_new() };
+            let output_activity =
+                output_activity::OutputActivity::new(output_activity_enabled.get());
+            config.pty_tee_cb = Some(output_activity::pty_output_cb);
+            config.pty_tee_userdata = std::sync::Arc::as_ptr(&output_activity).cast_mut().cast();
             let clipboard_context = Box::into_raw(Box::new(ClipboardContext {
                 surface: Cell::new(ptr::null_mut()),
                 callbacks: callbacks.clone(),
@@ -1802,6 +1826,7 @@ pub fn create_terminal(
             }
             let surface_key = surface as usize;
             let surface_identity = register_surface_identity(surface_key);
+            output_activity.bind(surface_identity);
             unsafe {
                 (*clipboard_context).surface.set(surface);
                 ghostty_surface_set_color_scheme(surface, current_ghostty_color_scheme());
@@ -1835,6 +1860,8 @@ pub fn create_terminal(
                     SurfaceEntry {
                         _startup_command: c_startup_command,
                         identity: surface_identity,
+                        output_activity,
+                        output_callbacks: callbacks.clone(),
                         gl_area: gl.clone(),
                         toast_overlay: overlay_for_map.clone(),
                         scrollbar: scrollbar_for_map.clone(),

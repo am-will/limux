@@ -159,6 +159,12 @@ does not inject keystrokes into the launched program.
 
 ## Agent integrations
 
+Terminal tabs show an activity spinner for five seconds after receiving output,
+including animated titles from tools such as Codex. The spinner works on renamed
+and inactive tabs. In **Settings > General**, turn off **Tab activity indicators**
+or adjust **Tab activity timeout** from 1 to 60 seconds. Cursor blinking and
+scrolling alone do not count as output.
+
 Limux ships first-class hooks for coding agents (Codex, Claude Code, and
 Gemini CLI). Every terminal limux spawns auto-exports
 `LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /

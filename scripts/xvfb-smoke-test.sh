@@ -390,6 +390,7 @@ if [ "$GRAPHICS" = hardware ] && ! grep -Fq 'terminal GL: ' "$LOG_DIR/terminal-g
   exit 1
 fi
 for regression in \
+  pane::activity_tests::real_pty_output_drives_tab_activity_lifecycle \
   pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
   pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \
   pane::tests::closing_the_active_tab_maps_only_its_replacement \

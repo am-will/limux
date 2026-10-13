@@ -7,7 +7,7 @@ use libadwaita as adw;
 
 use crate::app_config::{
     AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, WindowControlsSide,
-    DEFAULT_UI_SCALE,
+    DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS, MIN_TAB_ACTIVITY_SECONDS,
 };
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
@@ -415,6 +415,46 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     indicators_row.set_activatable_widget(Some(&indicators_switch));
     group.add(&indicators_row);
 
+    let tab_activity_row = adw::ActionRow::builder()
+        .title("Tab activity indicators")
+        .subtitle("Show a spinner on tabs that received terminal output recently")
+        .build();
+    tab_activity_row.set_title_lines(1);
+    tab_activity_row.set_subtitle_lines(2);
+    let tab_activity_switch = gtk::Switch::new();
+    let show_tab_activity = input.config.borrow().interface.show_tab_activity;
+    tab_activity_switch.set_active(show_tab_activity);
+    tab_activity_switch.set_valign(gtk::Align::Center);
+    tab_activity_row.add_suffix(&tab_activity_switch);
+    tab_activity_row.set_activatable_widget(Some(&tab_activity_switch));
+    group.add(&tab_activity_row);
+
+    let tab_activity_timeout_row = adw::ActionRow::builder()
+        .title("Tab activity timeout")
+        .subtitle("Keep the spinner visible for this many seconds after terminal output")
+        .build();
+    tab_activity_timeout_row.set_title_lines(1);
+    tab_activity_timeout_row.set_subtitle_lines(2);
+    let tab_activity_adjustment = gtk::Adjustment::new(
+        f64::from(input.config.borrow().interface.tab_activity_seconds),
+        f64::from(MIN_TAB_ACTIVITY_SECONDS),
+        f64::from(MAX_TAB_ACTIVITY_SECONDS),
+        1.0,
+        5.0,
+        0.0,
+    );
+    let tab_activity_timeout_spin = gtk::SpinButton::builder()
+        .adjustment(&tab_activity_adjustment)
+        .digits(0)
+        .numeric(true)
+        .valign(gtk::Align::Center)
+        .width_chars(3)
+        .build();
+    tab_activity_timeout_row.add_suffix(&tab_activity_timeout_spin);
+    tab_activity_timeout_row.set_activatable_widget(Some(&tab_activity_timeout_spin));
+    tab_activity_timeout_row.set_sensitive(show_tab_activity);
+    group.add(&tab_activity_timeout_row);
+
     let controls_row = adw::ActionRow::builder()
         .title("Window controls side")
         .subtitle("Place close, minimize, and maximize on the left or right of the top bar (or of the sidebar header when the top bar is off)")
@@ -623,6 +663,60 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
+        let timeout_row = tab_activity_timeout_row.clone();
+        let syncing = Rc::new(Cell::new(false));
+        tab_activity_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let show_tab_activity = switch.is_active();
+            if show_tab_activity == config.borrow().interface.show_tab_activity {
+                timeout_row.set_sensitive(show_tab_activity);
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_tab_activity = show_tab_activity;
+            })
+            .interface
+            .show_tab_activity;
+            timeout_row.set_sensitive(effective);
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        tab_activity_timeout_spin.connect_value_changed(move |spin| {
+            if syncing.get() {
+                return;
+            }
+            let seconds = spin.value_as_int().clamp(
+                MIN_TAB_ACTIVITY_SECONDS as i32,
+                MAX_TAB_ACTIVITY_SECONDS as i32,
+            ) as u32;
+            if seconds == config.borrow().interface.tab_activity_seconds {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.tab_activity_seconds = seconds;
+            })
+            .interface
+            .tab_activity_seconds;
+            if spin.value_as_int() != effective as i32 {
+                syncing.set(true);
+                spin.set_value(f64::from(effective));
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
         let syncing = Rc::new(Cell::new(false));
         controls_dropdown.connect_selected_notify(move |dropdown| {
             if syncing.get() {
@@ -740,6 +834,7 @@ fn build_notifications_page(input: &SettingsEditorInput) -> gtk::Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::DEFAULT_TAB_ACTIVITY_SECONDS;
 
     #[test]
     #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
@@ -763,6 +858,7 @@ mod tests {
         adw::init().expect("initialize GTK");
         let config = Rc::new(RefCell::new(AppConfig::default()));
         let rejected_changes = Rc::new(Cell::new(0));
+        let reject_changes = Rc::new(Cell::new(true));
         let page = build_general_page(&SettingsEditorInput {
             config: config.clone(),
             shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
@@ -770,9 +866,12 @@ mod tests {
             on_config_changed: Rc::new({
                 let config = config.clone();
                 let rejected_changes = rejected_changes.clone();
+                let reject_changes = reject_changes.clone();
                 move |previous, _| {
                     rejected_changes.set(rejected_changes.get() + 1);
-                    config.borrow_mut().clone_from(previous);
+                    if reject_changes.get() {
+                        config.borrow_mut().clone_from(previous);
+                    }
                 }
             }),
         });
@@ -790,8 +889,38 @@ mod tests {
             .expect("dropdown");
         dropdown.set_selected(0);
         assert_eq!(dropdown.selected(), 1);
+        let tab_activity_switch = find_control(&page, "Tab activity indicators")
+            .expect("settings control")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+        let timeout_spin = find_control(&page, "Tab activity timeout")
+            .expect("settings control")
+            .downcast::<gtk::SpinButton>()
+            .expect("spin button");
+        assert_eq!(timeout_spin.adjustment().lower(), 1.0);
+        assert_eq!(timeout_spin.adjustment().upper(), 60.0);
+        tab_activity_switch.set_active(false);
+        assert!(
+            tab_activity_switch.is_active(),
+            "rejected activity toggle was retained"
+        );
+        assert_eq!(
+            timeout_spin.value_as_int(),
+            DEFAULT_TAB_ACTIVITY_SECONDS as i32
+        );
+        timeout_spin.set_value(12.0);
+        assert_eq!(
+            timeout_spin.value_as_int(),
+            DEFAULT_TAB_ACTIVITY_SECONDS as i32
+        );
         assert_eq!(config.borrow().interface, Default::default());
-        assert_eq!(rejected_changes.get(), 3, "rollback must not save again");
+        assert_eq!(rejected_changes.get(), 5, "rollback must not save again");
+
+        reject_changes.set(false);
+        tab_activity_switch.set_active(false);
+        assert!(!tab_activity_switch.is_active());
+        assert!(!timeout_spin.is_sensitive());
+        assert!(!config.borrow().interface.show_tab_activity);
     }
 
     #[test]

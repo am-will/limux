@@ -3086,6 +3086,13 @@ fn handle_config_change(
         let detail = format!("Failed to save Limux settings: {err}");
         eprintln!("limux: {detail}");
         show_runtime_error(state, "Failed to save settings", &detail);
+        return;
+    }
+    if previous.interface.show_tab_activity != updated.interface.show_tab_activity
+        || previous.interface.tab_activity_seconds != updated.interface.tab_activity_seconds
+    {
+        let config = state.borrow().config.clone();
+        pane::apply_tab_activity_config(&config);
     }
 }
 
