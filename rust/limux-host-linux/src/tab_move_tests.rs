@@ -130,6 +130,7 @@ fn a_tab_moved_to_another_workspace_answers_to_its_original_ids() {
                 cwd: None,
                 folder_path: None,
                 autostart_command: None,
+                color: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(None)),
             },
         );

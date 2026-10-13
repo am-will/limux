@@ -423,7 +423,7 @@ fn control_surface_target(
     if let Some(hint) = surface_hint {
         let app_state = state.borrow();
         let workspace = &app_state.workspaces[index];
-        let pane::TabTargetResolution::Unique(pane_id, tab_id) =
+        let pane::HintResolution::Unique((pane_id, tab_id)) =
             pane::tab_target_for_workspace(&workspace.id, hint)
         else {
             return None;
@@ -566,11 +566,15 @@ fn resolve_pane_create_source_id(
     }
 
     if let Some(surface_id) = surface_id {
-        return tab_to_pane
-            .iter()
-            .find(|(tab_id, _)| pane::surface_hint_matches(tab_id, surface_id))
-            .map(|(_, pane_id)| *pane_id)
-            .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
+        let candidates = tab_to_pane.iter().filter_map(|&(tab_id, pane_id)| {
+            pane::surface_hint_match(pane_id, tab_id, surface_id).map(|rank| (rank, pane_id))
+        });
+        return match pane::resolve_surface_hint(candidates) {
+            pane::HintResolution::Unique(pane_id) => Ok(pane_id),
+            pane::HintResolution::NotFound | pane::HintResolution::Ambiguous => Err(
+                PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()),
+            ),
+        };
     }
 
     if let Some(pane_id) = pane_id {
@@ -840,11 +844,19 @@ fn surface_health_payload(
     workspace: &Workspace,
     surface_hint: Option<&str>,
 ) -> Result<serde_json::Value, BridgeError> {
-    let surfaces = pane::surface_summaries_for_root(&workspace.root)
+    let mut surfaces = pane::surface_summaries_for_root(&workspace.root);
+    if let Some(hint) = surface_hint {
+        let candidates = surfaces.into_iter().filter_map(|surface| {
+            pane::surface_hint_match(surface.pane_id, &surface.tab_id, hint)
+                .map(|rank| (rank, surface))
+        });
+        surfaces = match pane::resolve_surface_hint(candidates) {
+            pane::HintResolution::Unique(surface) => vec![surface],
+            pane::HintResolution::NotFound | pane::HintResolution::Ambiguous => Vec::new(),
+        };
+    }
+    let surfaces = surfaces
         .into_iter()
-        .filter(|surface| {
-            surface_hint.is_none_or(|hint| pane::surface_hint_matches(&surface.tab_id, hint))
-        })
         .enumerate()
         .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
         .collect::<Vec<_>>();
@@ -7804,33 +7816,21 @@ fn resolve_surface_tab_target(
         .map(|workspace| workspace.id.clone())
         .collect::<Vec<_>>();
 
-    match pane::tab_target_for_workspace(&workspace_ids[preferred_index], surface_hint) {
-        pane::TabTargetResolution::Unique(pane_id, tab_id) => {
-            return (preferred_index, Some((pane_id, tab_id)));
-        }
-        pane::TabTargetResolution::Ambiguous => return (preferred_index, None),
-        pane::TabTargetResolution::NotFound => {}
+    // Exact names first, then the preferred workspace.
+    let candidates = workspace_ids
+        .iter()
+        .enumerate()
+        .flat_map(|(index, workspace_id)| {
+            pane::tab_candidates_for_workspace(workspace_id, surface_hint)
+                .into_iter()
+                .map(move |(rank, pane_id, tab_id)| {
+                    ((rank, index == preferred_index), (index, pane_id, tab_id))
+                })
+        });
+    match pane::resolve_surface_hint(candidates) {
+        pane::HintResolution::Unique((index, pane_id, tab_id)) => (index, Some((pane_id, tab_id))),
+        pane::HintResolution::NotFound | pane::HintResolution::Ambiguous => (preferred_index, None),
     }
-
-    let mut target = None;
-    for (index, workspace_id) in workspace_ids.iter().enumerate() {
-        if index == preferred_index {
-            continue;
-        }
-        match pane::tab_target_for_workspace(workspace_id, surface_hint) {
-            pane::TabTargetResolution::Unique(pane_id, tab_id) if target.is_none() => {
-                target = Some((index, pane_id, tab_id));
-            }
-            pane::TabTargetResolution::Unique(_, _) | pane::TabTargetResolution::Ambiguous => {
-                return (preferred_index, None);
-            }
-            pane::TabTargetResolution::NotFound => {}
-        }
-    }
-
-    target
-        .map(|(index, pane_id, tab_id)| (index, Some((pane_id, tab_id))))
-        .unwrap_or((preferred_index, None))
 }
 
 fn has_unread(workspace_unread: bool, tab_unread: bool) -> bool {
@@ -8389,6 +8389,18 @@ mod tests {
             resolve_pane_create_source_id(None, None, Some(30), false, &panes, &surfaces),
             Ok(10)
         );
+    }
+
+    #[test]
+    fn pane_create_source_prefers_an_exact_restored_tab_id_over_a_stale_alias() {
+        let panes = [10, 20];
+        let surfaces = [("main", 10), ("0:main", 20)];
+        let source =
+            |hint| resolve_pane_create_source_id(Some(hint), None, None, true, &panes, &surfaces);
+
+        assert_eq!(source("0:main"), Ok(20));
+        assert_eq!(source("10:main"), Ok(10));
+        assert_eq!(source("main"), Ok(10));
     }
 
     #[test]
