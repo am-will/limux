@@ -4221,9 +4221,11 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     for (color, button) in swatches {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         button.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             set_workspace_color(&state, &ws_id, color);
         });
     }
