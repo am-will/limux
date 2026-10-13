@@ -46,6 +46,7 @@ fn moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique() {
             cwd: None,
             folder_path: None,
             autostart_command: None,
+            color: None,
             layout: LayoutNodeState::Pane(PaneState::fallback(None)),
         },
     );

@@ -15,6 +15,8 @@ use limux_control::socket_path::{bind_listener, resolve_socket_path, SocketMode}
 use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use serde_json::{json, Map, Value};
 
+use crate::workspace_color::WorkspaceColor;
+
 const METHODS: &[&str] = &[
     "system.ping",
     "system.identify",
@@ -25,6 +27,7 @@ const METHODS: &[&str] = &[
     "workspace.create",
     "workspace.select",
     "workspace.rename",
+    "workspace.set_color",
     "workspace.close",
     "pane.list",
     "pane.surfaces",
@@ -161,6 +164,11 @@ pub enum ControlCommand {
         title: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SetWorkspaceColor {
+        target: WorkspaceTarget,
+        color: Option<WorkspaceColor>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CloseWorkspace {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
@@ -239,6 +247,7 @@ impl ControlCommand {
             | Self::CreateWorkspace { reply, .. }
             | Self::SelectWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
+            | Self::SetWorkspaceColor { reply, .. }
             | Self::CloseWorkspace { reply, .. }
             | Self::SendText { reply, .. }
             | Self::SendKey { reply, .. }
@@ -545,6 +554,36 @@ fn parse_optional_workspace_target(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Read the `color` param of `workspace.set_color`: a palette name, or
+/// `"none"` / `null` to clear the colour.
+fn parse_workspace_color(
+    params: &Map<String, Value>,
+) -> Result<Option<WorkspaceColor>, BridgeError> {
+    let name = match params.get("color") {
+        None => {
+            return Err(BridgeError::invalid_params(
+                "workspace.set_color requires color",
+            ))
+        }
+        Some(Value::Null) => return Ok(None),
+        Some(Value::String(name)) => name.trim(),
+        Some(_) => {
+            return Err(BridgeError::invalid_params(
+                "workspace.set_color color must be a string or null",
+            ))
+        }
+    };
+    if name.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    WorkspaceColor::from_name(name).map(Some).ok_or_else(|| {
+        BridgeError::invalid_params(format!(
+            "unknown color {name:?}; expected one of: {}, none",
+            crate::workspace_color::color_names()
+        ))
+    })
+}
+
 fn parse_create_pane_request(
     params: &Map<String, Value>,
 ) -> Result<CreatePaneRequest, BridgeError> {
@@ -784,6 +823,25 @@ fn handle_method(
                 ControlCommand::RenameWorkspace {
                     target,
                     title,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "workspace.set_color" | "set-workspace-color" => {
+            let color = match parse_workspace_color(params) {
+                Ok(color) => color,
+                Err(error) => return error_response(id, error),
+            };
+            let target = match parse_optional_workspace_target(params, false) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SetWorkspaceColor {
+                    target,
+                    color,
                     reply,
                 },
                 rx,
@@ -1555,6 +1613,49 @@ mod tests {
                 },
             );
             assert_eq!(response.error, None);
+        }
+    }
+
+    #[test]
+    fn workspace_set_color_parses_names_and_clears() {
+        for (color, expected) in [
+            (json!("blue"), Some(WorkspaceColor::Blue)),
+            (json!(" Pink "), Some(WorkspaceColor::Pink)),
+            (json!("none"), None),
+            (Value::Null, None),
+        ] {
+            let response = dispatch_request(
+                &json!({"method": "workspace.set_color", "params": {"color": color}}).to_string(),
+                &|command| match command {
+                    ControlCommand::SetWorkspaceColor {
+                        target,
+                        color,
+                        reply,
+                    } => {
+                        assert_eq!(target, WorkspaceTarget::Active);
+                        assert_eq!(color, expected);
+                        reply.send(Ok(json!({}))).unwrap();
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                },
+            );
+            assert_eq!(response.error, None);
+        }
+    }
+
+    #[test]
+    fn workspace_set_color_rejects_missing_and_unknown_colors() {
+        for params in [
+            json!({}),
+            json!({"color": "chartreuse"}),
+            json!({"color": 3}),
+        ] {
+            let response = dispatch_request(
+                &json!({"method": "workspace.set_color", "params": params}).to_string(),
+                &|command| panic!("unexpected command: {command:?}"),
+            );
+            let error = response.error.expect("invalid color is rejected");
+            assert_eq!(error.code, INVALID_PARAMS_CODE);
         }
     }
 

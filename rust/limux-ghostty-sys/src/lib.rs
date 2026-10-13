@@ -33,7 +33,8 @@ pub const GHOSTTY_PLATFORM_IOS: c_int = 2;
 pub const GHOSTTY_PLATFORM_OPENGL: c_int = 3;
 pub const GHOSTTY_PLATFORM_METAL_EXTERNAL: c_int = 4;
 pub const GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED: c_int = 5;
-pub const GHOSTTY_PLATFORM_LINUX: c_int = 6;
+pub const GHOSTTY_PLATFORM_OFFSCREEN: c_int = 6;
+pub const GHOSTTY_PLATFORM_LINUX: c_int = 7;
 
 pub const GHOSTTY_CLIPBOARD_STANDARD: c_int = 0;
 pub const GHOSTTY_CLIPBOARD_SELECTION: c_int = 1;
@@ -335,7 +336,6 @@ pub struct ghostty_input_key_s {
     pub text: *const c_char,
     pub unshifted_codepoint: u32,
     pub composing: bool,
-    pub key: c_int, // ghostty_input_key_e, GHOSTTY_KEY_UNIDENTIFIED = derive from keycode
 }
 
 pub type ghostty_io_write_cb = unsafe extern "C" fn(*mut c_void, *const c_char, usize);
@@ -604,6 +604,11 @@ extern "C" {
     pub fn ghostty_surface_size(surface: ghostty_surface_t) -> ghostty_surface_size_s;
     pub fn ghostty_surface_process_exited(surface: ghostty_surface_t) -> bool;
     pub fn ghostty_surface_key(surface: ghostty_surface_t, event: ghostty_input_key_s) -> bool;
+    pub fn ghostty_surface_key_with_key(
+        surface: ghostty_surface_t,
+        event: ghostty_input_key_s,
+        resolved_key: c_int,
+    ) -> bool;
     pub fn ghostty_surface_text(surface: ghostty_surface_t, text: *const c_char, len: usize);
     pub fn ghostty_surface_preedit(surface: ghostty_surface_t, text: *const c_char, len: usize);
     pub fn ghostty_surface_mouse_button(
@@ -660,6 +665,10 @@ mod tests {
 
     #[test]
     fn embedding_struct_layouts_match_ghostty_header() {
+        assert_eq!(size_of::<ghostty_input_key_s>(), 32);
+        assert_eq!(align_of::<ghostty_input_key_s>(), 8);
+        assert_eq!(offset_of!(ghostty_input_key_s, composing), 28);
+
         assert_eq!(size_of::<ghostty_platform_u>(), 40);
         assert_eq!(align_of::<ghostty_platform_u>(), 8);
 

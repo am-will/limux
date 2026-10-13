@@ -655,6 +655,7 @@ Priority: optional
 Architecture: ${DEB_ARCH}
 Installed-Size: ${INSTALLED_SIZE}
 Depends: libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4
+Recommends: wl-clipboard
 Maintainer: Will R <will@limux.dev>
 Description: GPU-accelerated terminal workspace manager for Linux
  Limux is a terminal workspace manager powered by Ghostty's

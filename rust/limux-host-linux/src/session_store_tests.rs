@@ -12,6 +12,7 @@ fn workspace(number: u32) -> WorkspaceState {
         cwd: Some("/tmp".into()),
         folder_path: None,
         autostart_command: None,
+        color: None,
         layout: LayoutNodeState::Pane(PaneState {
             pane_id: Some(number),
             active_tab_id: Some(format!("tab-{number}")),

@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::workspace_color::WorkspaceColor;
+
 pub const SESSION_VERSION: u32 = 1;
 pub const PERSISTENCE_DIR_NAME: &str = "limux";
 pub const SESSION_FILE_NAME: &str = "session.json";
@@ -63,6 +65,12 @@ pub struct WorkspaceState {
     pub folder_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostart_command: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::workspace_color::deserialize_option"
+    )]
+    pub color: Option<WorkspaceColor>,
     pub layout: LayoutNodeState,
 }
 
@@ -391,6 +399,27 @@ pub fn split_position_from_ratio(ratio: f64, total_size: i32) -> i32 {
     (clamp_split_ratio(ratio) * total_size as f64).round() as i32
 }
 
+/// Keeps both children of a split at or above their minimum extent, so GTK
+/// never has to shift a shrunk child out of view (it allocates the minimum
+/// and clips the side away from the handle, hiding a pane's tab bar). Left
+/// unchanged when the split is too small to fit both minimums.
+pub fn clamp_split_position(position: i32, start_min: i32, end_min: i32, max_position: i32) -> i32 {
+    if start_min + end_min > max_position {
+        return position;
+    }
+    position.clamp(start_min, max_position - end_min)
+}
+
+/// Minimum extent of a nested split from its children's minimums: stacked
+/// along the split's own orientation (plus the handle), side by side across.
+pub fn nested_split_min_extent(start_min: i32, end_min: i32, along: bool, handle: i32) -> i32 {
+    if along {
+        start_min + end_min + handle
+    } else {
+        start_min.max(end_min)
+    }
+}
+
 pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
     state.version = SESSION_VERSION;
     state.sidebar.width = state.sidebar.width.max(DEFAULT_SIDEBAR_WIDTH);
@@ -454,6 +483,7 @@ impl AppSessionState {
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
                     autostart_command: None,
+                    color: None,
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
@@ -1045,6 +1075,7 @@ mod tests {
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
                 autostart_command: None,
+                color: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/canonical"))),
             }],
             ..AppSessionState::default()
@@ -1153,6 +1184,7 @@ mod tests {
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
                 autostart_command: Some("ssh user@server".to_string()),
+                color: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
@@ -1186,6 +1218,39 @@ mod tests {
             decoded.workspaces[0].autostart_command.as_deref(),
             Some("ssh user@server")
         );
+    }
+
+    #[test]
+    fn workspace_color_round_trips_and_tolerates_missing_or_unknown_names() {
+        let mut workspace = WorkspaceState {
+            id: None,
+            name: "colored".to_string(),
+            favorite: false,
+            cwd: None,
+            folder_path: None,
+            autostart_command: None,
+            color: Some(WorkspaceColor::Teal),
+            layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+        };
+
+        let mut encoded = serde_json::to_value(&workspace).expect("encode workspace");
+        assert_eq!(encoded["color"], "teal");
+        let decoded: WorkspaceState =
+            serde_json::from_value(encoded.clone()).expect("decode colored workspace");
+        assert_eq!(decoded, workspace);
+
+        // A colour this build does not know must not fail the whole session.
+        encoded["color"] = serde_json::json!("chartreuse");
+        let decoded: WorkspaceState =
+            serde_json::from_value(encoded.clone()).expect("decode unknown color");
+        assert_eq!(decoded.color, None);
+
+        workspace.color = None;
+        let encoded = serde_json::to_value(&workspace).expect("encode plain workspace");
+        assert!(encoded.get("color").is_none());
+        let decoded: WorkspaceState =
+            serde_json::from_value(encoded).expect("decode workspace without color");
+        assert_eq!(decoded.color, None);
     }
 
     #[test]
@@ -1735,6 +1800,7 @@ mod tests {
                 cwd: None,
                 folder_path: None,
                 autostart_command: None,
+                color: None,
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),
@@ -1766,6 +1832,22 @@ mod tests {
         assert_eq!(split_ratio_from_position(0, 0), DEFAULT_SPLIT_RATIO);
         assert!(split_ratio_from_position(9999, 10) <= MAX_SPLIT_RATIO);
         assert_eq!(split_position_from_ratio(f64::INFINITY, 200), 100);
+    }
+
+    #[test]
+    fn clamp_split_position_keeps_both_children_at_their_minimum() {
+        // Restored 0.1085 ratio on an 869 px split: 94 px < 160 px minimum.
+        assert_eq!(clamp_split_position(94, 160, 160, 868), 160);
+        assert_eq!(clamp_split_position(800, 160, 160, 868), 708);
+        assert_eq!(clamp_split_position(434, 160, 160, 868), 434);
+        // Too small for both minimums: leave the position alone.
+        assert_eq!(clamp_split_position(94, 160, 160, 300), 94);
+    }
+
+    #[test]
+    fn nested_split_min_extent_sums_along_and_maxes_across() {
+        assert_eq!(nested_split_min_extent(160, 320, true, 1), 481);
+        assert_eq!(nested_split_min_extent(160, 320, false, 1), 320);
     }
 
     #[test]

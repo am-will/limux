@@ -216,7 +216,8 @@ fi
 PREFERRED_PANE="$("$CLI" --json --id-format both identify | jq -r '.focused.pane_id')"
 click 70 65 3
 sleep 0.2
-click 360 30
+# GTK focuses the first action, regardless of where the popover fits on screen.
+key Return
 wait_for_count cwd-main 8
 assert_directory "$RUN_DIR/workspace" active-workspace-context-root
 "$CLI" --json --id-format both identify \
@@ -227,7 +228,7 @@ assert_directory "$RUN_DIR/workspace" active-workspace-context-root
 # workspace was inactive and restores a terminal in a nested directory.
 click 70 135 3
 sleep 0.2
-click 360 94
+key Return
 wait_for_count cwd-other 3
 assert_directory "$RUN_DIR/other" workspace-context-root cwd-other
 "$CLI" --json --id-format both identify >"$RUN_DIR/context-focus.json"
