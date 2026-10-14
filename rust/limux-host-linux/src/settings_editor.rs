@@ -6,8 +6,8 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config::{
-    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, WindowControlsSide,
-    DEFAULT_UI_SCALE,
+    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UnreadColor,
+    WindowControlsSide, DEFAULT_UI_SCALE,
 };
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
@@ -100,7 +100,7 @@ const UI_SCALE_DESCRIPTORS: &[UiScaleDescriptor] = &[
 
 pub fn ui_scale_css(config: &AppConfig) -> String {
     let scale = config.appearance.ui_scale.get();
-    UI_SCALE_DESCRIPTORS
+    let mut rules: Vec<String> = UI_SCALE_DESCRIPTORS
         .iter()
         .map(|descriptor| {
             format!(
@@ -110,8 +110,15 @@ pub fn ui_scale_css(config: &AppConfig) -> String {
                 descriptor.base_size * scale
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    let c = config.appearance.unread_color.css_color();
+    rules.push(format!(
+        ".limux-indicator-unread-dot, .limux-notify-dot, .limux-tab-unread-dot {{ color: {c}; }}\n\
+         .limux-notify-msg-unread {{ color: alpha({c}, 0.9); }}\n\
+         .limux-sidebar-row-unread {{ background-color: alpha({c}, 0.14); border-left: 3px solid {c}; }}\n\
+         .limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {{ background: alpha({c}, 0.18); border-left: 3px solid {c}; }}"
+    ));
+    rules.join("\n")
 }
 
 type OnConfigChanged = dyn Fn(&AppConfig, &AppConfig);
@@ -261,6 +268,28 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     ghostty_row.add_suffix(&ghostty_dropdown);
     ghostty_row.set_activatable_widget(Some(&ghostty_dropdown));
     group.add(&ghostty_row);
+
+    let unread_color_row = adw::ActionRow::builder()
+        .title("Unread indicator color")
+        .subtitle(
+            "Accent color for unread workspace rows, borders, and tab dots (distinct from blue selection)",
+        )
+        .build();
+    unread_color_row.set_title_lines(1);
+    unread_color_row.set_subtitle_lines(2);
+    let unread_color_dropdown = gtk::DropDown::from_strings(UnreadColor::labels());
+    unread_color_dropdown.set_selected(
+        input
+            .config
+            .borrow()
+            .appearance
+            .unread_color
+            .dropdown_index(),
+    );
+    unread_color_dropdown.set_valign(gtk::Align::Center);
+    unread_color_row.add_suffix(&unread_color_dropdown);
+    unread_color_row.set_activatable_widget(Some(&unread_color_dropdown));
+    group.add(&unread_color_row);
 
     let hover_row = adw::ActionRow::builder()
         .title("Hover terminal focus")
@@ -445,6 +474,16 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             };
             apply_config_change(&config, &*on_changed, move |c| {
                 c.appearance.ghostty_color_scheme = scheme;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        unread_color_dropdown.connect_selected_notify(move |dropdown| {
+            let unread_color = UnreadColor::from_dropdown_index(dropdown.selected());
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.appearance.unread_color = unread_color;
             });
         });
     }

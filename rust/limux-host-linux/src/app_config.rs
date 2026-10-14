@@ -88,12 +88,80 @@ pub struct WorkspaceConfig {
     pub keep_open_after_last_terminal_closes: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnreadColor {
+    #[default]
+    Amber,
+    Emerald,
+    Rose,
+    Cyan,
+    AccentBlue,
+}
+
+impl UnreadColor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Amber => "amber",
+            Self::Emerald => "emerald",
+            Self::Rose => "rose",
+            Self::Cyan => "cyan",
+            Self::AccentBlue => "accent_blue",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "amber" => Some(Self::Amber),
+            "emerald" => Some(Self::Emerald),
+            "rose" => Some(Self::Rose),
+            "cyan" => Some(Self::Cyan),
+            "accent_blue" => Some(Self::AccentBlue),
+            _ => None,
+        }
+    }
+
+    pub fn css_color(self) -> &'static str {
+        match self {
+            Self::Amber => "#f59e0b",
+            Self::Emerald => "#10b981",
+            Self::Rose => "#f43f5e",
+            Self::Cyan => "#06b6d4",
+            Self::AccentBlue => "@accent_bg_color",
+        }
+    }
+
+    pub fn labels() -> &'static [&'static str] {
+        &["Amber (Default)", "Emerald", "Rose", "Cyan", "Accent Blue"]
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::Amber => 0,
+            Self::Emerald => 1,
+            Self::Rose => 2,
+            Self::Cyan => 3,
+            Self::AccentBlue => 4,
+        }
+    }
+
+    pub fn from_dropdown_index(index: u32) -> Self {
+        match index {
+            1 => Self::Emerald,
+            2 => Self::Rose,
+            3 => Self::Cyan,
+            4 => Self::AccentBlue,
+            _ => Self::Amber,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppearanceConfig {
     pub color_scheme: ColorScheme,
     pub ghostty_color_scheme: ColorScheme,
     pub ui_scale: UiScale,
     pub show_workspace_path: bool,
+    pub unread_color: UnreadColor,
 }
 
 impl Default for AppearanceConfig {
@@ -103,6 +171,7 @@ impl Default for AppearanceConfig {
             ghostty_color_scheme: ColorScheme::default(),
             ui_scale: UiScale::default(),
             show_workspace_path: true,
+            unread_color: UnreadColor::default(),
         }
     }
 }
@@ -409,6 +478,12 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let unread_color = appearance
+        .and_then(|appearance| appearance.get("unread_color"))
+        .and_then(Value::as_str)
+        .and_then(UnreadColor::from_str)
+        .unwrap_or_default();
+
     let workspace = root.get("workspace").and_then(Value::as_object);
     let keep_open_after_last_terminal_closes = workspace
         .and_then(|workspace| workspace.get("keep_open_after_last_terminal_closes"))
@@ -475,6 +550,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             ghostty_color_scheme,
             ui_scale,
             show_workspace_path,
+            unread_color,
         },
         workspace: WorkspaceConfig {
             keep_open_after_last_terminal_closes,
@@ -525,6 +601,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         appearance.insert(
             "ui_scale".to_string(),
             json!(config.appearance.ui_scale.get()),
+        );
+    }
+    if config.appearance.unread_color != UnreadColor::default() {
+        appearance.insert(
+            "unread_color".to_string(),
+            json!(config.appearance.unread_color.as_str()),
         );
     }
     root.insert("appearance".to_string(), Value::Object(appearance));
@@ -898,6 +980,28 @@ mod tests {
 
         assert!(loaded.warnings.is_empty());
         assert_eq!(loaded.config.appearance.ui_scale.get(), MAX_UI_SCALE);
+    }
+
+    #[test]
+    fn save_and_load_round_trips_unread_color() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        let mut config = AppConfig::default();
+        assert_eq!(config.appearance.unread_color, UnreadColor::Amber);
+
+        for color in [
+            UnreadColor::Amber,
+            UnreadColor::Emerald,
+            UnreadColor::Rose,
+            UnreadColor::Cyan,
+            UnreadColor::AccentBlue,
+        ] {
+            config.appearance.unread_color = color;
+            save_to_path(&path, &config).expect("save config");
+            let loaded = load_from_path(&path);
+            assert!(loaded.warnings.is_empty());
+            assert_eq!(loaded.config.appearance.unread_color, color);
+        }
     }
 
     #[test]

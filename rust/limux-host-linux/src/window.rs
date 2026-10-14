@@ -54,6 +54,8 @@ struct Workspace {
     notify_label: gtk::Label,
     /// Unread state for notifications without a tab target.
     unread: bool,
+    /// True when the user explicitly marked this workspace unread via the context menu.
+    manual_unread: bool,
     /// Whether this workspace is favorited/pinned to top.
     favorite: bool,
     /// Background colour of the sidebar row, if the user picked one.
@@ -1541,7 +1543,7 @@ const BASE_CSS: &str = r#"
     font-weight: 600;
 }
 .limux-indicator-unread-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 7px;
     margin-right: 4px;
 }
@@ -1656,7 +1658,7 @@ const BASE_CSS: &str = r#"
     margin: 0;
 }
 .limux-notify-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 8px;
     margin-right: 6px;
 }
@@ -1670,14 +1672,18 @@ const BASE_CSS: &str = r#"
     font-size: 11px;
 }
 .limux-notify-msg-unread {
-    color: alpha(@accent_bg_color, 0.85);
+    color: alpha(#f59e0b, 0.9);
     font-size: 11px;
 }
 .limux-sidebar-row-unread {
-    background-color: alpha(@accent_bg_color, 0.1);
-    border-left: 3px solid @accent_bg_color;
+    background-color: alpha(#f59e0b, 0.14);
+    border-left: 3px solid #f59e0b;
     border-radius: 8px;
     margin-left: 3px;
+}
+.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {
+    background: alpha(#f59e0b, 0.18);
+    border-left: 3px solid #f59e0b;
 }
 .limux-sidebar-row-unread .limux-ws-name {
     color: @window_fg_color;
@@ -2179,7 +2185,7 @@ pub fn build_window(app: &adw::Application) {
                 .active_workspace()
                 .map(|workspace| workspace.id.clone());
             if let Some(workspace_id) = workspace_id {
-                clear_visible_tab_unread(&state, &workspace_id);
+                clear_visible_tab_unread_on_window_focus(&state, &workspace_id);
             }
         });
     }
@@ -2384,11 +2390,48 @@ pub fn build_window(app: &adw::Application) {
     }
 }
 
+const GTK4_14_HOST_ENTRY_CSS: &str = r#"
+.limux-host-entry {
+    background-color: alpha(@window_bg_color, 0.98);
+    color: alpha(@window_fg_color, 0.96);
+    border: 1px solid alpha(@window_fg_color, 0.16);
+    border-radius: 6px;
+    caret-color: currentColor;
+}
+.limux-host-entry:focus-within {
+    border-color: alpha(@accent_bg_color, 0.75);
+}
+.limux-host-entry text {
+    background-color: transparent;
+    color: alpha(@window_fg_color, 0.96);
+}
+.limux-host-entry text placeholder {
+    color: alpha(@window_fg_color, 0.5);
+}
+.limux-host-entry image {
+    color: alpha(@window_fg_color, 0.5);
+}
+"#;
+
+fn base_css_for_runtime_gtk() -> std::borrow::Cow<'static, str> {
+    if (gtk::major_version(), gtk::minor_version()) >= (4, 16) {
+        return std::borrow::Cow::Borrowed(BASE_CSS);
+    }
+    if let Some((_, rest)) = BASE_CSS.split_once("/* ---------- Top bar") {
+        std::borrow::Cow::Owned(format!(
+            "{GTK4_14_HOST_ENTRY_CSS}\n/* ---------- Top bar{rest}"
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(BASE_CSS)
+    }
+}
+
 fn build_window_css(background_opacity: f64) -> String {
     let background_opacity = sanitize_background_opacity(background_opacity);
     let (r, g, b) = CONTENT_BACKGROUND_RGB;
+    let base_css = base_css_for_runtime_gtk();
     format!(
-        "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
+        "{base_css}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
     )
 }
 
@@ -2973,7 +3016,9 @@ fn handle_config_change(
     let style_manager = adw::StyleManager::default();
     let system_prefers_dark = state.borrow().system_prefers_dark.get();
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
-    if updated.appearance.ui_scale != previous.appearance.ui_scale {
+    if updated.appearance.ui_scale != previous.appearance.ui_scale
+        || updated.appearance.unread_color != previous.appearance.unread_color
+    {
         reload_app_css(state, updated);
     }
     if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
@@ -2989,7 +3034,9 @@ fn handle_config_change(
     if let Err(err) = app_config::save(updated) {
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
-        if updated.appearance.ui_scale != previous.appearance.ui_scale {
+        if updated.appearance.ui_scale != previous.appearance.ui_scale
+            || updated.appearance.unread_color != previous.appearance.unread_color
+        {
             reload_app_css(state, previous);
         }
         if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
@@ -4171,6 +4218,22 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
 
+    let is_unread = {
+        let app_state = state.borrow();
+        let workspace_unread = app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .is_some_and(|workspace| workspace.unread);
+        workspace_unread || pane::workspace_has_unread_tabs(workspace_id)
+    };
+    let unread_label = if is_unread {
+        "Mark as Read"
+    } else {
+        "Mark as Unread"
+    };
+    let unread_btn = gtk::Button::with_label(unread_label);
+    unread_btn.add_css_class("flat");
     let new_tab_btn = gtk::Button::with_label("New tab from workspace directory");
     new_tab_btn.add_css_class("flat");
     let rename_btn = gtk::Button::with_label("Rename");
@@ -4194,6 +4257,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     delete_btn.add_css_class("destructive-action");
 
     menu_box.append(&new_tab_btn);
+    menu_box.append(&unread_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&autostart_btn);
 
@@ -4269,6 +4333,46 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
                 pop.popdown();
             }
             set_workspace_color(&state, &ws_id, color);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.downgrade();
+        unread_btn.connect_clicked(move |_| {
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
+            let state = state.clone();
+            let ws_id = ws_id.clone();
+            glib::idle_add_local_once(move || {
+                let root = {
+                    let mut app_state = state.borrow_mut();
+                    let Some(workspace) = app_state
+                        .workspaces
+                        .iter_mut()
+                        .find(|workspace| workspace.id == ws_id)
+                    else {
+                        return;
+                    };
+                    if is_unread {
+                        workspace.unread = false;
+                        workspace.manual_unread = false;
+                    } else {
+                        workspace.unread = true;
+                        workspace.manual_unread = true;
+                    }
+                    workspace.root.clone()
+                };
+                if is_unread {
+                    pane::clear_all_tabs_unread_in_root(&root);
+                } else {
+                    pane::mark_active_tab_manual_unread_in_root(&root);
+                }
+                sync_workspace_unread(&state, &ws_id);
+                request_session_save(&state);
+            });
         });
     }
 
@@ -5011,6 +5115,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_dot,
             notify_label,
             unread: false,
+            manual_unread: false,
             favorite: false,
             color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
@@ -5072,6 +5177,8 @@ fn install_workspace_row_interactions(
             if n_press == 2 {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 begin_workspace_inline_rename(&state, &workspace_id);
+            } else if n_press == 1 {
+                clear_visible_tab_unread(&state, &workspace_id);
             }
         });
     }
@@ -6460,6 +6567,7 @@ fn add_workspace_with_initial_command(
         notify_dot,
         notify_label,
         unread: false,
+        manual_unread: false,
         favorite: workspace.favorite,
         color: workspace.color,
         cwd,
@@ -6641,6 +6749,13 @@ pub(crate) fn create_pane_for_workspace(
             move || request_session_save(&state)
         }),
         on_unread_changed: Box::new(move || {
+            if !pane::workspace_has_unread_tabs(&ws_id_unread) {
+                let mut s = state_for_unread.borrow_mut();
+                if let Some(ws) = s.workspaces.iter_mut().find(|w| w.id == ws_id_unread) {
+                    ws.unread = false;
+                    ws.manual_unread = false;
+                }
+            }
             sync_workspace_unread(&state_for_unread, &ws_id_unread);
         }),
         is_pane_visible: Box::new(move |pane_widget| {
@@ -7953,9 +8068,32 @@ fn clear_visible_tab_unread(state: &State, ws_id: &str) {
             return;
         };
         workspace.unread = false;
+        workspace.manual_unread = false;
         workspace.root.clone()
     };
     pane::clear_active_tab_unread_in_root(&root);
+    sync_workspace_unread(state, ws_id);
+}
+
+fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &str) {
+    let root = {
+        let mut s = state.borrow_mut();
+        if !s.window.is_active() {
+            return;
+        }
+        let Some(workspace) = s
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == ws_id)
+        else {
+            return;
+        };
+        if !workspace.manual_unread {
+            workspace.unread = false;
+        }
+        workspace.root.clone()
+    };
+    pane::clear_active_tab_unread_in_root_if_not_manual(&root);
     sync_workspace_unread(state, ws_id);
 }
 
