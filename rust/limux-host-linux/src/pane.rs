@@ -457,7 +457,7 @@ pub const PANE_CSS: &str = r#"
     margin-right: 2px;
 }
 .limux-tab-unread-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 9px;
     margin-right: 2px;
 }
@@ -783,7 +783,7 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
         &internals.tab_state,
         &tab_id,
     );
-    clear_tab_unread_if_visible(
+    clear_tab_unread_if_visible_and_not_manual(
         &internals.tab_state,
         &tab_id,
         &internals.pane_outer.clone().upcast(),
@@ -938,6 +938,9 @@ pub fn set_tab_pinned_in_pane(pane_widget: &gtk::Widget, tab_id: &str, pinned: b
 }
 
 fn set_tab_unread(entry: &mut TabEntry, unread: bool) -> bool {
+    if !unread {
+        entry.manual_unread = false;
+    }
     if entry.unread == unread {
         return false;
     }
@@ -947,11 +950,27 @@ fn set_tab_unread(entry: &mut TabEntry, unread: bool) -> bool {
     true
 }
 
+fn set_tab_manual_unread(entry: &mut TabEntry, unread: bool) -> bool {
+    entry.manual_unread = unread;
+    set_tab_unread(entry, unread)
+}
+
 fn clear_tab_unread(tab_state: &Rc<RefCell<TabState>>, tab_id: &str) -> bool {
     tab_state
         .borrow_mut()
         .find_tab_mut(tab_id)
         .is_some_and(|entry| set_tab_unread(entry, false))
+}
+
+fn clear_tab_unread_if_not_manual(tab_state: &Rc<RefCell<TabState>>, tab_id: &str) -> bool {
+    let mut ts = tab_state.borrow_mut();
+    let Some(entry) = ts.find_tab_mut(tab_id) else {
+        return false;
+    };
+    if entry.manual_unread {
+        return false;
+    }
+    set_tab_unread(entry, false)
 }
 
 fn clear_tab_unread_if_visible(
@@ -961,6 +980,18 @@ fn clear_tab_unread_if_visible(
     callbacks: &Rc<PaneCallbacks>,
 ) {
     if (callbacks.is_pane_visible)(pane_widget) && clear_tab_unread(tab_state, tab_id) {
+        (callbacks.on_unread_changed)();
+    }
+}
+
+fn clear_tab_unread_if_visible_and_not_manual(
+    tab_state: &Rc<RefCell<TabState>>,
+    tab_id: &str,
+    pane_widget: &gtk::Widget,
+    callbacks: &Rc<PaneCallbacks>,
+) {
+    if (callbacks.is_pane_visible)(pane_widget) && clear_tab_unread_if_not_manual(tab_state, tab_id)
+    {
         (callbacks.on_unread_changed)();
     }
 }
@@ -1158,6 +1189,7 @@ struct TabEntry {
     automatic_title: Option<String>,
     pinned: bool,
     unread: bool,
+    manual_unread: bool,
     kind: TabKind,
 }
 
@@ -1984,6 +2016,7 @@ fn add_terminal_tab_inner(
             automatic_title: None,
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
             unread: false,
+            manual_unread: false,
             kind: TabKind::Terminal {
                 state: TerminalTabState {
                     ssh,
@@ -2169,6 +2202,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             automatic_title: Some(title),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
             unread: false,
+            manual_unread: false,
             kind: TabKind::Browser {
                 state: BrowserTabState {
                     uri: saved_uri.clone(),
@@ -2248,6 +2282,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
                 .map(|value| value.pinned)
                 .unwrap_or(false),
             unread: false,
+            manual_unread: false,
             kind: TabKind::Keybinds,
         });
     }
@@ -2608,6 +2643,56 @@ pub fn clear_active_tab_unread_in_root(root: &gtk::Widget) -> bool {
     changed
 }
 
+pub fn clear_active_tab_unread_in_root_if_not_manual(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let active_tab = internals.tab_state.borrow().active_tab.clone();
+        if let Some(tab_id) = active_tab {
+            changed |= clear_tab_unread_if_not_manual(&internals.tab_state, &tab_id);
+        }
+    }
+    changed
+}
+
+pub fn clear_all_tabs_unread_in_root(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let tab_ids: Vec<String> = internals
+            .tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .filter(|entry| entry.unread)
+            .map(|entry| entry.id.clone())
+            .collect();
+        for tab_id in tab_ids {
+            changed |= clear_tab_unread(&internals.tab_state, &tab_id);
+        }
+    }
+    changed
+}
+
+pub fn mark_active_tab_manual_unread_in_root(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let active_tab = internals.tab_state.borrow().active_tab.clone().or_else(|| {
+            internals
+                .tab_state
+                .borrow()
+                .tabs
+                .first()
+                .map(|e| e.id.clone())
+        });
+        if let Some(tab_id) = active_tab {
+            if let Some(entry) = internals.tab_state.borrow_mut().find_tab_mut(&tab_id) {
+                changed |= set_tab_manual_unread(entry, true);
+                break;
+            }
+        }
+    }
+    changed
+}
+
 pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
     pane_internals_for_workspace(workspace_id)
         .into_iter()
@@ -2960,15 +3045,45 @@ fn build_tab_button_from_label(
     }
     tab_btn.add_controller(right_click);
 
-    // Middle-click to close the tab.
+    // Middle-click to close the tab (on release inside bounds, unless pinned or renaming).
     let middle_click = gtk::GestureClick::new();
     middle_click.set_button(2);
     {
-        let tab_id = tab_id.to_string();
-        let pane_outer = internals.pane_outer.clone();
+        let tab_button = tab_btn.downgrade();
+        let tab_state = internals.tab_state.clone();
         middle_click.connect_pressed(move |gesture, _, _, _| {
+            let Some(tab_button) = tab_button.upgrade() else {
+                return;
+            };
+            if handle_tab_interaction_while_renaming(&tab_button, &tab_state) {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            close_tab_in_pane(pane_outer.upcast_ref(), &tab_id);
+        });
+    }
+    {
+        let tab_id = tab_id.to_string();
+        let tab_state = internals.tab_state.clone();
+        let pane_outer = internals.pane_outer.downgrade();
+        let tab_button = tab_btn.downgrade();
+        middle_click.connect_released(move |_, _, x, y| {
+            let Some(tab_button) = tab_button.upgrade() else {
+                return;
+            };
+            let Some(pane_outer) = pane_outer.upgrade() else {
+                return;
+            };
+            let is_renaming = tab_rename_active(&tab_state);
+            let inside_bounds = tab_button.contains(x, y);
+            let is_pinned = tab_state
+                .borrow()
+                .tabs
+                .iter()
+                .any(|entry| entry.id == tab_id && entry.pinned);
+            if can_middle_click_close_tab(is_pinned, is_renaming, inside_bounds) {
+                close_tab_in_pane(pane_outer.upcast_ref(), &tab_id);
+            }
         });
     }
     tab_btn.add_controller(middle_click);
@@ -3045,6 +3160,10 @@ fn build_tab_button_from_label(
     (tab_btn, unread_dot)
 }
 
+fn can_middle_click_close_tab(is_pinned: bool, is_renaming: bool, inside_bounds: bool) -> bool {
+    !is_pinned && !is_renaming && inside_bounds
+}
+
 fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextMenuContext) {
     let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -3052,6 +3171,45 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu_box.set_margin_bottom(4);
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
+
+    // Mark as Unread / Read
+    let is_unread = context
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .any(|e| e.id == tab_id && e.unread);
+    let unread_label = if is_unread {
+        "Mark as Read"
+    } else {
+        "Mark as Unread"
+    };
+    let unread_btn = gtk::Button::with_label(unread_label);
+    unread_btn.add_css_class("flat");
+    {
+        let state = context.tab_state.clone();
+        let tid = tab_id.to_string();
+        let menu_ref = menu.downgrade();
+        let callbacks = context.callbacks.clone();
+        unread_btn.connect_clicked(move |_| {
+            if let Some(menu) = menu_ref.upgrade() {
+                menu.popdown();
+            }
+            let state = state.clone();
+            let tid = tid.clone();
+            let callbacks = callbacks.clone();
+            glib::idle_add_local_once(move || {
+                let mut changed = false;
+                if let Some(entry) = state.borrow_mut().find_tab_mut(&tid) {
+                    changed = set_tab_manual_unread(entry, !is_unread);
+                }
+                if changed {
+                    (callbacks.on_unread_changed)();
+                    (callbacks.on_state_changed)();
+                }
+            });
+        });
+    }
 
     // Rename
     let rename_btn = gtk::Button::with_label("Rename");
@@ -3141,6 +3299,7 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         });
     }
 
+    menu_box.append(&unread_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&pin_btn);
     menu_box.append(&close_btn);
@@ -5241,6 +5400,14 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn middle_click_tab_close_guards_against_pinned_renaming_and_outside_release() {
+        assert!(super::can_middle_click_close_tab(false, false, true));
+        assert!(!super::can_middle_click_close_tab(true, false, true));
+        assert!(!super::can_middle_click_close_tab(false, true, true));
+        assert!(!super::can_middle_click_close_tab(false, false, false));
     }
 
     #[test]
