@@ -1016,82 +1016,60 @@ async fn run_agent_hook(
     // Build a human-friendly title + body depending on event + agent.
     let agent_label = agent.label();
     persist_agent_hook_session(agent, args, &payload, &event)?;
-    let (title, body) = match event.as_str() {
-        "Notification" => (
+    let notification_title_body = match event.as_str() {
+        "Notification" | "notification" => Some((
             format!("{agent_label} needs you"),
             hook_str(&payload, &["message", "notification"])
                 .unwrap_or("waiting for input")
                 .to_owned(),
-        ),
-        "Stop" | "SubagentStop" => (
+        )),
+        "Stop" | "stop" | "finished" => Some((
             format!("{agent_label} finished"),
             hook_str(&payload, &["message", "reason"])
                 .unwrap_or("task complete")
                 .to_owned(),
-        ),
-        "SessionStart" => (
-            format!("{agent_label} session started"),
-            hook_str(&payload, &["cwd", "source"])
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        "SessionEnd" => (
-            format!("{agent_label} session ended"),
-            hook_str(&payload, &["reason"]).unwrap_or("").to_owned(),
-        ),
-        "PreToolUse" | "PostToolUse" => (
-            format!(
-                "{agent_label}: {}",
-                hook_str(&payload, &["tool_name"]).unwrap_or("tool")
-            ),
-            hook_str(&payload, &["tool_input", "summary"])
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        "UserPromptSubmit" => (
-            format!("{agent_label}: new prompt"),
-            hook_str(&payload, &["prompt"])
-                .unwrap_or("")
-                .chars()
-                .take(120)
-                .collect(),
-        ),
-        other => (
+        )),
+        "SessionStart" | "session-start" | "SessionEnd" | "session-end" | "UserPromptSubmit"
+        | "prompt-submit" | "PreToolUse" | "PostToolUse" | "SubagentStop" | "subagent-stop"
+        | "Cleanup" | "cleanup" | "restore-exit" => None,
+        other => Some((
             format!("{agent_label}: {other}"),
             hook_str(&payload, &["message", "summary"])
                 .unwrap_or("")
                 .to_owned(),
-        ),
+        )),
     };
 
-    let subtitle = hook_str(&payload, &["session_id"])
-        .map(|s| {
-            // Show only a short prefix of the session id to keep sidebar tidy.
-            s.chars().take(8).collect::<String>()
-        })
-        .unwrap_or_default();
+    if let Some((title, body)) = notification_title_body {
+        let subtitle = hook_str(&payload, &["session_id"])
+            .map(|s| {
+                // Show only a short prefix of the session id to keep sidebar tidy.
+                s.chars().take(8).collect::<String>()
+            })
+            .unwrap_or_default();
 
-    let (workspace, surface) = notification_scope(args, env_opt);
+        let (workspace, surface) = notification_scope(args, env_opt);
 
-    let mut params = Map::new();
-    params.insert("title".to_string(), Value::String(title));
-    if !subtitle.is_empty() {
-        params.insert("subtitle".to_string(), Value::String(subtitle));
-    }
-    if !body.is_empty() {
-        params.insert("body".to_string(), Value::String(body));
-    }
-    if let Some(surface) = surface {
-        params.insert("surface_id".to_string(), Value::String(surface));
-    }
+        let mut params = Map::new();
+        params.insert("title".to_string(), Value::String(title));
+        if !subtitle.is_empty() {
+            params.insert("subtitle".to_string(), Value::String(subtitle));
+        }
+        if !body.is_empty() {
+            params.insert("body".to_string(), Value::String(body));
+        }
+        if let Some(surface) = surface {
+            params.insert("surface_id".to_string(), Value::String(surface));
+        }
 
-    let _ = call_in_workspace_scope(
-        client,
-        workspace,
-        "notification.create",
-        Value::Object(params),
-    )
-    .await;
+        let _ = call_in_workspace_scope(
+            client,
+            workspace,
+            "notification.create",
+            Value::Object(params),
+        )
+        .await;
+    }
 
     Ok(agent_hook_output(&event, &payload))
 }
