@@ -937,6 +937,7 @@ fn set_tab_unread(entry: &mut TabEntry, unread: bool) -> bool {
     }
     entry.unread = unread;
     entry.unread_dot.set_visible(unread);
+    entry.activity.set_unread(unread);
     true
 }
 
@@ -1724,6 +1725,7 @@ fn add_terminal_tab_inner(
         term_callbacks,
     );
     let widget = term.root.clone();
+    activity.watch_content(&widget);
     internals.content_stack.add_named(&widget, Some(&tab_id));
 
     {

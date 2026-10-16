@@ -417,7 +417,7 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
 
     let tab_activity_row = adw::ActionRow::builder()
         .title("Tab activity indicators")
-        .subtitle("Show a spinner on tabs that received terminal output recently")
+        .subtitle("Show a spinner when background tabs receive terminal output")
         .build();
     tab_activity_row.set_title_lines(1);
     tab_activity_row.set_subtitle_lines(2);

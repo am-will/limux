@@ -1,7 +1,7 @@
 use super::{
     activate_tab_in_pane, active_tab_in_pane, add_terminal_tab_to_pane, apply_tab_activity_config,
-    close_tab_in_pane, create_pane, find_pane_internals, move_tab_to_pane, rename_tab_in_pane,
-    tab_title, PaneCallbacks, TabKind,
+    close_tab_in_pane, create_pane, find_pane_internals, mark_tab_unread_in_workspace,
+    move_tab_to_pane, rename_tab_in_pane, tab_title, PaneCallbacks, TabKind,
 };
 use crate::app_config::AppConfig;
 use crate::shortcut_config::{default_shortcuts, ResolvedShortcutConfig};
@@ -99,6 +99,17 @@ fn terminal_entry(
     )
 }
 
+fn tab_unread_dot_is_visible(pane: &gtk::Widget, tab_id: &str) -> bool {
+    let internals = find_pane_internals(pane).expect("registered pane");
+    let tabs = internals.tab_state.borrow();
+    tabs.tabs
+        .iter()
+        .find(|entry| entry.id == tab_id)
+        .expect("terminal tab exists")
+        .unread_dot
+        .is_visible()
+}
+
 fn add_shell(pane: &gtk::Box, callbacks: &PaneCallbacks, command: &str) -> String {
     *callbacks.initial_command.borrow_mut() = Some(command.to_string());
     add_terminal_tab_to_pane(pane.upcast_ref());
@@ -179,29 +190,50 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
         &context,
         Duration::from_secs(5),
         "realized first PTY",
-        || first_handle.health().realized && source.is_mapped(),
+        || first_handle.health().realized && first_content.is_mapped(),
     );
     wait_for_marker(&context, &first_handle, "ACTIVITY_READY");
-    wait_for(
-        &context,
-        Duration::from_secs(2),
-        "startup activity spinner",
-        || first_activity.widget().is_visible(),
+    pump_for(&context, Duration::from_millis(250));
+    assert!(
+        !first_activity.widget().is_visible(),
+        "real PTY output in the mapped current tab does not show an activity spinner"
     );
 
     first_handle.focus_surface();
     first_handle.perform_binding_action("scroll_to_row:0");
-    wait_for(
-        &context,
-        Duration::from_secs(7),
-        "startup activity to expire without further PTY output",
-        || !first_activity.widget().is_visible(),
-    );
     first_handle.perform_binding_action("scroll_to_bottom");
     pump_for(&context, Duration::from_millis(150));
     assert!(
         !first_activity.widget().is_visible(),
-        "scrolling without PTY output does not restart activity"
+        "scrolling without PTY output does not show activity in the current tab"
+    );
+
+    let second_id = add_shell(
+        &source,
+        &source_callbacks,
+        r#"/bin/sh -c 'stty -echo; export PS1="" PS2=""; printf "SECOND_READY\n"; exec /bin/sh'"#,
+    );
+    let (second_activity, second_handle, second_content, _) =
+        terminal_entry(&source_widget, &second_id);
+    wait_for_marker(&context, &second_handle, "SECOND_READY");
+    wait_for(
+        &context,
+        Duration::from_secs(3),
+        "second terminal to become the mapped current tab",
+        || {
+            active_tab_in_pane(&source_widget).as_deref() == Some(second_id.as_str())
+                && second_handle.health().realized
+                && second_content.is_mapped()
+                && !first_content.is_mapped()
+        },
+    );
+    assert!(
+        !second_activity.widget().is_visible(),
+        "startup output in the mapped current tab does not show an activity spinner"
+    );
+    assert_eq!(
+        active_tab_in_pane(&source_widget).as_deref(),
+        Some(second_id.as_str())
     );
 
     config.borrow_mut().interface.tab_activity_seconds = 1;
@@ -213,13 +245,13 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
     wait_for(
         &context,
         Duration::from_secs(2),
-        "continuous output activity",
+        "continuous output activity in a background tab",
         || first_activity.widget().is_visible(),
     );
     pump_for(&context, Duration::from_millis(1100));
     assert!(
         first_activity.widget().is_visible(),
-        "continuous output keeps activity visible beyond one expiry interval"
+        "continuous background output keeps activity visible beyond one expiry interval"
     );
     send_command(
         &first_handle,
@@ -228,19 +260,16 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
     wait_for_marker(&context, &first_handle, "STREAM_DONE");
     wait_for(
         &context,
-        Duration::from_secs(2),
-        "continuous output activity to expire",
+        Duration::from_secs(3),
+        "continuous background output activity to expire",
         || !first_activity.widget().is_visible(),
     );
 
     config.borrow_mut().interface.tab_activity_seconds = 5;
     apply_tab_activity_config(&config);
-    wait_for(
-        &context,
-        Duration::from_secs(7),
-        "previous output to expire before OSC-only output",
-        || !first_activity.widget().is_visible(),
-    );
+    assert!(activate_tab_in_pane(&source_widget, &first_id));
+    assert!(activate_tab_in_pane(&source_widget, &second_id));
+    assert!(!first_activity.widget().is_visible());
     assert!(rename_tab_in_pane(&source_widget, &first_id, "Pinned name"));
     send_command(
         &first_handle,
@@ -255,7 +284,7 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
     wait_for(
         &context,
         Duration::from_secs(2),
-        "OSC-only title activity on a renamed tab",
+        "OSC-only title activity on a renamed background tab",
         || first_activity.widget().is_visible(),
     );
     assert_eq!(
@@ -263,73 +292,182 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
         Some("Pinned name"),
         "OSC title updates do not replace a renamed tab"
     );
-
-    let second_id = add_shell(
-        &source,
-        &source_callbacks,
-        r#"/bin/sh -c 'stty -echo; export PS1="" PS2=""; printf "SECOND_READY\n"; exec /bin/sh'"#,
-    );
-    let (second_activity, second_handle, _, _) = terminal_entry(&source_widget, &second_id);
-    wait_for_marker(&context, &second_handle, "SECOND_READY");
-    wait_for(
-        &context,
-        Duration::from_secs(2),
-        "second terminal startup activity",
-        || second_activity.widget().is_visible(),
-    );
     wait_for(
         &context,
         Duration::from_secs(7),
-        "both startup activities to expire",
-        || !first_activity.widget().is_visible() && !second_activity.widget().is_visible(),
-    );
-    assert_eq!(
-        active_tab_in_pane(&source_widget).as_deref(),
-        Some(second_id.as_str())
+        "OSC-only background activity to expire",
+        || !first_activity.widget().is_visible(),
     );
 
-    send_command(&first_handle, "printf 'HIDDEN_TAB_OUTPUT\\n'");
-    wait_for_marker(&context, &first_handle, "HIDDEN_TAB_OUTPUT");
+    send_command(&first_handle, "printf 'UNREAD_PREP_OUTPUT\\n'");
+    wait_for_marker(&context, &first_handle, "UNREAD_PREP_OUTPUT");
     wait_for(
         &context,
         Duration::from_secs(2),
-        "hidden tab activity",
+        "fresh background output before notification",
         || first_activity.widget().is_visible(),
     );
+    let source_pane_id = find_pane_internals(&source_widget)
+        .expect("registered source pane")
+        .pane_id;
+    assert_eq!(
+        mark_tab_unread_in_workspace("tab-activity-test", source_pane_id, &first_id),
+        Some(true),
+        "notification marks the background tab unread"
+    );
+    assert!(tab_unread_dot_is_visible(&source_widget, &first_id));
+    assert!(
+        !first_activity.widget().is_visible(),
+        "the unread dot replaces the transient activity spinner"
+    );
+    send_command(
+        &first_handle,
+        r#"(while printf 'UNREAD_STREAM\n'; do sleep 0.03; done) & unread_stream_pid=$!"#,
+    );
+    wait_for_marker(&context, &first_handle, "UNREAD_STREAM");
+    pump_for(&context, Duration::from_millis(250));
+    assert!(tab_unread_dot_is_visible(&source_widget, &first_id));
+    assert!(
+        !first_activity.widget().is_visible(),
+        "ongoing PTY output cannot restore the spinner while the unread dot is visible"
+    );
+    send_command(
+        &first_handle,
+        r#"kill "$unread_stream_pid"; wait "$unread_stream_pid" 2>/dev/null; printf 'UNREAD_STREAM_DONE\n'"#,
+    );
+    wait_for_marker(&context, &first_handle, "UNREAD_STREAM_DONE");
+
+    let queued_while_unread = Instant::now();
+    assert!(super::clear_tab_unread(
+        &find_pane_internals(&source_widget).unwrap().tab_state,
+        &first_id,
+    ));
+    first_activity.record_output(queued_while_unread);
+    assert!(!tab_unread_dot_is_visible(&source_widget, &first_id));
+    assert!(
+        !first_activity.widget().is_visible(),
+        "reading a notification cannot revive output queued while unread"
+    );
+    assert_eq!(
+        mark_tab_unread_in_workspace("tab-activity-test", source_pane_id, &first_id),
+        Some(true)
+    );
+
+    let queued_before_visit = Instant::now();
+    assert!(activate_tab_in_pane(&source_widget, &first_id));
+    wait_for(
+        &context,
+        Duration::from_secs(3),
+        "visiting the unread tab to map it and clear its blue dot",
+        || first_content.is_mapped() && !tab_unread_dot_is_visible(&source_widget, &first_id),
+    );
+    assert!(
+        !first_activity.widget().is_visible(),
+        "visiting a tab clears its transient activity"
+    );
+    first_activity.record_output(queued_before_visit);
+    assert!(
+        !first_activity.widget().is_visible(),
+        "a delayed output event from before the visit cannot restore activity"
+    );
+    let queued_while_current = Instant::now();
+    assert!(activate_tab_in_pane(&source_widget, &second_id));
+    wait_for(
+        &context,
+        Duration::from_secs(3),
+        "visited tab to become background",
+        || !first_content.is_mapped(),
+    );
+    first_activity.record_output(queued_before_visit);
+    first_activity.record_output(queued_while_current);
+    pump_for(&context, Duration::from_millis(100));
+    assert!(
+        !first_activity.widget().is_visible(),
+        "leaving a visited tab does not revive output queued before or during the visit"
+    );
+    send_command(&first_handle, "printf 'FRESH_BACKGROUND_OUTPUT\\n'");
+    wait_for_marker(&context, &first_handle, "FRESH_BACKGROUND_OUTPUT");
+    wait_for(
+        &context,
+        Duration::from_secs(2),
+        "new output after leaving the visited tab",
+        || first_activity.widget().is_visible(),
+    );
+
     assert!(move_tab_to_pane(
         &source_widget,
         &first_id,
         target.upcast_ref()
     ));
     let target_widget: gtk::Widget = target.clone().upcast();
-    let (moved_activity, moved_handle, _, _) = terminal_entry(&target_widget, &first_id);
+    let (moved_activity, moved_handle, moved_content, _) =
+        terminal_entry(&target_widget, &first_id);
     wait_for(
         &context,
         Duration::from_secs(3),
-        "moved terminal content to reach the target stack",
+        "moved terminal content to reach the visible target stack",
         || {
-            find_pane_internals(&target_widget)
+            let in_target_stack = find_pane_internals(&target_widget)
                 .and_then(|pane| pane.content_stack.first_child())
-                .is_some_and(|child| child == first_content)
+                .is_some_and(|child| child == moved_content);
+            in_target_stack && moved_content.is_mapped()
         },
     );
     assert!(
-        moved_activity.widget().is_visible(),
-        "activity follows the moved tab"
+        !moved_activity.widget().is_visible(),
+        "moving a tab into a visible target counts as visiting and clears activity"
     );
-    assert!(activate_tab_in_pane(&target_widget, &first_id));
+
+    target.set_visible(false);
+    wait_for(
+        &context,
+        Duration::from_secs(3),
+        "hiding the target pane to unmap the selected terminal",
+        || !moved_content.is_mapped(),
+    );
+    send_command(&moved_handle, "printf 'HIDDEN_PANE_OUTPUT\\n'");
+    wait_for_marker(&context, &moved_handle, "HIDDEN_PANE_OUTPUT");
+    wait_for(
+        &context,
+        Duration::from_secs(2),
+        "output in a hidden pane to show activity",
+        || moved_activity.widget().get_visible(),
+    );
+    target.set_visible(true);
+    wait_for(
+        &context,
+        Duration::from_secs(3),
+        "showing the target pane to map and acknowledge its terminal",
+        || moved_content.is_mapped() && !moved_activity.widget().is_visible(),
+    );
+
+    target.set_visible(false);
+    wait_for(
+        &context,
+        Duration::from_secs(3),
+        "hiding the target pane to unmap the selected terminal",
+        || !moved_content.is_mapped(),
+    );
+    send_command(&moved_handle, "printf 'BEFORE_DISABLE_OUTPUT\\n'");
+    wait_for_marker(&context, &moved_handle, "BEFORE_DISABLE_OUTPUT");
+    wait_for(
+        &context,
+        Duration::from_secs(2),
+        "fresh background activity before disabling indicators",
+        || moved_activity.widget().get_visible(),
+    );
 
     config.borrow_mut().interface.show_tab_activity = false;
     apply_tab_activity_config(&config);
     assert!(
-        !moved_activity.widget().is_visible(),
-        "disabling activity hides an active spinner immediately"
+        !moved_activity.widget().get_visible(),
+        "disabling activity hides the background spinner immediately"
     );
     send_command(&moved_handle, "printf 'DISABLED_OUTPUT\\n'");
     wait_for_marker(&context, &moved_handle, "DISABLED_OUTPUT");
     pump_for(&context, Duration::from_millis(250));
     assert!(
-        !moved_activity.widget().is_visible(),
+        !moved_activity.widget().get_visible(),
         "output while disabled does not restart activity"
     );
 
@@ -340,8 +478,8 @@ fn real_pty_output_drives_tab_activity_lifecycle() {
     wait_for(
         &context,
         Duration::from_secs(2),
-        "reenabled output activity",
-        || moved_activity.widget().is_visible(),
+        "reenabled background output activity",
+        || moved_activity.widget().get_visible(),
     );
 
     send_command(&moved_handle, "printf 'PENDING_CLOSE_OUTPUT\\n'; sleep 0.3");
