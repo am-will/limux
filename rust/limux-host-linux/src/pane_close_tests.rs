@@ -546,3 +546,64 @@ fn workspace_context_menu_never_retains_its_popover() {
     drop(menu);
     assert_freed("workspace context menu", &refs);
 }
+
+// Starts an inline rename with the focus in a terminal and commits it with
+// Enter, as a user would: the entry is removed while it holds the focus, so
+// unless the commit moves the focus first, GTK hands it to the next focusable
+// widget in the row, the star button.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn inline_rename_commit_returns_the_focus_to_the_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.InlineRenameFocusTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+
+    begin_workspace_inline_rename(&state, &ws_id);
+    let sidebar_list = state.borrow().sidebar_list.clone();
+    let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_focus_within("rename started", &state, entry.upcast_ref());
+
+    entry.set_text("renamed");
+    entry.emit_activate();
+    assert_focus_within("rename committed", &state, &root);
+    {
+        let s = state.borrow();
+        let ws = s.workspaces.iter().find(|ws| ws.id == ws_id).unwrap();
+        assert_eq!(ws.name, "renamed");
+    }
+    assert!(find_active_rename_entry(&sidebar_list).is_none());
+
+    // A click on a terminal commits the rename on press (the window's
+    // capture-phase `click_anywhere`), then the terminal takes the focus. The
+    // commit must leave it there, not pull it to the workspace's first pane.
+    let split = LayoutNodeState::Split(SplitState {
+        orientation: SplitOrientation::Horizontal,
+        ratio: 0.5,
+        start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+    });
+    let (ws_id, root) = show_focused_workspace(&state, split);
+    let clicked = find_leaf_pane(&root, gtk::Orientation::Horizontal, false);
+    begin_workspace_inline_rename(&state, &ws_id);
+    let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_focus_within("split rename started", &state, entry.upcast_ref());
+    entry.emit_activate();
+    assert!(find_gl_area(&clicked).expect("terminal").grab_focus());
+    pump_for(std::time::Duration::from_millis(200));
+    assert_focus_within("rename committed by a click", &state, &clicked);
+}
