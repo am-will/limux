@@ -4773,7 +4773,7 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
     let parent_for_commit = parent.clone();
     let commit = {
         let commit_guard = commit_guard.clone();
-        move |entry: &gtk::Entry| {
+        move |entry: &gtk::Entry, return_focus: bool| {
             if commit_guard.get() {
                 return;
             }
@@ -4797,17 +4797,27 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
             }
 
             // Removing the entry while it holds the focus hands it to the
-            // row's star button: give it back to the active workspace first.
+            // row's star button: clear it instead. After an Enter or a click,
+            // once that event has run, give it to the active workspace unless
+            // the click took it. A window deactivation (Alt-Tab away) takes
+            // nothing back.
             if crate::terminal::focus_is_within(entry.upcast_ref()) {
-                let active_root = state_for_commit
-                    .try_borrow()
-                    .ok()
-                    .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
-                if let Some(root) = active_root {
-                    focus_workspace_entrypoint(&root);
-                }
-                if crate::terminal::focus_is_within(entry.upcast_ref()) {
-                    crate::terminal::unset_focus_within(entry.upcast_ref());
+                let window = entry.root().and_downcast::<gtk::Window>();
+                crate::terminal::unset_focus_within(entry.upcast_ref());
+                if let Some(window) = window.filter(|_| return_focus) {
+                    let state = state_for_commit.clone();
+                    glib::idle_add_local_once(move || {
+                        if GtkWindowExt::focus(&window).is_some() {
+                            return;
+                        }
+                        let active_root = state
+                            .try_borrow()
+                            .ok()
+                            .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
+                        if let Some(root) = active_root {
+                            focus_workspace_entrypoint(&root);
+                        }
+                    });
                 }
             }
 
@@ -4819,7 +4829,7 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
     {
         let commit = commit.clone();
         entry.connect_activate(move |entry| {
-            commit(entry);
+            commit(entry, true);
         });
     }
     {
@@ -4828,7 +4838,9 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
         focus.connect_leave(move |controller| {
             if let Some(widget) = controller.widget() {
                 if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                    commit(entry);
+                    // The focus is still in the entry only when the window
+                    // itself lost it.
+                    commit(entry, false);
                 }
             }
         });

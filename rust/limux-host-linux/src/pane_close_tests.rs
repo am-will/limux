@@ -581,8 +581,29 @@ fn inline_rename_commit_returns_the_focus_to_the_workspace() {
     entry.set_text("renamed");
     entry.emit_activate();
     assert_focus_within("rename committed", &state, &root);
-    let s = state.borrow();
-    let ws = s.workspaces.iter().find(|ws| ws.id == ws_id).unwrap();
-    assert_eq!(ws.name, "renamed");
+    {
+        let s = state.borrow();
+        let ws = s.workspaces.iter().find(|ws| ws.id == ws_id).unwrap();
+        assert_eq!(ws.name, "renamed");
+    }
     assert!(find_active_rename_entry(&sidebar_list).is_none());
+
+    // A click on a terminal commits the rename on press (the window's
+    // capture-phase `click_anywhere`), then the terminal takes the focus. The
+    // commit must leave it there, not pull it to the workspace's first pane.
+    let split = LayoutNodeState::Split(SplitState {
+        orientation: SplitOrientation::Horizontal,
+        ratio: 0.5,
+        start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+    });
+    let (ws_id, root) = show_focused_workspace(&state, split);
+    let clicked = find_leaf_pane(&root, gtk::Orientation::Horizontal, false);
+    begin_workspace_inline_rename(&state, &ws_id);
+    let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_focus_within("split rename started", &state, entry.upcast_ref());
+    entry.emit_activate();
+    assert!(find_gl_area(&clicked).expect("terminal").grab_focus());
+    pump_for(std::time::Duration::from_millis(200));
+    assert_focus_within("rename committed by a click", &state, &clicked);
 }
