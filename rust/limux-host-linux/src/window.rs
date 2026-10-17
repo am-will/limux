@@ -4796,6 +4796,21 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
                 request_session_save(&state_for_commit);
             }
 
+            // Removing the entry while it holds the focus hands it to the
+            // row's star button: give it back to the active workspace first.
+            if crate::terminal::focus_is_within(entry.upcast_ref()) {
+                let active_root = state_for_commit
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
+                if let Some(root) = active_root {
+                    focus_workspace_entrypoint(&root);
+                }
+                if crate::terminal::focus_is_within(entry.upcast_ref()) {
+                    crate::terminal::unset_focus_within(entry.upcast_ref());
+                }
+            }
+
             label_for_commit.set_visible(true);
             parent_for_commit.remove(entry);
         }

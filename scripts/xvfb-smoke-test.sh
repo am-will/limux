@@ -410,6 +410,7 @@ for regression in \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
+  window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
