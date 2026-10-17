@@ -547,8 +547,10 @@ fn workspace_context_menu_never_retains_its_popover() {
     assert_freed("workspace context menu", &refs);
 }
 
-// Issue #231: committing an inline rename removed the entry while it held the
-// focus, and GTK handed it to the row's star button.
+// Starts an inline rename with the focus in a terminal and commits it with
+// Enter, as a user would: the entry is removed while it holds the focus, so
+// unless the commit moves the focus first, GTK hands it to the next focusable
+// widget in the row, the star button.
 #[test]
 #[ignore = "requires a graphical display and Ghostty resources"]
 fn inline_rename_commit_returns_the_focus_to_the_workspace() {
