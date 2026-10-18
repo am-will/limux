@@ -318,7 +318,8 @@ fn merge_session(
         }
     }
     workspaces.extend(merged.into_values());
-    workspaces.sort_by_key(|workspace| !workspace.favorite);
+    // Ungrouped favorites are pinned first; a group keeps its favorites in place.
+    workspaces.sort_by_key(|workspace| !workspace.favorite || workspace.group_id.is_some());
 
     // Selection and window chrome are view preferences, not workspace contents.
     let selected = if selected_id(local) != selected_id(previous_local) {

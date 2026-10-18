@@ -831,3 +831,42 @@ fn groups_survive_a_remote_save_and_follow_the_newer_edit() {
     saved(&mut a, &ours);
     assert_eq!(disk(dir.path()).groups, vec![group("g", "Services")]);
 }
+
+#[test]
+fn grouped_favorites_keep_their_place_across_saves() {
+    let dir = tempdir().unwrap();
+    let mut base = initial(dir.path());
+    base.workspaces.push(workspace(3));
+    base.groups = vec![group("g", "Backend")];
+    base.workspaces[1].group_id = Some("g".to_string());
+    base.workspaces[2].group_id = Some("g".to_string());
+    base.workspaces[2].favorite = true;
+    // The sidebar order: workspace 1, then group g with its favorite 3 first.
+    base.workspaces.swap(1, 2);
+    layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
+    let (mut store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    // Collapsing the group is saved without moving anything.
+    let mut collapsed = base.clone();
+    collapsed.groups[0].collapsed = true;
+    saved(&mut store, &collapsed);
+    let names = |state: &AppSessionState| -> Vec<String> {
+        state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.name.clone())
+            .collect()
+    };
+    assert_eq!(
+        names(&disk(dir.path())),
+        ["workspace-1", "workspace-3", "workspace-2"]
+    );
+
+    // Reordering again is not mistaken for a clash with another window.
+    let mut reordered = collapsed.clone();
+    reordered.workspaces.rotate_left(1);
+    saved(&mut store, &reordered);
+    assert_eq!(
+        names(&disk(dir.path())),
+        ["workspace-3", "workspace-2", "workspace-1"]
+    );
+}

@@ -32,17 +32,18 @@ pub(super) fn workspace_group_css() -> String {
         r#"
 /* ---------- Workspace groups ---------- */
 .limux-ws-group-header {
-    padding: 6px 8px 2px 8px;
+    padding: 4px 8px;
     margin: 4px 6px 0 6px;
     border-radius: 8px;
+    background: #2e2e2e;
 }
 .limux-sidebar-list row:hover .limux-ws-group-header {
-    background: alpha(@window_fg_color, 0.05);
+    background: #383838;
 }
 .limux-ws-group-chevron {
-    color: alpha(@window_fg_color, 0.6);
-    font-size: 10px;
-    min-width: 14px;
+    color: alpha(white, 0.7);
+    font-size: 15px;
+    min-width: 20px;
 }
 .limux-ws-group-pill {
     border-radius: 6px;
@@ -54,7 +55,7 @@ pub(super) fn workspace_group_css() -> String {
     font-weight: 600;
 }
 .limux-ws-group-count {
-    color: alpha(@window_fg_color, 0.55);
+    color: alpha(white, 0.6);
     font-size: 11px;
     margin-left: 6px;
 }

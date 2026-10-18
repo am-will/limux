@@ -1,8 +1,8 @@
 //! Sidebar order of workspaces and workspace groups.
 //!
 //! The sidebar holds top-level items: ungrouped workspaces and groups, each
-//! group with its own ordered members. Favorites are never grouped and always
-//! come first. This module owns that order and its rules; the GTK rows only
+//! group with its own ordered members. Ungrouped favorites come first in the
+//! sidebar, and a group's favorites come first among its members. This module owns that order and its rules; the GTK rows only
 //! mirror it, and `AppState::workspaces` follows `workspace_order`.
 
 use std::collections::HashSet;
@@ -17,11 +17,40 @@ pub struct WorkspaceGroup {
     pub color: WorkspaceColor,
     pub collapsed: bool,
     members: Vec<String>,
+    /// The first `pinned` members are favorites.
+    pinned: usize,
 }
 
 impl WorkspaceGroup {
     pub fn members(&self) -> &[String] {
         &self.members
+    }
+
+    fn is_pinned(&self, workspace_id: &str) -> bool {
+        self.members[..self.pinned]
+            .iter()
+            .any(|id| id == workspace_id)
+    }
+
+    /// Insert a member near `index`, kept on its side of the favorites.
+    fn insert_member(&mut self, index: usize, id: String, favorite: bool) {
+        let index = if favorite {
+            self.pinned += 1;
+            index.min(self.pinned - 1)
+        } else {
+            index.clamp(self.pinned, self.members.len())
+        };
+        self.members.insert(index, id);
+    }
+
+    /// Remove a member and return whether it was a favorite.
+    fn remove_member(&mut self, member: usize) -> bool {
+        self.members.remove(member);
+        let favorite = member < self.pinned;
+        if favorite {
+            self.pinned -= 1;
+        }
+        favorite
     }
 }
 
@@ -121,9 +150,8 @@ impl SidebarLayout {
             .collect();
         let mut placed = HashSet::new();
         for (id, favorite, group_id) in workspaces {
-            let group = group_id
-                .filter(|_| !favorite)
-                .and_then(|group_id| saved.iter().find(|group| group.id == group_id));
+            let group =
+                group_id.and_then(|group_id| saved.iter().find(|group| group.id == group_id));
             let Some(group) = group else {
                 layout.items.push(Item::Workspace { id, favorite });
                 continue;
@@ -137,7 +165,7 @@ impl SidebarLayout {
                 .iter_mut()
                 .find(|item| matches!(item, Item::Group(g) if g.id == group.id))
             {
-                target.members.push(id);
+                target.insert_member(target.members.len(), id, favorite);
             }
         }
         let mut empty: Vec<&WorkspaceGroupState> = saved
@@ -161,6 +189,7 @@ impl SidebarLayout {
             color: group.color.unwrap_or_else(|| self.next_group_color()),
             collapsed: group.collapsed,
             members: Vec::new(),
+            pinned: 0,
         }
     }
 
@@ -246,16 +275,27 @@ impl SidebarLayout {
     }
 
     pub fn is_favorite(&self, workspace_id: &str) -> bool {
-        self.items.iter().any(
-            |item| matches!(item, Item::Workspace { id, favorite: true } if id == workspace_id),
-        )
+        self.items.iter().any(|item| match item {
+            Item::Workspace { id, favorite } => *favorite && id == workspace_id,
+            Item::Group(group) => group.is_pinned(workspace_id),
+        })
     }
 
-    /// Pin or unpin a workspace. Pinning takes it out of its group; either
-    /// way it lands at the boundary between favorites and the rest.
+    /// Pin or unpin a workspace. It stays in its group, if any, and lands at
+    /// the boundary between the favorites and the rest of its level.
     pub fn set_favorite(&mut self, workspace_id: &str, favorite: bool) -> bool {
-        if self.take_workspace(workspace_id).is_none() {
-            return false;
+        match self.locate(workspace_id) {
+            None => return false,
+            Some(Location::InGroup(index, member)) => {
+                if let Item::Group(group) = &mut self.items[index] {
+                    group.remove_member(member);
+                    group.insert_member(group.pinned, workspace_id.to_string(), favorite);
+                }
+                return true;
+            }
+            Some(Location::TopLevel(_)) => {
+                self.take_workspace(workspace_id);
+            }
         }
         let index = self.favorites_len();
         self.items.insert(
@@ -298,14 +338,13 @@ impl SidebarLayout {
                 color: color.unwrap_or_else(|| self.next_group_color()),
                 collapsed: false,
                 members: Vec::new(),
+                pinned: 0,
             }),
         );
         for member in members {
-            if self.take_workspace(member).is_some() {
-                self.group_mut(&id)
-                    .expect("group just inserted")
-                    .members
-                    .push(member.clone());
+            if let Some(favorite) = self.take_workspace(member) {
+                let group = self.group_mut(&id).expect("group just inserted");
+                group.insert_member(group.members.len(), member.clone(), favorite);
             }
         }
         self.settle();
@@ -345,8 +384,8 @@ impl SidebarLayout {
         Ok(())
     }
 
-    /// Move a workspace to the end of a group, or out of its group to just
-    /// after it. Grouping a favorite unpins it.
+    /// Move a workspace to the end of a group (a favorite to the end of the
+    /// group's favorites), or out of its group to just after it.
     pub fn set_workspace_group(
         &mut self,
         workspace_id: &str,
@@ -366,24 +405,16 @@ impl SidebarLayout {
                 {
                     return Ok(());
                 }
-                self.take_workspace(workspace_id);
-                self.group_mut(group_id)
-                    .expect("group checked above")
-                    .members
-                    .push(workspace_id.to_string());
+                let favorite = self.take_workspace(workspace_id).unwrap_or(false);
+                let group = self.group_mut(group_id).expect("group checked above");
+                group.insert_member(group.members.len(), workspace_id.to_string(), favorite);
             }
             None => {
                 let Location::InGroup(index, _) = location else {
                     return Ok(());
                 };
-                self.take_workspace(workspace_id);
-                self.items.insert(
-                    index + 1,
-                    Item::Workspace {
-                        id: workspace_id.to_string(),
-                        favorite: false,
-                    },
-                );
+                let favorite = self.take_workspace(workspace_id).unwrap_or(false);
+                self.insert_top_level(index + 1, workspace_id.to_string(), favorite);
             }
         }
         self.settle();
@@ -392,7 +423,8 @@ impl SidebarLayout {
 
     /// Move a workspace next to a row. Next to a group member it joins that
     /// group; above a group header it lands outside the group, below one it
-    /// becomes the group's first member. Favorites stay above the rest.
+    /// becomes the group's first member. Favorites stay above the rest of
+    /// their level.
     pub fn move_workspace(
         &mut self,
         workspace_id: &str,
@@ -415,8 +447,7 @@ impl SidebarLayout {
                     Placement::After => self
                         .group_mut(group_id)
                         .expect("target checked above")
-                        .members
-                        .insert(0, id),
+                        .insert_member(0, id, favorite),
                 }
             }
             RowRef::Workspace(target_id) => {
@@ -424,7 +455,7 @@ impl SidebarLayout {
                     Location::TopLevel(index) => self.insert_top_level(index + after, id, favorite),
                     Location::InGroup(index, member) => {
                         if let Item::Group(group) = &mut self.items[index] {
-                            group.members.insert(member + after, id);
+                            group.insert_member(member + after, id, favorite);
                         }
                     }
                 }
@@ -499,12 +530,10 @@ impl SidebarLayout {
                 Item::Workspace { favorite, .. } => Some(favorite),
                 Item::Group(_) => unreachable!("located a workspace"),
             },
-            Location::InGroup(index, member) => {
-                if let Item::Group(group) = &mut self.items[index] {
-                    group.members.remove(member);
-                }
-                Some(false)
-            }
+            Location::InGroup(index, member) => match &mut self.items[index] {
+                Item::Group(group) => Some(group.remove_member(member)),
+                Item::Workspace { .. } => unreachable!("located a group member"),
+            },
         }
     }
 
@@ -570,22 +599,19 @@ mod tests {
         ids.iter().map(|id| id.to_string()).collect()
     }
 
-    /// Rows as text: `[name]` for a header, `name/id` for a member.
+    /// Rows as text: `[name]` for a header, `name/id` for a member, and a
+    /// `*` before a favorite's id.
     fn render(layout: &SidebarLayout) -> Vec<String> {
         layout
             .rows()
             .into_iter()
             .map(|row| match row {
                 SidebarRow::GroupHeader(group) => format!("[{}]", group.name),
-                SidebarRow::Workspace {
-                    id,
-                    group: Some(group),
-                } => format!("{}/{id}", group.name),
-                SidebarRow::Workspace { id, group: None } => {
-                    if layout.is_favorite(id) {
-                        format!("*{id}")
-                    } else {
-                        id.to_string()
+                SidebarRow::Workspace { id, group } => {
+                    let star = if layout.is_favorite(id) { "*" } else { "" };
+                    match group {
+                        Some(group) => format!("{}/{star}{id}", group.name),
+                        None => format!("{star}{id}"),
                     }
                 }
             })
@@ -689,21 +715,41 @@ mod tests {
     }
 
     #[test]
-    fn favorites_are_never_grouped_and_stay_on_top() {
+    fn grouped_favorites_stay_in_their_group_on_top() {
+        let mut layout = layout(&["a", "b", "c", "d"]);
+        let group = layout
+            .create_group(Some("G"), None, &ids(&["a", "b", "c"]))
+            .unwrap();
+
+        // Pinning a member moves it to the top of its group, after the
+        // group's other favorites.
+        layout.set_favorite("c", true);
+        assert_eq!(render(&layout), ["[G]", "G/*c", "G/a", "G/b", "d"]);
+        layout.set_favorite("b", true);
+        assert_eq!(render(&layout), ["[G]", "G/*c", "G/*b", "G/a", "d"]);
+
+        // Unpinning lands right after the remaining favorites.
+        layout.set_favorite("c", false);
+        assert_eq!(render(&layout), ["[G]", "G/*b", "G/c", "G/a", "d"]);
+
+        // A favorite joining a group goes after its favorites; leaving it
+        // returns to the pinned rows at the top.
+        layout.set_favorite("d", true);
+        layout.set_workspace_group("d", Some(&group)).unwrap();
+        assert_eq!(render(&layout), ["[G]", "G/*b", "G/*d", "G/c", "G/a"]);
+        layout.set_workspace_group("b", None).unwrap();
+        assert_eq!(render(&layout), ["*b", "[G]", "G/*d", "G/c", "G/a"]);
+    }
+
+    #[test]
+    fn grouping_a_favorite_keeps_it_pinned_in_the_group() {
         let mut layout = layout(&["a", "b", "c"]);
         layout.set_favorite("c", true);
         assert_eq!(render(&layout), ["*c", "a", "b"]);
-
-        // Grouping a favorite unpins it; the group takes its place.
-        let group = layout.create_group(Some("G"), None, &ids(&["c"])).unwrap();
-        assert_eq!(render(&layout), ["[G]", "G/c", "a", "b"]);
-        assert!(!layout.is_favorite("c"));
-
-        // Pinning a member takes it out of the group.
-        layout.set_favorite("c", true);
-        assert_eq!(render(&layout), ["*c", "[G]", "a", "b"]);
-        layout.set_workspace_group("c", Some(&group)).unwrap();
-        assert_eq!(render(&layout), ["[G]", "G/c", "a", "b"]);
+        layout
+            .create_group(Some("G"), None, &ids(&["a", "c"]))
+            .unwrap();
+        assert_eq!(render(&layout), ["[G]", "G/*c", "G/a", "b"]);
     }
 
     #[test]
@@ -769,13 +815,21 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_favorite_into_a_group_unpins_it() {
-        let mut layout = layout(&["a", "b"]);
-        layout.create_group(Some("G"), None, &ids(&["b"])).unwrap();
+    fn drops_inside_a_group_keep_its_favorites_on_top() {
+        let mut layout = layout(&["a", "b", "c"]);
+        let group = layout
+            .create_group(Some("G"), None, &ids(&["b", "c"]))
+            .unwrap();
         layout.set_favorite("a", true);
-        assert!(layout.move_workspace("a", &RowRef::Workspace("b".into()), Placement::Before));
-        assert_eq!(render(&layout), ["[G]", "G/a", "G/b"]);
-        assert!(!layout.is_favorite("a"));
+        // A favorite dropped below the group's other members still goes first.
+        assert!(layout.move_workspace("a", &RowRef::Workspace("c".into()), Placement::After));
+        assert_eq!(render(&layout), ["[G]", "G/*a", "G/b", "G/c"]);
+        // A regular member cannot go above the group's favorites.
+        assert!(layout.move_workspace("c", &RowRef::Group(group.clone()), Placement::After));
+        assert_eq!(render(&layout), ["[G]", "G/*a", "G/c", "G/b"]);
+        // Dropped above the header, the favorite is pinned at the top again.
+        assert!(layout.move_workspace("a", &RowRef::Group(group), Placement::Before));
+        assert_eq!(render(&layout), ["*a", "[G]", "G/c", "G/b"]);
     }
 
     #[test]
@@ -854,9 +908,13 @@ mod tests {
             .create_group(Some("G"), Some(WorkspaceColor::Blue), &ids(&["b", "c"]))
             .unwrap();
         layout.set_group_collapsed(&g, true).unwrap();
+        layout.set_favorite("c", true);
         layout.create_group(Some("Empty"), None, &[]).unwrap();
         layout.move_group(&g, &RowRef::Workspace("a".into()), Placement::Before);
-        assert_eq!(render(&layout), ["*d", "[G]", "G/b", "G/c", "a", "[Empty]"]);
+        assert_eq!(
+            render(&layout),
+            ["*d", "[G]", "G/*c", "G/b", "a", "[Empty]"]
+        );
 
         let groups = layout.saved_groups();
         let saved: Vec<(String, bool, Option<String>)> = layout
@@ -901,14 +959,15 @@ mod tests {
                 ("c".to_string(), false, Some("g")),
                 // Unknown group: kept ungrouped.
                 ("d".to_string(), false, Some("missing")),
-                // A favorite is never grouped.
+                // A favorite saved after regular members goes first.
                 ("f".to_string(), true, Some("g")),
+                ("p".to_string(), true, None),
             ],
             &groups,
         );
         assert_eq!(
             render(&restored),
-            ["*f", "[G]", "G/a", "G/c", "[E]", "b", "d"]
+            ["*p", "[G]", "G/*f", "G/a", "G/c", "[E]", "b", "d"]
         );
         // Missing colours are filled in from the unused palette.
         let colors: Vec<WorkspaceColor> = restored.groups().map(|g| g.color).collect();
