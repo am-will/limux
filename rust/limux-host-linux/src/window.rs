@@ -27,6 +27,9 @@ use crate::shortcut_config::{
 };
 use crate::split_tree::{self, SplitTreeContainer};
 use crate::workspace_color::{self, WorkspaceColor};
+use crate::workspace_group::{Placement, RowRef, SidebarLayout};
+
+mod sidebar_groups;
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
@@ -55,8 +58,6 @@ struct Workspace {
     notify_label: gtk::Label,
     /// Unread state for notifications without a tab target.
     unread: bool,
-    /// Whether this workspace is favorited/pinned to top.
-    favorite: bool,
     /// Background colour of the sidebar row, if the user picked one.
     color: Option<WorkspaceColor>,
     /// Last known working directory from the terminal (via OSC 7).
@@ -91,8 +92,13 @@ pub(crate) struct AppState {
     config: Rc<RefCell<app_config::AppConfig>>,
     css_provider: gtk::CssProvider,
     system_prefers_dark: Rc<Cell<Option<bool>>>,
+    /// Kept in `sidebar.workspace_order()`; see `sidebar_groups::sync_sidebar`.
     workspaces: Vec<Workspace>,
     active_idx: usize,
+    /// Sidebar order, favorites and groups.
+    sidebar: SidebarLayout,
+    /// Header rows of the groups in `sidebar`, by group id.
+    group_headers: HashMap<String, sidebar_groups::GroupHeader>,
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
@@ -113,6 +119,7 @@ pub(crate) struct AppState {
     session_close_pending: Option<SessionCloseMode>,
     close_after_recovery: bool,
     workspace_dragging: Option<String>,
+    group_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
@@ -296,7 +303,8 @@ fn control_request_target(
     }
 }
 
-fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> serde_json::Value {
+fn workspace_row(state: &AppState, index: usize, workspace: &Workspace) -> serde_json::Value {
+    let selected_idx = state.active_idx;
     let cwd = workspace.cwd.borrow().clone().unwrap_or_default();
     serde_json::json!({
         "index": index,
@@ -310,6 +318,11 @@ fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> se
         "focused": index == selected_idx,
         "cwd": cwd,
         "color": workspace.color.map(WorkspaceColor::as_str),
+        "group_id": state.sidebar.group_of(&workspace.id).map(|group| group.id.as_str()),
+        "group_ref": state
+            .sidebar
+            .group_of(&workspace.id)
+            .map(|group| sidebar_groups::group_ref(&group.id)),
     })
 }
 
@@ -318,7 +331,7 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
     Some(serde_json::json!({
         "workspace_id": workspace.id.as_str(),
         "workspace_ref": workspace_ref(&workspace.id),
-        "workspace": workspace_row(index, state.active_idx, workspace),
+        "workspace": workspace_row(state, index, workspace),
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
         "color": workspace.color.map(WorkspaceColor::as_str),
@@ -1246,7 +1259,23 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
         for workspace in &loaded.state.workspaces {
             add_workspace_from_state(state, workspace);
         }
-        restore_active_workspace(state, loaded.state.active_workspace_index);
+        // Restoring groups can repair the order, so track the active one by id.
+        let active_id = state
+            .borrow()
+            .workspaces
+            .get(loaded.state.active_workspace_index)
+            .map(|workspace| workspace.id.clone());
+        sidebar_groups::restore_groups(state, &loaded.state);
+        let active_index = active_id
+            .and_then(|id| {
+                state
+                    .borrow()
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == id)
+            })
+            .unwrap_or(loaded.state.active_workspace_index);
+        restore_active_workspace(state, active_index);
     } else {
         let workspace = initial_workspace_state(
             dirs::home_dir().as_deref(),
@@ -1339,11 +1368,15 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             WorkspaceState {
                 id: Some(workspace.id.clone()),
                 name: workspace.name.clone(),
-                favorite: workspace.favorite,
+                favorite: s.sidebar.is_favorite(&workspace.id),
                 cwd,
                 folder_path,
                 autostart_command: workspace.autostart_command.borrow().clone(),
                 color: workspace.color,
+                group_id: s
+                    .sidebar
+                    .group_of(&workspace.id)
+                    .map(|group| group.id.clone()),
                 layout,
             }
         })
@@ -1358,6 +1391,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             width: sidebar_width,
         },
         workspaces,
+        groups: s.sidebar.saved_groups(),
     })
 }
 
@@ -1869,7 +1903,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         ""
     };
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         build_window_css(background_opacity),
         pane::PANE_CSS,
         crate::terminal::CLIPBOARD_TOAST_CSS,
@@ -1878,6 +1912,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         crate::settings_editor::ui_scale_css(config),
         ssd_css,
         workspace_color::workspace_color_css(),
+        sidebar_groups::workspace_group_css(),
     )
 }
 
@@ -2209,6 +2244,8 @@ pub fn build_window(app: &adw::Application) {
         system_prefers_dark: system_prefers_dark.clone(),
         workspaces: Vec::new(),
         active_idx: 0,
+        sidebar: SidebarLayout::default(),
+        group_headers: HashMap::new(),
         shortcuts,
         stack: stack.clone(),
         indicator_box: indicator_box.clone(),
@@ -2229,6 +2266,7 @@ pub fn build_window(app: &adw::Application) {
         session_close_pending: None,
         close_after_recovery: false,
         workspace_dragging: None,
+        group_dragging: None,
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
@@ -2347,10 +2385,25 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         sidebar_list.connect_row_selected(move |_, row| {
-            if let Some(row) = row {
-                let idx = row.index() as usize;
+            // Group headers sit between workspace rows, so a row's index is
+            // not a workspace index.
+            let idx = row.and_then(|row| {
+                state
+                    .borrow()
+                    .workspaces
+                    .iter()
+                    .position(|workspace| &workspace.sidebar_row == row)
+            });
+            if let Some(idx) = idx {
                 switch_workspace(&state, idx);
             }
+        });
+    }
+
+    {
+        let state = state.clone();
+        sidebar_list.connect_row_activated(move |_, row| {
+            sidebar_groups::activate_header_row(&state, row);
         });
     }
 
@@ -2390,6 +2443,10 @@ pub fn build_window(app: &adw::Application) {
             btn.remove_css_class("limux-sidebar-btn-trash-hover");
             btn.remove_css_class("limux-tab-drop-target");
             if let Ok(payload) = value.get::<String>() {
+                // Groups are deleted from their menu, and only when empty.
+                if payload.starts_with(sidebar_groups::GROUP_DRAG_PREFIX) {
+                    return false;
+                }
                 if payload.contains(':') {
                     return create_workspace_for_tab(&state, &payload);
                 }
@@ -4181,10 +4238,6 @@ fn abbreviate_path(path: &str) -> String {
 // Workspace management
 // ---------------------------------------------------------------------------
 
-fn favorites_prefix_len(flags: &[bool]) -> usize {
-    flags.iter().take_while(|is_favorite| **is_favorite).count()
-}
-
 #[cfg(test)]
 fn workspace_drop_layout_path(layout: &LayoutNodeState) -> Vec<bool> {
     match layout {
@@ -4245,6 +4298,107 @@ fn next_active_workspace_index(
     removed_idx.min(remaining_workspace_ids.len() - 1)
 }
 
+/// A row of palette swatches, optionally led by "No color", with a check on
+/// the current colour. The caller wires each button to its colour.
+fn build_color_swatches(
+    current_color: Option<WorkspaceColor>,
+    include_none: bool,
+) -> (gtk::Box, Vec<(Option<WorkspaceColor>, gtk::Button)>) {
+    let swatch_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    swatch_row.set_margin_top(4);
+    swatch_row.set_margin_bottom(4);
+    swatch_row.set_halign(gtk::Align::Center);
+    // "No color" comes first, then the palette.
+    let swatches = include_none
+        .then_some(None)
+        .into_iter()
+        .chain(WorkspaceColor::ALL.into_iter().map(Some))
+        .map(|color| {
+            // The colour is painted on the label, not the button: see the
+            // swatch rules in `workspace_color`.
+            let dot = gtk::Label::new(Some(if current_color == color {
+                "\u{2713}"
+            } else {
+                ""
+            }));
+            dot.add_css_class(workspace_color::SWATCH_CSS_CLASS);
+            let swatch = gtk::Button::new();
+            swatch.set_child(Some(&dot));
+            swatch.add_css_class("flat");
+            swatch.add_css_class(workspace_color::SWATCH_BUTTON_CSS_CLASS);
+            match color {
+                Some(color) => {
+                    dot.add_css_class(&color.css_class());
+                    swatch.set_tooltip_text(Some(color.label()));
+                }
+                None => {
+                    dot.add_css_class(workspace_color::NO_COLOR_SWATCH_CSS_CLASS);
+                    swatch.set_tooltip_text(Some("No color"));
+                }
+            }
+            swatch.set_valign(gtk::Align::Center);
+            swatch_row.append(&swatch);
+            (color, swatch)
+        })
+        .collect();
+    (swatch_row, swatches)
+}
+
+/// A popover menu to the right of a sidebar row, not yet shown. Closing it
+/// hands the focus back and unparents it.
+fn sidebar_menu_popover(state: &State, row: &gtk::ListBoxRow, menu_box: &gtk::Box) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(menu_box));
+    popover.set_parent(row);
+    popover.set_position(gtk::PositionType::Right);
+    // Until the menu has a size, GTK's pointer pick lands on its last button
+    // and leaves "Delete" looking hovered. Take pointer input only once laid out.
+    menu_box.set_can_target(false);
+    menu_box.add_tick_callback(|menu_box, _| {
+        if menu_box.width() > 0 {
+            menu_box.set_can_target(true);
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+    {
+        // With the focus still on an item, the unparent would leak the popover
+        // (see `terminal::unset_focus_within`); give it back to whatever had it
+        // before the menu opened, usually a terminal, never to the row or a
+        // widget inside it (Delete may remove the row right after). Failing that,
+        // or if it left the window meanwhile, focus the active workspace.
+        let previous_focus = row
+            .root()
+            .and_then(|root| root.focus())
+            .filter(|w| w != row.upcast_ref::<gtk::Widget>() && !w.is_ancestor(row))
+            .map(|w| w.downgrade());
+        let state = state.clone();
+        popover.connect_closed(move |p| {
+            if crate::terminal::focus_is_within(p.upcast_ref())
+                && !previous_focus
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .is_some_and(|w| w.root().is_some() && w.grab_focus())
+            {
+                let active_root = state
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
+                if let Some(root) = active_root {
+                    focus_workspace_entrypoint(&root);
+                }
+            }
+            if crate::terminal::focus_is_within(p.upcast_ref()) {
+                crate::terminal::unset_focus_within(p.upcast_ref());
+            }
+            p.unparent();
+        });
+    }
+
+    popover
+}
+
 fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::ListBoxRow) {
     let preferred_pane_id = find_leaf_focused_pane(state)
         .filter(|(id, _)| id == workspace_id)
@@ -4289,60 +4443,16 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
             .find(|workspace| workspace.id == workspace_id)
             .and_then(|workspace| workspace.color)
     };
-    let swatch_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    swatch_row.set_margin_top(4);
-    swatch_row.set_margin_bottom(4);
-    swatch_row.set_halign(gtk::Align::Center);
-    // "No color" comes first, then the palette.
-    let swatches: Vec<(Option<WorkspaceColor>, gtk::Button)> = std::iter::once(None)
-        .chain(WorkspaceColor::ALL.into_iter().map(Some))
-        .map(|color| {
-            // The colour is painted on the label, not the button: see the
-            // swatch rules in `workspace_color`.
-            let dot = gtk::Label::new(Some(if current_color == color {
-                "\u{2713}"
-            } else {
-                ""
-            }));
-            dot.add_css_class(workspace_color::SWATCH_CSS_CLASS);
-            let swatch = gtk::Button::new();
-            swatch.set_child(Some(&dot));
-            swatch.add_css_class("flat");
-            swatch.add_css_class(workspace_color::SWATCH_BUTTON_CSS_CLASS);
-            match color {
-                Some(color) => {
-                    dot.add_css_class(&color.css_class());
-                    swatch.set_tooltip_text(Some(color.label()));
-                }
-                None => {
-                    dot.add_css_class(workspace_color::NO_COLOR_SWATCH_CSS_CLASS);
-                    swatch.set_tooltip_text(Some("No color"));
-                }
-            }
-            swatch.set_valign(gtk::Align::Center);
-            swatch_row.append(&swatch);
-            (color, swatch)
-        })
-        .collect();
+    let (swatch_row, swatches) = build_color_swatches(current_color, true);
     menu_box.append(&swatch_row);
+
+    let group_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_box.append(&group_box);
 
     menu_box.append(&delete_btn);
 
-    let popover = gtk::Popover::new();
-    popover.set_child(Some(&menu_box));
-    popover.set_parent(row);
-    popover.set_position(gtk::PositionType::Right);
-    // Until the menu has a size, GTK's pointer pick lands on its last button
-    // and leaves "Delete" looking hovered. Take pointer input only once laid out.
-    menu_box.set_can_target(false);
-    menu_box.add_tick_callback(|menu_box, _| {
-        if menu_box.width() > 0 {
-            menu_box.set_can_target(true);
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
-    });
+    let popover = sidebar_menu_popover(state, row, &menu_box);
+    sidebar_groups::append_workspace_group_items(state, workspace_id, &group_box, &popover);
 
     for (color, button) in swatches {
         let state = state.clone();
@@ -4442,40 +4552,6 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
             request_session_save(&state);
         });
     }
-    {
-        // With the focus still on an item, the unparent would leak the popover
-        // (see `terminal::unset_focus_within`); give it back to whatever had it
-        // before the menu opened, usually a terminal, never to the row or a
-        // widget inside it (Delete removes the row right after). Failing that,
-        // or if it left the window meanwhile, focus the active workspace.
-        let previous_focus = row
-            .root()
-            .and_then(|root| root.focus())
-            .filter(|w| w != row.upcast_ref::<gtk::Widget>() && !w.is_ancestor(row))
-            .map(|w| w.downgrade());
-        let state = state.clone();
-        popover.connect_closed(move |p| {
-            if crate::terminal::focus_is_within(p.upcast_ref())
-                && !previous_focus
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                    .is_some_and(|w| w.root().is_some() && w.grab_focus())
-            {
-                let active_root = state
-                    .try_borrow()
-                    .ok()
-                    .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
-                if let Some(root) = active_root {
-                    focus_workspace_entrypoint(&root);
-                }
-            }
-            if crate::terminal::focus_is_within(p.upcast_ref()) {
-                crate::terminal::unset_focus_within(p.upcast_ref());
-            }
-            p.unparent();
-        });
-    }
-
     popover.popup();
 }
 
@@ -4603,47 +4679,10 @@ fn workspace_autostart_dialog_dismisses(keyval: gtk::gdk::Key) -> bool {
     keyval == gtk::gdk::Key::Escape
 }
 
-fn clamp_workspace_insert_index_for_pinning(
-    favorite_flags_after_removal: &[bool],
-    moving_is_favorite: bool,
-    proposed_index: usize,
-) -> usize {
-    let favorites_top = favorites_prefix_len(favorite_flags_after_removal);
-    if moving_is_favorite {
-        proposed_index.min(favorites_top)
-    } else {
-        proposed_index.max(favorites_top)
-    }
-}
-
-fn sync_sidebar_row_order(
-    sidebar_list: &gtk::ListBox,
-    indicator_box: &gtk::Box,
-    rows: &[gtk::ListBoxRow],
-    indicators: &[gtk::Button],
-) {
-    while let Some(child) = sidebar_list.first_child() {
-        sidebar_list.remove(&child);
-    }
-    for row in rows {
-        sidebar_list.append(row);
-    }
-    while let Some(child) = indicator_box.first_child() {
-        indicator_box.remove(&child);
-    }
-    for button in indicators {
-        indicator_box.append(button);
-    }
-}
-
-fn set_workspace_favorite_visual(workspace: &Workspace) {
-    let symbol = if workspace.favorite {
-        "\u{2605}"
-    } else {
-        "\u{2606}"
-    };
+fn set_workspace_favorite_visual(workspace: &Workspace, favorite: bool) {
+    let symbol = if favorite { "\u{2605}" } else { "\u{2606}" };
     workspace.favorite_button.set_label(symbol);
-    if workspace.favorite {
+    if favorite {
         workspace
             .favorite_button
             .add_css_class("limux-ws-star-btn-active");
@@ -4739,7 +4778,33 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
         };
         (workspace.name_label.clone(), workspace.name.clone())
     };
+    let workspace_id = workspace_id.to_string();
+    let label_for_commit = label.clone();
+    begin_inline_rename(state, &label, &current_name, move |state, next_name| {
+        label_for_commit.set_label(&next_name);
+        let mut s = state.borrow_mut();
+        if let Some(workspace) = s
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            workspace.name = next_name;
+            // Update the indicator pill label
+            update_indicator_label(&workspace.indicator_button, &workspace.name);
+        }
+        drop(s);
+        request_session_save(state);
+    });
+}
 
+/// Swap `label` for an entry holding `current_name`. Enter or a focus loss
+/// commits: a non-blank name goes to `on_commit`, then the label returns.
+fn begin_inline_rename(
+    state: &State,
+    label: &gtk::Label,
+    current_name: &str,
+    on_commit: impl Fn(&State, String) + 'static,
+) {
     let Some(parent) = label.parent().and_then(|p| p.downcast::<gtk::Box>().ok()) else {
         return;
     };
@@ -4754,7 +4819,7 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
     }
 
     let entry = gtk::Entry::builder()
-        .text(&current_name)
+        .text(current_name)
         .hexpand(true)
         .build();
     for css_class in WORKSPACE_RENAME_ENTRY_CSS_CLASSES {
@@ -4762,15 +4827,15 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
     }
 
     label.set_visible(false);
-    parent.insert_child_after(&entry, Some(&label));
+    parent.insert_child_after(&entry, Some(label));
     entry.grab_focus();
     entry.select_region(0, -1);
 
     let commit_guard = Rc::new(std::cell::Cell::new(false));
     let state_for_commit = state.clone();
-    let workspace_id = workspace_id.to_string();
     let label_for_commit = label.clone();
     let parent_for_commit = parent.clone();
+    let on_commit = Rc::new(on_commit);
     let commit = {
         let commit_guard = commit_guard.clone();
         move |entry: &gtk::Entry, return_focus: bool| {
@@ -4781,19 +4846,7 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
 
             let next_name = entry.text().trim().to_string();
             if !next_name.is_empty() {
-                label_for_commit.set_label(&next_name);
-                let mut s = state_for_commit.borrow_mut();
-                if let Some(workspace) = s
-                    .workspaces
-                    .iter_mut()
-                    .find(|workspace| workspace.id == workspace_id)
-                {
-                    workspace.name = next_name;
-                    // Update the indicator pill label
-                    update_indicator_label(&workspace.indicator_button, &workspace.name);
-                }
-                drop(s);
-                request_session_save(&state_for_commit);
+                on_commit(&state_for_commit, next_name);
             }
 
             // Removing the entry while it holds the focus hands it to the
@@ -4854,163 +4907,35 @@ fn reorder_workspace_by_id(
     target_id: &str,
     drop_below: bool,
 ) -> bool {
-    let (sidebar_list, indicator_box, rows, indicators, row_to_select) = {
-        let mut s = state.borrow_mut();
-        let Some(source_idx) = s
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.id == source_id)
-        else {
-            return false;
-        };
-        let Some(target_idx) = s
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.id == target_id)
-        else {
-            return false;
-        };
-        if source_idx == target_idx {
-            return false;
-        }
-
-        let active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
-        let moving_workspace = s.workspaces.remove(source_idx);
-        let Some(target_idx_after_removal) = s
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.id == target_id)
-        else {
-            s.workspaces.insert(source_idx, moving_workspace);
-            return false;
-        };
-
-        // Insert after the target when dropping on the bottom half
-        let raw_insert_idx = if drop_below {
-            target_idx_after_removal + 1
-        } else {
-            target_idx_after_removal
-        };
-
-        let favorite_flags: Vec<bool> = s
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.favorite)
-            .collect();
-        let insert_idx = clamp_workspace_insert_index_for_pinning(
-            &favorite_flags,
-            moving_workspace.favorite,
-            raw_insert_idx,
-        );
-        s.workspaces.insert(insert_idx, moving_workspace);
-
-        if let Some(active_workspace_id) = active_workspace_id {
-            if let Some(new_active_idx) = s
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.id == active_workspace_id)
-            {
-                s.active_idx = new_active_idx;
-            }
-        }
-
-        let rows: Vec<gtk::ListBoxRow> = s
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.sidebar_row.clone())
-            .collect();
-        let indicators: Vec<gtk::Button> = s
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.indicator_button.clone())
-            .collect();
-        let row_to_select = s
-            .workspaces
-            .get(s.active_idx)
-            .map(|workspace| workspace.sidebar_row.clone());
-        (
-            s.sidebar_list.clone(),
-            s.indicator_box.clone(),
-            rows,
-            indicators,
-            row_to_select,
-        )
+    let placement = if drop_below {
+        Placement::After
+    } else {
+        Placement::Before
     };
-
-    // Mutate GTK container children after dropping `state.borrow_mut()` so
-    // synchronous `drag_source.connect_drag_end` callbacks do not panic.
-    sync_sidebar_row_order(&sidebar_list, &indicator_box, &rows, &indicators);
-
-    if let Some(row) = row_to_select {
-        sidebar_list.select_row(Some(&row));
+    let moved = state.borrow_mut().sidebar.move_workspace(
+        source_id,
+        &RowRef::Workspace(target_id.to_string()),
+        placement,
+    );
+    if moved {
+        sidebar_groups::sync_sidebar(state);
+        request_session_save(state);
     }
-    request_session_save(state);
-
-    true
+    moved
 }
 
 fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
-    let (sidebar_list, indicator_box, rows, indicators, row_to_select) = {
+    {
         let mut s = state.borrow_mut();
-        let Some(idx) = s
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.id == workspace_id)
-        else {
+        let favorite = !s.sidebar.is_favorite(workspace_id);
+        if !s.sidebar.set_favorite(workspace_id, favorite) {
             return;
-        };
-
-        let active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
-        s.workspaces[idx].favorite = !s.workspaces[idx].favorite;
-        set_workspace_favorite_visual(&s.workspaces[idx]);
-
-        let workspace = s.workspaces.remove(idx);
-        let favorite_flags: Vec<bool> = s
-            .workspaces
-            .iter()
-            .map(|candidate| candidate.favorite)
-            .collect();
-        let insert_idx = favorites_prefix_len(&favorite_flags);
-        s.workspaces.insert(insert_idx, workspace);
-
-        if let Some(active_workspace_id) = active_workspace_id {
-            if let Some(new_active_idx) = s
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.id == active_workspace_id)
-            {
-                s.active_idx = new_active_idx;
-            }
         }
-
-        let rows: Vec<gtk::ListBoxRow> = s
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.sidebar_row.clone())
-            .collect();
-        let indicators: Vec<gtk::Button> = s
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.indicator_button.clone())
-            .collect();
-        let row_to_select = s
-            .workspaces
-            .get(s.active_idx)
-            .map(|workspace| workspace.sidebar_row.clone());
-        (
-            s.sidebar_list.clone(),
-            s.indicator_box.clone(),
-            rows,
-            indicators,
-            row_to_select,
-        )
-    };
-
-    sync_sidebar_row_order(&sidebar_list, &indicator_box, &rows, &indicators);
-
-    if let Some(row) = row_to_select {
-        sidebar_list.select_row(Some(&row));
+        if let Some(workspace) = s.workspaces.iter().find(|w| w.id == workspace_id) {
+            set_workspace_favorite_visual(workspace, favorite);
+        }
     }
+    sidebar_groups::sync_sidebar(state);
     request_session_save(state);
 }
 
@@ -5168,7 +5093,6 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_dot,
             notify_label,
             unread: false,
-            favorite: false,
             color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
@@ -5177,6 +5101,9 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             indicator_button,
             indicator_unread_dot,
         });
+        app_state
+            .sidebar
+            .push_workspace(new_workspace_id.clone(), false);
         app_state.active_idx = app_state.workspaces.len() - 1;
         sync_indicator_active_state(&app_state);
         app_state.stack.set_visible_child_name(&stack_name);
@@ -5287,9 +5214,19 @@ fn install_workspace_row_interactions(
             r.remove_css_class("limux-drop-below");
             r.remove_css_class("limux-tab-drop-target");
 
-            let dragged_workspace = state.borrow().workspace_dragging.clone();
+            let (dragged_workspace, dragging_group) = {
+                let s = state.borrow();
+                (s.workspace_dragging.clone(), s.group_dragging.is_some())
+            };
             match dragged_workspace {
                 Some(ref dragged_workspace_id) if dragged_workspace_id != &target_workspace_id => {
+                    if y < h / 2.0 {
+                        r.add_css_class("limux-drop-above");
+                    } else {
+                        r.add_css_class("limux-drop-below");
+                    }
+                }
+                None if dragging_group => {
                     if y < h / 2.0 {
                         r.add_css_class("limux-drop-above");
                     } else {
@@ -5302,7 +5239,8 @@ fn install_workspace_row_interactions(
                 _ => {}
             }
 
-            if hover_timer.borrow().is_none() {
+            // Hovering a dragged group over a row must not switch workspaces.
+            if hover_timer.borrow().is_none() && !dragging_group {
                 let state = state.clone();
                 let target_workspace_id = target_workspace_id.clone();
                 let hover_timer = hover_timer.clone();
@@ -5369,10 +5307,23 @@ fn install_workspace_row_interactions(
                 source.remove();
             }
             if let Ok(payload) = value.get::<String>() {
+                let drop_below = y >= r.height() as f64 / 2.0;
+                if let Some(group_id) = payload.strip_prefix(sidebar_groups::GROUP_DRAG_PREFIX) {
+                    let placement = if drop_below {
+                        Placement::After
+                    } else {
+                        Placement::Before
+                    };
+                    return sidebar_groups::move_group(
+                        &state,
+                        group_id,
+                        &RowRef::Workspace(target_workspace_id.clone()),
+                        placement,
+                    );
+                }
                 if payload.contains(':') {
                     return handle_tab_drop_to_workspace(&state, &target_workspace_id, &payload);
                 }
-                let drop_below = y >= r.height() as f64 / 2.0;
                 if payload != target_workspace_id {
                     return reorder_workspace_by_id(
                         &state,
@@ -5664,6 +5615,7 @@ fn workspace_state_with_folder(name: &str, folder_path: &str) -> WorkspaceState 
         folder_path: Some(folder_path.to_string()),
         autostart_command: None,
         color: None,
+        group_id: None,
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     }
 }
@@ -5731,7 +5683,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .workspaces
                     .iter()
                     .enumerate()
-                    .map(|(index, workspace)| workspace_row(index, app_state.active_idx, workspace))
+                    .map(|(index, workspace)| workspace_row(&app_state, index, workspace))
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
@@ -6074,6 +6026,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let _ = reply.send(result.ok_or_else(|| {
                 crate::control_bridge::BridgeError::not_found("workspace not found")
             }));
+        }
+        ControlCommand::WorkspaceGroup { request, reply } => {
+            let _ = reply.send(sidebar_groups::handle_group_request(state, request));
         }
         ControlCommand::CloseWorkspace { target, reply } => {
             let resolved = {
@@ -6508,6 +6463,7 @@ fn connect_ssh_target(state: &State, target: crate::ssh_hosts::SshTarget) {
         folder_path: None,
         autostart_command: None,
         color: None,
+        group_id: None,
         layout: LayoutNodeState::Pane(PaneState::fallback(None)),
     };
     add_workspace_with_initial_command(state, &workspace, Some(target.command()));
@@ -6637,7 +6593,6 @@ fn add_workspace_with_initial_command(
         notify_dot,
         notify_label,
         unread: false,
-        favorite: workspace.favorite,
         color: workspace.color,
         cwd,
         folder_path: workspace.folder_path.clone(),
@@ -6648,12 +6603,13 @@ fn add_workspace_with_initial_command(
     };
 
     if workspace.favorite {
-        set_workspace_favorite_visual(&ws);
+        set_workspace_favorite_visual(&ws, true);
     }
     set_workspace_color_visual(&ws);
 
     {
         let mut s = state.borrow_mut();
+        s.sidebar.push_workspace(ws.id.clone(), workspace.favorite);
         s.workspaces.push(ws);
         s.active_idx = s.workspaces.len() - 1;
         sync_indicator_active_state(&s);
@@ -6896,6 +6852,7 @@ fn close_workspace_by_id_internal(
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
+    s.sidebar.remove_workspace(id);
     let sidebar_list = s.sidebar_list.clone();
     let indicator_box = s.indicator_box.clone();
 
@@ -6904,6 +6861,7 @@ fn close_workspace_by_id_internal(
         drop(s);
         sidebar_list.remove(&ws.sidebar_row);
         indicator_box.remove(&ws.indicator_button);
+        sidebar_groups::sync_sidebar(state);
         split_container.retire_panes();
         crate::terminal::remove_from_stack_after_repaint(&ws.root);
         apply_top_bar_mode(state);
@@ -6947,6 +6905,8 @@ fn close_workspace_by_id_internal(
     split_container.retire_panes();
     crate::terminal::remove_from_stack_after_repaint(&ws.root);
     sidebar_list.select_row(Some(&row));
+    // Refresh group counts, and show the new active row if it is collapsed.
+    sidebar_groups::sync_sidebar(state);
     apply_top_bar_mode(state);
     if persist {
         request_session_save(state);
@@ -7003,6 +6963,8 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
 
     stack.set_visible_child_name(&stack_name);
     clear_visible_tab_unread(state, &workspace_id);
+    // A collapsed group shows only its active member.
+    sidebar_groups::sync_row_visibility(state);
     if focus_entrypoint {
         glib::idle_add_local_once(move || {
             focus_workspace_entrypoint(&focus_root);
@@ -8344,14 +8306,13 @@ mod tests {
         }
     }
     use super::{
-        browser_command_requires_existing_target, build_window_css,
-        clamp_workspace_insert_index_for_pinning, commit_inline_rename_for_click,
+        browser_command_requires_existing_target, build_window_css, commit_inline_rename_for_click,
         desktop_notification_action_from_signal, desktop_notification_actions,
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
-        directional_neighbor_score, favorites_prefix_len, find_leaf_pane, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
-        initial_workspace_state, keep_workspace_open_after_empty_pane, next_active_workspace_index,
+        directional_neighbor_score, find_leaf_pane, font_size_after_delta, ghostty_prefers_dark,
+        gtk_system_prefers_dark_from_raw, has_unread, initial_workspace_state,
+        keep_workspace_open_after_empty_pane, next_active_workspace_index,
         normalize_autostart_command, pane_create_split_placement, queue_session_save_request,
         resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
@@ -8387,12 +8348,6 @@ mod tests {
         fn set_save_queued(&mut self, queued: bool) {
             self.save_queued = queued;
         }
-    }
-
-    #[test]
-    fn favorites_prefix_len_counts_only_leading_favorites() {
-        let flags = [true, true, false, true, false];
-        assert_eq!(favorites_prefix_len(&flags), 2);
     }
 
     #[test]
@@ -8724,25 +8679,6 @@ mod tests {
             SessionSaveRequest::Ignore
         );
         assert!(!state.borrow().save_queued);
-    }
-
-    #[test]
-    fn unpinned_workspace_cannot_move_above_favorites() {
-        // Remaining order after removing dragged workspace:
-        // [fav, fav, unfav, unfav]
-        let after_removal = [true, true, false, false];
-        let clamped = clamp_workspace_insert_index_for_pinning(&after_removal, false, 0);
-        assert_eq!(clamped, 2);
-    }
-
-    #[test]
-    fn favorite_workspace_cannot_move_below_unpinned() {
-        // Remaining order after removing dragged favorite:
-        // [fav, fav, unfav, unfav]
-        let after_removal = [true, true, false, false];
-        let clamped =
-            clamp_workspace_insert_index_for_pinning(&after_removal, true, after_removal.len());
-        assert_eq!(clamped, 2);
     }
 
     #[test]

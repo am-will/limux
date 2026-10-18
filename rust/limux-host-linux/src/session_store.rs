@@ -343,6 +343,13 @@ fn merge_session(
         } else {
             disk.sidebar.clone()
         },
+        // Group metadata follows the sidebar: the newer local edit wins. Members
+        // name their group per workspace, so membership merges with workspaces.
+        groups: if local.groups != previous_local.groups {
+            local.groups.clone()
+        } else {
+            disk.groups.clone()
+        },
         ..AppSessionState::default()
     };
     normalize_pane_ids(&mut result, disk);

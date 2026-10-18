@@ -13,6 +13,7 @@ fn workspace(number: u32) -> WorkspaceState {
         folder_path: None,
         autostart_command: None,
         color: None,
+        group_id: None,
         layout: LayoutNodeState::Pane(PaneState {
             pane_id: Some(number),
             active_tab_id: Some(format!("tab-{number}")),
@@ -790,4 +791,43 @@ fn load_persists_ids_minted_for_empty_panes() {
     let (_store, loaded) = SessionStore::load_from_dir(dir.path()).unwrap();
 
     assert_eq!(disk(dir.path()), loaded.state);
+}
+
+fn group(id: &str, name: &str) -> layout_state::WorkspaceGroupState {
+    layout_state::WorkspaceGroupState {
+        id: id.to_string(),
+        name: name.to_string(),
+        color: Some(crate::workspace_color::WorkspaceColor::Teal),
+        collapsed: false,
+        position: 0,
+    }
+}
+
+#[test]
+fn groups_survive_a_remote_save_and_follow_the_newer_edit() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (mut a, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let (mut b, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+    // Window A groups workspace 1.
+    let mut ours = base.clone();
+    ours.groups = vec![group("g", "Backend")];
+    ours.workspaces[0].group_id = Some("g".to_string());
+    saved(&mut a, &ours);
+
+    // Window B, which never touched groups, saves an unrelated addition.
+    let mut theirs = base;
+    theirs.workspaces.push(workspace(3));
+    saved(&mut b, &theirs);
+    let result = disk(dir.path());
+    assert_eq!(result.groups, vec![group("g", "Backend")]);
+    assert_eq!(result.workspaces[0].group_id.as_deref(), Some("g"));
+
+    // A later rename in B wins over A's unchanged groups.
+    let mut renamed = result.clone();
+    renamed.groups[0].name = "Services".to_string();
+    saved(&mut b, &renamed);
+    saved(&mut a, &ours);
+    assert_eq!(disk(dir.path()).groups, vec![group("g", "Services")]);
 }

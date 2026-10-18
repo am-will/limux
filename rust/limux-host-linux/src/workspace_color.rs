@@ -89,6 +89,11 @@ impl WorkspaceColor {
     pub fn css_class(self) -> String {
         format!("limux-ws-color-{}", self.as_str())
     }
+
+    /// The colour as a CSS hex value, for styles generated elsewhere.
+    pub fn css_hex(self) -> String {
+        hex(self.rgb())
+    }
 }
 
 /// Comma-separated palette names, for error messages.

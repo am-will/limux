@@ -18,6 +18,7 @@ mod tab_activity;
 mod terminal;
 mod window;
 mod workspace_color;
+mod workspace_group;
 mod x11_cursor_errors;
 
 use adw::prelude::*;

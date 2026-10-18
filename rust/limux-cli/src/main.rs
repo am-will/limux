@@ -228,6 +228,14 @@ Common commands:
       Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.
   rename-workspace [--workspace <id|ref>] <title>
   set-workspace-color [--workspace <id|ref>] <red|orange|amber|green|teal|blue|purple|pink|none>
+  list-groups
+  create-group [--color <color>] [--workspace <id|ref>]... [<name>]
+  rename-group --group <id|ref|name> <name>
+  set-group-color --group <id|ref|name> <color>
+  collapse-group --group <id|ref|name>
+  expand-group --group <id|ref|name>
+  delete-group --group <id|ref|name>   (only an empty group can be deleted)
+  set-workspace-group [--workspace <id|ref>] <group id|ref|name|none>
   rename-window [--workspace <id|ref>] <title>
   rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>
   read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]
@@ -476,6 +484,8 @@ fn trailing_title(args: &[String]) -> Option<String> {
             || arg == "--value"
             || arg == "--amount"
             || arg == "--unset"
+            || arg == "--group"
+            || arg == "--color"
         {
             skip = true;
             continue;
@@ -2686,6 +2696,118 @@ fn build_set_workspace_color_params(
     Ok(Value::Object(params))
 }
 
+/// The socket method and params of a sidebar workspace-group command.
+fn build_group_request(
+    command: &str,
+    args: &[String],
+    env_value: impl Fn(&str) -> Option<String>,
+) -> Result<(&'static str, Value)> {
+    let mut params = Map::new();
+    let group = || {
+        parse_opt(args, "--group")
+            .filter(|group| !group.trim().is_empty())
+            .ok_or_else(|| anyhow!("{command} requires --group <id|ref|name>"))
+    };
+    let method = match command {
+        "list-groups" => "workspace.group_list",
+        "create-group" => {
+            if let Some(name) = trailing_title(args) {
+                params.insert("name".to_string(), Value::String(name));
+            }
+            if let Some(color) = parse_opt(args, "--color") {
+                params.insert("color".to_string(), Value::String(color));
+            }
+            let workspaces: Vec<Value> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--workspace")
+                .map(|pair| Value::String(pair[1].clone()))
+                .collect();
+            if !workspaces.is_empty() {
+                params.insert("workspace_ids".to_string(), Value::Array(workspaces));
+            }
+            "workspace.group_create"
+        }
+        "rename-group" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            let name =
+                trailing_title(args).ok_or_else(|| anyhow!("rename-group requires a name"))?;
+            params.insert("name".to_string(), Value::String(name));
+            "workspace.group_rename"
+        }
+        "set-group-color" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            let color = trailing_title(args)
+                .ok_or_else(|| anyhow!("set-group-color requires a color name"))?;
+            params.insert("color".to_string(), Value::String(color));
+            "workspace.group_set_color"
+        }
+        "collapse-group" | "expand-group" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            params.insert(
+                "collapsed".to_string(),
+                Value::Bool(command == "collapse-group"),
+            );
+            "workspace.group_set_collapsed"
+        }
+        "delete-group" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            "workspace.group_delete"
+        }
+        "set-workspace-group" => {
+            let group = trailing_title(args).ok_or_else(|| {
+                anyhow!("set-workspace-group requires a group, or \"none\" to ungroup")
+            })?;
+            let group = if group.eq_ignore_ascii_case("none") {
+                Value::Null
+            } else {
+                Value::String(group)
+            };
+            params.insert("group_id".to_string(), group);
+            if let Some(workspace) =
+                parse_opt(args, "--workspace").or_else(|| env_value("LIMUX_WORKSPACE_ID"))
+            {
+                params.insert("workspace_id".to_string(), Value::String(workspace));
+            }
+            "workspace.set_group"
+        }
+        _ => bail!("unsupported group command {command}"),
+    };
+    Ok((method, Value::Object(params)))
+}
+
+fn render_group_list(payload: &Value) -> String {
+    let groups = payload
+        .get("groups")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if groups.is_empty() {
+        return "No groups".to_string();
+    }
+    groups
+        .iter()
+        .map(|group| {
+            let handle = get_string(group, &["ref", "id"]).unwrap_or_default();
+            let name = get_string(group, &["name"]).unwrap_or_default();
+            let color = get_string(group, &["color"]).unwrap_or_default();
+            let count = group
+                .get("workspace_ids")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let collapsed = if group.get("collapsed").and_then(Value::as_bool) == Some(true) {
+                ", collapsed"
+            } else {
+                ""
+            };
+            format!(
+                "{handle} {name} ({color}, {count} workspace{}{collapsed})",
+                if count == 1 { "" } else { "s" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn run_rename_workspace_like(
     client: &mut Client,
     command: &str,
@@ -3804,6 +3926,24 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
+        "list-groups"
+        | "create-group"
+        | "rename-group"
+        | "set-group-color"
+        | "collapse-group"
+        | "expand-group"
+        | "delete-group"
+        | "set-workspace-group" => {
+            let (method, params) = build_group_request(command, args, |name| env::var(name).ok())?;
+            let payload = client.call(method, params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if command == "list-groups" {
+                CommandOutput::Text(render_group_list(&payload))
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
         "rename-tab" => {
             let payload = run_rename_tab(client, args).await?;
             if opts.json_output {
@@ -4581,6 +4721,104 @@ mod new_pane_tests {
                 .unwrap_err();
 
         assert!(error.to_string().contains("requires a color"));
+    }
+
+    #[test]
+    fn group_commands_build_their_socket_requests() {
+        let cases = [
+            (vec!["list-groups"], "workspace.group_list", json!({})),
+            (
+                vec![
+                    "create-group",
+                    "--color",
+                    "teal",
+                    "--workspace",
+                    "workspace:1",
+                    "--workspace",
+                    "2",
+                    "Back",
+                    "end",
+                ],
+                "workspace.group_create",
+                json!({ "name": "Back end", "color": "teal", "workspace_ids": ["workspace:1", "2"] }),
+            ),
+            (vec!["create-group"], "workspace.group_create", json!({})),
+            (
+                vec!["rename-group", "--group", "group:abc", "Ops"],
+                "workspace.group_rename",
+                json!({ "group_id": "group:abc", "name": "Ops" }),
+            ),
+            (
+                vec!["set-group-color", "--group", "Ops", "red"],
+                "workspace.group_set_color",
+                json!({ "group_id": "Ops", "color": "red" }),
+            ),
+            (
+                vec!["collapse-group", "--group", "abc"],
+                "workspace.group_set_collapsed",
+                json!({ "group_id": "abc", "collapsed": true }),
+            ),
+            (
+                vec!["expand-group", "--group", "abc"],
+                "workspace.group_set_collapsed",
+                json!({ "group_id": "abc", "collapsed": false }),
+            ),
+            (
+                vec!["delete-group", "--group", "abc"],
+                "workspace.group_delete",
+                json!({ "group_id": "abc" }),
+            ),
+            (
+                vec!["set-workspace-group", "Ops"],
+                "workspace.set_group",
+                json!({ "group_id": "Ops", "workspace_id": "workspace:agent" }),
+            ),
+            (
+                vec!["set-workspace-group", "--workspace", "raw", "None"],
+                "workspace.set_group",
+                json!({ "group_id": null, "workspace_id": "raw" }),
+            ),
+        ];
+        for (argv, method, params) in cases {
+            let (command, rest) = argv.split_first().unwrap();
+            assert_eq!(
+                build_group_request(command, &args(rest), test_env).unwrap(),
+                (method, params),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_commands_require_their_arguments() {
+        for (argv, message) in [
+            (vec!["rename-group", "Ops"], "requires --group"),
+            (vec!["rename-group", "--group", "abc"], "requires a name"),
+            (
+                vec!["set-group-color", "--group", "abc"],
+                "requires a color",
+            ),
+            (vec!["delete-group"], "requires --group"),
+            (vec!["collapse-group", "--group", " "], "requires --group"),
+            (vec!["set-workspace-group"], "or \"none\" to ungroup"),
+        ] {
+            let (command, rest) = argv.split_first().unwrap();
+            let error = build_group_request(command, &args(rest), test_env).unwrap_err();
+            assert!(error.to_string().contains(message), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn group_list_renders_one_line_per_group() {
+        let payload = json!({ "groups": [
+            { "ref": "group:a", "name": "Backend", "color": "blue", "collapsed": false, "workspace_ids": ["1", "2"] },
+            { "ref": "group:b", "name": "Docs", "color": "teal", "collapsed": true, "workspace_ids": ["3"] },
+        ]});
+        assert_eq!(
+            render_group_list(&payload),
+            "group:a Backend (blue, 2 workspaces)\ngroup:b Docs (teal, 1 workspace, collapsed)"
+        );
+        assert_eq!(render_group_list(&json!({ "groups": [] })), "No groups");
     }
 
     #[test]

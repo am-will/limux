@@ -50,6 +50,8 @@ pub struct AppSessionState {
     pub sidebar: SidebarState,
     #[serde(default)]
     pub workspaces: Vec<WorkspaceState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<WorkspaceGroupState>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -71,7 +73,28 @@ pub struct WorkspaceState {
         deserialize_with = "crate::workspace_color::deserialize_option"
     )]
     pub color: Option<WorkspaceColor>,
+    /// The sidebar group this workspace belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     pub layout: LayoutNodeState,
+}
+
+/// A sidebar workspace group. Members name it through `WorkspaceState::group_id`;
+/// `position` is its top-level sidebar index, which only places an empty group.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct WorkspaceGroupState {
+    pub id: String,
+    pub name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::workspace_color::deserialize_option"
+    )]
+    pub color: Option<WorkspaceColor>,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub position: usize,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -238,6 +261,7 @@ impl Default for AppSessionState {
             top_bar_visible: default_top_bar_visible(),
             sidebar: SidebarState::default(),
             workspaces: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
@@ -484,6 +508,7 @@ impl AppSessionState {
                     folder_path: workspace.folder_path,
                     autostart_command: None,
                     color: None,
+                    group_id: None,
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
@@ -1089,6 +1114,7 @@ mod tests {
                 folder_path: Some("/canonical".to_string()),
                 autostart_command: None,
                 color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/canonical"))),
             }],
             ..AppSessionState::default()
@@ -1198,6 +1224,7 @@ mod tests {
                 folder_path: Some("/tmp".to_string()),
                 autostart_command: Some("ssh user@server".to_string()),
                 color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
@@ -1243,6 +1270,7 @@ mod tests {
             folder_path: None,
             autostart_command: None,
             color: Some(WorkspaceColor::Teal),
+            group_id: None,
             layout: LayoutNodeState::Pane(PaneState::fallback(None)),
         };
 
@@ -1264,6 +1292,54 @@ mod tests {
         let decoded: WorkspaceState =
             serde_json::from_value(encoded).expect("decode workspace without color");
         assert_eq!(decoded.color, None);
+    }
+
+    #[test]
+    fn workspace_groups_round_trip_and_are_optional() {
+        let mut workspace = WorkspaceState {
+            id: Some("ws".to_string()),
+            name: "grouped".to_string(),
+            favorite: false,
+            cwd: None,
+            folder_path: None,
+            autostart_command: None,
+            color: None,
+            group_id: Some("g".to_string()),
+            layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+        };
+        let state = AppSessionState {
+            workspaces: vec![workspace.clone()],
+            groups: vec![WorkspaceGroupState {
+                id: "g".to_string(),
+                name: "Backend".to_string(),
+                color: Some(WorkspaceColor::Blue),
+                collapsed: true,
+                position: 0,
+            }],
+            ..AppSessionState::default()
+        };
+        let encoded = serde_json::to_value(&state).expect("encode grouped session");
+        assert_eq!(encoded["groups"][0]["color"], "blue");
+        assert_eq!(encoded["workspaces"][0]["group_id"], "g");
+        let decoded: AppSessionState =
+            serde_json::from_value(encoded).expect("decode grouped session");
+        assert_eq!(decoded, state);
+
+        // Sessions without groups neither write nor need the fields.
+        workspace.group_id = None;
+        let plain = AppSessionState {
+            workspaces: vec![workspace],
+            ..AppSessionState::default()
+        };
+        let encoded = serde_json::to_value(&plain).expect("encode plain session");
+        assert!(encoded.get("groups").is_none());
+        assert!(encoded["workspaces"][0].get("group_id").is_none());
+
+        // An unknown group colour still loads; the sidebar picks a new one.
+        let raw = r#"{"groups": [{"id": "g", "name": "G", "color": "chartreuse"}]}"#;
+        let decoded: AppSessionState = serde_json::from_str(raw).expect("decode unknown color");
+        assert_eq!(decoded.groups[0].color, None);
+        assert!(!decoded.groups[0].collapsed);
     }
 
     #[test]
@@ -1814,6 +1890,7 @@ mod tests {
                 folder_path: None,
                 autostart_command: None,
                 color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),

@@ -28,6 +28,13 @@ const METHODS: &[&str] = &[
     "workspace.select",
     "workspace.rename",
     "workspace.set_color",
+    "workspace.set_group",
+    "workspace.group_list",
+    "workspace.group_create",
+    "workspace.group_rename",
+    "workspace.group_set_color",
+    "workspace.group_set_collapsed",
+    "workspace.group_delete",
     "workspace.close",
     "pane.list",
     "pane.surfaces",
@@ -60,6 +67,38 @@ pub enum WorkspaceTarget {
     Handle(String),
     Name(String),
     Index(usize),
+}
+
+/// A sidebar workspace group request. A group is named by id (the `group:`
+/// prefix is optional) or by its exact name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupRequest {
+    List,
+    Create {
+        name: Option<String>,
+        color: Option<WorkspaceColor>,
+        workspaces: Vec<WorkspaceTarget>,
+    },
+    Rename {
+        group: String,
+        name: String,
+    },
+    SetColor {
+        group: String,
+        color: WorkspaceColor,
+    },
+    SetCollapsed {
+        group: String,
+        collapsed: bool,
+    },
+    Delete {
+        group: String,
+    },
+    /// Move a workspace into a group, or out of its group with `None`.
+    SetWorkspaceGroup {
+        target: WorkspaceTarget,
+        group: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +212,10 @@ pub enum ControlCommand {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
     },
+    WorkspaceGroup {
+        request: GroupRequest,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SendText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -249,6 +292,7 @@ impl ControlCommand {
             | Self::RenameWorkspace { reply, .. }
             | Self::SetWorkspaceColor { reply, .. }
             | Self::CloseWorkspace { reply, .. }
+            | Self::WorkspaceGroup { reply, .. }
             | Self::SendText { reply, .. }
             | Self::SendKey { reply, .. }
             | Self::CreateSurface { reply, .. }
@@ -553,35 +597,157 @@ fn parse_optional_workspace_target(
     Ok(WorkspaceTarget::Active)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// Read the `color` param of `workspace.set_color`: a palette name, or
 /// `"none"` / `null` to clear the colour.
 fn parse_workspace_color(
     params: &Map<String, Value>,
 ) -> Result<Option<WorkspaceColor>, BridgeError> {
+    parse_color_param(params, "workspace.set_color", true)
+}
+
+/// Read a palette colour param; `allow_none` also accepts `"none"` / `null`.
+fn parse_color_param(
+    params: &Map<String, Value>,
+    method: &str,
+    allow_none: bool,
+) -> Result<Option<WorkspaceColor>, BridgeError> {
     let name = match params.get("color") {
         None => {
-            return Err(BridgeError::invalid_params(
-                "workspace.set_color requires color",
-            ))
+            return Err(BridgeError::invalid_params(format!(
+                "{method} requires color"
+            )))
         }
-        Some(Value::Null) => return Ok(None),
+        Some(Value::Null) if allow_none => return Ok(None),
         Some(Value::String(name)) => name.trim(),
+        Some(_) if allow_none => {
+            return Err(BridgeError::invalid_params(format!(
+                "{method} color must be a string or null"
+            )))
+        }
         Some(_) => {
-            return Err(BridgeError::invalid_params(
-                "workspace.set_color color must be a string or null",
-            ))
+            return Err(BridgeError::invalid_params(format!(
+                "{method} color must be a string"
+            )))
         }
     };
-    if name.eq_ignore_ascii_case("none") {
+    if allow_none && name.eq_ignore_ascii_case("none") {
         return Ok(None);
     }
     WorkspaceColor::from_name(name).map(Some).ok_or_else(|| {
         BridgeError::invalid_params(format!(
-            "unknown color {name:?}; expected one of: {}, none",
-            crate::workspace_color::color_names()
+            "unknown color {name:?}; expected one of: {}{}",
+            crate::workspace_color::color_names(),
+            if allow_none { ", none" } else { "" },
         ))
     })
+}
+
+fn required_group(params: &Map<String, Value>, method: &str) -> Result<String, BridgeError> {
+    optional_ref_handle(params, &["group_id", "group"], "group:")?
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires group_id")))
+}
+
+fn parse_group_request(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<GroupRequest, BridgeError> {
+    match method {
+        "workspace.group_list" => Ok(GroupRequest::List),
+        "workspace.group_create" => {
+            let name = match params.get("name") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(name)) if !name.trim().is_empty() => {
+                    Some(name.trim().to_string())
+                }
+                Some(_) => {
+                    return Err(BridgeError::invalid_params(
+                        "workspace.group_create name must be a non-empty string",
+                    ))
+                }
+            };
+            let color = if params.get("color").is_none_or(Value::is_null) {
+                None
+            } else {
+                parse_color_param(params, method, false)?
+            };
+            let mut workspaces = Vec::new();
+            if let Some(handle) = optional_handle(params, &["workspace_id"])? {
+                workspaces.push(WorkspaceTarget::Handle(handle));
+            }
+            match params.get("workspace_ids") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(handles)) => {
+                    for handle in handles {
+                        let handle = match handle {
+                            Value::String(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+                            Value::Number(number) if number.is_u64() => number.to_string(),
+                            _ => {
+                                return Err(BridgeError::invalid_params(
+                                    "workspace_ids must hold workspace handles",
+                                ))
+                            }
+                        };
+                        workspaces.push(WorkspaceTarget::Handle(handle));
+                    }
+                }
+                Some(_) => {
+                    return Err(BridgeError::invalid_params(
+                        "workspace_ids must be an array of workspace handles",
+                    ))
+                }
+            }
+            Ok(GroupRequest::Create {
+                name,
+                color,
+                workspaces,
+            })
+        }
+        "workspace.group_rename" => {
+            let group = required_group(params, method)?;
+            let name = optional_string(params, &["name", "title"]).ok_or_else(|| {
+                BridgeError::invalid_params("workspace.group_rename requires name")
+            })?;
+            Ok(GroupRequest::Rename { group, name })
+        }
+        "workspace.group_set_color" => {
+            let group = required_group(params, method)?;
+            let color = parse_color_param(params, method, false)?
+                .expect("a colour is required without allow_none");
+            Ok(GroupRequest::SetColor { group, color })
+        }
+        "workspace.group_set_collapsed" => {
+            let group = required_group(params, method)?;
+            let collapsed = params
+                .get("collapsed")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    BridgeError::invalid_params(
+                        "workspace.group_set_collapsed requires boolean collapsed",
+                    )
+                })?;
+            Ok(GroupRequest::SetCollapsed { group, collapsed })
+        }
+        "workspace.group_delete" => Ok(GroupRequest::Delete {
+            group: required_group(params, method)?,
+        }),
+        "workspace.set_group" => {
+            let group = match params.get("group_id") {
+                None => {
+                    return Err(BridgeError::invalid_params(
+                        "workspace.set_group requires group_id (null to ungroup)",
+                    ))
+                }
+                Some(Value::Null) => None,
+                Some(_) => Some(required_group(params, method)?),
+            };
+            let target = parse_optional_workspace_target(params, false)?;
+            Ok(GroupRequest::SetWorkspaceGroup { target, group })
+        }
+        _ => Err(BridgeError::new(
+            UNKNOWN_METHOD_CODE,
+            format!("unknown group method {method}"),
+        )),
+    }
 }
 
 fn parse_create_pane_request(
@@ -846,6 +1012,35 @@ fn handle_method(
                 },
                 rx,
             )
+        }
+        "workspace.group_list"
+        | "list-groups"
+        | "workspace.group_create"
+        | "create-group"
+        | "workspace.group_rename"
+        | "rename-group"
+        | "workspace.group_set_color"
+        | "set-group-color"
+        | "workspace.group_set_collapsed"
+        | "workspace.group_delete"
+        | "delete-group"
+        | "workspace.set_group"
+        | "set-workspace-group" => {
+            let canonical = match method {
+                "list-groups" => "workspace.group_list",
+                "create-group" => "workspace.group_create",
+                "rename-group" => "workspace.group_rename",
+                "set-group-color" => "workspace.group_set_color",
+                "delete-group" => "workspace.group_delete",
+                "set-workspace-group" => "workspace.set_group",
+                method => method,
+            };
+            let request = match parse_group_request(canonical, params) {
+                Ok(request) => request,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::WorkspaceGroup { request, reply }, rx)
         }
         "workspace.close" | "close-workspace" => {
             let target = match parse_optional_workspace_target(params, false) {
@@ -1662,6 +1857,168 @@ mod tests {
             let error = response.error.expect("invalid color is rejected");
             assert_eq!(error.code, INVALID_PARAMS_CODE);
         }
+    }
+
+    fn dispatched_group_request(method: &str, params: Value) -> GroupRequest {
+        let seen = std::cell::RefCell::new(None);
+        let response = dispatch_request(
+            &json!({"method": method, "params": params}).to_string(),
+            &|command| match command {
+                ControlCommand::WorkspaceGroup { request, reply } => {
+                    *seen.borrow_mut() = Some(request);
+                    reply.send(Ok(json!({}))).unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(response.error, None, "{method} {params:?}");
+        seen.into_inner().expect("group request dispatched")
+    }
+
+    fn group_request_error(method: &str, params: Value) -> i64 {
+        dispatch_request(
+            &json!({"method": method, "params": params}).to_string(),
+            &|command| panic!("unexpected command: {command:?}"),
+        )
+        .error
+        .expect("request is rejected")
+        .code
+    }
+
+    #[test]
+    fn group_methods_are_advertised() {
+        for method in [
+            "workspace.set_group",
+            "workspace.group_list",
+            "workspace.group_create",
+            "workspace.group_rename",
+            "workspace.group_set_color",
+            "workspace.group_set_collapsed",
+            "workspace.group_delete",
+        ] {
+            assert!(METHODS.contains(&method), "{method}");
+        }
+    }
+
+    #[test]
+    fn group_create_parses_name_color_and_members() {
+        assert_eq!(
+            dispatched_group_request("workspace.group_create", json!({})),
+            GroupRequest::Create {
+                name: None,
+                color: None,
+                workspaces: Vec::new(),
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_create",
+                json!({
+                    "name": " Backend ",
+                    "color": "Teal",
+                    "workspace_id": "workspace:1",
+                    "workspace_ids": ["2", 3],
+                })
+            ),
+            GroupRequest::Create {
+                name: Some("Backend".to_string()),
+                color: Some(WorkspaceColor::Teal),
+                workspaces: vec![
+                    WorkspaceTarget::Handle("workspace:1".to_string()),
+                    WorkspaceTarget::Handle("2".to_string()),
+                    WorkspaceTarget::Handle("3".to_string()),
+                ],
+            }
+        );
+        for params in [
+            json!({"name": ""}),
+            json!({"color": "none"}),
+            json!({"color": "chartreuse"}),
+            json!({"workspace_ids": "1"}),
+            json!({"workspace_ids": [true]}),
+        ] {
+            assert_eq!(
+                group_request_error("workspace.group_create", params),
+                INVALID_PARAMS_CODE
+            );
+        }
+    }
+
+    #[test]
+    fn group_edits_take_ids_refs_or_names() {
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_rename",
+                json!({"group_id": "group:abc", "name": "Ops"})
+            ),
+            GroupRequest::Rename {
+                group: "abc".to_string(),
+                name: "Ops".to_string(),
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_set_color",
+                json!({"group": "Backend", "color": "red"})
+            ),
+            GroupRequest::SetColor {
+                group: "Backend".to_string(),
+                color: WorkspaceColor::Red,
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_set_collapsed",
+                json!({"group_id": "abc", "collapsed": true})
+            ),
+            GroupRequest::SetCollapsed {
+                group: "abc".to_string(),
+                collapsed: true,
+            }
+        );
+        assert_eq!(
+            dispatched_group_request("delete-group", json!({"group_id": "abc"})),
+            GroupRequest::Delete {
+                group: "abc".to_string(),
+            }
+        );
+        for (method, params) in [
+            ("workspace.group_rename", json!({"name": "Ops"})),
+            ("workspace.group_rename", json!({"group_id": "abc"})),
+            (
+                "workspace.group_set_color",
+                json!({"group_id": "abc", "color": null}),
+            ),
+            ("workspace.group_set_collapsed", json!({"group_id": "abc"})),
+            ("workspace.group_delete", json!({})),
+        ] {
+            assert_eq!(group_request_error(method, params), INVALID_PARAMS_CODE);
+        }
+    }
+
+    #[test]
+    fn set_group_requires_an_explicit_group_or_null() {
+        assert_eq!(
+            dispatched_group_request("workspace.set_group", json!({"group_id": "group:abc"})),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Active,
+                group: Some("abc".to_string()),
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.set_group",
+                json!({"group_id": null, "workspace_id": "workspace:2"})
+            ),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Handle("workspace:2".to_string()),
+                group: None,
+            }
+        );
+        assert_eq!(
+            group_request_error("workspace.set_group", json!({})),
+            INVALID_PARAMS_CODE
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ fn moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique() {
             folder_path: None,
             autostart_command: None,
             color: None,
+            group_id: None,
             layout: LayoutNodeState::Pane(PaneState::fallback(None)),
         },
     );
@@ -131,6 +132,7 @@ fn a_tab_moved_to_another_workspace_answers_to_its_original_ids() {
                 folder_path: None,
                 autostart_command: None,
                 color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(None)),
             },
         );
@@ -262,6 +264,7 @@ fn an_unscoped_surface_hint_is_resolved_once_across_workspaces() {
                 folder_path: None,
                 autostart_command: None,
                 color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some(tab.id.clone()),
@@ -340,6 +343,7 @@ fn a_surface_hidden_by_a_zoom_is_reported_not_found() {
             folder_path: None,
             autostart_command: None,
             color: None,
+            group_id: None,
             layout: LayoutNodeState::Split(SplitState {
                 orientation: SplitOrientation::Horizontal,
                 ratio: 0.5,

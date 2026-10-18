@@ -860,6 +860,45 @@ jq -e --arg workspace "$WORKSPACE_ID" --arg other "$OTHER_WORKSPACE" \
   '(.workspaces | any(.workspace_id == $workspace and .color == "pink")) and (.workspaces | any(.workspace_id == $other and .color == null))' \
   "$LOG_DIR/stage6c-color-scope.json" >/dev/null \
   || { echo "FAIL: workspace color escaped the requested scope"; exit 1; }
+# Exercise sidebar workspace groups: membership, collapse, and the guard
+# that keeps a group with workspaces from being deleted.
+"$LIMUX_CLI" --json --id-format both create-group --color teal \
+  --workspace "$WORKSPACE_ID" --workspace "$OTHER_WORKSPACE" Smoke >"$LOG_DIR/stage6d-create.json"
+GROUP_ID="$(jq -r '.group_id' "$LOG_DIR/stage6d-create.json")"
+jq -e --arg a "$WORKSPACE_ID" --arg b "$OTHER_WORKSPACE" \
+  '.name == "Smoke" and .color == "teal" and .collapsed == false and .workspace_ids == [$a, $b]' \
+  "$LOG_DIR/stage6d-create.json" >/dev/null \
+  || { echo "FAIL: create-group did not group both workspaces"; exit 1; }
+"$LIMUX_CLI" rename-group --group "group:$GROUP_ID" Smoked
+"$LIMUX_CLI" set-group-color --group Smoked purple
+"$LIMUX_CLI" collapse-group --group "$GROUP_ID"
+"$LIMUX_CLI" --json --id-format both list-groups >"$LOG_DIR/stage6d-list.json"
+jq -e --arg id "$GROUP_ID" \
+  '.groups | any(.group_id == $id and .name == "Smoked" and .color == "purple" and .collapsed == true)' \
+  "$LOG_DIR/stage6d-list.json" >/dev/null \
+  || { echo "FAIL: group rename, color or collapse was not applied"; exit 1; }
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6d-workspaces.json"
+jq -e --arg id "$GROUP_ID" --arg a "$WORKSPACE_ID" \
+  '.workspaces | any(.workspace_id == $a and .group_id == $id)' \
+  "$LOG_DIR/stage6d-workspaces.json" >/dev/null \
+  || { echo "FAIL: list-workspaces did not report the group"; exit 1; }
+if "$LIMUX_CLI" delete-group --group "$GROUP_ID" >"$LOG_DIR/stage6d-delete-nonempty.txt" 2>&1; then
+  echo "FAIL: a group with workspaces was deleted"
+  exit 1
+fi
+"$LIMUX_CLI" set-workspace-group --workspace "$OTHER_WORKSPACE" none
+"$LIMUX_CLI" --json --id-format both create-group Empty >"$LOG_DIR/stage6d-empty.json"
+EMPTY_GROUP_ID="$(jq -r '.group_id' "$LOG_DIR/stage6d-empty.json")"
+"$LIMUX_CLI" set-workspace-group --workspace "$WORKSPACE_ID" "$EMPTY_GROUP_ID"
+"$LIMUX_CLI" delete-group --group "$GROUP_ID"
+"$LIMUX_CLI" --json --id-format both list-groups >"$LOG_DIR/stage6d-after-delete.json"
+jq -e --arg empty "$EMPTY_GROUP_ID" --arg a "$WORKSPACE_ID" \
+  '(.groups | length) == 1 and .groups[0].group_id == $empty and .groups[0].workspace_ids == [$a]' \
+  "$LOG_DIR/stage6d-after-delete.json" >/dev/null \
+  || { echo "FAIL: deleting the emptied group left the wrong groups"; exit 1; }
+# Keep the second group, collapsed, for the restart check in stage 8.
+"$LIMUX_CLI" collapse-group --group "$EMPTY_GROUP_ID"
+echo "stage 6d: OK (workspace groups)"
 "$LIMUX_CLI" close-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6c-other-close.txt"
 wait_for_healthy_surfaces limux "$LOG_DIR/stage6c-final-health.json"
 echo "stage 6c: OK (scoped lifecycle, background focus, pins, and saved tab selection)"
@@ -900,6 +939,12 @@ jq -e --arg workspace "$WORKSPACE_ID" \
   '.workspaces | any(.workspace_id == $workspace and .color == "pink")' \
   "$LOG_DIR/stage8-colors.json" >/dev/null \
   || { echo "FAIL: workspace color was not restored"; exit 1; }
+"$LIMUX_CLI" --json --id-format both list-groups >"$LOG_DIR/stage8-groups.json"
+jq -e --arg empty "$EMPTY_GROUP_ID" --arg workspace "$WORKSPACE_ID" \
+  '.groups == [.groups[0]] and .groups[0].group_id == $empty and .groups[0].name == "Empty"
+    and .groups[0].collapsed == true and .groups[0].workspace_ids == [$workspace]' \
+  "$LOG_DIR/stage8-groups.json" >/dev/null \
+  || { echo "FAIL: workspace group was not restored"; exit 1; }
 for _ in $(seq 1 50); do
   "$LIMUX_CLI" --json list-panes --workspace "$RESTORED_WORKSPACE" \
     >"$LOG_DIR/stage8-panes.json"

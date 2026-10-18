@@ -121,6 +121,7 @@ fn show_focused_workspace(state: &State, layout: LayoutNodeState) -> (String, gt
         state,
         &WorkspaceState {
             color: None,
+            group_id: None,
             id: None,
             name: "closed".to_string(),
             favorite: false,
