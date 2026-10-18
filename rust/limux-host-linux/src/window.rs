@@ -5113,6 +5113,9 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         let sidebar_list = state.borrow().sidebar_list.clone();
         sidebar_list.select_row(Some(&row_clone));
     }
+    // The row selection does not switch workspaces here (the new one is
+    // already active), so a collapsed group still shows the one left behind.
+    sidebar_groups::sync_row_visibility(state);
 
     if pane::move_tab_to_pane(&source_pane, tab_id, &pane.clone().upcast()) {
         apply_top_bar_mode(state);
@@ -6617,6 +6620,9 @@ fn add_workspace_with_initial_command(
 
     stack.set_visible_child_name(&stack_name);
     sidebar_list.select_row(Some(&row));
+    // The new workspace is already active, so the selection does not switch
+    // and a collapsed group still shows the one left behind.
+    sidebar_groups::sync_row_visibility(state);
     // Ensure the new pill's visibility honors the show_workspace_indicators
     // preference, and that pane/sidebar placement is up to date.
     apply_top_bar_mode(state);
@@ -6847,9 +6853,13 @@ fn close_workspace_by_id_internal(
     let Some(idx) = s.workspaces.iter().position(|workspace| workspace.id == id) else {
         return;
     };
+    // Closing the active workspace activates its sidebar neighbour, skipping
+    // rows hidden in collapsed groups.
     let desired_active_workspace_id = preferred_active_workspace_id
         .map(ToOwned::to_owned)
-        .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
+        .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()))
+        .filter(|desired| desired != id)
+        .or_else(|| s.sidebar.workspace_to_activate_after(id));
 
     let ws = s.workspaces.remove(idx);
     s.sidebar.remove_workspace(id);

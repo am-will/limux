@@ -264,6 +264,32 @@ impl SidebarLayout {
         self.groups().find(|group| group.id == id)
     }
 
+    /// The workspace to activate when `closing_id` closes: the nearest one
+    /// above it that is not hidden in a collapsed group, else the nearest
+    /// such one below it, else the nearest of any above or below.
+    pub fn workspace_to_activate_after(&self, closing_id: &str) -> Option<String> {
+        let workspaces: Vec<(&str, bool)> = self
+            .rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Workspace { id, group } => {
+                    Some((id, group.is_none_or(|group| !group.collapsed)))
+                }
+                SidebarRow::GroupHeader(_) => None,
+            })
+            .collect();
+        let index = workspaces.iter().position(|(id, _)| *id == closing_id)?;
+        let (above, below) = (&workspaces[..index], &workspaces[index + 1..]);
+        above
+            .iter()
+            .rev()
+            .find(|(_, shown)| *shown)
+            .or_else(|| below.iter().find(|(_, shown)| *shown))
+            .or_else(|| above.last())
+            .or_else(|| below.first())
+            .map(|(id, _)| id.to_string())
+    }
+
     pub fn group_of(&self, workspace_id: &str) -> Option<&WorkspaceGroup> {
         match self.locate(workspace_id)? {
             Location::InGroup(index, _) => match &self.items[index] {
@@ -855,6 +881,43 @@ mod tests {
         let g = layout.create_group(Some("G"), None, &ids(&["b"])).unwrap();
         assert!(layout.move_group(&g, &RowRef::Workspace("a".into()), Placement::Before));
         assert_eq!(render(&layout), ["*a", "[G]", "G/b"]);
+    }
+
+    #[test]
+    fn closing_activates_the_nearest_shown_workspace_above() {
+        let mut layout = layout(&["a", "b", "c", "d", "e"]);
+        let g = layout
+            .create_group(Some("G"), None, &ids(&["b", "c"]))
+            .unwrap();
+        layout.set_group_collapsed(&g, true).unwrap();
+        assert_eq!(render(&layout), ["a", "[G]", "G/b", "G/c", "d", "e"]);
+        let next = |layout: &SidebarLayout, id| layout.workspace_to_activate_after(id);
+        // The plain case: the one above.
+        assert_eq!(next(&layout, "e").as_deref(), Some("d"));
+        // Members of the collapsed group are skipped.
+        assert_eq!(next(&layout, "d").as_deref(), Some("a"));
+        // Closing a (visible, active) member skips its hidden siblings too.
+        assert_eq!(next(&layout, "c").as_deref(), Some("a"));
+        // Expanded groups count as shown.
+        layout.set_group_collapsed(&g, false).unwrap();
+        assert_eq!(next(&layout, "d").as_deref(), Some("c"));
+        assert_eq!(next(&layout, "x"), None);
+    }
+
+    #[test]
+    fn closing_the_top_workspace_falls_back_below_then_to_hidden_ones() {
+        assert_eq!(layout(&["only"]).workspace_to_activate_after("only"), None);
+        let mut layout = layout(&["a", "b", "c"]);
+        let g = layout.create_group(Some("G"), None, &ids(&["b"])).unwrap();
+        layout.set_group_collapsed(&g, true).unwrap();
+        let next = |layout: &SidebarLayout, id| layout.workspace_to_activate_after(id);
+        // Nothing shown above: the nearest shown one below, past the group.
+        assert_eq!(next(&layout, "a").as_deref(), Some("c"));
+        // Only hidden workspaces left: the nearest one.
+        layout.set_workspace_group("c", Some(&g)).unwrap();
+        assert_eq!(next(&layout, "a").as_deref(), Some("b"));
+        layout.remove_workspace("a");
+        assert_eq!(next(&layout, "c").as_deref(), Some("b"));
     }
 
     #[test]

@@ -870,3 +870,42 @@ fn grouped_favorites_keep_their_place_across_saves() {
         ["workspace-3", "workspace-2", "workspace-1"]
     );
 }
+
+#[test]
+fn groups_from_two_windows_are_both_kept() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (mut a, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let (mut b, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+    // Window A groups workspace 1 into G1.
+    let mut ours = base.clone();
+    ours.groups = vec![group("g1", "Backend")];
+    ours.workspaces[0].group_id = Some("g1".to_string());
+    saved(&mut a, &ours);
+
+    // Window B, which never saw G1, groups workspace 2 into G2.
+    let mut theirs = base;
+    theirs.groups = vec![group("g2", "Frontend")];
+    theirs.workspaces[1].group_id = Some("g2".to_string());
+    saved(&mut b, &theirs);
+    // Order is irrelevant: groups are placed by their members and position.
+    let ids = |state: &AppSessionState| -> Vec<String> {
+        let mut ids: Vec<String> = state.groups.iter().map(|group| group.id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(&disk(dir.path())), ["g1", "g2"]);
+
+    // A saves again without touching groups: G2 stays. Deleting G1 drops
+    // only G1.
+    saved(&mut a, &ours);
+    assert_eq!(ids(&disk(dir.path())), ["g1", "g2"]);
+    let mut deleted = ours.clone();
+    deleted.groups.clear();
+    deleted.workspaces[0].group_id = None;
+    saved(&mut a, &deleted);
+    let result = disk(dir.path());
+    assert_eq!(ids(&result), ["g2"]);
+    assert_eq!(result.workspaces[1].group_id.as_deref(), Some("g2"));
+}

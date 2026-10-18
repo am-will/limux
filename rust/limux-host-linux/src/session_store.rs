@@ -5,7 +5,9 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::layout_state::{self, AppSessionState, LoadedSession, WorkspaceState};
+use crate::layout_state::{
+    self, AppSessionState, LoadedSession, WorkspaceGroupState, WorkspaceState,
+};
 
 pub(crate) enum SaveOutcome {
     Saved,
@@ -214,6 +216,35 @@ fn workspace_order(state: &AppSessionState) -> Vec<String> {
         .collect()
 }
 
+/// Merge groups by id: a group this window created, edited or deleted since
+/// its last save takes its local version; any other group keeps the disk
+/// version, so groups made by other windows survive.
+fn merge_groups(
+    previous_local: &AppSessionState,
+    local: &AppSessionState,
+    disk: &AppSessionState,
+) -> Vec<WorkspaceGroupState> {
+    let find = |state: &'_ AppSessionState, id: &str| -> Option<WorkspaceGroupState> {
+        state.groups.iter().find(|group| group.id == id).cloned()
+    };
+    let mut ids: Vec<&str> = Vec::new();
+    for group in local.groups.iter().chain(&disk.groups) {
+        if !ids.contains(&group.id.as_str()) {
+            ids.push(&group.id);
+        }
+    }
+    ids.into_iter()
+        .filter_map(|id| {
+            let ours = find(local, id);
+            if ours != find(previous_local, id) {
+                ours
+            } else {
+                find(disk, id)
+            }
+        })
+        .collect()
+}
+
 fn selected_id(state: &AppSessionState) -> Option<&str> {
     state
         .workspaces
@@ -344,13 +375,9 @@ fn merge_session(
         } else {
             disk.sidebar.clone()
         },
-        // Group metadata follows the sidebar: the newer local edit wins. Members
-        // name their group per workspace, so membership merges with workspaces.
-        groups: if local.groups != previous_local.groups {
-            local.groups.clone()
-        } else {
-            disk.groups.clone()
-        },
+        // Members name their group per workspace, so membership merges with
+        // workspaces; group metadata merges per group.
+        groups: merge_groups(previous_local, local, disk),
         ..AppSessionState::default()
     };
     normalize_pane_ids(&mut result, disk);

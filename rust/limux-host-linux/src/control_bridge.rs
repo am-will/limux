@@ -731,10 +731,10 @@ fn parse_group_request(
             group: required_group(params, method)?,
         }),
         "workspace.set_group" => {
-            let group = match params.get("group_id") {
+            let group = match params.get("group_id").or_else(|| params.get("group")) {
                 None => {
                     return Err(BridgeError::invalid_params(
-                        "workspace.set_group requires group_id (null to ungroup)",
+                        "workspace.set_group requires group_id or group (null to ungroup)",
                     ))
                 }
                 Some(Value::Null) => None,
@@ -2003,6 +2003,21 @@ mod tests {
             GroupRequest::SetWorkspaceGroup {
                 target: WorkspaceTarget::Active,
                 group: Some("abc".to_string()),
+            }
+        );
+        // Like the other group methods, `group` takes an id, ref or name.
+        assert_eq!(
+            dispatched_group_request("workspace.set_group", json!({"group": "Backend"})),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Active,
+                group: Some("Backend".to_string()),
+            }
+        );
+        assert_eq!(
+            dispatched_group_request("workspace.set_group", json!({"group": null})),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Active,
+                group: None,
             }
         );
         assert_eq!(

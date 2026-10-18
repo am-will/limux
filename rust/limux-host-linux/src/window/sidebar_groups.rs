@@ -218,8 +218,7 @@ pub(super) fn sync_sidebar(state: &State) {
                     workspace.sidebar_row.clone()
                 }
             };
-            widget.set_visible(row.visible(active_id.as_deref()));
-            rows.push(widget);
+            rows.push((widget, row.visible(active_id.as_deref())));
         }
         let indicators: Vec<gtk::Button> = s
             .workspaces
@@ -240,6 +239,10 @@ pub(super) fn sync_sidebar(state: &State) {
 
     // Mutate GTK container children after dropping `state.borrow_mut()` so
     // synchronous `drag_source.connect_drag_end` callbacks do not panic.
+    // Hiding a row can move the focus out of an inline-rename entry, whose
+    // commit borrows the state too.
+    set_rows_visible(&rows);
+    let rows: Vec<gtk::ListBoxRow> = rows.into_iter().map(|(row, _)| row).collect();
     replace_children(
         sidebar_list.upcast_ref(),
         &rows,
@@ -289,14 +292,30 @@ fn replace_children<W: IsA<gtk::Widget>>(
 
 /// Show or hide member rows of collapsed groups for the active workspace.
 pub(super) fn sync_row_visibility(state: &State) {
-    let s = state.borrow();
-    let active = s.active_workspace().map(|workspace| workspace.id.as_str());
-    for row in s.sidebar.rows() {
-        if let SidebarRow::Workspace { id, .. } = row {
-            if let Some(workspace) = s.workspaces.iter().find(|w| w.id == id) {
-                workspace.sidebar_row.set_visible(row.visible(active));
-            }
-        }
+    let rows: Vec<(gtk::ListBoxRow, bool)> = {
+        let s = state.borrow();
+        let active = s.active_workspace().map(|workspace| workspace.id.as_str());
+        s.sidebar
+            .rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Workspace { id, .. } => s
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|workspace| (workspace.sidebar_row.clone(), row.visible(active))),
+                SidebarRow::GroupHeader(_) => None,
+            })
+            .collect()
+    };
+    set_rows_visible(&rows);
+}
+
+/// Call without holding the state: hiding the row that holds the focus runs
+/// focus-leave handlers synchronously.
+fn set_rows_visible(rows: &[(gtk::ListBoxRow, bool)]) {
+    for (row, visible) in rows {
+        row.set_visible(*visible);
     }
 }
 
@@ -605,28 +624,29 @@ pub(super) fn append_workspace_group_items(
             .sidebar
             .group_of(workspace_id)
             .map(|group| group.id.clone());
+        // The groups it can move to: every group but its own.
         let groups: Vec<(String, String, WorkspaceColor)> = s
             .sidebar
             .groups()
+            .filter(|group| current.as_deref() != Some(group.id.as_str()))
             .map(|group| (group.id.clone(), group.name.clone(), group.color))
             .collect();
         (current, groups)
     };
 
-    let heading = gtk::Label::builder()
-        .label("Move to group")
-        .xalign(0.0)
-        .margin_start(8)
-        .margin_top(4)
-        .build();
-    heading.add_css_class("dim-label");
-    heading.add_css_class("caption");
-    container.append(&heading);
+    if !groups.is_empty() {
+        let heading = gtk::Label::builder()
+            .label("Move to group")
+            .xalign(0.0)
+            .margin_start(8)
+            .margin_top(4)
+            .build();
+        heading.add_css_class("dim-label");
+        heading.add_css_class("caption");
+        container.append(&heading);
+    }
 
     for (group_id, name, color) in groups {
-        if current_group.as_deref() == Some(group_id.as_str()) {
-            continue;
-        }
         let dot = gtk::Label::new(Some("\u{25CF}"));
         dot.add_css_class(&format!("{DOT_CSS_PREFIX}{}", color.as_str()));
         let label = gtk::Label::builder()
