@@ -15,6 +15,7 @@ use limux_control::socket_path::{bind_listener, resolve_socket_path, SocketMode}
 use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use serde_json::{json, Map, Value};
 
+use crate::gui_hooks::{GuiHookEvent, GuiHookUpdate};
 use crate::workspace_color::WorkspaceColor;
 
 const METHODS: &[&str] = &[
@@ -50,6 +51,9 @@ const METHODS: &[&str] = &[
     "pane.focus",
     "tab.action",
     "notification.create",
+    "gui_hook.list",
+    "gui_hook.set",
+    "gui_hook.clear",
 ];
 
 const PARSE_ERROR_CODE: i64 = -32700;
@@ -98,6 +102,19 @@ pub enum GroupRequest {
     SetWorkspaceGroup {
         target: WorkspaceTarget,
         group: Option<String>,
+    },
+}
+
+/// Read or change the GUI hooks in the app settings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuiHookRequest {
+    List,
+    Set {
+        event: GuiHookEvent,
+        update: GuiHookUpdate,
+    },
+    Clear {
+        event: GuiHookEvent,
     },
 }
 
@@ -216,6 +233,10 @@ pub enum ControlCommand {
         request: GroupRequest,
         reply: mpsc::Sender<BridgeResult>,
     },
+    GuiHook {
+        request: GuiHookRequest,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SendText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -293,6 +314,7 @@ impl ControlCommand {
             | Self::SetWorkspaceColor { reply, .. }
             | Self::CloseWorkspace { reply, .. }
             | Self::WorkspaceGroup { reply, .. }
+            | Self::GuiHook { reply, .. }
             | Self::SendText { reply, .. }
             | Self::SendKey { reply, .. }
             | Self::CreateSurface { reply, .. }
@@ -750,6 +772,57 @@ fn parse_group_request(
     }
 }
 
+fn parse_gui_hook_request(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<GuiHookRequest, BridgeError> {
+    if method == "gui_hook.list" {
+        return Ok(GuiHookRequest::List);
+    }
+    let raw_event = optional_string(params, &["event", "hook"])
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires event")))?;
+    let event = GuiHookEvent::parse(&raw_event).ok_or_else(|| {
+        let known: Vec<&str> = GuiHookEvent::ALL
+            .iter()
+            .map(|event| event.as_str())
+            .collect();
+        BridgeError::invalid_params(format!(
+            "unknown hook event `{raw_event}` (expected {})",
+            known.join(" or ")
+        ))
+    })?;
+    if method == "gui_hook.clear" {
+        return Ok(GuiHookRequest::Clear { event });
+    }
+    let flag = |key: &str| match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(BridgeError::invalid_params(format!(
+            "{method} {key} must be a boolean"
+        ))),
+    };
+    let command = match params.get("command") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(command)) if !command.trim().is_empty() => Some(command.clone()),
+        Some(_) => {
+            return Err(BridgeError::invalid_params(format!(
+                "{method} command must be a non-empty string"
+            )))
+        }
+    };
+    let update = GuiHookUpdate {
+        command,
+        show_terminal: flag("show_terminal")?,
+        suppress_default: flag("suppress_default")?,
+    };
+    if update == GuiHookUpdate::default() {
+        return Err(BridgeError::invalid_params(format!(
+            "{method} requires command, show_terminal or suppress_default"
+        )));
+    }
+    Ok(GuiHookRequest::Set { event, update })
+}
+
 fn parse_create_pane_request(
     params: &Map<String, Value>,
 ) -> Result<CreatePaneRequest, BridgeError> {
@@ -1041,6 +1114,14 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::WorkspaceGroup { request, reply }, rx)
+        }
+        "gui_hook.list" | "gui_hook.set" | "gui_hook.clear" => {
+            let request = match parse_gui_hook_request(method, params) {
+                Ok(request) => request,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::GuiHook { request, reply }, rx)
         }
         "workspace.close" | "close-workspace" => {
             let target = match parse_optional_workspace_target(params, false) {
@@ -2293,5 +2374,92 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert_eq!(response.result.expect("result")["ok"], true);
+    }
+
+    fn dispatched_gui_hook_request(method: &str, params: Value) -> GuiHookRequest {
+        let seen = std::cell::RefCell::new(None);
+        let response = dispatch_request(
+            &json!({"method": method, "params": params}).to_string(),
+            &|command| match command {
+                ControlCommand::GuiHook { request, reply } => {
+                    *seen.borrow_mut() = Some(request);
+                    reply.send(Ok(json!({}))).unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(response.error, None, "{method} {params:?}");
+        seen.into_inner().expect("gui hook request dispatched")
+    }
+
+    #[test]
+    fn gui_hook_requests_parse_event_command_and_flags() {
+        for method in ["gui_hook.list", "gui_hook.set", "gui_hook.clear"] {
+            assert!(METHODS.contains(&method), "{method}");
+        }
+        assert_eq!(
+            dispatched_gui_hook_request("gui_hook.list", json!({})),
+            GuiHookRequest::List
+        );
+        assert_eq!(
+            dispatched_gui_hook_request(
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "command": "new.sh --force", "show_terminal": true}),
+            ),
+            GuiHookRequest::Set {
+                event: GuiHookEvent::WorkspaceCreate,
+                update: GuiHookUpdate {
+                    command: Some("new.sh --force".to_string()),
+                    show_terminal: Some(true),
+                    suppress_default: None,
+                },
+            }
+        );
+        assert_eq!(
+            dispatched_gui_hook_request(
+                "gui_hook.set",
+                json!({"hook": "on_workspace_delete", "suppress_default": false}),
+            ),
+            GuiHookRequest::Set {
+                event: GuiHookEvent::WorkspaceDelete,
+                update: GuiHookUpdate {
+                    suppress_default: Some(false),
+                    ..Default::default()
+                },
+            }
+        );
+        assert_eq!(
+            dispatched_gui_hook_request("gui_hook.clear", json!({"event": "on-workspace-delete"})),
+            GuiHookRequest::Clear {
+                event: GuiHookEvent::WorkspaceDelete,
+            }
+        );
+    }
+
+    #[test]
+    fn gui_hook_requests_reject_bad_params() {
+        for (method, params) in [
+            ("gui_hook.set", json!({"command": "x"})),
+            (
+                "gui_hook.set",
+                json!({"event": "on-tab-create", "command": "x"}),
+            ),
+            ("gui_hook.set", json!({"event": "on-workspace-create"})),
+            (
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "command": " "}),
+            ),
+            (
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "show_terminal": "yes"}),
+            ),
+            ("gui_hook.clear", json!({})),
+        ] {
+            assert_eq!(
+                group_request_error(method, params.clone()),
+                INVALID_PARAMS_CODE,
+                "{method} {params}"
+            );
+        }
     }
 }

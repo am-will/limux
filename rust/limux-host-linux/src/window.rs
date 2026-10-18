@@ -16,6 +16,7 @@ use crate::control_bridge::{
     BridgeError, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType,
     WorkspaceTarget,
 };
+use crate::gui_hooks::{GuiHookContext, GuiHookEvent};
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, WorkspaceState,
@@ -29,6 +30,7 @@ use crate::split_tree::{self, SplitTreeContainer};
 use crate::workspace_color::{self, WorkspaceColor};
 use crate::workspace_group::{Placement, RowRef, SidebarLayout};
 
+mod gui_hooks;
 mod sidebar_groups;
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
@@ -2455,7 +2457,7 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         new_ws_btn.connect_clicked(move |_| {
-            add_workspace(&state, None);
+            add_workspace_from_gui(&state);
         });
     }
 
@@ -2495,7 +2497,7 @@ pub fn build_window(app: &adw::Application) {
                 if payload.contains(':') {
                     return create_workspace_for_tab(&state, &payload);
                 }
-                close_workspace_by_id(&state, &payload);
+                close_workspace_from_gui(&state, &payload);
                 return true;
             }
             false
@@ -2970,7 +2972,7 @@ fn shortcut_match_from_key_press(
 fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
     match command {
         ShortcutCommand::NewWorkspace => {
-            add_workspace(state, None);
+            add_workspace_from_gui(state);
             true
         }
         ShortcutCommand::CloseWorkspace => {
@@ -4694,7 +4696,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
             if let Some(pop) = pop.upgrade() {
                 pop.popdown();
             }
-            close_workspace_by_id(&state, &ws_id);
+            close_workspace_from_gui(&state, &ws_id);
             request_session_save(&state);
         });
     }
@@ -5209,7 +5211,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         let state = state.clone();
         let ws_id = new_workspace_id.clone();
         close_button.connect_clicked(move |_| {
-            close_workspace_by_id(&state, &ws_id);
+            close_workspace_from_gui(&state, &ws_id);
         });
     }
     let (indicator_button, indicator_unread_dot) = build_workspace_indicator(&seed.name);
@@ -5509,6 +5511,17 @@ fn install_workspace_row_interactions(
         favorite_button.connect_clicked(move |_| {
             toggle_workspace_favorite(&state, &workspace_id);
         });
+    }
+}
+
+/// Add a workspace the user asked for, after its GUI hook.
+fn add_workspace_from_gui(state: &State) {
+    if gui_hooks::run_gui_hook(
+        state,
+        GuiHookEvent::WorkspaceCreate,
+        &GuiHookContext::default(),
+    ) {
+        add_workspace(state, None);
     }
 }
 
@@ -6195,6 +6208,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         ControlCommand::WorkspaceGroup { request, reply } => {
             let _ = reply.send(sidebar_groups::handle_group_request(state, request));
         }
+        ControlCommand::GuiHook { request, reply } => {
+            let _ = reply.send(gui_hooks::handle_gui_hook_request(state, request));
+        }
         ControlCommand::CloseWorkspace { target, reply } => {
             let resolved = {
                 let app_state = state.borrow();
@@ -6733,7 +6749,7 @@ fn add_workspace_with_initial_command(
         let state = state.clone();
         let ws_id = id.clone();
         close_button.connect_clicked(move |_| {
-            close_workspace_by_id(&state, &ws_id);
+            close_workspace_from_gui(&state, &ws_id);
         });
     }
 
@@ -7002,7 +7018,15 @@ fn close_workspace(state: &State) {
         s.active_workspace().map(|w| w.id.clone())
     };
     if let Some(id) = id {
-        close_workspace_by_id(state, &id);
+        close_workspace_from_gui(state, &id);
+    }
+}
+
+/// Close a workspace the user asked to delete, after its GUI hook.
+fn close_workspace_from_gui(state: &State, id: &str) {
+    let context = gui_hooks::workspace_hook_context(state, id);
+    if gui_hooks::run_gui_hook(state, GuiHookEvent::WorkspaceDelete, &context) {
+        close_workspace_by_id(state, id);
     }
 }
 

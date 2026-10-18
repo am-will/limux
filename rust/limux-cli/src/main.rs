@@ -237,6 +237,12 @@ Common commands:
   delete-group --group <id|ref|name>   (only an empty group can be deleted)
   set-workspace-group [--workspace <id|ref>] <group id|ref|name|none>
   rename-window [--workspace <id|ref>] <title>
+  gui-hooks list
+  gui-hooks set <on-workspace-create|on-workspace-delete> [--command <text>]
+      [--show-terminal|--no-show-terminal] [--suppress-default|--no-suppress-default]
+      Runs <text> in bash when that action is done in the GUI (not over the socket).
+      --suppress-default leaves the create/delete itself to the hook.
+  gui-hooks clear <on-workspace-create|on-workspace-delete>
   rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>
   read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]
   capture-pane (alias of read-screen)
@@ -2784,6 +2790,87 @@ fn build_group_request(
     Ok((method, Value::Object(params)))
 }
 
+/// The socket method and params of a `gui-hooks` subcommand.
+fn build_gui_hooks_request(args: &[String]) -> Result<(&'static str, Value)> {
+    const USAGE: &str = "gui-hooks list | set <on-workspace-create|on-workspace-delete> [--command <text>] [--show-terminal|--no-show-terminal] [--suppress-default|--no-suppress-default] | clear <event>";
+    let (subcommand, rest) = args
+        .split_first()
+        .ok_or_else(|| anyhow!("usage: limux {USAGE}"))?;
+    let event = || {
+        rest.first()
+            .filter(|event| !event.starts_with('-'))
+            .cloned()
+            .ok_or_else(|| anyhow!("gui-hooks {subcommand} requires an event: on-workspace-create or on-workspace-delete"))
+    };
+    let toggle = |on: &str, off: &str| -> Result<Option<bool>> {
+        match (parse_flag(rest, on), parse_flag(rest, off)) {
+            (true, true) => bail!("{on} and {off} cannot be combined"),
+            (true, false) => Ok(Some(true)),
+            (false, true) => Ok(Some(false)),
+            (false, false) => Ok(None),
+        }
+    };
+    match subcommand.as_str() {
+        "list" => Ok(("gui_hook.list", json!({}))),
+        "set" => {
+            let mut params = Map::new();
+            params.insert("event".to_string(), Value::String(event()?));
+            if let Some(command) = parse_opt(rest, "--command") {
+                params.insert("command".to_string(), Value::String(command));
+            } else if parse_flag(rest, "--command") {
+                bail!("--command requires the command to run");
+            }
+            for (key, on, off) in [
+                ("show_terminal", "--show-terminal", "--no-show-terminal"),
+                (
+                    "suppress_default",
+                    "--suppress-default",
+                    "--no-suppress-default",
+                ),
+            ] {
+                if let Some(value) = toggle(on, off)? {
+                    params.insert(key.to_string(), Value::Bool(value));
+                }
+            }
+            if params.len() == 1 {
+                bail!("gui-hooks set requires --command, --[no-]show-terminal or --[no-]suppress-default");
+            }
+            Ok(("gui_hook.set", Value::Object(params)))
+        }
+        "clear" => Ok(("gui_hook.clear", json!({ "event": event()? }))),
+        other => bail!("unknown gui-hooks subcommand `{other}`; usage: limux {USAGE}"),
+    }
+}
+
+fn render_gui_hook(hook: &Value) -> String {
+    let event = get_string(hook, &["event"]).unwrap_or_default();
+    if hook.get("configured").and_then(Value::as_bool) != Some(true) {
+        return format!("{event}: not set");
+    }
+    let command = get_string(hook, &["command"]).unwrap_or_default();
+    let flag = |key| hook.get(key).and_then(Value::as_bool) == Some(true);
+    let mut notes = vec![if flag("show_terminal") {
+        "in a terminal"
+    } else {
+        "in the background"
+    }];
+    if flag("suppress_default") {
+        notes.push("default action skipped");
+    }
+    format!("{event}: {command} ({})", notes.join(", "))
+}
+
+fn render_gui_hooks(payload: &Value) -> String {
+    match payload.get("hooks").and_then(Value::as_array) {
+        Some(hooks) => hooks
+            .iter()
+            .map(render_gui_hook)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => render_gui_hook(payload),
+    }
+}
+
 fn render_group_list(payload: &Value) -> String {
     let groups = payload
         .get("groups")
@@ -3953,6 +4040,15 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
+        "gui-hooks" => {
+            let (method, params) = build_gui_hooks_request(args)?;
+            let payload = client.call(method, params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_gui_hooks(&payload))
+            }
+        }
         "rename-tab" => {
             let payload = run_rename_tab(client, args).await?;
             if opts.json_output {
@@ -4853,6 +4949,86 @@ mod new_pane_tests {
             let error = build_group_request(command, &args(rest), test_env).unwrap_err();
             assert!(error.to_string().contains(message), "{argv:?}: {error}");
         }
+    }
+
+    #[test]
+    fn gui_hooks_commands_build_their_socket_requests() {
+        let cases = [
+            (vec!["list"], "gui_hook.list", json!({})),
+            (
+                vec![
+                    "set",
+                    "on-workspace-create",
+                    "--command",
+                    "~/bin/new.sh --force",
+                    "--show-terminal",
+                    "--no-suppress-default",
+                ],
+                "gui_hook.set",
+                json!({
+                    "event": "on-workspace-create",
+                    "command": "~/bin/new.sh --force",
+                    "show_terminal": true,
+                    "suppress_default": false,
+                }),
+            ),
+            (
+                vec!["set", "on-workspace-delete", "--suppress-default"],
+                "gui_hook.set",
+                json!({ "event": "on-workspace-delete", "suppress_default": true }),
+            ),
+            (
+                vec!["clear", "on-workspace-delete"],
+                "gui_hook.clear",
+                json!({ "event": "on-workspace-delete" }),
+            ),
+        ];
+        for (argv, method, params) in cases {
+            assert_eq!(
+                build_gui_hooks_request(&args(&argv)).unwrap(),
+                (method, params),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_hooks_commands_reject_incomplete_arguments() {
+        for (argv, message) in [
+            (vec![], "usage"),
+            (vec!["remove"], "unknown gui-hooks subcommand"),
+            (vec!["set", "--show-terminal"], "requires an event"),
+            (vec!["set", "on-workspace-create"], "requires --command"),
+            (
+                vec!["set", "on-workspace-create", "--command"],
+                "requires the command",
+            ),
+            (
+                vec![
+                    "set",
+                    "on-workspace-create",
+                    "--show-terminal",
+                    "--no-show-terminal",
+                ],
+                "cannot be combined",
+            ),
+            (vec!["clear"], "requires an event"),
+        ] {
+            let error = build_gui_hooks_request(&args(&argv)).unwrap_err();
+            assert!(error.to_string().contains(message), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn gui_hooks_render_one_line_per_hook() {
+        let payload = json!({ "hooks": [
+            { "event": "on-workspace-create", "configured": true, "command": "new.sh -y", "show_terminal": true, "suppress_default": true },
+            { "event": "on-workspace-delete", "configured": false, "command": "", "show_terminal": false, "suppress_default": false },
+        ]});
+        assert_eq!(
+            render_gui_hooks(&payload),
+            "on-workspace-create: new.sh -y (in a terminal, default action skipped)\non-workspace-delete: not set"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::gui_hooks::GuiHooksConfig;
 use crate::shortcut_config;
 
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -84,6 +85,8 @@ pub struct AppConfig {
     pub links: LinkConfig,
     #[serde(skip)]
     pub font_size: Option<f32>,
+    #[serde(skip)]
+    pub hooks: GuiHooksConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -599,6 +602,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         links: LinkConfig { open_destination },
         font_size,
+        hooks: GuiHooksConfig::from_value(root.get("hooks")),
     }
 }
 
@@ -687,6 +691,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         root.insert("font_size".to_string(), json!(size));
     } else {
         root.remove("font_size");
+    }
+
+    if let Some(hooks) = config.hooks.to_value() {
+        root.insert("hooks".to_string(), hooks);
+    } else {
+        root.remove("hooks");
     }
 
     let serialized =
@@ -856,6 +866,31 @@ mod tests {
             assert!(loaded.warnings.is_empty());
             assert_eq!(loaded.config, config);
         }
+    }
+
+    #[test]
+    fn gui_hooks_round_trip_and_clearing_them_removes_the_key() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        let mut config = AppConfig {
+            hooks: GuiHooksConfig {
+                on_workspace_delete: crate::gui_hooks::GuiHook {
+                    command: "cleanup.sh -y".to_string(),
+                    show_terminal: true,
+                    suppress_default: true,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        save_to_path(&path, &config).expect("save config");
+        assert_eq!(load_from_path(&path).config, config);
+
+        config.hooks = GuiHooksConfig::default();
+        save_to_path(&path, &config).expect("save config");
+        let root: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root.get("hooks").is_none(), "{root}");
     }
 
     #[test]

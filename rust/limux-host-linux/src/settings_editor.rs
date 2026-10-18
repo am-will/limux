@@ -9,6 +9,7 @@ use crate::app_config::{
     AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UnreadColor,
     WindowControlsSide, DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS, MIN_TAB_ACTIVITY_SECONDS,
 };
+use crate::gui_hooks::GuiHookEvent;
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
@@ -187,6 +188,10 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
         stack.add_titled(&notifications_page, Some("notifications"), "Notifications");
     notifications_stack_page.set_icon_name(Some("preferences-system-notifications-symbolic"));
 
+    let hooks_page = build_hooks_page(&input);
+    let hooks_stack_page = stack.add_titled(&hooks_page, Some("hooks"), "Hooks");
+    hooks_stack_page.set_icon_name(Some("system-run-symbolic"));
+
     let keybinds_page = keybind_editor::build_keybind_editor(&input.shortcuts, input.on_capture);
     let keybinds_stack_page = stack.add_titled(&keybinds_page, Some("keybindings"), "Keybindings");
     keybinds_stack_page.set_icon_name(Some("input-keyboard-symbolic"));
@@ -221,6 +226,116 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
     outer.append(&header_bar);
     outer.append(&stack);
     outer.upcast()
+}
+
+fn build_hooks_page(input: &SettingsEditorInput) -> gtk::Widget {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Hooks");
+    page.set_name(Some("hooks"));
+    page.set_icon_name(Some("system-run-symbolic"));
+    page.set_hexpand(true);
+    page.set_vexpand(true);
+    page.add(&build_gui_hooks_group(input));
+    page.upcast()
+}
+
+fn build_gui_hooks_group(input: &SettingsEditorInput) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("GUI hooks");
+    group.set_description(Some(
+        "Run a command when you create or delete a workspace from the GUI. \
+         The command runs in bash and gets LIMUX_HOOK, LIMUX_SOCKET and, for a \
+         delete, LIMUX_WORKSPACE_ID, LIMUX_WORKSPACE_NAME and LIMUX_WORKSPACE_FOLDER.",
+    ));
+    for event in GuiHookEvent::ALL {
+        group.add(&build_gui_hook_row(input, event));
+    }
+    group
+}
+
+fn gui_hook_subtitle(command: &str) -> String {
+    if command.trim().is_empty() {
+        "Not set".to_string()
+    } else {
+        command.trim().to_string()
+    }
+}
+
+fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::ExpanderRow {
+    let hook = input.config.borrow().hooks.get(event).clone();
+    let expander = adw::ExpanderRow::builder()
+        .title(event.title())
+        .subtitle(gui_hook_subtitle(&hook.command))
+        .build();
+
+    let command_row = adw::ActionRow::builder().title("Command").build();
+    let command_entry = gtk::Entry::builder()
+        .text(hook.command.as_str())
+        .placeholder_text("e.g. ~/bin/workspace-hook.sh --force")
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    command_row.add_suffix(&command_entry);
+    expander.add_row(&command_row);
+
+    let terminal_row = adw::ActionRow::builder()
+        .title("Show in a terminal")
+        .subtitle("Run the command in a pop-up terminal you can type into")
+        .build();
+    terminal_row.set_subtitle_lines(2);
+    let terminal_switch = gtk::Switch::new();
+    terminal_switch.set_active(hook.show_terminal);
+    terminal_switch.set_valign(gtk::Align::Center);
+    terminal_row.add_suffix(&terminal_switch);
+    terminal_row.set_activatable_widget(Some(&terminal_switch));
+    expander.add_row(&terminal_row);
+
+    let suppress_row = adw::ActionRow::builder()
+        .title("Skip the default action")
+        .subtitle("Let the command create or delete the workspace itself, e.g. with the limux CLI")
+        .build();
+    suppress_row.set_subtitle_lines(2);
+    let suppress_switch = gtk::Switch::new();
+    suppress_switch.set_active(hook.suppress_default);
+    suppress_switch.set_valign(gtk::Align::Center);
+    suppress_row.add_suffix(&suppress_switch);
+    suppress_row.set_activatable_widget(Some(&suppress_switch));
+    expander.add_row(&suppress_row);
+
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let expander = expander.clone();
+        command_entry.connect_changed(move |entry| {
+            let command = entry.text().trim().to_string();
+            expander.set_subtitle(&gui_hook_subtitle(&command));
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.hooks.get_mut(event).command = command;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        terminal_switch.connect_active_notify(move |switch| {
+            let show_terminal = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.hooks.get_mut(event).show_terminal = show_terminal;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        suppress_switch.connect_active_notify(move |switch| {
+            let suppress_default = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.hooks.get_mut(event).suppress_default = suppress_default;
+            });
+        });
+    }
+
+    expander
 }
 
 fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {

@@ -506,6 +506,14 @@ fn add_workspace_to_group(state: &State, group_id: &str) {
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/"));
     let folder_path = folder.to_string_lossy().to_string();
+    let context = GuiHookContext {
+        folder: Some(folder_path.clone()),
+        group_id: Some(group_id.to_string()),
+        ..GuiHookContext::default()
+    };
+    if !super::gui_hooks::run_gui_hook(state, GuiHookEvent::WorkspaceCreate, &context) {
+        return;
+    }
     let name = folder
         .file_name()
         .map(|segment| segment.to_string_lossy().to_string())

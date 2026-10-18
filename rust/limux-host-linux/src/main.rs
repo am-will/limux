@@ -2,6 +2,7 @@ mod app_config;
 mod browser_link;
 mod control_bridge;
 mod ghostty_config;
+mod gui_hooks;
 mod ime;
 mod input_seats;
 mod keybind_editor;
