@@ -33,14 +33,24 @@ jobs:
             let sourceSha;
             let jobName;
             if (run.event === 'pull_request') {
-              const associations = run.pull_requests || eventRun.pull_requests || [];
-              const association = associations.find(item => item.number && item.head?.sha);
+              const headRepo = run.head_repository;
+              if (!headRepo?.owner?.login || !run.head_branch) {
+                core.info('Rust Quality run has no source repository or branch.');
+                return;
+              }
+              const candidates = await github.paginate(github.rest.pulls.list, {
+                owner, repo, state: 'open',
+                head: `${headRepo.owner.login}:${run.head_branch}`, per_page: 100,
+              });
+              const association = candidates.find(pr =>
+                pr.head.sha === run.head_sha && pr.head.repo?.full_name === headRepo.full_name &&
+                pr.base.repo.full_name === `${owner}/${repo}` && pr.base.ref === 'main');
               if (!association) {
-                core.info('Rust Quality run has no pull request association.');
+                core.info('Rust Quality run has no open PR at its exact source head.');
                 return;
               }
               pullNumber = association.number;
-              sourceSha = association.head.sha;
+              sourceSha = run.head_sha;
               jobName = 'GTK host smoke';
             } else if (run.event === 'workflow_dispatch' && run.head_branch === 'main') {
               const match = /^Rust Quality dispatch PR #([1-9][0-9]*) at ([0-9a-f]{40})$/.exec(run.display_title || '');
