@@ -909,3 +909,39 @@ fn groups_from_two_windows_are_both_kept() {
     assert_eq!(ids(&result), ["g2"]);
     assert_eq!(result.workspaces[1].group_id.as_deref(), Some("g2"));
 }
+
+#[test]
+fn concurrent_group_deletion_and_membership_addition_conflict_in_both_orders() {
+    for delete_first in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut base = initial(dir.path());
+        base.groups = vec![group("g", "Backend")];
+        layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
+        let (mut a, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+        let (mut b, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+
+        let mut deleted = base.clone();
+        deleted.groups.clear();
+        let mut grouped = base;
+        grouped.workspaces[0].group_id = Some("g".to_string());
+        let (first, second) = if delete_first {
+            (&deleted, &grouped)
+        } else {
+            (&grouped, &deleted)
+        };
+        saved(&mut a, first);
+
+        let SaveOutcome::Conflict {
+            recovery,
+            workspaces,
+        } = b.save(second).unwrap()
+        else {
+            panic!("group deletion and concurrent membership must conflict")
+        };
+        assert_eq!(workspaces, ["workspace-1"]);
+        assert_eq!(disk(dir.path()), *first);
+        let recovered: AppSessionState =
+            serde_json::from_slice(&fs::read(recovery).unwrap()).unwrap();
+        assert_eq!(recovered, *second);
+    }
+}

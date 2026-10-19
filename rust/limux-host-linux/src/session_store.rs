@@ -352,6 +352,24 @@ fn merge_session(
     // Ungrouped favorites are pinned first; a group keeps its favorites in place.
     workspaces.sort_by_key(|workspace| !workspace.favorite || workspace.group_id.is_some());
 
+    // A stale empty-group deletion can race with another window adding a member.
+    // Keep both snapshots recoverable instead of silently orphaning that member.
+    let groups = merge_groups(previous_local, local, disk);
+    let group_ids: BTreeSet<_> = groups.iter().map(|group| group.id.as_str()).collect();
+    let group_conflicts: Vec<_> = workspaces
+        .iter()
+        .filter(|workspace| {
+            workspace
+                .group_id
+                .as_deref()
+                .is_some_and(|id| !group_ids.contains(id))
+        })
+        .map(|workspace| workspace.name.clone())
+        .collect();
+    if !group_conflicts.is_empty() {
+        return Err(group_conflicts);
+    }
+
     // Selection and window chrome are view preferences, not workspace contents.
     let selected = if selected_id(local) != selected_id(previous_local) {
         selected_id(local)
@@ -377,7 +395,7 @@ fn merge_session(
         },
         // Members name their group per workspace, so membership merges with
         // workspaces; group metadata merges per group.
-        groups: merge_groups(previous_local, local, disk),
+        groups,
         ..AppSessionState::default()
     };
     normalize_pane_ids(&mut result, disk);

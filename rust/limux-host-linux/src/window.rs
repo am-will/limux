@@ -1259,23 +1259,6 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
         for workspace in &loaded.state.workspaces {
             add_workspace_from_state(state, workspace);
         }
-        // Restoring groups can repair the order, so track the active one by id.
-        let active_id = state
-            .borrow()
-            .workspaces
-            .get(loaded.state.active_workspace_index)
-            .map(|workspace| workspace.id.clone());
-        sidebar_groups::restore_groups(state, &loaded.state);
-        let active_index = active_id
-            .and_then(|id| {
-                state
-                    .borrow()
-                    .workspaces
-                    .iter()
-                    .position(|workspace| workspace.id == id)
-            })
-            .unwrap_or(loaded.state.active_workspace_index);
-        restore_active_workspace(state, active_index);
     } else {
         let workspace = initial_workspace_state(
             dirs::home_dir().as_deref(),
@@ -1283,6 +1266,24 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
         );
         add_workspace_from_state(state, &workspace);
     }
+    // Empty groups survive even when startup has to create a fallback workspace.
+    // Restoring them can repair the order, so track the active workspace by id.
+    let active_id = state
+        .borrow()
+        .workspaces
+        .get(loaded.state.active_workspace_index)
+        .map(|workspace| workspace.id.clone());
+    sidebar_groups::restore_groups(state, &loaded.state);
+    let active_index = active_id
+        .and_then(|id| {
+            state
+                .borrow()
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+        })
+        .unwrap_or(loaded.state.active_workspace_index);
+    restore_active_workspace(state, active_index);
     apply_sidebar_state_immediately(state, &loaded.state.sidebar);
 
     let mut restored = snapshot_session_state(state);
@@ -9390,3 +9391,7 @@ mod pane_close_tests;
 #[cfg(test)]
 #[path = "session_save_tests.rs"]
 mod session_save_tests;
+
+#[cfg(test)]
+#[path = "sidebar_group_tests.rs"]
+mod sidebar_group_tests;
