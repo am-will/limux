@@ -238,13 +238,18 @@ Common commands:
   set-workspace-group [--workspace <id|ref>] <group id|ref|name|none>
   rename-window [--workspace <id|ref>] <title>
   gui-hooks list
-  gui-hooks set <on-workspace-create|on-workspace-delete> [--command <text>] [--enable|--disable]
+  gui-hooks set <event> [--command <text>] [--enable|--disable]
       [--show-terminal|--no-show-terminal] [--suppress-default|--no-suppress-default]
-      Runs <text> in bash when that action is done in the GUI (not over the socket).
-      --suppress-default leaves the create/delete itself to the hook.
+      <event>: on-workspace-create, after-workspace-create, on-workspace-delete
+      or after-workspace-delete. Runs <text> in bash when that action is done in
+      the GUI (not over the socket): an on-* hook before Limux does it, an
+      after-* hook once it is done.
+      --suppress-default (on-* hooks only) leaves the create/delete to the hook;
+      the matching after-* hook then does not run, since requests made through
+      the CLI or socket never run hooks.
       --disable keeps the hook's settings but stops it from running.
-  gui-hooks enable|disable <on-workspace-create|on-workspace-delete>
-  gui-hooks clear <on-workspace-create|on-workspace-delete>
+  gui-hooks enable|disable <event>
+  gui-hooks clear <event>
   rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>
   read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]
   capture-pane (alias of read-screen)
@@ -2794,7 +2799,7 @@ fn build_group_request(
 
 /// The socket method and params of a `gui-hooks` subcommand.
 fn build_gui_hooks_request(args: &[String]) -> Result<(&'static str, Value)> {
-    const USAGE: &str = "gui-hooks list | set <on-workspace-create|on-workspace-delete> [--command <text>] [--enable|--disable] [--show-terminal|--no-show-terminal] [--suppress-default|--no-suppress-default] | enable <event> | disable <event> | clear <event>";
+    const USAGE: &str = "gui-hooks list | set <event> [--command <text>] [--enable|--disable] [--show-terminal|--no-show-terminal] [--suppress-default|--no-suppress-default] | enable <event> | disable <event> | clear <event>, where <event> is on-workspace-create, after-workspace-create, on-workspace-delete or after-workspace-delete";
     let (subcommand, rest) = args
         .split_first()
         .ok_or_else(|| anyhow!("usage: limux {USAGE}"))?;
@@ -2802,7 +2807,7 @@ fn build_gui_hooks_request(args: &[String]) -> Result<(&'static str, Value)> {
         rest.first()
             .filter(|event| !event.starts_with('-'))
             .cloned()
-            .ok_or_else(|| anyhow!("gui-hooks {subcommand} requires an event: on-workspace-create or on-workspace-delete"))
+            .ok_or_else(|| anyhow!("gui-hooks {subcommand} requires an event: on-workspace-create, after-workspace-create, on-workspace-delete or after-workspace-delete"))
     };
     let toggle = |on: &str, off: &str| -> Result<Option<bool>> {
         match (parse_flag(rest, on), parse_flag(rest, off)) {
@@ -4995,6 +5000,26 @@ mod new_pane_tests {
                 json!({ "event": "on-workspace-delete", "enabled": false }),
             ),
             (
+                vec![
+                    "set",
+                    "after-workspace-create",
+                    "--command",
+                    "notify-send created",
+                    "--show-terminal",
+                ],
+                "gui_hook.set",
+                json!({
+                    "event": "after-workspace-create",
+                    "command": "notify-send created",
+                    "show_terminal": true,
+                }),
+            ),
+            (
+                vec!["disable", "after-workspace-delete"],
+                "gui_hook.set",
+                json!({ "event": "after-workspace-delete", "enabled": false }),
+            ),
+            (
                 vec!["disable", "on-workspace-create"],
                 "gui_hook.set",
                 json!({ "event": "on-workspace-create", "enabled": false }),
@@ -5055,11 +5080,14 @@ mod new_pane_tests {
     fn gui_hooks_render_one_line_per_hook() {
         let payload = json!({ "hooks": [
             { "event": "on-workspace-create", "configured": true, "command": "new.sh -y", "show_terminal": true, "suppress_default": true },
+            { "event": "after-workspace-create", "configured": true, "enabled": true, "command": "notify-send created", "show_terminal": false, "suppress_default": false },
             { "event": "on-workspace-delete", "configured": false, "command": "", "show_terminal": false, "suppress_default": false },
         ]});
         assert_eq!(
             render_gui_hooks(&payload),
-            "on-workspace-create: new.sh -y (in a terminal, default action skipped)\non-workspace-delete: not set"
+            "on-workspace-create: new.sh -y (in a terminal, default action skipped)\n\
+             after-workspace-create: notify-send created (in the background)\n\
+             on-workspace-delete: not set"
         );
         let disabled = json!({ "event": "on-workspace-delete", "configured": true, "enabled": false, "command": "rm.sh", "show_terminal": false, "suppress_default": false });
         assert_eq!(

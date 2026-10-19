@@ -816,6 +816,12 @@ fn parse_gui_hook_request(
         show_terminal: flag("show_terminal")?,
         suppress_default: flag("suppress_default")?,
     };
+    if update.suppress_default.is_some() && !event.can_skip_default() {
+        return Err(BridgeError::invalid_params(format!(
+            "the {} hook runs after Limux's action, so it cannot skip it",
+            event.as_str()
+        )));
+    }
     if update == GuiHookUpdate::default() {
         return Err(BridgeError::invalid_params(format!(
             "{method} requires enabled, command, show_terminal or suppress_default"
@@ -2408,7 +2414,7 @@ mod tests {
                 json!({"event": "on-workspace-create", "command": "new.sh --force", "show_terminal": true}),
             ),
             GuiHookRequest::Set {
-                event: GuiHookEvent::WorkspaceCreate,
+                event: GuiHookEvent::OnWorkspaceCreate,
                 update: GuiHookUpdate {
                     command: Some("new.sh --force".to_string()),
                     show_terminal: Some(true),
@@ -2422,7 +2428,7 @@ mod tests {
                 json!({"hook": "on_workspace_delete", "enabled": false, "suppress_default": false}),
             ),
             GuiHookRequest::Set {
-                event: GuiHookEvent::WorkspaceDelete,
+                event: GuiHookEvent::OnWorkspaceDelete,
                 update: GuiHookUpdate {
                     enabled: Some(false),
                     suppress_default: Some(false),
@@ -2431,9 +2437,23 @@ mod tests {
             }
         );
         assert_eq!(
+            dispatched_gui_hook_request(
+                "gui_hook.set",
+                json!({"event": "after-workspace-delete", "command": "cleanup.sh", "show_terminal": true}),
+            ),
+            GuiHookRequest::Set {
+                event: GuiHookEvent::AfterWorkspaceDelete,
+                update: GuiHookUpdate {
+                    command: Some("cleanup.sh".to_string()),
+                    show_terminal: Some(true),
+                    ..Default::default()
+                },
+            }
+        );
+        assert_eq!(
             dispatched_gui_hook_request("gui_hook.clear", json!({"event": "on-workspace-delete"})),
             GuiHookRequest::Clear {
-                event: GuiHookEvent::WorkspaceDelete,
+                event: GuiHookEvent::OnWorkspaceDelete,
             }
         );
     }
@@ -2458,6 +2478,10 @@ mod tests {
             (
                 "gui_hook.set",
                 json!({"event": "on-workspace-create", "enabled": 0}),
+            ),
+            (
+                "gui_hook.set",
+                json!({"event": "after-workspace-create", "suppress_default": false}),
             ),
             ("gui_hook.clear", json!({})),
         ] {

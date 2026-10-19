@@ -400,6 +400,8 @@ for regression in \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
   split_tree::tests::restoring_split_respects_nested_pane_minimums \
   settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
+  settings_editor::tests::hook_rows_show_socket_changes_without_saving_them_again \
+  settings_editor::tests::hooks_is_the_second_settings_tab \
   window::tests::hidden_workspace_path_does_not_reserve_sidebar_row_height \
   terminal::tests::submenu_popovers_never_grab \
   terminal::tests::clipboard_toast_never_retains_its_terminal \
@@ -414,6 +416,7 @@ for regression in \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
   window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \
   window::eager_restore_tests::eager_restore_follows_moved_tabs_and_skips_closed_tabs_after_reordering \
+  window::gui_hook_tests::gui_actions_run_their_hooks_and_socket_requests_do_not \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
@@ -932,7 +935,38 @@ jq -e --arg empty "$EMPTY_GROUP_ID" --arg a "$WORKSPACE_ID" \
 # Keep the second group, collapsed, for the restart check in stage 8.
 "$LIMUX_CLI" collapse-group --group "$EMPTY_GROUP_ID"
 echo "stage 6d: OK (workspace groups)"
+# GUI hooks: the CLI stores them in settings.json, and socket requests never
+# run them, so closing a workspace below must leave no marker.
+HOOK_MARKER="$LOG_DIR/stage6e-hook-ran"
+"$LIMUX_CLI" gui-hooks set on-workspace-delete --command "touch '$HOOK_MARKER'" --suppress-default
+"$LIMUX_CLI" gui-hooks set after-workspace-delete --command "touch '$HOOK_MARKER'" --show-terminal
+"$LIMUX_CLI" gui-hooks disable on-workspace-create
+if "$LIMUX_CLI" gui-hooks set after-workspace-create --command true --suppress-default \
+  >"$LOG_DIR/stage6e-after-suppress.txt" 2>&1; then
+  echo "FAIL: an after-* hook accepted --suppress-default"
+  exit 1
+fi
+"$LIMUX_CLI" --json gui-hooks list >"$LOG_DIR/stage6e-list.json"
+jq -e '(.hooks | map(.event)) == ["on-workspace-create", "after-workspace-create", "on-workspace-delete", "after-workspace-delete"]
+    and (.hooks | any(.event == "on-workspace-delete" and .configured and .enabled and .suppress_default))
+    and (.hooks | any(.event == "after-workspace-delete" and .configured and .show_terminal and (.can_skip_default | not)))
+    and (.hooks | any(.event == "after-workspace-create" and (.configured | not)))
+    and (.hooks | any(.event == "on-workspace-create" and (.configured | not) and (.enabled | not)))' \
+  "$LOG_DIR/stage6e-list.json" >/dev/null \
+  || { echo "FAIL: gui-hooks list did not report the hooks just set"; exit 1; }
+jq -e '.hooks.on_workspace_delete.suppress_default == true and .hooks.on_workspace_create.enabled == false
+    and .hooks.after_workspace_delete.show_terminal == true and (.hooks | has("after_workspace_create") | not)' \
+  "$XDG_CONFIG_HOME/limux/settings.json" >/dev/null \
+  || { echo "FAIL: gui-hooks were not saved to settings.json"; exit 1; }
 "$LIMUX_CLI" close-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6c-other-close.txt"
+sleep 0.5
+[ ! -e "$HOOK_MARKER" ] || { echo "FAIL: a socket close-workspace ran the GUI delete hook"; exit 1; }
+"$LIMUX_CLI" gui-hooks clear on-workspace-delete
+"$LIMUX_CLI" gui-hooks clear after-workspace-delete
+"$LIMUX_CLI" gui-hooks clear on-workspace-create
+jq -e 'has("hooks") | not' "$XDG_CONFIG_HOME/limux/settings.json" >/dev/null \
+  || { echo "FAIL: clearing every gui-hook left a hooks key"; exit 1; }
+echo "stage 6e: OK (on-* and after-* gui-hooks set, list and clear; socket requests run no hook)"
 wait_for_healthy_surfaces limux "$LOG_DIR/stage6c-final-health.json"
 echo "stage 6c: OK (scoped lifecycle, background focus, pins, and saved tab selection)"
 

@@ -506,19 +506,20 @@ fn add_workspace_to_group(state: &State, group_id: &str) {
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/"));
     let folder_path = folder.to_string_lossy().to_string();
-    let context = GuiHookContext {
-        folder: Some(folder_path.clone()),
-        group_id: Some(group_id.to_string()),
-        ..GuiHookContext::default()
-    };
-    if !super::gui_hooks::run_gui_hook(state, GuiHookEvent::WorkspaceCreate, &context) {
-        return;
-    }
     let name = folder
         .file_name()
         .map(|segment| segment.to_string_lossy().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| folder_path.clone());
+    let context = GuiHookContext {
+        workspace_name: Some(name.clone()),
+        folder: Some(folder_path.clone()),
+        group_id: Some(group_id.to_string()),
+        ..GuiHookContext::default()
+    };
+    if !super::gui_hooks::run_gui_hook(state, GuiHookEvent::OnWorkspaceCreate, &context) {
+        return;
+    }
     create_workspace_with_folder(state, &name, &folder_path);
     let new_id = state
         .borrow()
@@ -526,6 +527,7 @@ fn add_workspace_to_group(state: &State, group_id: &str) {
         .map(|workspace| workspace.id.clone());
     if let Some(new_id) = new_id {
         let _ = set_workspace_group(state, &new_id, Some(group_id));
+        super::gui_hooks::notify_workspace_created(state, context);
     }
 }
 

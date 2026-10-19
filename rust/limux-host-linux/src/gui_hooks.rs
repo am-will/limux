@@ -1,39 +1,59 @@
 //! GUI hooks: user commands that Limux runs when a workspace is created or
-//! deleted from the GUI. Socket requests never fire a hook, so a hook can
-//! create or close workspaces itself through the `limux` CLI.
+//! deleted from the GUI, either before Limux's own action (`on-*`, which may
+//! replace it) or after it (`after-*`). Socket requests never fire a hook, so
+//! a hook can create or close workspaces itself through the `limux` CLI.
 
 use serde_json::{json, Map, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuiHookEvent {
-    WorkspaceCreate,
-    WorkspaceDelete,
+    OnWorkspaceCreate,
+    AfterWorkspaceCreate,
+    OnWorkspaceDelete,
+    AfterWorkspaceDelete,
 }
 
 impl GuiHookEvent {
-    pub const ALL: [Self; 2] = [Self::WorkspaceCreate, Self::WorkspaceDelete];
+    pub const ALL: [Self; 4] = [
+        Self::OnWorkspaceCreate,
+        Self::AfterWorkspaceCreate,
+        Self::OnWorkspaceDelete,
+        Self::AfterWorkspaceDelete,
+    ];
 
     /// The name used by the CLI, the socket and `LIMUX_HOOK`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::WorkspaceCreate => "on-workspace-create",
-            Self::WorkspaceDelete => "on-workspace-delete",
+            Self::OnWorkspaceCreate => "on-workspace-create",
+            Self::AfterWorkspaceCreate => "after-workspace-create",
+            Self::OnWorkspaceDelete => "on-workspace-delete",
+            Self::AfterWorkspaceDelete => "after-workspace-delete",
         }
     }
 
     /// The key under `hooks` in settings.json.
     pub fn config_key(self) -> &'static str {
         match self {
-            Self::WorkspaceCreate => "on_workspace_create",
-            Self::WorkspaceDelete => "on_workspace_delete",
+            Self::OnWorkspaceCreate => "on_workspace_create",
+            Self::AfterWorkspaceCreate => "after_workspace_create",
+            Self::OnWorkspaceDelete => "on_workspace_delete",
+            Self::AfterWorkspaceDelete => "after_workspace_delete",
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::WorkspaceCreate => "On workspace create",
-            Self::WorkspaceDelete => "On workspace delete",
+            Self::OnWorkspaceCreate => "On workspace create",
+            Self::AfterWorkspaceCreate => "After workspace create",
+            Self::OnWorkspaceDelete => "On workspace delete",
+            Self::AfterWorkspaceDelete => "After workspace delete",
         }
+    }
+
+    /// Whether the hook runs before Limux's own action and so can replace it.
+    /// An `after-*` hook runs once the action is done.
+    pub fn can_skip_default(self) -> bool {
+        matches!(self, Self::OnWorkspaceCreate | Self::OnWorkspaceDelete)
     }
 
     /// Accepts the CLI name or the settings key.
@@ -102,21 +122,27 @@ impl GuiHook {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GuiHooksConfig {
     pub on_workspace_create: GuiHook,
+    pub after_workspace_create: GuiHook,
     pub on_workspace_delete: GuiHook,
+    pub after_workspace_delete: GuiHook,
 }
 
 impl GuiHooksConfig {
     pub fn get(&self, event: GuiHookEvent) -> &GuiHook {
         match event {
-            GuiHookEvent::WorkspaceCreate => &self.on_workspace_create,
-            GuiHookEvent::WorkspaceDelete => &self.on_workspace_delete,
+            GuiHookEvent::OnWorkspaceCreate => &self.on_workspace_create,
+            GuiHookEvent::AfterWorkspaceCreate => &self.after_workspace_create,
+            GuiHookEvent::OnWorkspaceDelete => &self.on_workspace_delete,
+            GuiHookEvent::AfterWorkspaceDelete => &self.after_workspace_delete,
         }
     }
 
     pub fn get_mut(&mut self, event: GuiHookEvent) -> &mut GuiHook {
         match event {
-            GuiHookEvent::WorkspaceCreate => &mut self.on_workspace_create,
-            GuiHookEvent::WorkspaceDelete => &mut self.on_workspace_delete,
+            GuiHookEvent::OnWorkspaceCreate => &mut self.on_workspace_create,
+            GuiHookEvent::AfterWorkspaceCreate => &mut self.after_workspace_create,
+            GuiHookEvent::OnWorkspaceDelete => &mut self.on_workspace_delete,
+            GuiHookEvent::AfterWorkspaceDelete => &mut self.after_workspace_delete,
         }
     }
 
@@ -129,7 +155,10 @@ impl GuiHooksConfig {
         let mut config = Self::default();
         if let Some(hooks) = value.and_then(Value::as_object) {
             for event in GuiHookEvent::ALL {
-                if let Some(hook) = hooks.get(event.config_key()).and_then(GuiHook::from_value) {
+                if let Some(mut hook) = hooks.get(event.config_key()).and_then(GuiHook::from_value)
+                {
+                    // An after-* hook has no default action left to skip.
+                    hook.suppress_default &= event.can_skip_default();
                     *config.get_mut(event) = hook;
                 }
             }
@@ -157,6 +186,7 @@ impl GuiHooksConfig {
             "command": hook.command,
             "show_terminal": hook.show_terminal,
             "suppress_default": hook.suppress_default,
+            "can_skip_default": event.can_skip_default(),
         })
     }
 }
@@ -194,6 +224,8 @@ pub struct GuiHookContext {
     pub workspace_name: Option<String>,
     pub folder: Option<String>,
     pub group_id: Option<String>,
+    /// The command a new workspace starts with, e.g. an SSH connection.
+    pub command: Option<String>,
 }
 
 /// Variables the hook must not inherit from the host's own environment:
@@ -205,19 +237,21 @@ pub const INHERITED_IDENTITY_VARS: &[&str] = &[
     "LIMUX_TAB_ID",
 ];
 
+/// `default_action_runs` is false only when the hook replaces Limux's own
+/// action; a notify-only hook is always told the action runs.
 pub fn hook_environment(
     event: GuiHookEvent,
-    hook: &GuiHook,
+    default_action_runs: bool,
     context: &GuiHookContext,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("LIMUX_HOOK".to_string(), event.as_str().to_string()),
         (
             "LIMUX_HOOK_DEFAULT_ACTION".to_string(),
-            if hook.suppress_default {
-                "suppressed"
-            } else {
+            if default_action_runs {
                 "run"
+            } else {
+                "suppressed"
             }
             .to_string(),
         ),
@@ -227,6 +261,7 @@ pub fn hook_environment(
         ("LIMUX_WORKSPACE_NAME", &context.workspace_name),
         ("LIMUX_WORKSPACE_FOLDER", &context.folder),
         ("LIMUX_GROUP_ID", &context.group_id),
+        ("LIMUX_WORKSPACE_COMMAND", &context.command),
     ];
     for (name, value) in fields {
         if let Some(value) = value {
@@ -279,23 +314,56 @@ mod tests {
             assert_eq!(GuiHookEvent::parse(event.config_key()), Some(event));
         }
         assert_eq!(GuiHookEvent::parse("on-tab-create"), None);
+        assert_eq!(
+            GuiHookEvent::parse("after-workspace-create"),
+            Some(GuiHookEvent::AfterWorkspaceCreate)
+        );
+        assert_eq!(
+            GuiHookEvent::parse("after_workspace_delete"),
+            Some(GuiHookEvent::AfterWorkspaceDelete)
+        );
+    }
+
+    #[test]
+    fn only_on_hooks_can_skip_the_default_action() {
+        let skippable: Vec<&str> = GuiHookEvent::ALL
+            .into_iter()
+            .filter(|event| event.can_skip_default())
+            .map(GuiHookEvent::as_str)
+            .collect();
+        assert_eq!(skippable, ["on-workspace-create", "on-workspace-delete"]);
+        // A hand-edited settings.json cannot make an after-* hook skip anything.
+        let config = GuiHooksConfig::from_value(Some(&json!({
+            "after_workspace_create": {"command": "done.sh", "suppress_default": true},
+            "after_workspace_delete": {"command": "gone.sh", "show_terminal": true},
+        })));
+        assert_eq!(config.after_workspace_create, hook("done.sh", false, false));
+        assert_eq!(config.after_workspace_delete, hook("gone.sh", true, false));
+        assert_eq!(
+            config.describe(GuiHookEvent::AfterWorkspaceCreate)["can_skip_default"],
+            json!(false)
+        );
     }
 
     #[test]
     fn hooks_round_trip_through_settings_json() {
         let config = GuiHooksConfig {
             on_workspace_create: hook("~/bin/new.sh --force", true, false),
+            after_workspace_create: hook("notify-send created", false, false),
             on_workspace_delete: GuiHook {
                 enabled: false,
                 ..hook("rm-ws -y", false, true)
             },
+            after_workspace_delete: hook("cleanup.sh", true, false),
         };
         let value = config.to_value().expect("hooks are saved");
         assert_eq!(
             value,
             json!({
                 "on_workspace_create": {"enabled": true, "command": "~/bin/new.sh --force", "show_terminal": true, "suppress_default": false},
+                "after_workspace_create": {"enabled": true, "command": "notify-send created", "show_terminal": false, "suppress_default": false},
                 "on_workspace_delete": {"enabled": false, "command": "rm-ws -y", "show_terminal": false, "suppress_default": true},
+                "after_workspace_delete": {"enabled": true, "command": "cleanup.sh", "show_terminal": true, "suppress_default": false},
             })
         );
         assert_eq!(GuiHooksConfig::from_value(Some(&value)), config);
@@ -309,7 +377,7 @@ mod tests {
             "on_workspace_delete": "echo",
         })));
         assert_eq!(config, GuiHooksConfig::default());
-        assert_eq!(config.active(GuiHookEvent::WorkspaceCreate), None);
+        assert_eq!(config.active(GuiHookEvent::OnWorkspaceCreate), None);
     }
 
     #[test]
@@ -318,7 +386,7 @@ mod tests {
             "on_workspace_create": {"command": "new.sh", "show_terminal": true},
         })));
         assert_eq!(config.on_workspace_create, hook("new.sh", true, false));
-        assert!(config.active(GuiHookEvent::WorkspaceCreate).is_some());
+        assert!(config.active(GuiHookEvent::OnWorkspaceCreate).is_some());
     }
 
     #[test]
@@ -331,10 +399,10 @@ mod tests {
             enabled: Some(false),
             ..Default::default()
         }
-        .apply(config.get_mut(GuiHookEvent::WorkspaceCreate));
-        assert_eq!(config.active(GuiHookEvent::WorkspaceCreate), None);
+        .apply(config.get_mut(GuiHookEvent::OnWorkspaceCreate));
+        assert_eq!(config.active(GuiHookEvent::OnWorkspaceCreate), None);
         assert_eq!(
-            config.describe(GuiHookEvent::WorkspaceCreate),
+            config.describe(GuiHookEvent::OnWorkspaceCreate),
             json!({
                 "event": "on-workspace-create",
                 "configured": true,
@@ -342,6 +410,7 @@ mod tests {
                 "command": "new.sh",
                 "show_terminal": true,
                 "suppress_default": true,
+                "can_skip_default": true,
             })
         );
         // A disabled hook is not a default one, so it is still saved.
@@ -355,7 +424,7 @@ mod tests {
             on_workspace_delete: hook("   ", true, true),
             ..Default::default()
         };
-        assert_eq!(config.active(GuiHookEvent::WorkspaceDelete), None);
+        assert_eq!(config.active(GuiHookEvent::OnWorkspaceDelete), None);
     }
 
     #[test]
@@ -379,13 +448,14 @@ mod tests {
     #[test]
     fn environment_describes_the_event() {
         let env = hook_environment(
-            GuiHookEvent::WorkspaceDelete,
-            &hook("x", false, true),
+            GuiHookEvent::OnWorkspaceDelete,
+            false,
             &GuiHookContext {
                 workspace_id: Some("ws-1".to_string()),
                 workspace_name: Some("api".to_string()),
                 folder: Some("/src/api".to_string()),
                 group_id: None,
+                command: None,
             },
         );
         let pairs: Vec<(&str, &str)> = env
@@ -400,6 +470,31 @@ mod tests {
                 ("LIMUX_WORKSPACE_ID", "ws-1"),
                 ("LIMUX_WORKSPACE_NAME", "api"),
                 ("LIMUX_WORKSPACE_FOLDER", "/src/api"),
+            ]
+        );
+
+        let env = hook_environment(
+            GuiHookEvent::OnWorkspaceCreate,
+            true,
+            &GuiHookContext {
+                workspace_name: Some("SSH: host".to_string()),
+                group_id: Some("g".to_string()),
+                command: Some("ssh host".to_string()),
+                ..Default::default()
+            },
+        );
+        let pairs: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("LIMUX_HOOK", "on-workspace-create"),
+                ("LIMUX_HOOK_DEFAULT_ACTION", "run"),
+                ("LIMUX_WORKSPACE_NAME", "SSH: host"),
+                ("LIMUX_GROUP_ID", "g"),
+                ("LIMUX_WORKSPACE_COMMAND", "ssh host"),
             ]
         );
     }

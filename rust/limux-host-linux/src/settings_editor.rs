@@ -9,7 +9,7 @@ use crate::app_config::{
     AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UnreadColor,
     WindowControlsSide, DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS, MIN_TAB_ACTIVITY_SECONDS,
 };
-use crate::gui_hooks::{GuiHook, GuiHookEvent};
+use crate::gui_hooks::{GuiHook, GuiHookEvent, GuiHooksConfig};
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
@@ -183,14 +183,14 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
     let general_stack_page = stack.add_titled(&general_page, Some("general"), "General");
     general_stack_page.set_icon_name(Some("preferences-system-symbolic"));
 
+    let hooks_page = build_hooks_page(&input);
+    let hooks_stack_page = stack.add_titled(&hooks_page, Some("hooks"), "Hooks");
+    hooks_stack_page.set_icon_name(Some("system-run-symbolic"));
+
     let notifications_page = build_notifications_page(&input);
     let notifications_stack_page =
         stack.add_titled(&notifications_page, Some("notifications"), "Notifications");
     notifications_stack_page.set_icon_name(Some("preferences-system-notifications-symbolic"));
-
-    let hooks_page = build_hooks_page(&input);
-    let hooks_stack_page = stack.add_titled(&hooks_page, Some("hooks"), "Hooks");
-    hooks_stack_page.set_icon_name(Some("system-run-symbolic"));
 
     let keybinds_page = keybind_editor::build_keybind_editor(&input.shortcuts, input.on_capture);
     let keybinds_stack_page = stack.add_titled(&keybinds_page, Some("keybindings"), "Keybindings");
@@ -243,9 +243,15 @@ fn build_gui_hooks_group(input: &SettingsEditorInput) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("GUI hooks");
     group.set_description(Some(
-        "Run a command when you create or delete a workspace from the GUI. \
-         The command runs in bash and gets LIMUX_HOOK, LIMUX_SOCKET and, for a \
-         delete, LIMUX_WORKSPACE_ID, LIMUX_WORKSPACE_NAME and LIMUX_WORKSPACE_FOLDER.",
+        "Run a command when you create or delete a workspace from the GUI: \
+         an \"On\" hook runs before Limux does it and can take it over, an \
+         \"After\" hook runs once Limux has done it. A hook that takes the \
+         action over does its own follow-up: requests made through the limux \
+         CLI or socket never run hooks. The command runs in bash with \
+         LIMUX_HOOK, LIMUX_SOCKET, LIMUX_WORKSPACE_NAME and, when known, \
+         LIMUX_WORKSPACE_ID, LIMUX_WORKSPACE_FOLDER, LIMUX_GROUP_ID and \
+         LIMUX_WORKSPACE_COMMAND. Closing a workspace's last tab also runs the \
+         delete hooks, but cannot be skipped.",
     ));
     for event in GuiHookEvent::ALL {
         group.add(&build_gui_hook_row(input, event));
@@ -261,27 +267,105 @@ fn gui_hook_subtitle(hook: &GuiHook) -> String {
     }
 }
 
+/// The widgets of one hook row, so a change made over the socket can be
+/// shown in an open Settings window.
+struct GuiHookRowWidgets {
+    event: GuiHookEvent,
+    expander: gtk::glib::WeakRef<adw::ExpanderRow>,
+    enabled: gtk::glib::WeakRef<gtk::Switch>,
+    command: gtk::glib::WeakRef<gtk::Entry>,
+    show_terminal: gtk::glib::WeakRef<gtk::Switch>,
+    /// `None` for an after-* hook, which cannot skip Limux's action.
+    suppress_default: Option<gtk::glib::WeakRef<gtk::Switch>>,
+}
+
+impl GuiHookRowWidgets {
+    fn show(&self, hook: &GuiHook) -> Option<()> {
+        self.expander
+            .upgrade()?
+            .set_subtitle(&gui_hook_subtitle(hook));
+        self.enabled.upgrade()?.set_active(hook.enabled);
+        let command = self.command.upgrade()?;
+        // Rewriting equal text would move the cursor while the user types.
+        if command.text().trim() != hook.command {
+            command.set_text(&hook.command);
+        }
+        self.show_terminal.upgrade()?.set_active(hook.show_terminal);
+        if let Some(suppress_default) = &self.suppress_default {
+            suppress_default
+                .upgrade()?
+                .set_active(hook.suppress_default);
+        }
+        Some(())
+    }
+}
+
+thread_local! {
+    static GUI_HOOK_ROWS: RefCell<Vec<GuiHookRowWidgets>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Show `hooks` in any open Settings window. The row handlers see that the
+/// config already holds these values, so nothing is saved again.
+pub fn refresh_gui_hook_rows(hooks: &GuiHooksConfig) {
+    GUI_HOOK_ROWS.with(|rows| {
+        let mut rows = rows.borrow_mut();
+        rows.retain(|row| row.expander.upgrade().is_some());
+        for row in rows.iter() {
+            row.show(hooks.get(row.event));
+        }
+    });
+}
+
+fn hook_switch_row(title: &str, subtitle: &str, active: bool) -> (adw::ActionRow, gtk::Switch) {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .build();
+    // Wrap the whole explanation rather than cut it off.
+    row.set_subtitle_lines(0);
+    let switch = gtk::Switch::new();
+    switch.set_active(active);
+    switch.set_valign(gtk::Align::Center);
+    row.add_suffix(&switch);
+    row.set_activatable_widget(Some(&switch));
+    (row, switch)
+}
+
+/// Save a change to `event`'s hook, unless the hook already has it.
+fn connect_gui_hook_field<T: PartialEq + 'static>(
+    input: &SettingsEditorInput,
+    event: GuiHookEvent,
+    expander: &adw::ExpanderRow,
+    field: fn(&mut GuiHook) -> &mut T,
+) -> impl Fn(T) + 'static {
+    let config = input.config.clone();
+    let on_changed = input.on_config_changed.clone();
+    let expander = expander.downgrade();
+    move |value: T| {
+        if *field(config.borrow_mut().hooks.get_mut(event)) == value {
+            return;
+        }
+        let effective = apply_config_change(&config, &*on_changed, move |c| {
+            *field(c.hooks.get_mut(event)) = value;
+        });
+        if let Some(expander) = expander.upgrade() {
+            expander.set_subtitle(&gui_hook_subtitle(effective.hooks.get(event)));
+        }
+    }
+}
+
 fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::ExpanderRow {
     let hook = input.config.borrow().hooks.get(event).clone();
     let expander = adw::ExpanderRow::builder()
         .title(event.title())
         .subtitle(gui_hook_subtitle(&hook))
         .build();
-    let refresh_subtitle = {
-        let config = input.config.clone();
-        let expander = expander.clone();
-        move || expander.set_subtitle(&gui_hook_subtitle(config.borrow().hooks.get(event)))
-    };
 
-    let enabled_row = adw::ActionRow::builder()
-        .title("Enabled")
-        .subtitle("Turn the hook off without losing its command")
-        .build();
-    let enabled_switch = gtk::Switch::new();
-    enabled_switch.set_active(hook.enabled);
-    enabled_switch.set_valign(gtk::Align::Center);
-    enabled_row.add_suffix(&enabled_switch);
-    enabled_row.set_activatable_widget(Some(&enabled_switch));
+    let (enabled_row, enabled_switch) = hook_switch_row(
+        "Enabled",
+        "Turn the hook off without losing its command",
+        hook.enabled,
+    );
     expander.add_row(&enabled_row);
 
     let command_row = adw::ActionRow::builder().title("Command").build();
@@ -294,74 +378,48 @@ fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::
     command_row.add_suffix(&command_entry);
     expander.add_row(&command_row);
 
-    let terminal_row = adw::ActionRow::builder()
-        .title("Show in a terminal")
-        .subtitle("Run the command in a pop-up terminal you can type into")
-        .build();
-    terminal_row.set_subtitle_lines(2);
-    let terminal_switch = gtk::Switch::new();
-    terminal_switch.set_active(hook.show_terminal);
-    terminal_switch.set_valign(gtk::Align::Center);
-    terminal_row.add_suffix(&terminal_switch);
-    terminal_row.set_activatable_widget(Some(&terminal_switch));
+    let (terminal_row, terminal_switch) = hook_switch_row(
+        "Show in a terminal",
+        "Run the command in a pop-up terminal you can type into",
+        hook.show_terminal,
+    );
     expander.add_row(&terminal_row);
 
-    let suppress_row = adw::ActionRow::builder()
-        .title("Skip the default action")
-        .subtitle("Let the command create or delete the workspace itself, e.g. with the limux CLI")
-        .build();
-    suppress_row.set_subtitle_lines(2);
-    let suppress_switch = gtk::Switch::new();
-    suppress_switch.set_active(hook.suppress_default);
-    suppress_switch.set_valign(gtk::Align::Center);
-    suppress_row.add_suffix(&suppress_switch);
-    suppress_row.set_activatable_widget(Some(&suppress_switch));
-    expander.add_row(&suppress_row);
+    let suppress_switch = event.can_skip_default().then(|| {
+        let (suppress_row, suppress_switch) = hook_switch_row(
+            "Skip the default action",
+            "Let the command create or delete the workspace itself, e.g. with the limux CLI. \
+             The matching After hook does not run then.",
+            hook.suppress_default,
+        );
+        expander.add_row(&suppress_row);
+        suppress_switch
+    });
 
-    {
-        let config = input.config.clone();
-        let on_changed = input.on_config_changed.clone();
-        let refresh_subtitle = refresh_subtitle.clone();
-        enabled_switch.connect_active_notify(move |switch| {
-            let enabled = switch.is_active();
-            apply_config_change(&config, &*on_changed, move |c| {
-                c.hooks.get_mut(event).enabled = enabled;
-            });
-            refresh_subtitle();
-        });
-    }
-    {
-        let config = input.config.clone();
-        let on_changed = input.on_config_changed.clone();
-        command_entry.connect_changed(move |entry| {
-            let command = entry.text().trim().to_string();
-            apply_config_change(&config, &*on_changed, move |c| {
-                c.hooks.get_mut(event).command = command;
-            });
-            refresh_subtitle();
-        });
-    }
-    {
-        let config = input.config.clone();
-        let on_changed = input.on_config_changed.clone();
-        terminal_switch.connect_active_notify(move |switch| {
-            let show_terminal = switch.is_active();
-            apply_config_change(&config, &*on_changed, move |c| {
-                c.hooks.get_mut(event).show_terminal = show_terminal;
-            });
-        });
-    }
-    {
-        let config = input.config.clone();
-        let on_changed = input.on_config_changed.clone();
-        suppress_switch.connect_active_notify(move |switch| {
-            let suppress_default = switch.is_active();
-            apply_config_change(&config, &*on_changed, move |c| {
-                c.hooks.get_mut(event).suppress_default = suppress_default;
-            });
-        });
+    let set_enabled = connect_gui_hook_field(input, event, &expander, |hook| &mut hook.enabled);
+    enabled_switch.connect_active_notify(move |switch| set_enabled(switch.is_active()));
+    let set_command = connect_gui_hook_field(input, event, &expander, |hook| &mut hook.command);
+    command_entry.connect_changed(move |entry| set_command(entry.text().trim().to_string()));
+    let set_show_terminal =
+        connect_gui_hook_field(input, event, &expander, |hook| &mut hook.show_terminal);
+    terminal_switch.connect_active_notify(move |switch| set_show_terminal(switch.is_active()));
+    if let Some(suppress_switch) = &suppress_switch {
+        let set_suppress_default =
+            connect_gui_hook_field(input, event, &expander, |hook| &mut hook.suppress_default);
+        suppress_switch
+            .connect_active_notify(move |switch| set_suppress_default(switch.is_active()));
     }
 
+    GUI_HOOK_ROWS.with(|rows| {
+        rows.borrow_mut().push(GuiHookRowWidgets {
+            event,
+            expander: expander.downgrade(),
+            enabled: enabled_switch.downgrade(),
+            command: command_entry.downgrade(),
+            show_terminal: terminal_switch.downgrade(),
+            suppress_default: suppress_switch.as_ref().map(|switch| switch.downgrade()),
+        });
+    });
     expander
 }
 
@@ -1031,25 +1089,45 @@ mod tests {
     use super::*;
     use crate::app_config::DEFAULT_TAB_ACTIVITY_SECONDS;
 
+    fn find_row(widget: &gtk::Widget, title: &str) -> Option<adw::ActionRow> {
+        if let Some(row) = widget.downcast_ref::<adw::ActionRow>() {
+            if row.title() == title {
+                return Some(row.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(row) = find_row(&widget, title) {
+                return Some(row);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    fn find_control(widget: &gtk::Widget, title: &str) -> Option<gtk::Widget> {
+        find_row(widget, title)?.activatable_widget()
+    }
+
+    fn find_descendant<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Option<T> {
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(found) = widget
+                .clone()
+                .downcast::<T>()
+                .ok()
+                .or_else(|| find_descendant(&widget))
+            {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
     #[test]
     #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
     fn interface_controls_restore_effective_values_after_save_failure() {
-        fn find_control(widget: &gtk::Widget, title: &str) -> Option<gtk::Widget> {
-            if let Some(row) = widget.downcast_ref::<adw::ActionRow>() {
-                if row.title() == title {
-                    return row.activatable_widget();
-                }
-            }
-            let mut child = widget.first_child();
-            while let Some(widget) = child {
-                if let Some(control) = find_control(&widget, title) {
-                    return Some(control);
-                }
-                child = widget.next_sibling();
-            }
-            None
-        }
-
         adw::init().expect("initialize GTK");
         let config = Rc::new(RefCell::new(AppConfig::default()));
         let rejected_changes = Rc::new(Cell::new(0));
@@ -1126,6 +1204,109 @@ mod tests {
         assert!(!tab_activity_switch.is_active());
         assert!(!timeout_spin.is_sensitive());
         assert!(!config.borrow().interface.show_tab_activity);
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn hook_rows_show_socket_changes_without_saving_them_again() {
+        fn find_expander(widget: &gtk::Widget, title: &str) -> Option<adw::ExpanderRow> {
+            if let Some(row) = widget.downcast_ref::<adw::ExpanderRow>() {
+                if row.title() == title {
+                    return Some(row.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(row) = find_expander(&widget, title) {
+                    return Some(row);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+
+        adw::init().expect("initialize GTK");
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let saves = Rc::new(Cell::new(0));
+        let page = build_hooks_page(&SettingsEditorInput {
+            config: config.clone(),
+            shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+            on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+            on_config_changed: Rc::new({
+                let saves = saves.clone();
+                move |_, _| saves.set(saves.get() + 1)
+            }),
+        });
+
+        for event in GuiHookEvent::ALL {
+            let row = find_expander(&page, event.title())
+                .unwrap_or_else(|| panic!("{} row", event.title()));
+            let row: &gtk::Widget = row.upcast_ref();
+            let switch = |title| {
+                find_control(row, title).and_then(|control| control.downcast::<gtk::Switch>().ok())
+            };
+            let enabled = switch("Enabled").expect("Enabled switch");
+            let terminal = switch("Show in a terminal").expect("terminal switch");
+            let suppress = switch("Skip the default action");
+            // An after-* hook runs once Limux's action is done: nothing to skip.
+            assert_eq!(suppress.is_some(), event.can_skip_default(), "{event:?}");
+            let command = find_row(row, "Command")
+                .and_then(|row| find_descendant::<gtk::Entry>(row.upcast_ref()))
+                .expect("command entry");
+
+            // What the socket handler does after saving a change.
+            let saves_before = saves.get();
+            let hooks = {
+                let mut config = config.borrow_mut();
+                let hook = config.hooks.get_mut(event);
+                hook.command = format!("{} --force", event.as_str());
+                hook.enabled = false;
+                hook.show_terminal = true;
+                hook.suppress_default = event.can_skip_default();
+                config.hooks.clone()
+            };
+            refresh_gui_hook_rows(&hooks);
+            assert_eq!(command.text(), format!("{} --force", event.as_str()));
+            assert!(!enabled.is_active());
+            assert!(terminal.is_active());
+            if let Some(suppress) = &suppress {
+                assert!(suppress.is_active());
+            }
+            assert_eq!(saves.get(), saves_before, "a refresh must not save again");
+            assert_eq!(config.borrow().hooks, hooks);
+
+            // The user's own changes still save, to this hook only.
+            enabled.set_active(true);
+            assert_eq!(saves.get(), saves_before + 1);
+            assert!(config.borrow().hooks.get(event).enabled);
+            let mut others = hooks.clone();
+            others.get_mut(event).enabled = true;
+            assert_eq!(config.borrow().hooks, others);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn hooks_is_the_second_settings_tab() {
+        adw::init().expect("initialize GTK");
+        let window = adw::Window::new();
+        let content = build_settings_window_content(
+            &window,
+            SettingsEditorInput {
+                config: Rc::new(RefCell::new(AppConfig::default())),
+                shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+                on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+                on_config_changed: Rc::new(|_, _| {}),
+            },
+        );
+        let stack = find_descendant::<adw::ViewStack>(&content).expect("settings stack");
+        let pages = stack.pages();
+        let names: Vec<String> = (0..pages.n_items())
+            .filter_map(|index| pages.item(index))
+            .filter_map(|page| page.downcast::<adw::ViewStackPage>().ok())
+            .filter_map(|page| page.name().map(|name| name.to_string()))
+            .collect();
+        assert_eq!(names, ["general", "hooks", "notifications", "keybindings"]);
     }
 
     #[test]

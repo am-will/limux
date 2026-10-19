@@ -2,6 +2,7 @@
 //! handler that reads and changes them. The hook model lives in
 //! `crate::gui_hooks`.
 
+use std::cell::Cell;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -15,19 +16,69 @@ use crate::gui_hooks::{
 };
 use crate::terminal::{TerminalCallbacks, TerminalOptions};
 
-/// Run the hook configured for `event`, if any. Returns whether Limux should
-/// still run its own action.
+thread_local! {
+    static SOCKET_COMMAND_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `f` as part of a socket request. Hooks never fire inside it, so a hook
+/// can drive Limux through the CLI, and agents never trigger user hooks.
+pub(super) fn handling_socket_command<R>(f: impl FnOnce() -> R) -> R {
+    struct Exit;
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            SOCKET_COMMAND_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    SOCKET_COMMAND_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _exit = Exit;
+    f()
+}
+
+fn active_hook(state: &State, event: GuiHookEvent) -> Option<GuiHook> {
+    if SOCKET_COMMAND_DEPTH.with(Cell::get) > 0 {
+        return None;
+    }
+    let s = state.borrow();
+    let hook = s.config.borrow().hooks.active(event).cloned();
+    hook
+}
+
+/// Run the hook configured for `event`, if any, before a user action. Returns
+/// whether Limux should still run its own action.
 pub(super) fn run_gui_hook(state: &State, event: GuiHookEvent, context: &GuiHookContext) -> bool {
-    let hook = {
-        let s = state.borrow();
-        let hook = s.config.borrow().hooks.active(event).cloned();
-        hook
-    };
-    let Some(hook) = hook else {
+    let Some(hook) = active_hook(state, event) else {
         return true;
     };
+    launch_hook(state, event, &hook, !hook.suppress_default, context);
+    !hook.suppress_default
+}
 
-    let mut env = hook_environment(event, &hook, context);
+/// Run the hook for an action that happens anyway, such as a workspace closing
+/// with its last tab. The hook cannot skip it, and is told so.
+pub(super) fn notify_gui_hook(state: &State, event: GuiHookEvent, context: &GuiHookContext) {
+    if let Some(hook) = active_hook(state, event) {
+        launch_hook(state, event, &hook, true, context);
+    }
+}
+
+/// Run the after-create hook for the workspace Limux just created, which is
+/// the active one.
+pub(super) fn notify_workspace_created(state: &State, mut context: GuiHookContext) {
+    context.workspace_id = state
+        .borrow()
+        .active_workspace()
+        .map(|workspace| workspace.id.clone());
+    notify_gui_hook(state, GuiHookEvent::AfterWorkspaceCreate, &context);
+}
+
+fn launch_hook(
+    state: &State,
+    event: GuiHookEvent,
+    hook: &GuiHook,
+    default_action_runs: bool,
+    context: &GuiHookContext,
+) {
+    let mut env = hook_environment(event, default_action_runs, context);
     env.extend(crate::terminal_child_environment_overrides());
     if let Some(socket) = limux_control::socket_path::resolve_socket_path(
         None,
@@ -51,11 +102,10 @@ pub(super) fn run_gui_hook(state: &State, event: GuiHookEvent, context: &GuiHook
         .unwrap_or_else(|| PathBuf::from("/"));
 
     if hook.show_terminal {
-        open_hook_terminal(state, event, &hook, env, &unset, &cwd);
+        open_hook_terminal(state, event, hook, env, &unset, &cwd);
     } else {
-        spawn_hook(state, event, &hook, env, &unset, &cwd);
+        spawn_hook(state, event, hook, env, &unset, &cwd);
     }
-    !hook.suppress_default
 }
 
 fn spawn_hook(
@@ -175,6 +225,7 @@ pub(super) fn workspace_hook_context(state: &State, workspace_id: &str) -> GuiHo
             .sidebar
             .group_of(workspace_id)
             .map(|group| group.id.clone()),
+        command: None,
     }
 }
 
@@ -192,15 +243,10 @@ pub(super) fn handle_gui_hook_request(
                 .collect();
             return Ok(json!({ "hooks": hooks }));
         }
+        // Like the Settings page, a hook's options can be set before its
+        // command; it does not run until it has one.
         GuiHookRequest::Set { event, update } => {
-            let hook = updated.hooks.get_mut(event);
-            update.apply(hook);
-            if !hook.is_configured() {
-                return Err(BridgeError::invalid_params(format!(
-                    "the {} hook has no command; set one with command",
-                    event.as_str()
-                )));
-            }
+            update.apply(updated.hooks.get_mut(event));
             event
         }
         GuiHookRequest::Clear { event } => {
@@ -210,6 +256,8 @@ pub(super) fn handle_gui_hook_request(
     };
     app_config::save(&updated).map_err(BridgeError::internal)?;
     let payload = updated.hooks.describe(event);
+    let hooks = updated.hooks.clone();
     *config.borrow_mut() = updated;
+    crate::settings_editor::refresh_gui_hook_rows(&hooks);
     Ok(payload)
 }
