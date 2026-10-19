@@ -17,7 +17,8 @@ resolve `HostName`, `IdentityFile`, `ProxyJump`, `Match`, tokens, or option
 precedence itself. It does not invoke `ssh -G` during discovery, since evaluating
 SSH configuration may execute `Match exec`. Connecting explicitly uses the
 user's existing SSH configuration, including any configured commands or
-forwarding. Limux does not change authentication or host-key checking policy.
+forwarding. Interactive connections use OpenSSH's configured authentication and host-key
+policies.
 
 A one-shot connection launches `env TERM=xterm-256color ssh -t [ -p PORT ] -- DESTINATION`,
 with each argument quoted for Ghostty's command-string API. Destination input is
@@ -82,8 +83,8 @@ OpenSSH's responsibility; their policies are not weakened.
 Persistent launches add `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and
 `ConnectTimeout=10`. They do not install helpers, change tmux global options,
 enable passthrough, or establish a separate SSH control socket. User-configured
-SSH multiplexing and forwarding still apply. Image transfer, agent notification
-forwarding, and helper provisioning remain later slices of
+SSH multiplexing and forwarding still apply. Agent notification
+forwarding and helper provisioning remain a later slice of
 [the SSH proposal](https://github.com/am-will/limux/issues/135).
 
 ## Validation
@@ -92,7 +93,7 @@ forwarding, and helper provisioning remain later slices of
 serialization, rejection of unsafe saved values, both shell argument boundaries,
 and the retry policy. Tests live in the existing inline Rust test modules.
 
-`LIMUX_SMOKE_PROFILE=debug ./scripts/xvfb-smoke-test.sh` runs two SSH regressions
+`LIMUX_SMOKE_PROFILE=debug ./scripts/xvfb-smoke-test.sh` runs SSH regressions
 under a private headless Weston session. Executable SSH fixtures check actual
 argv, TERM, and PTY; transient launch remains non-persistent. The persistent
 fixture exercises repeated errors, background reconnect, separate tab/split
@@ -106,3 +107,71 @@ the same PID. Restart Limux and verify each tab's session identity. Confirm
 normal detach/exit stops retries, missing tmux leaves an error, and closing a
 tab during an outage stops new SSH processes. Do not disrupt shared SSH masters
 or other users' tmux sessions when simulating a lost connection.
+
+## Clipboard image transfer
+
+In a **persistent SSH tab**, copy an image to the desktop clipboard and use
+Limux's **Paste** shortcut (default Ctrl+Shift+V) or the terminal context menu's
+**Paste** action. Limux encodes the image as PNG, uploads it asynchronously to
+the tab's saved SSH destination, then pastes the remote filename followed by a
+space. Bracketed paste is preserved; no Enter key or agent prompt is submitted.
+Agents such as Codex can recognize the path as an image attachment. Ordinary
+text continues through Ghostty's existing clipboard path.
+
+This requires actual clipboard image data, not a copied filename, file-manager
+URI, or drag-and-drop. Local terminals, one-shot SSH tabs, and nested `ssh`
+commands have no supported upload destination. In a nested SSH/container
+session, the path still belongs to the persistent tab's original SSH host;
+Limux does not infer or follow nested destinations. Use the agent on that host
+with access to its `/tmp`. Ghostty-only custom paste bindings do not invoke this
+Limux action. Terminal-initiated OSC 52 clipboard reads cannot start an upload;
+existing clipboard consent handling remains in effect.
+
+Each paste starts a separate non-PTY `ssh` command, preserving the alias and
+explicit port. It uses current SSH configuration, including user-configured
+multiplexing, ProxyJump, ProxyCommand, Match commands, and forwarding. The upload
+requires noninteractive authentication (keys/agent or an existing multiplexed
+connection). `BatchMode=yes`, `SSH_ASKPASS_REQUIRE=never`, and
+`StrictHostKeyChecking=yes` prevent background password/host-key prompts and
+reject unknown or changed host keys. Password-only interactive sessions may
+connect normally but fail to upload. No keys or passwords are saved, and no
+SSH master is created by Limux. Flatpak uses the bundled host-spawn with
+`--no-pty` to run host OpenSSH and preserve binary stdin.
+
+The remote command runs a fixed `/bin/sh` script using `mktemp`, `cat`, `test`,
+`printf`, `rm`, and `rmdir` from the remote account's environment. Those programs
+and the SSH host are trusted; no helper is installed or downloaded. A private
+`/tmp/limux-paste.XXXXXXXXXX` directory (mode 0700) contains `image.png` (0600).
+PNG bytes are streamed on stdin, with no local staging file. Only a successful
+SSH exit and an exact path matching this format permit terminal insertion;
+remote output is never evaluated as a command.
+
+Successful uploads remain on the remote host so agents can read them later.
+Remove their directories when no longer needed, or let the host's temporary
+file policy clean them up. The remote script attempts cleanup on failure and
+signals; abrupt disconnection can still leave a partial or completed file.
+Limux does not recursively clean remote directories on tab close.
+
+Images are limited to 16,777,216 pixels and 32 MiB of encoded PNG. One upload
+per terminal and four across the application may be pending. Uploads have a
+30-second deadline, with a 45-second overall clipboard/paste deadline. Status
+and errors appear in the terminal; SSH diagnostics go to the launch log. Failed
+uploads insert nothing. Closing or reconnecting cancels the pending upload;
+late callbacks cannot paste into a replacement terminal. Moving the same tab
+between panes keeps the upload attached to that tab.
+
+Upload argument construction, binary preservation, permissions, malformed or
+oversized replies, nonzero exits, deadlines, cancellation, and failed-file
+cleanup are covered by `./scripts/check.sh`. The maintained GUI smoke suite also
+checks image delivery, bracketed paste, ordinary text, duplicate requests,
+context-menu errors, moving a tab, and cancellation on reconnect or close.
+
+An optional live Codex attachment test is ignored by default:
+`terminal::image_paste::tests::live_ssh_agent_image_attachment`. Run it under a
+private display with `LIMUX_IMAGE_TEST_COMMAND` set to a disposable localhost
+SSH/tmux command launching an authenticated Codex composer. It uses strict,
+noninteractive localhost SSH for the upload and checks image attachment plus
+text copy/paste without submitting a model turn. Supply a private Codex home
+and tmux server, and clean up their credentials/processes afterward. This test
+requires local credentials and an SSH server; the maintained smoke suite does
+not.

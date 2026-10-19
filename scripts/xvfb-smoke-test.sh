@@ -391,6 +391,7 @@ if [ "$GRAPHICS" = hardware ] && ! grep -Fq 'terminal GL: ' "$LOG_DIR/terminal-g
 fi
 for regression in \
   pane::activity_tests::real_pty_output_drives_tab_activity_lifecycle \
+  pane::ssh_reconnect_tests::image_paste_follows_moves_and_cancels_on_reconnect \
   pane::ssh_reconnect_tests::reconnect_and_deferred_tab_moves_keep_one_current_widget \
   pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
   pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \

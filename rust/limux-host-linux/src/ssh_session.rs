@@ -57,6 +57,10 @@ impl SshConnection {
         }
     }
 
+    pub fn target(&self) -> &SshTarget {
+        &self.target
+    }
+
     pub fn new_tab(&self) -> Self {
         Self::new(self.target.clone(), self.auto_reconnect)
     }

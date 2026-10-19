@@ -280,3 +280,163 @@ fn reconnect_and_deferred_tab_moves_keep_one_current_widget() {
         pump_for(Duration::from_millis(150));
     }
 }
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn image_paste_follows_moves_and_cancels_on_reconnect() {
+    let fixture = Fixture::new();
+    let root = fixture.directory.path();
+    std::fs::write(
+        root.join("ssh"),
+        r#"#!/usr/bin/python3
+import os, sys, pathlib, tty, time, signal
+root = pathlib.Path(__file__).parent
+if '-T' in sys.argv:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    data = sys.stdin.buffer.read()
+    (root / 'uploaded').write_bytes(data)
+    with (root / 'calls').open('a') as f: f.write('upload\n')
+    while not (root / 'release').exists(): time.sleep(.01)
+    if (root / 'fail').exists(): sys.exit(17)
+    print('/tmp/limux-paste.ABCDEF1234/image.png')
+else:
+    tty.setraw(0)
+    os.write(1, b'\x1b[?2004hREADY')
+    while True:
+        data = os.read(0, 4096)
+        if not data: break
+        with (root / ('input-' + os.environ['LIMUX_TAB_ID'])).open('ab') as f: f.write(data)
+"#,
+    )
+    .unwrap();
+    let id = fixture.add_ssh(0);
+    let (_, handle) =
+        terminal_handle_for_surface(fixture.panes[0].pane_outer.upcast_ref(), Some(&id)).unwrap();
+    pump_until(|| {
+        handle
+            .read_viewport_text()
+            .is_some_and(|s| s.contains("READY"))
+    });
+    let clipboard = gtk::gdk::Display::default().unwrap().clipboard();
+    let texture = gtk::gdk::MemoryTexture::new(
+        1,
+        1,
+        gtk::gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from_static(&[12, 34, 56, 255]),
+        4,
+    );
+    clipboard.set_texture(&texture);
+    assert!(handle.perform_binding_action("paste_from_clipboard"));
+    pump_until(|| root.join("uploaded").exists());
+    assert_eq!(
+        std::fs::read(root.join("uploaded")).unwrap(),
+        texture.save_to_png_bytes().as_ref()
+    );
+    assert!(handle.perform_binding_action("paste_from_clipboard"));
+    pump_for(Duration::from_millis(100));
+    assert_eq!(
+        std::fs::read_to_string(root.join("calls")).unwrap(),
+        "upload\n"
+    );
+    assert!(move_tab_to_pane(
+        fixture.panes[0].pane_outer.upcast_ref(),
+        &id,
+        fixture.panes[1].pane_outer.upcast_ref()
+    ));
+    std::fs::write(root.join("release"), "").unwrap();
+    let input = root.join(format!("input-{id}"));
+    pump_until(|| input.exists());
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        b"\x1b[200~/tmp/limux-paste.ABCDEF1234/image.png \x1b[201~"
+    );
+
+    // Text still follows Ghostty's ordinary clipboard path.
+    clipboard.set_text("ordinary text");
+    handle.perform_binding_action("paste_from_clipboard");
+    pump_until(|| {
+        std::fs::read(&input)
+            .unwrap()
+            .ends_with(b"ordinary text\x1b[201~")
+    });
+    let before = std::fs::read(&input).unwrap();
+    clipboard.set_texture(&texture);
+    std::fs::write(root.join("fail"), "").unwrap();
+    fn paste_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.label().as_deref() == Some("Paste") {
+                return Some(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(button) = paste_button(&widget) {
+                return Some(button);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+    let menu = handle.build_context_menu_for_test();
+    paste_button(menu.upcast_ref())
+        .expect("Paste menu action")
+        .emit_clicked();
+    menu.unparent();
+    pump_until(|| {
+        std::fs::read_to_string(root.join("calls"))
+            .unwrap()
+            .lines()
+            .count()
+            == 2
+    });
+    pump_for(Duration::from_millis(150));
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        before,
+        "failed upload injected input"
+    );
+    std::fs::remove_file(root.join("fail")).unwrap();
+    std::fs::remove_file(root.join("release")).unwrap();
+    handle.perform_binding_action("paste_from_clipboard");
+    pump_until(|| {
+        std::fs::read_to_string(root.join("calls"))
+            .unwrap()
+            .lines()
+            .count()
+            == 3
+    });
+    let generation = fixture.generation(1, &id);
+    respawn_terminal_tab(&id, &generation);
+    pump_until(|| !Rc::ptr_eq(&fixture.generation(1, &id), &generation));
+    std::fs::write(root.join("release"), "").unwrap();
+    pump_for(Duration::from_millis(250));
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        before,
+        "obsolete upload reached replacement terminal"
+    );
+    let (_, replacement) =
+        terminal_handle_for_surface(fixture.panes[1].pane_outer.upcast_ref(), Some(&id)).unwrap();
+    pump_until(|| {
+        replacement
+            .read_viewport_text()
+            .is_some_and(|s| s.contains("READY"))
+    });
+    std::fs::remove_file(root.join("release")).unwrap();
+    replacement.perform_binding_action("paste_from_clipboard");
+    pump_until(|| {
+        std::fs::read_to_string(root.join("calls"))
+            .unwrap()
+            .lines()
+            .count()
+            == 4
+    });
+    remove_terminal_tab(&fixture.panes[1], &id);
+    std::fs::write(root.join("release"), "").unwrap();
+    pump_for(Duration::from_millis(250));
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        before,
+        "closed terminal received late input"
+    );
+}

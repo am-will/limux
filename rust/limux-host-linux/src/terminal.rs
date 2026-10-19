@@ -22,6 +22,7 @@ use crate::shortcut_config::NormalizedShortcut;
 
 mod clipboard;
 mod flatpak;
+mod image_paste;
 mod output_activity;
 mod wakeup;
 use clipboard::{
@@ -381,7 +382,11 @@ impl TerminalHandle {
 
     pub fn perform_binding_action(&self, action: &str) -> bool {
         let surface = *self.surface_cell.borrow();
-        surface_action(surface, action);
+        if action == "paste_from_clipboard" {
+            paste_clipboard(surface, &self.callbacks);
+        } else {
+            surface_action(surface, action);
+        }
         surface.is_some()
     }
 
@@ -1397,6 +1402,7 @@ pub struct TerminalCallbacks {
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
     pub identity: Box<IdentityCallback>,
+    pub image_paste_target: Box<dyn Fn() -> Option<crate::ssh_hosts::SshTarget>>,
     pub hover_focus: Box<dyn Fn() -> bool>,
     pub copy_selection_to_clipboard: Box<dyn Fn() -> bool>,
 }
@@ -1405,6 +1411,7 @@ impl TerminalCallbacks {
     fn disconnected() -> Self {
         Self {
             on_output_activity: Rc::new(|_| {}),
+            image_paste_target: Box::new(|| None),
             on_title_changed: Box::new(|_| {}),
             on_pwd_changed: Box::new(|_| {}),
             on_desktop_notification: Box::new(|_, _, _| {}),
@@ -1467,6 +1474,7 @@ fn free_terminal_surface(
         unregister_surface_identity(entry.identity);
     }
 
+    image_paste::cancel_surface(surface_key);
     clipboard::cancel_surface_requests(surface_key);
 
     // The Linux C API frees GL objects in the caller's current context. A
@@ -2781,7 +2789,7 @@ fn build_terminal_context_menu(
                             }
                         }
                     }
-                    "Paste" => surface_action(surface, "paste_from_clipboard"),
+                    "Paste" => paste_clipboard(surface, &cb),
                     "Browser" => {
                         let callbacks = cb.borrow();
                         (callbacks.on_open_browser_here)();
@@ -3129,10 +3137,19 @@ label.limux-toast {
 }
 "#;
 
-/// Show a brief "Copied to clipboard" toast at the bottom of the terminal.
+/// Intercept images only for an explicit user paste action.
+fn paste_clipboard(surface: Option<ghostty_surface_t>, callbacks: &Rc<RefCell<TerminalCallbacks>>) {
+    if !image_paste::try_begin(surface, callbacks) {
+        surface_action(surface, "paste_from_clipboard");
+    }
+}
+
 fn show_clipboard_toast(overlay: &gtk::Overlay) {
-    // One toast per terminal: a new copy, OSC 52 writes included, replaces the
-    // one shown, so it stays 2 s after the last copy instead of stacking.
+    show_terminal_toast(overlay, "Copied to clipboard", Duration::from_secs(2));
+}
+
+fn show_terminal_toast(overlay: &gtk::Overlay, message: &str, duration: Duration) {
+    // Replace the previous toast instead of stacking status messages.
     let mut child = overlay.first_child();
     while let Some(widget) = child {
         child = widget.next_sibling();
@@ -3141,7 +3158,9 @@ fn show_clipboard_toast(overlay: &gtk::Overlay) {
         }
     }
 
-    let toast = gtk::Label::new(Some("Copied to clipboard"));
+    let toast = gtk::Label::new(Some(message));
+    toast.set_wrap(true);
+    toast.set_max_width_chars(60);
     toast.add_css_class("limux-toast");
     toast.set_halign(gtk::Align::Center);
     toast.set_valign(gtk::Align::End);
@@ -3151,7 +3170,7 @@ fn show_clipboard_toast(overlay: &gtk::Overlay) {
 
     // Weak, so a toast whose terminal has closed is freed at once.
     let toast = toast.downgrade();
-    glib::timeout_add_local_once(Duration::from_secs(2), move || {
+    glib::timeout_add_local_once(duration, move || {
         if let Some(toast) = toast.upgrade() {
             if let Some(overlay) = toast.parent().and_downcast::<gtk::Overlay>() {
                 overlay.remove_overlay(&toast);

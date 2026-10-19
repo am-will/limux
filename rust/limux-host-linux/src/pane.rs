@@ -1460,6 +1460,20 @@ fn make_terminal_callbacks(
     let pane_id = internals.pane_id;
 
     TerminalCallbacks {
+        image_paste_target: Box::new({
+            let tab_id = tab_id.to_string();
+            move || {
+                let pane = terminal_tab_owner(&tab_id)?;
+                let tabs = pane.tab_state.borrow();
+                let entry = tabs.tabs.iter().find(|entry| entry.id == tab_id)?;
+                match &entry.kind {
+                    TabKind::Terminal { state } => {
+                        state.ssh.as_ref().map(|ssh| ssh.target().clone())
+                    }
+                    _ => None,
+                }
+            }
+        }),
         on_output_activity: Rc::new({
             let tab_state = Rc::downgrade(&internals.tab_state);
             let tab_id = tab_id.to_string();
