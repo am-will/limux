@@ -296,16 +296,8 @@ struct TerminalTabState {
     generation: Rc<()>,
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
-    /// The agent this tab was created/restored with.
-    ///
-    /// `snapshot_pane_state` previously always wrote `agent: None`, so the
-    /// agent binding on disk survived only as long as an external hook file
-    /// (`*-hook-sessions.json`) happened to describe the surface. Any tab
-    /// whose agent was started manually — or restored by an out-of-band
-    /// injector — was therefore serialized back to `"agent": null` on the
-    /// very first save after launch, permanently losing the session. Holding
-    /// the state here makes `session.json` self-sufficient.
-    agent: Rc<RefCell<Option<RestorableAgentState>>>,
+    /// Preserve restored bindings even when no external hook record remains.
+    agent: Option<Box<RestorableAgentState>>,
 }
 
 #[derive(Clone)]
@@ -916,49 +908,24 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
     true
 }
 
-/// Realize a tab's content child in the stack during the startup eager-restore
-/// sweep without changing the logical active tab, stealing keyboard focus,
-/// clearing unread state, or triggering session saves.
-pub fn realize_tab_in_pane_quietly(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
-    let Some(internals) = find_pane_internals(pane_widget) else {
-        return false;
-    };
-    if internals.content_stack.child_by_name(tab_id).is_some() {
-        internals.content_stack.set_visible_child_name(tab_id);
-        true
-    } else {
-        false
-    }
-}
-
-/// Every tab id in `pane_widget`, in tab-strip order.
-///
-/// The startup eager-restore sweep needs this because a background tab has no
-/// terminal surface yet and therefore cannot be discovered from the surface
-/// registry — only the tab state knows it exists.
-pub fn tab_ids_in_pane(pane_widget: &gtk::Widget) -> Vec<String> {
+/// Terminal identities and handles, including tabs that have no surface yet.
+pub(crate) fn terminal_tabs_in_pane(
+    pane_widget: &gtk::Widget,
+) -> Vec<(String, terminal::TerminalHandle)> {
     let Some(internals) = find_pane_internals(pane_widget) else {
         return Vec::new();
     };
-    let ids = internals
+    let tabs = internals
         .tab_state
         .borrow()
         .tabs
         .iter()
-        .map(|entry| entry.id.clone())
+        .filter_map(|entry| match &entry.kind {
+            TabKind::Terminal { state } => Some((entry.id.clone(), state.handle.clone())),
+            _ => None,
+        })
         .collect();
-    ids
-}
-
-/// The currently active tab id in `pane_widget`, if any.
-///
-/// Captured before the sweep so the user's original tab selection can be put
-/// back afterwards; a warm-up that leaves a different tab focused is
-/// indistinguishable from the layout corruption it exists to prevent.
-pub fn active_tab_id_in_pane(pane_widget: &gtk::Widget) -> Option<String> {
-    let internals = find_pane_internals(pane_widget)?;
-    let active = internals.tab_state.borrow().active_tab.clone();
-    active
+    tabs
 }
 
 /// Set a custom title, or clear it when the title is empty.
@@ -1952,7 +1919,7 @@ fn finish_terminal_respawn(
             state.generation = Rc::new(());
         }
     }
-    term.handle.realize_for_reconnect();
+    term.handle.realize_in_background();
     label.set_tooltip_text(None);
     if active {
         internals.content_stack.set_visible_child_name(tab_id);
@@ -2080,9 +2047,10 @@ fn add_terminal_tab_inner(
                     generation: Rc::new(()),
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
-                    agent: Rc::new(RefCell::new(
-                        options.as_ref().and_then(|value| value.agent.clone()),
-                    )),
+                    agent: options
+                        .as_ref()
+                        .and_then(|value| value.agent.clone())
+                        .map(Box::new),
                 },
             },
         });
@@ -2503,7 +2471,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
             let content = match &entry.kind {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
-                    agent: state.agent.borrow().clone(),
+                    agent: state.agent.as_deref().cloned(),
                     ssh: state.ssh.clone().map(Box::new),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {

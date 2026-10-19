@@ -7101,29 +7101,10 @@ fn close_workspace_by_id_internal(
     }
 }
 
-/// One tab that the startup sweep still has to realize.
-struct EagerRestoreStep {
-    workspace_idx: usize,
-    pane: gtk::Widget,
-    tab_id: String,
-}
-
-/// Interval between sweep steps. One GTK frame is enough for the stack to map
-/// the child and for `GtkGLArea::realize` to fire, which is what actually
-/// creates the Ghostty surface and forks the PTY.
+/// Spread restored process creation across main-loop iterations.
 const EAGER_RESTORE_STEP_MS: u64 = 90;
 
-/// Kick off the startup eager-restore sweep shortly after the window appears.
-///
-/// Limux restores tabs lazily: a tab's PTY is not created until GTK realizes
-/// its `GtkGLArea`, and a stack only realizes its visible child. A restored
-/// agent sitting in a background tab therefore stays dead until the user
-/// clicks it, which is why session recovery previously required an external
-/// script to crawl workspaces over the control socket — and, for background
-/// tabs it could not reach, to split panes and type `cli --resume` into them.
-/// That produced duplicate sessions, presence-lock collisions and permanent
-/// layout damage. Doing the sweep in-process removes the need for all of it.
-///
+/// Start restored terminals without selecting their workspace or tab.
 /// Set `LIMUX_EAGER_RESTORE=0` to opt out.
 fn schedule_startup_eager_restore(state: &State) {
     if matches!(std::env::var("LIMUX_EAGER_RESTORE").as_deref(), Ok("0")) {
@@ -7132,109 +7113,57 @@ fn schedule_startup_eager_restore(state: &State) {
     }
 
     let state = state.clone();
-    // Let the first frame settle so the initial workspace finishes mapping
-    // before we start switching the stack underneath it.
+    // Let the initial workspace finish its first frame before starting agents.
     glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
         run_startup_eager_restore(&state);
     });
 }
 
 fn run_startup_eager_restore(state: &State) {
-    let original_idx = state.borrow().active_idx;
-
-    let mut steps: Vec<EagerRestoreStep> = Vec::new();
-    // Per-pane selection captured up front, so the sweep is invisible: every
-    // pane ends on the tab the user left it on.
-    let mut restore: Vec<(gtk::Widget, String)> = Vec::new();
-    {
+    let mut tabs = {
         let app_state = state.borrow();
-        for (workspace_idx, workspace) in app_state.workspaces.iter().enumerate() {
-            for pane in workspace.split_container.panes() {
-                let tab_ids = pane::tab_ids_in_pane(&pane);
-                if tab_ids.is_empty() {
-                    continue;
-                }
-                let active = pane::active_tab_id_in_pane(&pane);
-                for tab_id in tab_ids {
-                    // Active tabs in the initial workspace are already mapped
-                    // and realized; non-active workspaces need every tab
-                    // visited for at least one tick so multi-tab panes do not
-                    // immediately switch away from their active tab before
-                    // GTK maps it.
-                    if workspace_idx == original_idx && active.as_deref() == Some(tab_id.as_str()) {
-                        continue;
-                    }
-                    steps.push(EagerRestoreStep {
-                        workspace_idx,
-                        pane: pane.clone(),
-                        tab_id,
-                    });
-                }
-                if let Some(active) = active {
-                    restore.push((pane.clone(), active));
-                }
-            }
-        }
-    }
-
-    if steps.is_empty() {
+        app_state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.split_container.panes())
+            .flat_map(|pane| pane::terminal_tabs_in_pane(&pane))
+            .filter_map(|(id, handle)| (!handle.health().realized).then_some(id))
+            .collect::<Vec<_>>()
+            .into_iter()
+    };
+    let total = tabs.len();
+    if total == 0 {
         return;
     }
-
-    let total = steps.len();
     eprintln!("limux: startup eager restore sweeping {total} tabs");
-
-    let saved_focus = gtk::prelude::GtkWindowExt::focus(&state.borrow().window);
-    crate::terminal::set_suppress_realize_focus(true);
-
-    let steps = Rc::new(steps);
-    let restore = Rc::new(restore);
-    let cursor = Rc::new(Cell::new(0usize));
-    let state = state.clone();
-
+    let state = Rc::downgrade(state);
     glib::timeout_add_local(
         std::time::Duration::from_millis(EAGER_RESTORE_STEP_MS),
         move || {
-            let index = cursor.get();
-
-            if index >= steps.len() {
-                for (pane, tab_id) in restore.iter() {
-                    pane::realize_tab_in_pane_quietly(pane, tab_id);
-                }
-                let focus_root = {
-                    let app_state = state.borrow();
-                    let active_idx = original_idx.min(app_state.workspaces.len().saturating_sub(1));
-                    app_state.workspaces.get(active_idx).map(|ws| {
-                        let stack_name = format!("ws-{}", ws.id);
-                        app_state.stack.set_visible_child_name(&stack_name);
-                        ws.root.clone()
-                    })
-                };
-                crate::terminal::set_suppress_realize_focus(false);
-                if let Some(root) = focus_root {
-                    let restored_focus = saved_focus
-                        .as_ref()
-                        .filter(|widget| widget.is_ancestor(&root) && widget.is_mapped())
-                        .is_some_and(|widget| widget.grab_focus());
-                    if !restored_focus {
-                        focus_workspace_entrypoint(&root);
-                    }
-                }
-                eprintln!("limux: startup eager restore complete ({total} tabs)");
+            let Some(state) = state.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !state.borrow().window.is_visible() {
                 return glib::ControlFlow::Break;
             }
-
-            let step = &steps[index];
-            {
+            let Some(tab_id) = tabs.next() else {
+                eprintln!("limux: startup eager restore requested ({total} tabs)");
+                return glib::ControlFlow::Break;
+            };
+            // A queued tab can move or close before its turn. Resolve its current
+            // owner, then release the state borrow before GTK emits callbacks.
+            let terminal = {
                 let app_state = state.borrow();
-                if let Some(ws) = app_state.workspaces.get(step.workspace_idx) {
-                    let stack_name = format!("ws-{}", ws.id);
-                    app_state.stack.set_visible_child_name(&stack_name);
-                }
+                app_state
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| workspace.split_container.panes())
+                    .flat_map(|pane| pane::terminal_tabs_in_pane(&pane))
+                    .find_map(|(id, handle)| (id == tab_id).then_some(handle))
+            };
+            if let Some(terminal) = terminal {
+                terminal.realize_in_background();
             }
-            pane::realize_tab_in_pane_quietly(&step.pane, &step.tab_id);
-
-            cursor.set(index + 1);
             glib::ControlFlow::Continue
         },
     );
@@ -7896,9 +7825,8 @@ fn find_leaf_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
     let window = stack.root()?.downcast::<gtk::Window>().ok()?;
     let focus = gtk::prelude::GtkWindowExt::focus(&window)?;
 
-    // A closed pane keeps the focus until its teardown frame, and an unmapped
-    // workspace's stack page may temporarily hold focus during startup eager
-    // restore: only accept live panes inside the active workspace.
+    // A retiring pane can retain focus until its teardown frame. Only accept
+    // live panes inside the active workspace.
     let mut widget: Option<gtk::Widget> = Some(focus);
     while let Some(w) = widget {
         if pane::is_live_pane(&w) && w.is_ancestor(&ws_root) {
@@ -9900,3 +9828,7 @@ mod session_save_tests;
 #[cfg(test)]
 #[path = "sidebar_group_tests.rs"]
 mod sidebar_group_tests;
+
+#[cfg(test)]
+#[path = "eager_restore_tests.rs"]
+mod eager_restore_tests;

@@ -45,12 +45,7 @@ static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIG
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
 static GHOSTTY_WAKEUP: LazyLock<wakeup::Wakeup> = LazyLock::new(wakeup::Wakeup::default);
-static SUPPRESS_REALIZE_FOCUS: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
-
-pub fn set_suppress_realize_focus(suppress: bool) {
-    SUPPRESS_REALIZE_FOCUS.store(suppress, Ordering::Relaxed);
-}
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -247,6 +242,7 @@ pub struct TerminalHandle {
     output_activity_enabled: Rc<Cell<bool>>,
     clipboard_context_cell: Rc<Cell<*mut ClipboardContext>>,
     shutting_down: Rc<Cell<bool>>,
+    background_realize: Rc<BackgroundRealizeState>,
     gl_area: gtk::GLArea,
     link_popover: gtk::Popover,
     search_bar: gtk::SearchBar,
@@ -267,7 +263,37 @@ pub struct TerminalHealth {
     pub height_px: u32,
 }
 
+#[derive(Default)]
+struct BackgroundRealizeState {
+    requested: Cell<bool>,
+    suppress_focus: Cell<bool>,
+}
+
+impl BackgroundRealizeState {
+    fn realize(&self, gl_area: &gtk::GLArea, shutting_down: &Cell<bool>) {
+        if shutting_down.get() || gl_area.is_realized() {
+            self.requested.set(false);
+            return;
+        }
+        // Split rebuilds and tab moves can temporarily unroot a live terminal.
+        // Its root notification retries the request after reparenting completes.
+        self.requested.set(gl_area.root().is_none());
+        if self.requested.get() {
+            return;
+        }
+        let suppressed = self.suppress_focus.replace(true);
+        gl_area.realize();
+        self.suppress_focus.set(suppressed);
+    }
+}
+
 impl TerminalHandle {
+    /// Start a rooted terminal without mapping it or changing input ownership.
+    pub(crate) fn realize_in_background(&self) {
+        self.background_realize
+            .realize(&self.gl_area, &self.shutting_down);
+    }
+
     pub fn set_output_activity_enabled(&self, enabled: bool) {
         self.output_activity_enabled.set(enabled);
         if let Some(surface) = *self.surface_cell.borrow() {
@@ -334,13 +360,6 @@ impl TerminalHandle {
         self.link_popover.unparent();
 
         *self.callbacks.borrow_mut() = TerminalCallbacks::disconnected();
-    }
-
-    /// A replacement in a hidden tab must start without mapping or focusing it.
-    pub fn realize_for_reconnect(&self) {
-        if !self.shutting_down.get() && self.gl_area.root().is_some() {
-            self.gl_area.realize();
-        }
     }
 
     pub fn focus_surface(&self) -> bool {
@@ -1476,7 +1495,15 @@ pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() +
         move || {
             let id = handler.borrow_mut().take();
             if let Some(id) = id {
-                clock.disconnect(id);
+                // Closing the window can dispose its clock before the fallback.
+                if unsafe {
+                    glib::gobject_ffi::g_signal_handler_is_connected(
+                        clock.as_ptr().cast(),
+                        id.as_raw(),
+                    ) != 0
+                } {
+                    clock.disconnect(id);
+                }
             }
             let source = timeout.borrow_mut().take();
             if let Some(source) = source {
@@ -1587,6 +1614,10 @@ pub fn create_terminal(
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let display_realized: Rc<DisplayRealizeState> = Rc::new(DisplayRealizeState::default());
     let shutting_down = Rc::new(Cell::new(false));
+    let background_realize = Rc::new(BackgroundRealizeState {
+        suppress_focus: Cell::new(suppress_initial_focus),
+        ..Default::default()
+    });
     let had_focus = Rc::new(Cell::new(false));
     let scrollbar_syncing = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
@@ -1660,6 +1691,7 @@ pub fn create_terminal(
         output_activity_enabled: output_activity_enabled.clone(),
         clipboard_context_cell: clipboard_context_cell.clone(),
         shutting_down: shutting_down.clone(),
+        background_realize: background_realize.clone(),
         gl_area: gl_area.clone(),
         link_popover: link_popover.clone(),
         search_bar: search_bar.clone(),
@@ -1669,6 +1701,25 @@ pub fn create_terminal(
         signal_handlers: signal_handlers.clone(),
         controllers: controllers.clone(),
     };
+
+    {
+        let background_realize = background_realize.clone();
+        let shutting_down = shutting_down.clone();
+        let handler = gl_area.connect_root_notify(move |gl_area| {
+            if !background_realize.requested.get() || gl_area.root().is_none() {
+                return;
+            }
+            let gl_area = gl_area.downgrade();
+            let background_realize = background_realize.clone();
+            let shutting_down = shutting_down.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(gl_area) = gl_area.upgrade() {
+                    background_realize.realize(&gl_area, &shutting_down);
+                }
+            });
+        });
+        track_signal(&signal_handlers, &gl_area, handler);
+    }
 
     {
         let surface_cell = surface_cell.clone();
@@ -1763,6 +1814,7 @@ pub fn create_terminal(
         let display_realized = display_realized.clone();
         let pane_ime = pane_ime.clone();
         let output_activity_enabled = output_activity_enabled.clone();
+        let background_realize = background_realize.clone();
         let handler = gl_area.connect_realize(move |gl_area| {
             if shutting_down.get() {
                 return;
@@ -1961,9 +2013,12 @@ pub fn create_terminal(
 
             display_realized.adopt_realized();
             *surface_cell.borrow_mut() = Some(surface);
+            // A restored background terminal may never receive an initial unmap.
+            // Keep its renderer paused until the normal map callback shows it.
+            gl_area.set_auto_render(gl_area.is_mapped());
+            unsafe { ghostty_surface_set_occlusion(surface, gl_area.is_mapped()) };
 
-            let suppress_focus =
-                suppress_initial_focus || SUPPRESS_REALIZE_FOCUS.load(Ordering::Relaxed);
+            let suppress_focus = background_realize.suppress_focus.get();
             unsafe {
                 ghostty_surface_set_focus(surface, !suppress_focus || gl_area.has_focus());
             }
@@ -3486,6 +3541,44 @@ mod tests {
         window.set_child(gtk::Widget::NONE);
         drain_for(Duration::from_millis(100));
         terminal.handle.shutdown();
+
+        // A pending request survives reparenting into a hidden stack page.
+        let background = create_terminal(
+            Some("/tmp"),
+            TerminalOptions {
+                startup_command: Some("/bin/sh".to_string()),
+                ..TerminalOptions::default()
+            },
+            TerminalCallbacks::disconnected(),
+        );
+        let im = &background.handle.pane_ime.primary;
+        im.set_context_id(Some("ibus"));
+        background.handle.realize_in_background();
+        assert!(!background.handle.gl_area.is_realized());
+        let stack = gtk::Stack::new();
+        let foreground = gtk::Entry::new();
+        stack.add_named(&foreground, Some("foreground"));
+        stack.add_named(&background.root, Some("background"));
+        window.set_child(Some(&stack));
+        foreground.grab_focus();
+        drain_for(Duration::from_secs(1));
+        assert!(background.handle.surface_cell.borrow().is_some());
+        assert!(!background.root.is_mapped());
+        assert!(!background.handle.gl_area.is_mapped());
+        assert_eq!(stack.visible_child_name().as_deref(), Some("foreground"));
+        assert!(gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus.is_ancestor(&foreground)));
+        im.focus_in();
+        im.set_cursor_location(&gtk::gdk::Rectangle::new(1, 1, 41, 43));
+        drain_for(Duration::from_millis(100));
+        background.handle.shutdown();
+        im.focus_out();
+        im.focus_in();
+        im.set_cursor_location(&gtk::gdk::Rectangle::new(1, 1, 23, 29));
+        stack.set_visible_child_name("background");
+        drain_for(Duration::from_millis(100));
+        assert!(background.handle.surface_cell.borrow().is_none());
+        window.set_child(gtk::Widget::NONE);
 
         let unshown = create_terminal(
             Some("/tmp"),

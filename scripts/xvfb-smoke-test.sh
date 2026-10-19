@@ -411,6 +411,8 @@ for regression in \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
+  window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \
+  window::eager_restore_tests::eager_restore_follows_moved_tabs_and_skips_closed_tabs_after_reordering \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
@@ -424,11 +426,10 @@ for regression in \
     -- --exact --ignored --test-threads=1 --nocapture
 done
 
-# Weston headless has no active input seat, so it cannot validate active-window
-# focus or keyboard delivery. Keep the other GTK regressions on Wayland and run these
-# under isolated X11, where the window can become active.
+# Weston headless has no active input seat. Exercise the active-window focus
+# and native terminal focus-reporting contracts under isolated X11.
 command -v xvfb-run >/dev/null || {
-  echo "FAIL: xvfb-run is required for the inline rename focus regression"
+  echo "FAIL: xvfb-run is required for the GTK focus regressions"
   exit 2
 }
 command -v xdotool >/dev/null || {
@@ -438,15 +439,17 @@ command -v xdotool >/dev/null || {
 for regression in \
   window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
   window::pane_close_tests::passive_rename_focus_restore_preserves_manual_tab_unread \
-  pane::ssh_reconnect_tests::reconnect_preserves_neighbor_keyboard_focus_and_restores_its_own; do
+  pane::ssh_reconnect_tests::reconnect_preserves_neighbor_keyboard_focus_and_restores_its_own \
+  window::eager_restore_tests::eager_restore_preserves_live_selection_focus_and_agent_bindings; do
   echo "== regression: $regression under isolated X11 =="
+  regression_log="$LOG_DIR/${regression##*::}-x11.txt"
   timeout -k 5s 30s xvfb-run -a -s '-screen 0 1440x1000x24 -nolisten tcp' \
-    env -u WAYLAND_DISPLAY GDK_BACKEND=x11 \
+    env -u WAYLAND_DISPLAY GDK_BACKEND=x11 G_DEBUG=fatal-criticals \
     cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
       -- --exact --ignored --test-threads=1 --nocapture \
-    >"$LOG_DIR/${regression##*::}-x11.txt" 2>&1 \
-    || { cat "$LOG_DIR/${regression##*::}-x11.txt"; exit 1; }
-  cat "$LOG_DIR/${regression##*::}-x11.txt"
+    >"$regression_log" 2>&1 \
+    || { cat "$regression_log"; exit 1; }
+  cat "$regression_log"
 done
 
 start_host host
