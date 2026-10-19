@@ -400,6 +400,7 @@ for regression in \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
   split_tree::tests::restoring_split_respects_nested_pane_minimums \
   settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
+  settings_editor::tests::hook_controls_restore_effective_values_after_save_failure \
   settings_editor::tests::hook_rows_show_socket_changes_without_saving_them_again \
   settings_editor::tests::hooks_is_the_second_settings_tab \
   window::tests::hidden_workspace_path_does_not_reserve_sidebar_row_height \
@@ -417,6 +418,7 @@ for regression in \
   window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \
   window::eager_restore_tests::eager_restore_follows_moved_tabs_and_skips_closed_tabs_after_reordering \
   window::gui_hook_tests::gui_actions_run_their_hooks_and_socket_requests_do_not \
+  window::gui_hooks::tests::failed_hook_child_reports_the_event_and_exit_status \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \

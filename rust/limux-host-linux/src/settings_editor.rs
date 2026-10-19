@@ -302,11 +302,29 @@ impl GuiHookRowWidgets {
 
 thread_local! {
     static GUI_HOOK_ROWS: RefCell<Vec<GuiHookRowWidgets>> = const { RefCell::new(Vec::new()) };
+    static REFRESHING_GUI_HOOK_ROWS: Cell<bool> = const { Cell::new(false) };
+}
+
+struct GuiHookRefreshGuard(bool);
+
+impl GuiHookRefreshGuard {
+    fn new() -> Self {
+        Self(REFRESHING_GUI_HOOK_ROWS.with(|refreshing| refreshing.replace(true)))
+    }
+}
+
+impl Drop for GuiHookRefreshGuard {
+    fn drop(&mut self) {
+        REFRESHING_GUI_HOOK_ROWS.with(|refreshing| refreshing.set(self.0));
+    }
 }
 
 /// Show `hooks` in any open Settings window. The row handlers see that the
-/// config already holds these values, so nothing is saved again.
+/// config already holds these values, so nothing is saved again. GTK emits
+/// entry changes synchronously while setting text; suppress those callbacks
+/// until every row reflects the effective config.
 pub fn refresh_gui_hook_rows(hooks: &GuiHooksConfig) {
+    let _guard = GuiHookRefreshGuard::new();
     GUI_HOOK_ROWS.with(|rows| {
         let mut rows = rows.borrow_mut();
         rows.retain(|row| row.expander.upgrade().is_some());
@@ -335,22 +353,21 @@ fn hook_switch_row(title: &str, subtitle: &str, active: bool) -> (adw::ActionRow
 fn connect_gui_hook_field<T: PartialEq + 'static>(
     input: &SettingsEditorInput,
     event: GuiHookEvent,
-    expander: &adw::ExpanderRow,
     field: fn(&mut GuiHook) -> &mut T,
 ) -> impl Fn(T) + 'static {
     let config = input.config.clone();
     let on_changed = input.on_config_changed.clone();
-    let expander = expander.downgrade();
     move |value: T| {
+        if REFRESHING_GUI_HOOK_ROWS.with(Cell::get) {
+            return;
+        }
         if *field(config.borrow_mut().hooks.get_mut(event)) == value {
             return;
         }
         let effective = apply_config_change(&config, &*on_changed, move |c| {
             *field(c.hooks.get_mut(event)) = value;
         });
-        if let Some(expander) = expander.upgrade() {
-            expander.set_subtitle(&gui_hook_subtitle(effective.hooks.get(event)));
-        }
+        refresh_gui_hook_rows(&effective.hooks);
     }
 }
 
@@ -396,16 +413,15 @@ fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::
         suppress_switch
     });
 
-    let set_enabled = connect_gui_hook_field(input, event, &expander, |hook| &mut hook.enabled);
+    let set_enabled = connect_gui_hook_field(input, event, |hook| &mut hook.enabled);
     enabled_switch.connect_active_notify(move |switch| set_enabled(switch.is_active()));
-    let set_command = connect_gui_hook_field(input, event, &expander, |hook| &mut hook.command);
-    command_entry.connect_changed(move |entry| set_command(entry.text().trim().to_string()));
-    let set_show_terminal =
-        connect_gui_hook_field(input, event, &expander, |hook| &mut hook.show_terminal);
+    let set_command = connect_gui_hook_field(input, event, |hook| &mut hook.command);
+    command_entry.connect_text_notify(move |entry| set_command(entry.text().trim().to_string()));
+    let set_show_terminal = connect_gui_hook_field(input, event, |hook| &mut hook.show_terminal);
     terminal_switch.connect_active_notify(move |switch| set_show_terminal(switch.is_active()));
     if let Some(suppress_switch) = &suppress_switch {
         let set_suppress_default =
-            connect_gui_hook_field(input, event, &expander, |hook| &mut hook.suppress_default);
+            connect_gui_hook_field(input, event, |hook| &mut hook.suppress_default);
         suppress_switch
             .connect_active_notify(move |switch| set_suppress_default(switch.is_active()));
     }
@@ -1208,6 +1224,93 @@ mod tests {
 
     #[test]
     #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn hook_controls_restore_effective_values_after_save_failure() {
+        fn find_expander(widget: &gtk::Widget, title: &str) -> Option<adw::ExpanderRow> {
+            if let Some(row) = widget.downcast_ref::<adw::ExpanderRow>() {
+                if row.title() == title {
+                    return Some(row.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(row) = find_expander(&widget, title) {
+                    return Some(row);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+
+        adw::init().expect("initialize GTK");
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let event = GuiHookEvent::OnWorkspaceCreate;
+        let original = GuiHook {
+            enabled: false,
+            command: "before-save".to_string(),
+            show_terminal: true,
+            suppress_default: false,
+        };
+        *config.borrow_mut().hooks.get_mut(event) = original.clone();
+        let rejected_changes = Rc::new(Cell::new(0));
+        let page = build_hooks_page(&SettingsEditorInput {
+            config: config.clone(),
+            shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+            on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+            on_config_changed: Rc::new({
+                let config = config.clone();
+                let rejected_changes = rejected_changes.clone();
+                move |previous, _| {
+                    rejected_changes.set(rejected_changes.get() + 1);
+                    config.borrow_mut().clone_from(previous);
+                }
+            }),
+        });
+        let row = find_expander(&page, event.title()).expect("hook row");
+        let row: &gtk::Widget = row.upcast_ref();
+        let enabled = find_control(row, "Enabled")
+            .expect("Enabled switch")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+        let command = find_row(row, "Command")
+            .and_then(|row| find_descendant::<gtk::Entry>(row.upcast_ref()))
+            .expect("command entry");
+        let show_terminal = find_control(row, "Show in a terminal")
+            .expect("Show in a terminal switch")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+        let suppress_default = find_control(row, "Skip the default action")
+            .expect("Skip the default action switch")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+
+        enabled.set_active(true);
+        assert!(!enabled.is_active(), "rejected enabled change was retained");
+        command.set_text("rejected-command");
+        assert_eq!(command.text(), original.command);
+        show_terminal.set_active(false);
+        assert!(
+            show_terminal.is_active(),
+            "rejected terminal change was retained"
+        );
+        suppress_default.set_active(true);
+        assert!(
+            !suppress_default.is_active(),
+            "rejected suppress-default change was retained"
+        );
+        assert_eq!(
+            row.downcast_ref::<adw::ExpanderRow>().unwrap().subtitle(),
+            gui_hook_subtitle(&original)
+        );
+        assert_eq!(config.borrow().hooks.get(event), &original);
+        assert_eq!(
+            rejected_changes.get(),
+            4,
+            "refreshing controls must not save the rejected values again"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
     fn hook_rows_show_socket_changes_without_saving_them_again() {
         fn find_expander(widget: &gtk::Widget, title: &str) -> Option<adw::ExpanderRow> {
             if let Some(row) = widget.downcast_ref::<adw::ExpanderRow>() {
@@ -1227,6 +1330,10 @@ mod tests {
 
         adw::init().expect("initialize GTK");
         let config = Rc::new(RefCell::new(AppConfig::default()));
+        for event in GuiHookEvent::ALL {
+            config.borrow_mut().hooks.get_mut(event).command =
+                format!("{} before-socket", event.as_str());
+        }
         let saves = Rc::new(Cell::new(0));
         let page = build_hooks_page(&SettingsEditorInput {
             config: config.clone(),

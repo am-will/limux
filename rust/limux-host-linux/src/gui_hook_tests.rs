@@ -394,6 +394,31 @@ fn gui_actions_run_their_hooks_and_socket_requests_do_not() {
         );
     }
 
+    // A popup hook executes the same harmless fixture in its own terminal.
+    // Closing that popup exercises terminal shutdown while its wrapper waits
+    // for input after the hook exits.
+    set_hook(AfterWorkspaceCreate, true, false);
+    config
+        .borrow_mut()
+        .hooks
+        .get_mut(AfterWorkspaceCreate)
+        .show_terminal = true;
+    let before = workspace_ids(&state);
+    add_workspace_from_gui(&state);
+    new_workspace(&before, &workspace_ids(&state));
+    log.expect(&[OnWorkspaceCreate, AfterWorkspaceCreate]);
+    let popup = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+        .find(|window| {
+            window.is_visible()
+                && window.title().as_deref() == Some("Limux hook: after-workspace-create")
+        })
+        .expect("after-create hook popup is visible");
+    popup.close();
+    pump_for(Duration::from_millis(150));
+    assert!(!popup.is_visible(), "hook popup did not close cleanly");
+
     window.close();
     pump_for(Duration::from_millis(300));
 }
