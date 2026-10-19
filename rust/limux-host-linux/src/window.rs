@@ -5535,7 +5535,8 @@ fn add_workspace_from_gui(state: &State) {
         let s = state.borrow();
         s.workspaces.is_empty() || s.config.borrow().workspace.prompt_for_folder_on_create
     };
-    if prompt_for_folder {
+    // A hook that skips the default action replaces the folder prompt too.
+    if prompt_for_folder && !gui_hooks::hook_skips_default(state, GuiHookEvent::OnWorkspaceCreate) {
         show_workspace_path_dialog(state);
         return;
     }

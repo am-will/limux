@@ -389,7 +389,7 @@ fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::
         let (suppress_row, suppress_switch) = hook_switch_row(
             "Skip the default action",
             "Let the command create or delete the workspace itself, e.g. with the limux CLI. \
-             The matching After hook does not run then.",
+             Limux's folder prompt is skipped too, and the matching After hook does not run.",
             hook.suppress_default,
         );
         expander.add_row(&suppress_row);

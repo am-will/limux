@@ -244,9 +244,9 @@ Common commands:
       or after-workspace-delete. Runs <text> in bash when that action is done in
       the GUI (not over the socket): an on-* hook before Limux does it, an
       after-* hook once it is done.
-      --suppress-default (on-* hooks only) leaves the create/delete to the hook;
-      the matching after-* hook then does not run, since requests made through
-      the CLI or socket never run hooks.
+      --suppress-default (on-* hooks only) leaves the create/delete to the hook,
+      so Limux skips its folder prompt as well; the matching after-* hook then
+      does not run, since requests made through the CLI or socket never run hooks.
       --disable keeps the hook's settings but stops it from running.
   gui-hooks enable|disable <event>
   gui-hooks clear <event>

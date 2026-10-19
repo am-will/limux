@@ -43,6 +43,12 @@ fn active_hook(state: &State, event: GuiHookEvent) -> Option<GuiHook> {
     hook
 }
 
+/// Whether an active hook for `event` takes over Limux's own action, so the
+/// action's dialogs (such as the folder prompt) are skipped as well.
+pub(super) fn hook_skips_default(state: &State, event: GuiHookEvent) -> bool {
+    active_hook(state, event).is_some_and(|hook| hook.suppress_default)
+}
+
 /// Run the hook configured for `event`, if any, before a user action. Returns
 /// whether Limux should still run its own action.
 pub(super) fn run_gui_hook(state: &State, event: GuiHookEvent, context: &GuiHookContext) -> bool {

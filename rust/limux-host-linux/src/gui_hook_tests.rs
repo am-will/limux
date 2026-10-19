@@ -140,6 +140,15 @@ fn folder_prompt() -> gtk::Window {
         .expect("folder prompt is shown")
 }
 
+fn folder_prompt_shown() -> bool {
+    gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+        .any(|window| {
+            window.is_visible() && window.title().as_deref() == Some("Open Folder as Workspace")
+        })
+}
+
 #[test]
 #[ignore = "requires GTK and Ghostty resources; exercised by xvfb-smoke-test.sh"]
 fn gui_actions_run_their_hooks_and_socket_requests_do_not() {
@@ -317,6 +326,19 @@ fn gui_actions_run_their_hooks_and_socket_requests_do_not() {
         );
     }
     assert_eq!(runs["after-workspace-create"].id, created);
+    // A hook that skips the default action replaces the prompt as well, and
+    // gets the folder Limux uses without a prompt.
+    set_hook(OnWorkspaceCreate, true, true);
+    let before = workspace_ids(&state);
+    add_workspace_from_gui(&state);
+    pump_for(Duration::from_millis(100));
+    assert!(!folder_prompt_shown());
+    assert_eq!(workspace_ids(&state), before);
+    let runs = log.expect(&[OnWorkspaceCreate]);
+    let home = dirs::home_dir().unwrap();
+    assert_eq!(runs["on-workspace-create"].folder, home.to_str().unwrap());
+    assert_eq!(runs["on-workspace-create"].default_action, "suppressed");
+    set_hook(OnWorkspaceCreate, true, false);
     config.borrow_mut().workspace.prompt_for_folder_on_create = false;
 
     // Socket requests never run hooks, before or after.
