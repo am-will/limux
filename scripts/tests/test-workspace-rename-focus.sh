@@ -131,6 +131,7 @@ done
 cli --json --id-format both list-panels --workspace "$WORKSPACE_ID" >"$RUN_DIR/created-panels.json"
 FIRST_SURFACE="$(jq -r '.surfaces[] | select(.type == "terminal") | .surface_id' "$RUN_DIR/created-panels.json" | head -1)"
 [ -n "$FIRST_SURFACE" ] || { echo 'FAIL: created workspace has no terminal surface'; exit 1; }
+FIRST_PANE="$(jq -r '.surfaces[] | select(.type == "terminal") | .pane_id' "$RUN_DIR/created-panels.json" | head -1)"
 cli --json --id-format both new-surface --workspace "$WORKSPACE_ID" --type terminal \
   >"$RUN_DIR/second-surface.json"
 SECOND_SURFACE="$(jq -r '.surface_id' "$RUN_DIR/second-surface.json")"
@@ -212,7 +213,8 @@ focus_limux
 sleep 0.5
 
 # Put focus in the first terminal, then use the real sidebar gesture to begin
-# editing the workspace name. X11 activation of xmessage commits the editor.
+# editing the workspace name. X11 activation of xmessage commits it.
+cli focus-surface --workspace "$WORKSPACE_ID" --surface "$FIRST_SURFACE" >/dev/null
 xdotool mousemove --window "$WINDOW" 1000 650 click 1
 sleep 0.2
 xdotool mousemove --window "$WINDOW" 100 110 click --repeat 2 --delay 100 1
@@ -228,8 +230,10 @@ focus_limux
 NO_CLICK_MARKER="RESTORED_WITHOUT_CLICK_$(date +%s%N)"
 type_marker_command "$NO_CLICK_MARKER" "$RUN_DIR/no-click-proof"
 cli read-screen --workspace "$WORKSPACE_ID" --surface "$FIRST_SURFACE" >"$RUN_DIR/first-screen.txt"
-grep -Fq "$NO_CLICK_MARKER" "$RUN_DIR/first-screen.txt" \
-  || { echo 'FAIL: reactivation keystrokes did not reach the previously active terminal'; exit 1; }
+if ! grep -Fq "$NO_CLICK_MARKER" "$RUN_DIR/first-screen.txt"; then
+  echo 'FAIL: reactivation did not restore terminal input after inline rename'
+  exit 1
+fi
 echo 'PASS: returning from another X11 application restores terminal input after inline rename'
 
 # Repeat the interruption, then deliberately select and click the second tab.
@@ -257,6 +261,63 @@ if ! grep -Fq "$CLICK_MARKER" "$RUN_DIR/second-after-click.txt" \
   exit 1
 fi
 echo 'PASS: deliberate terminal click after reactivation retains focus'
+if command -v import >/dev/null; then import -window "$WINDOW" "$RUN_DIR/clicked-tab-restored.png" || true; fi
+
+# Now split the workspace and focus the nonfirst pane. Returning from an
+# interrupted rename must restore that exact pane rather than the tree's first
+# leaf, and a normal Enter commit must return to it as well.
+cli --json new-pane --workspace "$WORKSPACE_ID" --pane "$FIRST_PANE" --direction right --type terminal \
+  >"$RUN_DIR/split-surface.json"
+SPLIT_PANE_REF="$(jq -r '.pane_ref' "$RUN_DIR/split-surface.json")"
+if [ -z "$SPLIT_PANE_REF" ] || [ "$SPLIT_PANE_REF" = null ]; then
+  echo 'FAIL: CLI did not return the split pane reference'
+  exit 1
+fi
+cli --json --id-format both list-panels --workspace "$WORKSPACE_ID" >"$RUN_DIR/split-panels.json"
+SPLIT_SURFACE="$(jq -r --arg pane "$SPLIT_PANE_REF" \
+  '.surfaces[] | select(.pane_ref == $pane and .type == "terminal") | .surface_id' \
+  "$RUN_DIR/split-panels.json" | head -1)"
+if [ -z "$SPLIT_SURFACE" ] || [ "$SPLIT_SURFACE" = null ]; then
+  echo 'FAIL: CLI did not list the newly created split terminal surface'
+  exit 1
+fi
+cli focus-surface --workspace "$WORKSPACE_ID" --surface "$SPLIT_SURFACE" >/dev/null
+xdotool mousemove --window "$WINDOW" 100 110 click --repeat 2 --delay 100 1
+sleep 0.2
+xdotool key --clearmodifiers ctrl+a
+xdotool type --clearmodifiers --delay 10 'Split pane restored while away'
+focus_external_app
+wait_for_title 'Split pane restored while away'
+assert_external_input_focus
+focus_limux
+SPLIT_MARKER="RESTORED_SPLIT_PANE_$(date +%s%N)"
+type_marker_command "$SPLIT_MARKER" "$RUN_DIR/split-proof"
+cli read-screen --workspace "$WORKSPACE_ID" --surface "$FIRST_SURFACE" >"$RUN_DIR/first-after-split.txt"
+cli read-screen --workspace "$WORKSPACE_ID" --surface "$SPLIT_SURFACE" >"$RUN_DIR/split-after-restore.txt"
+if ! grep -Fq "$SPLIT_MARKER" "$RUN_DIR/split-after-restore.txt" \
+  || grep -Fq "$SPLIT_MARKER" "$RUN_DIR/first-after-split.txt"; then
+  echo 'FAIL: reactivation did not restore input to the previously focused split pane'
+  exit 1
+fi
+echo 'PASS: app reactivation restores the previously focused nonfirst split pane'
+if command -v import >/dev/null; then import -window "$WINDOW" "$RUN_DIR/split-pane-restored.png" || true; fi
+
+xdotool mousemove --window "$WINDOW" 100 110 click --repeat 2 --delay 100 1
+sleep 0.2
+xdotool key --clearmodifiers ctrl+a
+xdotool type --clearmodifiers --delay 10 'Split pane restored after Enter'
+xdotool key --clearmodifiers Return
+wait_for_title 'Split pane restored after Enter'
+ENTER_MARKER="RESTORED_AFTER_ENTER_$(date +%s%N)"
+type_marker_command "$ENTER_MARKER" "$RUN_DIR/enter-proof"
+cli read-screen --workspace "$WORKSPACE_ID" --surface "$FIRST_SURFACE" >"$RUN_DIR/first-after-enter.txt"
+cli read-screen --workspace "$WORKSPACE_ID" --surface "$SPLIT_SURFACE" >"$RUN_DIR/split-after-enter.txt"
+if ! grep -Fq "$ENTER_MARKER" "$RUN_DIR/split-after-enter.txt" \
+  || grep -Fq "$ENTER_MARKER" "$RUN_DIR/first-after-enter.txt"; then
+  echo 'FAIL: normal Enter commit did not restore input to the focused split pane'
+  exit 1
+fi
+echo 'PASS: normal Enter commit restores the previously focused nonfirst split pane'
 
 cli --json create-group --workspace "$WORKSPACE_ID" 'Focus group' >"$RUN_DIR/focus-group.json"
 for _ in $(seq 1 50); do
@@ -278,7 +339,8 @@ assert_external_input_focus
 focus_limux
 GROUP_MARKER="GROUP_RESTORE_$(date +%s%N)"
 type_marker_command "$GROUP_MARKER" "$RUN_DIR/group-proof"
-cli read-screen --workspace "$WORKSPACE_ID" --surface "$SECOND_SURFACE" >"$RUN_DIR/group-screen.txt"
+cli read-screen --workspace "$WORKSPACE_ID" --surface "$SPLIT_SURFACE" >"$RUN_DIR/group-screen.txt"
 grep -Fq "$GROUP_MARKER" "$RUN_DIR/group-screen.txt" \
   || { echo 'FAIL: group rename reactivation did not restore terminal input'; exit 1; }
 echo 'PASS: group inline rename also restores terminal input after reactivation'
+if command -v import >/dev/null; then import -window "$WINDOW" "$RUN_DIR/group-rename-restored.png" || true; fi
