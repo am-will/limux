@@ -1,79 +1,83 @@
-# Flatpak manifest for Limux — GPU-accelerated terminal workspace manager.
-#
-# Build layout mirrors the source AUR recipe (PKGBUILD-source.template) but
-# rooted at /app instead of /usr. The GTK4 CLI dispatcher installs as
-# /app/bin/limux, the GTK host as /app/libexec/limux/limux-host, and the Zig
-# libghostty engine as /app/lib/limux/libghostty-internal.so. limux-host-linux
-# resolves Ghostty resources relative to the executable (see
-# rust/limux-host-linux/src/main.rs set_ghostty_runtime_env_for_exe), so the
-# /app/share/limux tree below is found without hardcoded /usr paths.
-#
-# See flatpak/README.md for the remaining items: host-shell execution (terminals
-# still run the sandbox /bin/sh), offline vendoring of Ghostty's own Zig build
-# dependencies, and metainfo screenshots + <releases> entries.
+# Local source-build manifest. See README.md for the remaining Flathub work.
 app-id: dev.limux.linux
 runtime: org.gnome.Platform
-# GNOME 49 (freedesktop 25.08) is the minimum: its rust-stable extension ships
-# rustc 1.98, and the GTK4 Rust crates (gdk4 0.11 / cairo-rs 0.22 / gdk-pixbuf
-# 0.22) require rustc >= 1.92, which the 24.08 (GNOME 48) SDK does not provide.
 runtime-version: '49'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-  - org.freedesktop.Sdk.Extension.ziglang
+  - org.freedesktop.Sdk.Extension.golang
 command: limux
 
 finish-args:
-  # Native Wayland with an X11 fallback for the GTK4/libadwaita shell.
   - --socket=wayland
   - --socket=fallback-x11
   - --share=ipc
-  # Ghostty renders terminals with OpenGL; the GPU node is required.
-  - --device=dri
-  # Terminals run arbitrary user commands and the built-in browser (WebKitGTK)
-  # needs the network; both are core features.
+  # Host terminals need the shared host /dev/pts namespace, including ttyname
+  # and job control. DRI alone leaves PTYs private to the sandbox.
+  - --device=all
   - --share=network
-  # A terminal workspace manager is only useful with access to the user's
-  # projects. --filesystem=host is deliberately broad: a terminal that runs
-  # arbitrary shell commands cannot meaningfully be confined to a subtree.
+  # Project files and a host-visible control socket.
   - --filesystem=host
-  # The control socket lives at $XDG_RUNTIME_DIR/limux/limux.sock. --filesystem=host
-  # does NOT cover $XDG_RUNTIME_DIR (the sandbox gets a private tmpfs there), so the
-  # app's socket would be invisible to a host limux CLI. Bind-mount the host's
-  # runtime subdir so the socket lands on the host and `limux <command>` on the host
-  # reaches this app — see flatpak/README.md ("Driving the app from a terminal").
   - --filesystem=xdg-run/limux:create
   - --talk-name=org.freedesktop.Notifications
+  # host-spawn uses HostCommand to run interactive shells on the host.
+  - --talk-name=org.freedesktop.Flatpak
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/ziglang
+  append-path: /app/lib/sdk/zig:/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/golang/bin
   env:
+    CARGO_BUILD_JOBS: '2'
     CARGO_HOME: /run/build/limux/cargo
-    # Ghostty's zig build writes its package cache here; see README for the
-    # offline-vendoring note.
     ZIG_GLOBAL_CACHE_DIR: /run/build/limux/zig-cache
+cleanup:
+  - /lib/sdk
 
 modules:
-  - name: limux
+  # The rolling ziglang SDK extension is not pinned to Ghostty's Zig version.
+  - name: zig
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/lib/sdk/zig
+      - cp -a . /app/lib/sdk/zig/
+    sources:
+      - type: archive
+        url: https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+        sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+        only-arches: [x86_64]
+      - type: archive
+        url: https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz
+        sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+        only-arches: [aarch64]
+
+  - name: host-spawn
     buildsystem: simple
     build-options:
       env:
-        # Override the rpath baked in by .cargo/config.toml (/usr/local/lib/limux)
-        # so the host binary finds libghostty-internal.so under /app, and keep
-        # --export-dynamic which the Ghostty FFI symbol lookup relies on.
+        GOCACHE: /run/build/host-spawn/go-cache
+    build-commands:
+      - go build -mod=vendor -ldflags='-s -w -X main.Version=1.6.2' -o host-spawn .
+      - install -Dm755 host-spawn /app/bin/host-spawn
+      - install -Dm644 LICENSE /app/share/licenses/host-spawn/LICENSE
+    sources:
+      - type: archive
+        url: https://github.com/1player/host-spawn/archive/refs/tags/v1.6.2.tar.gz
+        sha256: 77be74180d3c14cdf6199e2f5d77ad5a732b5902beecfdb81a3760038862af43
+      - type: archive
+        url: https://github.com/1player/host-spawn/releases/download/v1.6.2/host-spawn-vendor.tar.zst
+        sha256: 9abfddf5c1eba0704d643de06988ff3b8cdd2f594bfb4d1c0027315552dad5cc
+        strip-components: 0
+
+  - name: limux
+    buildsystem: simple
+    build-options:
+      # Ghostty's Zig packages still need network access. This local-build
+      # manifest is not ready for a network-free Flathub builder yet.
+      build-args: [--share=network]
+      env:
         RUSTFLAGS: -C link-arg=-Wl,-rpath,/app/lib/limux -C link-arg=-Wl,--export-dynamic
     build-commands:
-      # 1. Build the Zig libghostty engine (ReleaseFast, baseline CPU, no
-      #    gtk4-layer-shell), exactly as the AUR recipe does.
-      #    NOTE: -Dflatpak=true (Ghostty's native HostCommand path) does NOT
-      #    compile here — it pulls in `@import("gio_c")`, which Ghostty's build
-      #    only wires up for exe steps, not the `-Dapp-runtime=none` lib we build
-      #    (SharedDeps.zig:667 guards the gio_c translate behind `step.kind !=
-      #    .lib`). Running terminals on the host shell is tracked as open item 1.
-      - cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline -fno-sys=gtk4-layer-shell
-      # 2. Build the Rust workspace fully offline against the vendored crates.
+      - cd ghostty && zig build -j2 -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline -Demit-docs=false -fno-sys=gtk4-layer-shell
       - cargo build --release --locked --offline
-      # 3. Install, mirroring package() from PKGBUILD-source.template at /app.
       - install -Dm755 target/release/limux-cli /app/bin/limux
       - install -Dm755 target/release/limux /app/libexec/limux/limux-host
       - install -Dm644 ghostty/zig-out/lib/libghostty-internal.so /app/lib/limux/libghostty-internal.so
@@ -81,8 +85,6 @@ modules:
       - cp -a ghostty/zig-out/share/ghostty/. /app/share/limux/ghostty/
       - install -Dm644 ghostty/zig-out/share/terminfo/x/xterm-ghostty /app/share/limux/terminfo/x/xterm-ghostty
       - install -Dm644 rust/limux-host-linux/dev.limux.linux.desktop /app/share/applications/dev.limux.linux.desktop
-      # Flathub requires the icon to be named after the app-id; upstream ships
-      # Icon=limux, so point it at the app-id-named icon installed below.
       - desktop-file-edit --set-icon=dev.limux.linux /app/share/applications/dev.limux.linux.desktop
       - install -Dm644 rust/limux-host-linux/dev.limux.linux.metainfo.xml /app/share/metainfo/dev.limux.linux.metainfo.xml
       - |
@@ -90,24 +92,16 @@ modules:
           install -Dm644 "rust/limux-host-linux/icons/app/$size.png" \
             "/app/share/icons/hicolor/${size}x${size}/apps/dev.limux.linux.png"
         done
-      # The browser/split-pane toolbar buttons load these -symbolic action icons
-      # by name; without them GTK falls back to the broken-image glyph. Mirrors
-      # the scalable/actions install from PKGBUILD-source.template.
       - install -dm755 /app/share/icons/hicolor/scalable/actions
       - install -m644 rust/limux-host-linux/icons/*.svg -t /app/share/icons/hicolor/scalable/actions/
       - install -Dm644 LICENSE /app/share/licenses/limux/LICENSE
     sources:
-      - type: git
-        url: https://github.com/am-will/limux.git
-        tag: v0.1.30
-        commit: f8727a56237d055cad0c14a3eff3fcb986e03093
-        # The repo declares `ghostty` as a submodule; skip it so the pinned
-        # ghostty source below owns that directory without a .git collision.
-        disable-submodules: true
+      # Build the checkout containing this manifest, including reviewed changes.
+      - type: dir
+        path: ..
+        skip: [.git, .flatpak-builder, target, ghostty, build-dir]
       - type: git
         url: https://github.com/bvolpato/ghostty.git
-        commit: 1a89efa4d75e04702c375d32edf6bbdc5328fcd2
+        commit: 9fb2c115c6029064ab6ff862a023d3a9a4944d8d
         dest: ghostty
-      # Offline Rust crate sources, generated from Cargo.lock with
-      # flatpak-cargo-generator (see flatpak/README.md).
       - cargo-sources.json

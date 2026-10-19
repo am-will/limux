@@ -592,6 +592,12 @@ extern "C" {
         app: ghostty_app_t,
         config: *const ghostty_surface_config_s,
     ) -> ghostty_surface_t;
+    pub fn ghostty_surface_new_with_argv(
+        app: ghostty_app_t,
+        config: *const ghostty_surface_config_s,
+        argv: *const *const c_char,
+        argv_len: usize,
+    ) -> ghostty_surface_t;
     pub fn ghostty_surface_free(surface: ghostty_surface_t);
     pub fn ghostty_surface_refresh(surface: ghostty_surface_t);
     pub fn ghostty_surface_display_unrealized(surface: ghostty_surface_t);
