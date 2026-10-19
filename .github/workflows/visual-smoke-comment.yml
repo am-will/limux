@@ -32,6 +32,7 @@ jobs:
             let pullNumber;
             let sourceSha;
             let jobName;
+            let captureStepName;
             if (run.event === 'pull_request') {
               const headRepo = run.head_repository;
               if (!headRepo?.owner?.login || !run.head_branch) {
@@ -52,6 +53,7 @@ jobs:
               pullNumber = association.number;
               sourceSha = run.head_sha;
               jobName = 'GTK host smoke';
+              captureStepName = 'Capture Limux visual smoke states';
             } else if (run.event === 'workflow_dispatch' && run.head_branch === 'main') {
               const match = /^Rust Quality dispatch PR #([1-9][0-9]*) at ([0-9a-f]{40})$/.exec(run.display_title || '');
               if (!match) {
@@ -61,6 +63,7 @@ jobs:
               pullNumber = Number(match[1]);
               sourceSha = match[2];
               jobName = 'GTK visual smoke dispatch';
+              captureStepName = 'Capture requested PR visual states with trusted harness';
             } else {
               return;
             }
@@ -83,7 +86,8 @@ jobs:
               return;
             }
 
-            const status = visualJob?.conclusion || 'not reported';
+            const captureStep = visualJob?.steps?.find(step => step.name === captureStepName);
+            const status = captureStep?.conclusion || 'not reported';
             const artifactUrl = `https://github.com/${owner}/${repo}/actions/runs/${run.id}/artifacts/${artifact.id}`;
             const marker = `<!-- limux-visual-smoke:${sourceSha} -->`;
             const body = `${marker}\nLimux visual smoke for \`${sourceSha}\`: **${status}**. [Download the screenshots and open the included HTML gallery](${artifactUrl}). [Workflow run](${run.html_url}).`;

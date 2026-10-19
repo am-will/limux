@@ -15,21 +15,28 @@ LIMUX_VISUAL_SMOKE_ARTIFACT_DIR=/tmp/limux-visual-smoke \
   ./scripts/tests/visual-smoke-test.sh
 ```
 
+The environment variable names the artifact parent directory. Each invocation
+creates a new `run-*` subdirectory containing only that run's screenshots,
+logs, and gallery, so retries never reuse or mix files. Existing sibling runs
+and unrelated files in the parent are left untouched. Open `run-*/index.html`
+to view a completed run.
+
 To exercise an existing build from a separate checkout while using the trusted
 harness in this tree, set `LIMUX_TEST_ROOT=/path/to/checkout`. The source root
 must contain executable `target/debug/limux` and `target/debug/limux-cli`, plus
 Ghostty's `zig-out` library and resources. `LIMUX_TEST_HOST` and
 `LIMUX_TEST_CLI` can override the binary paths individually.
 
-The `Rust Quality` workflow uploads the gallery on success and failure. For
+The `Rust Quality` workflow uploads the gallery on success and failure. Each
+CI job writes one `run-*` directory under its artifact parent. For
 PRs that need a run before the harness is present in their branch, dispatch the
 workflow on `main` with the PR number and its exact current head SHA. The
 trusted dispatch job checks out the harness from `main`, builds the requested
 PR source without stored credentials, and records the PR head SHA in the run.
 The trusted `Visual smoke PR comment` workflow then links the downloadable
 artifact in a PR comment only if that head is still current. Download the zip
-and open `index.html` to view the gallery; GitHub Actions artifacts do not
-provide inline image hosting.
+and open the included `run-*/index.html` to view the gallery. GitHub Actions
+artifacts do not provide inline image hosting.
 
 For example, dispatch PR #240 at its current head with:
 

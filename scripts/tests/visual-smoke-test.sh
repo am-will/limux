@@ -7,9 +7,9 @@ SOURCE_ROOT="${LIMUX_TEST_ROOT:-$TOOLING_ROOT}"
 HOST="${LIMUX_TEST_HOST:-$SOURCE_ROOT/target/debug/limux}"
 CLI="${LIMUX_TEST_CLI:-$SOURCE_ROOT/target/debug/limux-cli}"
 GHOSTTY_ROOT="$SOURCE_ROOT/ghostty/zig-out"
-ARTIFACT_DIR="${LIMUX_VISUAL_SMOKE_ARTIFACT_DIR:-$TOOLING_ROOT/visual-smoke-artifacts}"
-mkdir -p "$ARTIFACT_DIR"
-ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
+ARTIFACT_ROOT="${LIMUX_VISUAL_SMOKE_ARTIFACT_DIR:-$TOOLING_ROOT/visual-smoke-artifacts}"
+mkdir -p "$ARTIFACT_ROOT"
+ARTIFACT_ROOT="$(cd "$ARTIFACT_ROOT" && pwd)"
 
 if [ "${1:-}" != --inside ]; then
 for dependency in xvfb-run dbus-run-session xdotool metacity jq setsid import identify montage; do
@@ -28,6 +28,8 @@ if [ ! -x "$HOST" ] || [ ! -x "$CLI" ]; then
 fi
 
 RUN_DIR="$(mktemp -d -t limux-visual-smoke-XXXXXX)"
+ARTIFACT_DIR="$(mktemp -d "$ARTIFACT_ROOT/run-XXXXXX")"
+echo "Visual smoke artifacts: $ARTIFACT_DIR"
 export LIMUX_VISUAL_RUN_DIR="$RUN_DIR" LIMUX_VISUAL_ARTIFACT_DIR="$ARTIFACT_DIR"
 export LIMUX_SOURCE_ROOT="$SOURCE_ROOT" LIMUX_VISUAL_HOST="$HOST" LIMUX_VISUAL_CLI="$CLI"
 export XDG_DATA_HOME="$RUN_DIR/data" XDG_STATE_HOME="$RUN_DIR/state"
@@ -154,7 +156,11 @@ HTML
     printf '</div></body></html>\n'
   } >"$gallery"
   if [ -s "$SCENARIOS" ]; then
-    montage "$ARTIFACT_DIR"/screenshots/*.png -font DejaVu-Sans -pointsize 14 \
+    local -a captured_images=()
+    while IFS="$(printf '\t')" read -r name _caption image_path; do
+      [ -n "$name" ] && captured_images+=("$ARTIFACT_DIR/$image_path")
+    done <"$SCENARIOS"
+    montage "${captured_images[@]}" -font DejaVu-Sans -pointsize 14 \
       -background '#12151d' -fill white -set label '%f' -thumbnail 640x400 \
       -tile 2x -geometry +12+28 "$ARTIFACT_DIR/contact-sheet.png" 2>"$LOG_DIR/montage.stderr" || true
   fi

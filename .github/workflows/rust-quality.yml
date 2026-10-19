@@ -289,7 +289,7 @@ jobs:
 
       - name: Build GUI host and CLI from requested PR source
         working-directory: source
-        run: cargo build --locked -p limux-cli --bin limux-cli -p limux-host-linux
+        run: cargo build --locked -p limux-cli -p limux-host-linux --bins
 
       - name: Capture requested PR visual states with trusted harness
         if: always() && !cancelled() && steps.pr.outputs.head_sha != ''
