@@ -424,9 +424,8 @@ for regression in \
     -- --exact --ignored --test-threads=1 --nocapture
 done
 
-# Weston headless has no active input seat: GtkWindow::is_active() is false
-# when this test commits its editor, so it cannot validate the active-window
-# focus contract. Keep the other GTK regressions on Wayland and run this one
+# Weston headless has no active input seat, so it cannot validate active-window
+# focus or keyboard delivery. Keep the other GTK regressions on Wayland and run these
 # under isolated X11, where the window can become active.
 command -v xvfb-run >/dev/null || {
   echo "FAIL: xvfb-run is required for the inline rename focus regression"
@@ -438,6 +437,7 @@ command -v xdotool >/dev/null || {
 }
 for regression in \
   window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
+  window::pane_close_tests::passive_rename_focus_restore_preserves_manual_tab_unread \
   pane::ssh_reconnect_tests::reconnect_preserves_neighbor_keyboard_focus_and_restores_its_own; do
   echo "== regression: $regression under isolated X11 =="
   timeout -k 5s 30s xvfb-run -a -s '-screen 0 1440x1000x24 -nolisten tcp' \

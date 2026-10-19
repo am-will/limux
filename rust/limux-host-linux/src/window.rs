@@ -7219,7 +7219,7 @@ fn schedule_focus_restore_if_idle(
                 {
                     return;
                 }
-                if pane::activate_tab_in_pane(&pane_widget, &target.tab_id) {
+                if pane::focus_active_tab_in_pane(&pane_widget) {
                     return;
                 }
             }

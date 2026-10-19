@@ -610,6 +610,86 @@ fn inline_rename_commit_returns_the_focus_to_the_workspace() {
 }
 
 #[test]
+#[ignore = "requires an active X11 window and Ghostty resources"]
+fn passive_rename_focus_restore_preserves_manual_tab_unread() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.UnreadFocusRestoreTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    let tab_id = pane::active_tab_in_pane(&pane).unwrap();
+    let (window, row, sidebar_list) = {
+        let s = state.borrow();
+        let ws = s.workspaces.iter().find(|ws| ws.id == ws_id).unwrap();
+        (
+            s.window.clone(),
+            ws.sidebar_row.clone(),
+            s.sidebar_list.clone(),
+        )
+    };
+    let wait = std::time::Duration::from_secs(5);
+    pump_until(wait, || window.is_active());
+    assert!(window.is_active(), "Limux must start active");
+    assert!(pane::mark_active_tab_manual_unread_in_root(&root));
+    sync_workspace_unread(&state, &ws_id);
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Rename").emit_clicked();
+    pump_until(wait, || find_active_rename_entry(&sidebar_list).is_some());
+    let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_focus_within("rename started", &state, entry.upcast_ref());
+    entry.set_text("renamed while inactive");
+
+    let peer = adw::ApplicationWindow::builder()
+        .application(&app)
+        .title("Focus peer")
+        .build();
+    peer.present();
+    pump_until(wait, || peer.is_active() && !window.is_active());
+    assert!(peer.is_active() && !window.is_active());
+    assert!(find_active_rename_entry(&sidebar_list).is_none());
+    assert!(state.borrow().pending_focus_restore.is_some());
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    assert_eq!(
+        state.borrow().active_workspace().unwrap().name,
+        entry.text()
+    );
+
+    window.present();
+    pump_until(wait, || window.is_active());
+    assert!(window.is_active());
+    assert_focus_within("passive activation restores terminal focus", &state, &pane);
+    assert!(state.borrow().pending_focus_restore.is_none());
+    assert!(
+        pane::workspace_has_unread_tabs(&ws_id),
+        "passive rename focus restoration must preserve a manual tab marker"
+    );
+    assert!(pane::activate_tab_in_pane(&pane, &tab_id));
+    assert!(
+        !pane::workspace_has_unread_tabs(&ws_id),
+        "explicit tab activation still acknowledges its marker"
+    );
+    peer.close();
+    window.close();
+}
+
+#[test]
 #[ignore = "requires a graphical display and Ghostty resources"]
 fn tab_unread_changes_preserve_independent_workspace_notifications() {
     let temp = tempfile::tempdir().unwrap();

@@ -1020,8 +1020,16 @@ async fn run_agent_hook(
         serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
     };
 
-    // Explicit --event or positional event beats the JSON field.
-    let event = parse_hook_event(args, &payload);
+    let mut event = parse_hook_event(args, &payload);
+    // Older installers routed Claude Notification through positional stop.
+    // Preserve that payload's identity while honoring an explicit --event.
+    if agent == agent_hooks::AgentKind::Claude
+        && event == "stop"
+        && parse_opt(args, "--event").is_none()
+        && hook_str(&payload, &["hook_event_name"]) == Some("Notification")
+    {
+        event = "Notification".to_string();
+    }
 
     // Build a human-friendly title + body depending on event + agent.
     let agent_label = agent.label();
@@ -1563,7 +1571,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("SessionStart", "session-start"),
                 ("UserPromptSubmit", "prompt-submit"),
                 ("Stop", "stop"),
-                ("Notification", "stop"),
+                ("Notification", "notification"),
                 ("SessionEnd", "session-end"),
             ],
         ),
