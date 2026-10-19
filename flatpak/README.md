@@ -47,11 +47,13 @@ Inside this Flatpak, Limux uses Ghostty's structured argv C API to launch
 and invokes the Flatpak `HostCommand` interface. The default terminal starts the
 host session's `$SHELL` as a login shell, falling back to `/bin/sh`. The terminal
 starts in the workspace's project directory. It inherits the host toolchain's
-`PATH`; the sandbox's `PATH` is not forwarded.
+`PATH` unless Ghostty's `env` configuration explicitly overrides it; the default
+sandbox `PATH` is not forwarded.
 
-`COLORTERM`, `LIMUX_*`, and the per-terminal environment are forwarded. Host
-terminals use `TERM=xterm-256color`, so applications can use the host terminfo
-database without a native Ghostty installation. The bundled `xterm-ghostty`
+`COLORTERM`, `LIMUX_*`, Ghostty's configured `env` keys, and the per-terminal
+environment are forwarded. Host terminals use `TERM=xterm-256color`, so
+applications can use the host terminfo database without a native Ghostty
+installation. The bundled `xterm-ghostty`
 terminfo entry remains inside the Flatpak.
 
 Configured `command` and `initial-command` values also execute on the host.
@@ -122,9 +124,10 @@ installation, and `LIMUX_TEST_CLI` to use a CLI outside `target/debug`.
 `LIMUX_FLATPAK_TEST_INTEGRATION` can select additional shell/configuration cases.
 
 It verifies a host-only fixture, interactive PTY input/output, project `pwd`,
-`tty`, host terminfo, forwarded `LIMUX_*` identity, a native CLI request from the
-terminal, and a request through the packaged CLI. It retains logs and a screenshot
-when ImageMagick is available. The test uses an explicit private socket path to
+`tty`, host terminfo, forwarded `LIMUX_*` identity and configured environment, a
+native CLI request from the terminal, and a request through the packaged CLI. It
+retains logs and a screenshot when ImageMagick is available. The test uses an
+explicit private socket path to
 avoid the user's running session.
 It also restores a synthetic agent, verifies automatic cleanup, installs hooks
 into the private home, and executes their host launcher with a native `limux`

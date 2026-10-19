@@ -5,6 +5,7 @@ use std::ffi::{CString, NulError};
 struct Commands {
     command: Option<String>,
     initial_command: Option<String>,
+    env_names: Vec<String>,
     surface_created: bool,
 }
 
@@ -35,6 +36,17 @@ pub(super) fn load_config(contents: &str) {
         commands.initial_command =
             crate::ghostty_config::read_ghostty_value(contents, "initial-command")
                 .filter(|command| !command.is_empty());
+        // This is Ghostty's effective serialized map. Ghostty sets the values
+        // on host-spawn's environment; only names belong in its --env argument.
+        commands.env_names = contents
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .filter(|(key, _)| key.trim() == "env")
+            .filter_map(|(_, value)| value.split_once('='))
+            .map(|(key, _)| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .collect();
     });
 }
 
@@ -54,6 +66,7 @@ pub(super) fn argv(
                 .filter(|key| key.starts_with("LIMUX_")),
         );
         names.extend(extra_env.iter().map(|(key, _)| key.clone()));
+        names.extend(commands.env_names.iter().cloned());
         build_argv(commands.selected(startup_command), names)
             .into_iter()
             .map(CString::new)
@@ -110,7 +123,7 @@ mod tests {
         let mut commands = Commands {
             command: Some("bash".into()),
             initial_command: Some("nvim".into()),
-            surface_created: false,
+            ..Commands::default()
         };
         assert_eq!(commands.selected(None), Some("nvim"));
         assert_eq!(commands.selected(Some("ssh host")), Some("ssh host"));
@@ -149,5 +162,22 @@ mod tests {
     #[test]
     fn invalid_command_is_reported_instead_of_panicking() {
         assert!(super::argv(Some("printf\0bad"), &[]).is_err());
+    }
+
+    #[test]
+    fn configured_environment_names_are_forwarded_without_interpreting_values() {
+        super::load_config(
+            "env = EDITOR=nvim\nenv = FOO=a b \"$HOME\"=done\nenv = PATH=/custom/bin\n",
+        );
+        let argv = super::argv(None, &[]).unwrap();
+        let names = argv[2].to_str().unwrap().strip_prefix("--env=").unwrap();
+        let names: Vec<_> = names.split(',').collect();
+        for key in ["EDITOR", "FOO", "PATH"] {
+            assert!(names.contains(&key), "{key} was not forwarded");
+        }
+        assert!(!names.iter().any(|key| key.contains('=')));
+        super::load_config("env = \n");
+        let argv = super::argv(None, &[]).unwrap();
+        assert!(!argv[2].to_str().unwrap().contains("EDITOR"));
     }
 }

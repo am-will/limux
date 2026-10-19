@@ -90,6 +90,9 @@ flatpak_args=(--user run --socket=x11 --nosocket=wayland
 private_env=("HOME=$HOME" "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" "XDG_DATA_HOME=$XDG_DATA_HOME"
   "XDG_STATE_HOME=$XDG_STATE_HOME" "XDG_CACHE_HOME=$XDG_CACHE_HOME")
 printf 'shell-integration = %s\nfont-size = 12\n' "${LIMUX_FLATPAK_TEST_INTEGRATION:-none}" >"$XDG_CONFIG_HOME/ghostty/config"
+cat >>"$XDG_CONFIG_HOME/ghostty/config" <<'CONFIG'
+env = FLATPAK_CONFIGURED_VALUE=a b "$HOME"=done
+CONFIG
 if [ -n "${LIMUX_FLATPAK_TEST_COMMAND:-}" ]; then
   printf 'command = %s\n' "$LIMUX_FLATPAK_TEST_COMMAND" >>"$XDG_CONFIG_HOME/ghostty/config"
 fi
@@ -130,6 +133,7 @@ set -eu
 [ -t 0 ] && [ -t 1 ]
 [ "$PWD" = "$LIMUX_FLATPAK_TEST_DIR/project" ]
 [ "$TERM" = xterm-256color ]
+[ "$FLATPAK_CONFIGURED_VALUE" = 'a b "$HOME"=done' ]
 [ -n "$LIMUX_WORKSPACE_ID" ] && [ -n "$LIMUX_PANE_ID" ]
 [ -n "$LIMUX_TAB_ID" ] && [ -n "$LIMUX_SURFACE_ID" ]
 [ "$LIMUX_SOCKET" = "$LIMUX_FLATPAK_TEST_DIR/limux.sock" ]
