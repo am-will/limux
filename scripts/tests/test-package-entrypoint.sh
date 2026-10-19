@@ -37,4 +37,25 @@ if (assert_cli_entrypoint host_help "host help") >/dev/null 2>&1; then
     exit 1
 fi
 
+TMP_DIR="$(mktemp -d -t limux-flatpak-entrypoint-XXXXXX)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+FLATPAK_BRANCH_DIR="$TMP_DIR/app/dev.limux.linux/x86_64/master"
+mkdir -p "$FLATPAK_BRANCH_DIR/commit/files/libexec/limux" "$TMP_DIR/bin"
+cp "$ROOT_DIR/flatpak/limux-host-cli" "$FLATPAK_BRANCH_DIR/commit/files/libexec/limux/limux-host-cli"
+ln -s commit "$FLATPAK_BRANCH_DIR/active"
+cat >"$TMP_DIR/bin/flatpak" <<'SH'
+#!/bin/sh
+printf '%s\0' "$@" >"$LIMUX_TEST_ARGUMENTS"
+cat >"$LIMUX_TEST_STDIN"
+SH
+chmod 755 "$TMP_DIR/bin/flatpak"
+printf '%s\0' run --arch=x86_64 --branch=master --command=limux dev.limux.linux \
+  --json hooks claude cleanup 'a b' "it's literal" "\$HOME" $'line\nbreak' >"$TMP_DIR/expected-arguments"
+printf '%s' '{"session_id":"synthetic"}' >"$TMP_DIR/payload"
+PATH="$TMP_DIR/bin:$PATH" LIMUX_TEST_ARGUMENTS="$TMP_DIR/arguments" LIMUX_TEST_STDIN="$TMP_DIR/stdin" \
+  "$FLATPAK_BRANCH_DIR/active/files/libexec/limux/limux-host-cli" \
+  --json hooks claude cleanup 'a b' "it's literal" "\$HOME" $'line\nbreak' <"$TMP_DIR/payload"
+cmp "$TMP_DIR/expected-arguments" "$TMP_DIR/arguments"
+cmp "$TMP_DIR/payload" "$TMP_DIR/stdin"
+
 echo "package CLI entrypoint validation: OK"

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Host entry point used by agent hooks and restored terminal cleanup.
+set -eu
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+files=$(dirname -- "$(dirname -- "$script_dir")")
+branch_dir=$(dirname -- "$(dirname -- "$files")")
+arch_dir=$(dirname -- "$branch_dir")
+if [ "$(basename -- "$(dirname -- "$arch_dir")")" = dev.limux.linux ]; then
+  set -- "--arch=$(basename -- "$arch_dir")" "--branch=$(basename -- "$branch_dir")" \
+    --command=limux dev.limux.linux "$@"
+else
+  set -- --command=limux dev.limux.linux "$@"
+fi
+exec flatpak run "$@"

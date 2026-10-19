@@ -98,6 +98,12 @@ flatpak run --command=limux dev.limux.linux list-workspaces
 flatpak run --command=limux dev.limux.linux identify
 ```
 
+Agent hook installation and restored-agent cleanup use a packaged host launcher,
+not `/app/bin/limux` or a native CLI on `PATH`. Limux resolves the host deployment
+path from `/.flatpak-info` and uses the branch's `active` symlink so hooks survive
+package updates. The launcher runs the packaged CLI through host `flatpak run`,
+preserving the branch, architecture, arguments, and hook input.
+
 ## Runtime validation
 
 After installing the package, build a native test CLI and run the isolated smoke
@@ -120,6 +126,9 @@ It verifies a host-only fixture, interactive PTY input/output, project `pwd`,
 terminal, and a request through the packaged CLI. It retains logs and a screenshot
 when ImageMagick is available. The test uses an explicit private socket path to
 avoid the user's running session.
+It also restores a synthetic agent, verifies automatic cleanup, installs hooks
+into the private home, and executes their host launcher with a native `limux`
+masked from `PATH`.
 
 ## Remaining Flathub work
 

@@ -1756,6 +1756,9 @@ fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
 }
 
 fn hook_cli_command() -> Result<String> {
+    if let Some(path) = limux_control::flatpak::host_cli_executable() {
+        return Ok(shell_single_quote(&path.to_string_lossy()));
+    }
     let exe = env::current_exe().context("failed to resolve current executable")?;
     let file_name = exe
         .file_name()
@@ -1768,6 +1771,9 @@ fn hook_cli_command() -> Result<String> {
 }
 
 fn opencode_plugin_cli_command() -> Result<String> {
+    if let Some(path) = limux_control::flatpak::host_cli_executable() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
     let exe = env::current_exe().context("failed to resolve current executable")?;
     let file_name = exe
         .file_name()

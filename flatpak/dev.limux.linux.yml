@@ -80,6 +80,7 @@ modules:
       - cargo build --release --locked --offline
       - install -Dm755 target/release/limux-cli /app/bin/limux
       - install -Dm755 target/release/limux /app/libexec/limux/limux-host
+      - install -Dm755 flatpak/limux-host-cli /app/libexec/limux/limux-host-cli
       - install -Dm644 ghostty/zig-out/lib/libghostty-internal.so /app/lib/limux/libghostty-internal.so
       - install -dm755 /app/share/limux/ghostty
       - cp -a ghostty/zig-out/share/ghostty/. /app/share/limux/ghostty/

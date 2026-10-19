@@ -929,6 +929,9 @@ fn wrap_restored_agent_command(
 }
 
 fn limux_cli_executable() -> String {
+    if let Some(path) = limux_control::flatpak::host_cli_executable() {
+        return path.to_string_lossy().into_owned();
+    }
     std::env::current_exe()
         .ok()
         .and_then(|path| {
