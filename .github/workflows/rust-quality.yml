@@ -140,6 +140,7 @@ jobs:
             util-linux \
             weston \
             xauth \
+            x11-utils \
             xdotool \
             xinput \
             xvfb
@@ -166,6 +167,21 @@ jobs:
 
       - name: Check existing-window activation
         run: ./scripts/tests/test-window-activate.sh
+
+      - name: Check inline rename focus after application switching
+        timeout-minutes: 3
+        env:
+          LIMUX_TEST_ARTIFACT_DIR: ${{ runner.temp }}/limux-rename-focus
+        run: ./scripts/tests/test-workspace-rename-focus.sh
+
+      - name: Upload inline rename test captures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: limux-rename-focus
+          path: ${{ runner.temp }}/limux-rename-focus/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Capture Limux visual smoke states
         if: always() && !cancelled()

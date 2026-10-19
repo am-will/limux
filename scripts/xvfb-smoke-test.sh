@@ -411,7 +411,6 @@ for regression in \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
-  window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
@@ -421,6 +420,25 @@ for regression in \
   timeout -k 5s 30s cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture
 done
+
+# Weston headless has no active input seat: GtkWindow::is_active() is false
+# when this test commits its editor, so it cannot validate the active-window
+# focus contract. Keep the other GTK regressions on Wayland and run this one
+# under isolated X11, where the window can become active.
+command -v xvfb-run >/dev/null || {
+  echo "FAIL: xvfb-run is required for the inline rename focus regression"
+  exit 2
+}
+echo "== regression: inline rename focus under isolated X11 =="
+timeout -k 5s 30s xvfb-run -a -s '-screen 0 1440x1000x24 -nolisten tcp' \
+  env -u WAYLAND_DISPLAY GDK_BACKEND=x11 \
+  cargo test --locked $CARGO_FLAGS -p limux-host-linux \
+    window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
+    -- --exact --ignored --test-threads=1 --nocapture \
+  >"$LOG_DIR/inline-rename-focus-x11.txt" 2>&1 \
+  || { cat "$LOG_DIR/inline-rename-focus-x11.txt"; exit 1; }
+cat "$LOG_DIR/inline-rename-focus-x11.txt"
+
 start_host host
 
 echo

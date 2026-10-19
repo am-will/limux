@@ -99,6 +99,7 @@ pub(crate) struct AppState {
     sidebar: SidebarLayout,
     /// Header rows of the groups in `sidebar`, by group id.
     group_headers: HashMap<String, sidebar_groups::GroupHeader>,
+    pending_focus_restore: bool,
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
@@ -2247,6 +2248,7 @@ pub fn build_window(app: &adw::Application) {
         active_idx: 0,
         sidebar: SidebarLayout::default(),
         group_headers: HashMap::new(),
+        pending_focus_restore: false,
         shortcuts,
         stack: stack.clone(),
         indicator_box: indicator_box.clone(),
@@ -2297,8 +2299,21 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         window.connect_is_active_notify(move |window| {
             if !window.is_active() {
+                let rename_entry = state
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| find_active_rename_entry(&s.sidebar_list));
+                if let Some(entry) = rename_entry {
+                    state.borrow_mut().pending_focus_restore = true;
+                    // Some window backends do not send focus.leave when an
+                    // external application takes activation. Commit the edit
+                    // explicitly so both backends preserve deactivation
+                    // semantics.
+                    entry.emit_activate();
+                }
                 return;
             }
+            restore_pending_focus_if_idle(&state, window.upcast_ref());
             let workspace_id = state
                 .borrow()
                 .active_workspace()
@@ -4850,28 +4865,14 @@ fn begin_inline_rename(
                 on_commit(&state_for_commit, next_name);
             }
 
-            // Removing the entry while it holds the focus hands it to the
-            // row's star button: clear it instead. After an Enter or a click,
-            // once that event has run, give it to the active workspace unless
-            // the click took it. A window deactivation (Alt-Tab away) takes
-            // nothing back.
+            // Removing a focused entry leaves the target to the caller. After
+            // an Enter or a click, return focus unless the click took it. A
+            // window deactivation records a deferred restore for reactivation.
             if crate::terminal::focus_is_within(entry.upcast_ref()) {
                 let window = entry.root().and_downcast::<gtk::Window>();
                 crate::terminal::unset_focus_within(entry.upcast_ref());
                 if let Some(window) = window.filter(|_| return_focus) {
-                    let state = state_for_commit.clone();
-                    glib::idle_add_local_once(move || {
-                        if GtkWindowExt::focus(&window).is_some() {
-                            return;
-                        }
-                        let active_root = state
-                            .try_borrow()
-                            .ok()
-                            .and_then(|s| s.active_workspace().map(|ws| ws.root.clone()));
-                        if let Some(root) = active_root {
-                            focus_workspace_entrypoint(&root);
-                        }
-                    });
+                    schedule_focus_restore_if_idle(&state_for_commit, &window);
                 }
             }
 
@@ -4883,18 +4884,33 @@ fn begin_inline_rename(
     {
         let commit = commit.clone();
         entry.connect_activate(move |entry| {
-            commit(entry, true);
+            let return_focus = entry
+                .root()
+                .and_downcast::<gtk::Window>()
+                .is_some_and(|window| window.is_active());
+            commit(entry, return_focus);
         });
     }
     {
         let commit = commit.clone();
+        let state = state.clone();
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |controller| {
             if let Some(widget) = controller.widget() {
                 if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                    // The focus is still in the entry only when the window
-                    // itself lost it.
+                    let window = entry.root().and_downcast::<gtk::Window>();
                     commit(entry, false);
+                    if let Some(window) = window {
+                        let state = state.clone();
+                        // The controller may leave before the toplevel's
+                        // active notification. Decide after GTK processes
+                        // both signals whether this was an app deactivation.
+                        glib::idle_add_local_once(move || {
+                            if !window.is_active() {
+                                state.borrow_mut().pending_focus_restore = true;
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -7016,6 +7032,37 @@ fn focus_workspace_entrypoint(root: &gtk::Widget) {
         } else {
             pane.child_focus(gtk::DirectionType::TabForward);
         }
+    }
+}
+
+fn schedule_focus_restore_if_idle(state: &State, window: &gtk::Window) {
+    let state = state.clone();
+    let window = window.clone();
+    glib::idle_add_local_once(move || {
+        if !window.is_active() {
+            state.borrow_mut().pending_focus_restore = true;
+            return;
+        }
+        if GtkWindowExt::focus(&window).is_some() {
+            return;
+        }
+        let active_root = state
+            .try_borrow()
+            .ok()
+            .and_then(|s| s.active_workspace().map(|workspace| workspace.root.clone()));
+        if let Some(root) = active_root {
+            focus_workspace_entrypoint(&root);
+        }
+    });
+}
+
+fn restore_pending_focus_if_idle(state: &State, window: &gtk::Window) {
+    let pending = state
+        .try_borrow_mut()
+        .map(|mut state| std::mem::take(&mut state.pending_focus_restore))
+        .unwrap_or(false);
+    if pending {
+        schedule_focus_restore_if_idle(state, window);
     }
 }
 
