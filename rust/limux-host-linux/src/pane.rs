@@ -31,6 +31,8 @@ use crate::terminal::{self, LinkOpenRequest, TerminalCallbacks};
 
 #[cfg(test)]
 mod activity_tests;
+#[cfg(test)]
+mod ssh_reconnect_tests;
 
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -1665,30 +1667,22 @@ fn build_terminal_env(internals: &Rc<PaneInternals>, tab_id: &str) -> Vec<(Strin
 /// This is the reusable half of tab creation: it does not touch the tab strip,
 /// the content stack, or `TabState`, so it can serve both the initial spawn
 /// ([`add_terminal_tab_inner`]) and an in-place auto-reconnect respawn
-/// ([`respawn_terminal_tab`]). Passing `startup_command = Some(cmd)` execs that
-/// command as the child (e.g. an SSH reconnect line).
+/// ([`respawn_terminal_tab`]). The launch options carry the command, initial
+/// input, and whether first realization may acquire focus.
 fn build_terminal_widget(
     internals: &Rc<PaneInternals>,
     tab_id: &str,
     title_label: &gtk::Label,
     term_cwd: &Rc<RefCell<Option<String>>>,
     working_directory: Option<&str>,
-    startup_command: Option<String>,
-    initial_input: Option<String>,
+    mut options: terminal::TerminalOptions,
 ) -> terminal::TerminalWidget {
     let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd);
-    let extra_env = build_terminal_env(internals, tab_id);
-    terminal::create_terminal(
-        working_directory,
-        terminal::TerminalOptions {
-            track_output_activity: (internals.callbacks.current_config)().borrow().interface.show_tab_activity,
-            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
-            startup_command,
-            initial_input,
-            extra_env,
-        },
-        term_callbacks,
-    )
+    let config = (internals.callbacks.current_config)();
+    options.track_output_activity = config.borrow().interface.show_tab_activity;
+    options.saved_font_size = config.borrow().font_size;
+    options.extra_env = build_terminal_env(internals, tab_id);
+    terminal::create_terminal(working_directory, options, term_callbacks)
 }
 
 /// Remove a terminal tab through the shared [`remove_tab`] path. Idempotent:
@@ -1777,7 +1771,7 @@ fn respawn_terminal_tab(tab_id: &str, generation: &Rc<()>) {
     let Some(internals) = terminal_tab_owner(tab_id) else {
         return;
     };
-    let (content, handle) = {
+    let (content, handle, focused) = {
         let tabs = internals.tab_state.borrow();
         let Some(entry) = tabs.tabs.iter().find(|entry| entry.id == tab_id) else {
             return;
@@ -1788,21 +1782,31 @@ fn respawn_terminal_tab(tab_id: &str, generation: &Rc<()>) {
         if !Rc::ptr_eq(&state.generation, generation) {
             return;
         }
-        (entry.content.clone(), state.handle.clone())
+        (
+            entry.content.clone(),
+            state.handle.clone(),
+            terminal::focus_is_within(&entry.content),
+        )
     };
     handle.shutdown();
     let tab_id = tab_id.to_string();
     let generation = generation.clone();
+    let old_widget = content.clone();
     terminal::detach_after_repaint(&content, move || {
-        finish_terminal_respawn(&tab_id, &generation)
+        finish_terminal_respawn(&tab_id, &generation, &old_widget, focused)
     });
 }
 
-fn finish_terminal_respawn(tab_id: &str, generation: &Rc<()>) {
+fn finish_terminal_respawn(
+    tab_id: &str,
+    generation: &Rc<()>,
+    old_widget: &gtk::Widget,
+    previously_focused: bool,
+) {
     let Some(internals) = terminal_tab_owner(tab_id) else {
         return;
     };
-    let (label, cwd, command, old_widget, active, focused) = {
+    let (label, cwd, command, active, activity) = {
         let tabs = internals.tab_state.borrow();
         let Some(entry) = tabs.tabs.iter().find(|entry| entry.id == tab_id) else {
             return;
@@ -1810,7 +1814,7 @@ fn finish_terminal_respawn(tab_id: &str, generation: &Rc<()>) {
         let TabKind::Terminal { state } = &entry.kind else {
             return;
         };
-        if !Rc::ptr_eq(&state.generation, generation) {
+        if !Rc::ptr_eq(&state.generation, generation) || entry.content != *old_widget {
             return;
         }
         let Some(ssh) = &state.ssh else {
@@ -1820,15 +1824,18 @@ fn finish_terminal_respawn(tab_id: &str, generation: &Rc<()>) {
             entry.title_label.clone(),
             state.cwd.clone(),
             ssh.command(),
-            entry.content.clone(),
             tabs.active_tab.as_deref() == Some(tab_id),
-            entry
-                .content
-                .root()
-                .and_then(|root| root.focus())
-                .is_some_and(|focus| focus == entry.content || focus.is_ancestor(&entry.content)),
+            entry.activity.clone(),
         )
     };
+    // A click or tab switch while repainting takes precedence over the old
+    // surface's focus. Teardown clears its own focus before hiding it.
+    let restore_focus = previously_focused
+        && active
+        && internals
+            .pane_outer
+            .root()
+            .is_some_and(|root| root.focus().is_none());
     let directory = cwd.borrow().clone();
     let term = build_terminal_widget(
         &internals,
@@ -1836,11 +1843,15 @@ fn finish_terminal_respawn(tab_id: &str, generation: &Rc<()>) {
         &label,
         &cwd,
         directory.as_deref(),
-        Some(command),
-        None,
+        terminal::TerminalOptions {
+            startup_command: Some(command),
+            suppress_initial_focus: true,
+            ..Default::default()
+        },
     );
     // GTK removal may emit callbacks; never hold the tab-state borrow here.
-    internals.content_stack.remove(&old_widget);
+    terminal::remove_from_stack(old_widget);
+    activity.watch_content(&term.root);
     internals.content_stack.add_named(&term.root, Some(tab_id));
     {
         let mut tabs = internals.tab_state.borrow_mut();
@@ -1859,7 +1870,7 @@ fn finish_terminal_respawn(tab_id: &str, generation: &Rc<()>) {
     if active {
         internals.content_stack.set_visible_child_name(tab_id);
     }
-    if focused {
+    if restore_focus {
         term.handle.focus_surface();
     }
 }
@@ -1891,7 +1902,8 @@ fn add_terminal_tab_inner(
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(new_tab_id);
-    let (tab_btn, title_label, unread_dot, activity) = build_tab_button("Terminal", &tab_id, internals);
+    let (tab_btn, title_label, unread_dot, activity) =
+        build_tab_button("Terminal", &tab_id, internals);
 
     let term_cwd = Rc::new(RefCell::new(
         options
@@ -1947,8 +1959,11 @@ fn add_terminal_tab_inner(
         &title_label,
         &term_cwd,
         working_directory,
-        startup_command,
-        initial_input,
+        terminal::TerminalOptions {
+            startup_command,
+            initial_input,
+            ..Default::default()
+        },
     );
     let widget = term.root.clone();
     activity.watch_content(&widget);
@@ -3648,7 +3663,10 @@ fn transfer_tab_between_panes(
             let (still_here, active) = {
                 let target_state = target.tab_state.borrow();
                 (
-                    target_state.tabs.iter().any(|item| item.id == tab_id),
+                    target_state
+                        .tabs
+                        .iter()
+                        .any(|item| item.id == tab_id && item.content == moved),
                     target_state.active_tab.as_deref() == Some(tab_id.as_str()),
                 )
             };

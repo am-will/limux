@@ -1158,9 +1158,16 @@ unsafe extern "C" fn ghostty_action_cb(
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let exit_code = unsafe { action.action.child_exited }.exit_code;
                 let surface_key = unsafe { target.target.surface } as usize;
+                let Some(identity) = current_surface_identity(surface_key) else {
+                    return true;
+                };
                 glib::idle_add_local_once(move || {
                     SURFACE_MAP.with(|map| {
-                        if let Some(entry) = map.borrow().get(&surface_key) {
+                        if let Some(entry) = map
+                            .borrow()
+                            .get(&surface_key)
+                            .filter(|entry| entry.identity == identity)
+                        {
                             if let Some(cb) = &entry.on_close {
                                 if !entry.exit_reported.replace(true) {
                                     cb(Some(exit_code));
@@ -1308,9 +1315,16 @@ unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_al
     else {
         return;
     };
+    let Some(identity) = current_surface_identity(surface_key) else {
+        return;
+    };
     glib::idle_add_local_once(move || {
         SURFACE_MAP.with(|map| {
-            if let Some(entry) = map.borrow().get(&surface_key) {
+            if let Some(entry) = map
+                .borrow()
+                .get(&surface_key)
+                .filter(|entry| entry.identity == identity)
+            {
                 if let Some(cb) = &entry.on_close {
                     if !entry.exit_reported.replace(true) {
                         cb(None);
@@ -1369,6 +1383,7 @@ impl TerminalCallbacks {
 #[derive(Default)]
 pub struct TerminalOptions {
     pub track_output_activity: bool,
+    pub suppress_initial_focus: bool,
     pub saved_font_size: Option<f32>,
     pub startup_command: Option<String>,
     pub initial_input: Option<String>,
@@ -1559,6 +1574,7 @@ pub fn create_terminal(
     let wd = working_directory.map(|s| s.to_string());
     let output_activity_enabled = Rc::new(Cell::new(options.track_output_activity));
     let saved_font_size = options.saved_font_size;
+    let suppress_initial_focus = options.suppress_initial_focus;
     let startup_command = options.startup_command;
     let initial_input = options.initial_input;
     let extra_env = options.extra_env;
@@ -1942,11 +1958,11 @@ pub fn create_terminal(
             *surface_cell.borrow_mut() = Some(surface);
 
             unsafe {
-                ghostty_surface_set_focus(surface, true);
+                ghostty_surface_set_focus(surface, !suppress_initial_focus || gl_area.has_focus());
             }
-
-            // Grab GTK focus so key events reach this widget.
-            request_terminal_focus(gl_area, &had_focus);
+            if !suppress_initial_focus {
+                request_terminal_focus(gl_area, &had_focus);
+            }
         });
         track_signal(&signal_handlers, &gl_area, handler);
     }

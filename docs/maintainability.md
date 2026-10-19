@@ -25,7 +25,7 @@ also run the maintained headless Weston harness from the repository root:
 LIMUX_SMOKE_PROFILE=debug ./scripts/xvfb-smoke-test.sh
 ```
 
-It requires Weston, Xvfb (`xvfb-run`), `xauth`, `jq`, `setsid`, `findmnt`,
+It requires Weston, Xvfb (`xvfb-run`), `xauth`, `xdotool`, `jq`, `setsid`, `findmnt`,
 `dbus-run-session`, the host build dependencies,
 and the embedded Ghostty library built as described in the README. It builds the CLI and host,
 uses a private socket and temporary session/configuration directories, and
@@ -34,9 +34,9 @@ retains logs on failure. The `Rust Quality` workflow runs this harness as well.
 Tests that require a graphical display are marked `#[ignore]` so the ordinary
 `cargo test --workspace` run can work without a display. They must be explicitly
 invoked by the harness; an ignored test alone does not provide coverage in the
-quality gate. Most run under Weston. The inline rename focus regression runs
-under isolated Xvfb because headless Weston has no active input seat and cannot
-validate the active-window focus contract.
+quality gate. Most run under Weston. The keyboard focus regressions run under
+isolated Xvfb because headless Weston has no active input seat and cannot
+validate active-window focus or keyboard delivery.
 
 The terminal shutdown regression checks that freeing a terminal selects its
 own OpenGL context even when another widget's context is current. The harness

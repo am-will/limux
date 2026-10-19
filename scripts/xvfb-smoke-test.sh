@@ -391,6 +391,7 @@ if [ "$GRAPHICS" = hardware ] && ! grep -Fq 'terminal GL: ' "$LOG_DIR/terminal-g
 fi
 for regression in \
   pane::activity_tests::real_pty_output_drives_tab_activity_lifecycle \
+  pane::ssh_reconnect_tests::reconnect_and_deferred_tab_moves_keep_one_current_widget \
   pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
   pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \
   pane::tests::closing_the_active_tab_maps_only_its_replacement \
@@ -430,15 +431,22 @@ command -v xvfb-run >/dev/null || {
   echo "FAIL: xvfb-run is required for the inline rename focus regression"
   exit 2
 }
-echo "== regression: inline rename focus under isolated X11 =="
-timeout -k 5s 30s xvfb-run -a -s '-screen 0 1440x1000x24 -nolisten tcp' \
-  env -u WAYLAND_DISPLAY GDK_BACKEND=x11 \
-  cargo test --locked $CARGO_FLAGS -p limux-host-linux \
-    window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
-    -- --exact --ignored --test-threads=1 --nocapture \
-  >"$LOG_DIR/inline-rename-focus-x11.txt" 2>&1 \
-  || { cat "$LOG_DIR/inline-rename-focus-x11.txt"; exit 1; }
-cat "$LOG_DIR/inline-rename-focus-x11.txt"
+command -v xdotool >/dev/null || {
+  echo "FAIL: xdotool is required for the SSH reconnect keyboard regression"
+  exit 2
+}
+for regression in \
+  window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
+  pane::ssh_reconnect_tests::reconnect_preserves_neighbor_keyboard_focus_and_restores_its_own; do
+  echo "== regression: $regression under isolated X11 =="
+  timeout -k 5s 30s xvfb-run -a -s '-screen 0 1440x1000x24 -nolisten tcp' \
+    env -u WAYLAND_DISPLAY GDK_BACKEND=x11 \
+    cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
+      -- --exact --ignored --test-threads=1 --nocapture \
+    >"$LOG_DIR/${regression##*::}-x11.txt" 2>&1 \
+    || { cat "$LOG_DIR/${regression##*::}-x11.txt"; exit 1; }
+  cat "$LOG_DIR/${regression##*::}-x11.txt"
+done
 
 start_host host
 
