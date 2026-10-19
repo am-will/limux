@@ -1712,10 +1712,12 @@ pub fn create_terminal(
             let gl_area = gl_area.downgrade();
             let background_realize = background_realize.clone();
             let shutting_down = shutting_down.clone();
-            glib::idle_add_local_once(move || {
+            // Finish rooting first, without waiting for foreground work to idle.
+            glib::idle_add_local_full(glib::Priority::DEFAULT, move || {
                 if let Some(gl_area) = gl_area.upgrade() {
                     background_realize.realize(&gl_area, &shutting_down);
                 }
+                glib::ControlFlow::Break
             });
         });
         track_signal(&signal_handlers, &gl_area, handler);
@@ -3559,10 +3561,14 @@ mod tests {
         let foreground = gtk::Entry::new();
         stack.add_named(&foreground, Some("foreground"));
         stack.add_named(&background.root, Some("background"));
+        // Foreground terminal work must not starve a rooted background request.
+        let busy =
+            glib::idle_add_local_full(glib::Priority::DEFAULT, || glib::ControlFlow::Continue);
         window.set_child(Some(&stack));
         foreground.grab_focus();
         drain_for(Duration::from_secs(1));
         assert!(background.handle.surface_cell.borrow().is_some());
+        busy.remove();
         assert!(!background.root.is_mapped());
         assert!(!background.handle.gl_area.is_mapped());
         assert_eq!(stack.visible_child_name().as_deref(), Some("foreground"));
