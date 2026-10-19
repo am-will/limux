@@ -63,6 +63,13 @@ one argument to the host `/bin/sh -c`, preserving quotes, variable references,
 and newlines. `direct:` keeps Ghostty's literal space splitting and performs no
 shell expansion. Native packages retain their existing launch path.
 
+The pinned Ghostty API cannot serialize a configured `env` map entry whose
+`KEY=VALUE` exceeds 256 bytes. This can affect long `PATH` settings. If effective
+configuration serialization fails, the Flatpak displays a held terminal with an
+error and starts no host command, including restored commands. Shorten configured
+environment values or use a native package. Other serialization failures produce
+the same explicit error. The native launch path does not depend on this snapshot.
+
 Host shell startup files are responsible for their own shell integration; the
 sandbox's Ghostty resources and helper paths are not host executable paths.
 Without host-side shell integration, `cd` works in the current terminal, but new
@@ -122,6 +129,9 @@ session helper available. Set `FLATPAK_USER_DIR` to test a separate user
 installation, and `LIMUX_TEST_CLI` to use a CLI outside `target/debug`.
 `LIMUX_FLATPAK_TEST_SHELL`, `LIMUX_FLATPAK_TEST_COMMAND`, and
 `LIMUX_FLATPAK_TEST_INTEGRATION` can select additional shell/configuration cases.
+Run with `LIMUX_FLATPAK_TEST_LONG_ENV=1` to verify the held error for a long
+configured environment entry and confirm that no restored or configured command
+executes.
 
 It verifies a host-only fixture, interactive PTY input/output, project `pwd`,
 `tty`, host terminfo, forwarded `LIMUX_*` identity and configured environment, a

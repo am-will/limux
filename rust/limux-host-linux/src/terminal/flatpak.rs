@@ -7,6 +7,7 @@ struct Commands {
     initial_command: Option<String>,
     env_names: Vec<String>,
     surface_created: bool,
+    config_unavailable: bool,
 }
 
 impl Commands {
@@ -31,6 +32,7 @@ pub(super) fn enabled() -> bool {
 
 pub(super) fn load_config(contents: &str) {
     COMMANDS.with_borrow_mut(|commands| {
+        commands.config_unavailable = false;
         commands.command = crate::ghostty_config::read_ghostty_value(contents, "command")
             .filter(|command| !command.is_empty());
         commands.initial_command =
@@ -50,6 +52,18 @@ pub(super) fn load_config(contents: &str) {
     });
 }
 
+pub(super) fn config_unavailable() {
+    COMMANDS.with_borrow_mut(|commands| commands.config_unavailable = true);
+}
+
+pub(super) fn wait_after_command(startup_command: Option<&str>) -> bool {
+    startup_command.is_some() || holds_config_error()
+}
+
+pub(super) fn holds_config_error() -> bool {
+    COMMANDS.with_borrow(|commands| commands.config_unavailable)
+}
+
 pub(super) fn surface_created() {
     COMMANDS.with_borrow_mut(|commands| commands.surface_created = true);
 }
@@ -59,6 +73,21 @@ pub(super) fn argv(
     extra_env: &[(String, String)],
 ) -> Result<Vec<CString>, NulError> {
     COMMANDS.with_borrow(|commands| {
+        if commands.config_unavailable {
+            return [
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' \
+                 'Limux Flatpak could not serialize the Ghostty configuration.' \
+                 'No host command was started.' \
+                 '' \
+                 'Known cause: a configured env KEY=VALUE entry exceeds 256 bytes.' \
+                 'Shorten configured env values, or use a native Limux package.'; exit 1",
+            ]
+            .into_iter()
+            .map(CString::new)
+            .collect();
+        }
         let mut names = vec!["TERM".to_string(), "COLORTERM".to_string()];
         names.extend(
             std::env::vars_os()
@@ -179,5 +208,26 @@ mod tests {
         super::load_config("env = \n");
         let argv = super::argv(None, &[]).unwrap();
         assert!(!argv[2].to_str().unwrap().contains("EDITOR"));
+    }
+
+    #[test]
+    fn unavailable_config_holds_an_error_without_executing_host_commands() {
+        super::load_config("command = exit 47\n");
+        super::config_unavailable();
+        for startup in [None, Some("exit 48")] {
+            assert!(super::wait_after_command(startup));
+            let argv = super::argv(startup, &[]).unwrap();
+            assert_eq!(argv[0].to_str().unwrap(), "/bin/sh");
+            assert_eq!(argv[1].to_str().unwrap(), "-c");
+            let output = std::process::Command::new(argv[0].to_str().unwrap())
+                .args(argv[1..].iter().map(|arg| arg.to_str().unwrap()))
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("could not serialize the Ghostty configuration"));
+        }
+        super::load_config("env = \n");
+        assert!(!super::wait_after_command(None));
     }
 }

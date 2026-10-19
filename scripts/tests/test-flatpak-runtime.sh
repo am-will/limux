@@ -96,6 +96,10 @@ CONFIG
 if [ -n "${LIMUX_FLATPAK_TEST_COMMAND:-}" ]; then
   printf 'command = %s\n' "$LIMUX_FLATPAK_TEST_COMMAND" >>"$XDG_CONFIG_HOME/ghostty/config"
 fi
+if [ "${LIMUX_FLATPAK_TEST_LONG_ENV:-0}" = 1 ]; then
+  printf 'command = touch "%s/configured-command-ran"\nenv = FLATPAK_LONG_VALUE=%0300d\n' \
+    "$RUN_DIR" 0 >>"$XDG_CONFIG_HOME/ghostty/config"
+fi
 cat >"$RESTORED_AGENT" <<'AGENT'
 #!/bin/sh
 set -eu
@@ -168,6 +172,32 @@ done
 WORKSPACE="$(jq -r '.workspaces[0].workspace_id' "$RUN_DIR/workspaces.json")"
 cli --json list-panels --workspace "$WORKSPACE" >"$RUN_DIR/panes.json"
 SURFACE="$(jq -r '.surfaces[0].surface_id' "$RUN_DIR/panes.json")"
+if [ "${LIMUX_FLATPAK_TEST_LONG_ENV:-0}" = 1 ]; then
+  cli --json new-surface --workspace "$WORKSPACE" --type terminal >"$RUN_DIR/second-surface.json"
+  SECOND_SURFACE="$(jq -r '.surface_id' "$RUN_DIR/second-surface.json")"
+  for surface in "$SURFACE" "$SECOND_SURFACE"; do
+    for _ in $(seq 1 100); do
+      cli read-screen --workspace "$WORKSPACE" --surface "$surface" >"$RUN_DIR/config-error-$surface.txt"
+      if rg -q 'could not serialize the Ghostty configuration' "$RUN_DIR/config-error-$surface.txt"; then break; fi
+      sleep 0.1
+    done
+    rg -q 'could not serialize the Ghostty configuration' "$RUN_DIR/config-error-$surface.txt" \
+      || { echo "Serialization failure did not remain readable on $surface" >&2; exit 1; }
+    rg -q 'No host command was started' "$RUN_DIR/config-error-$surface.txt"
+  done
+  if [ -e "$RUN_DIR/restored-agent-ran" ] || [ -e "$RUN_DIR/configured-command-ran" ]; then
+    echo 'A host command executed after configuration serialization failed' >&2
+    exit 1
+  fi
+  if command -v import >/dev/null; then import -window root "$RUN_DIR/flatpak-config-error.png"; fi
+  cli close-surface --workspace "$WORKSPACE" --surface "$SECOND_SURFACE" >/dev/null
+  cli --json list-panels --workspace "$WORKSPACE" >"$RUN_DIR/held-error-after-close.json"
+  jq -e --arg closed "$SECOND_SURFACE" --arg held "$SURFACE" \
+    '(.surfaces | all(.surface_id != $closed)) and (.surfaces | any(.surface_id == $held))' \
+    "$RUN_DIR/held-error-after-close.json" >/dev/null
+  printf 'PASS: unsupported configuration holds a readable error without running restored or configured commands\nArtifacts: %s\n' "$RUN_DIR"
+  exit 0
+fi
 for _ in $(seq 1 100); do [ -f "$RUN_DIR/restored-agent-ran" ] && break; sleep 0.1; done
 [ -f "$RUN_DIR/restored-agent-ran" ] || { echo 'Restored agent did not run on the host' >&2; exit 1; }
 touch "$RUN_DIR/release-restored-agent"
