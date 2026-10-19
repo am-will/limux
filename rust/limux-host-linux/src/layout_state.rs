@@ -553,6 +553,14 @@ struct HookSessionRecord {
 struct HookSessionFile {
     #[serde(default)]
     sessions: BTreeMap<String, HookSessionRecord>,
+    #[serde(default)]
+    ended_sessions: Vec<EndedHookSession>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct EndedHookSession {
+    session_id: String,
+    surface_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -560,6 +568,7 @@ pub struct RestorableAgentIndex {
     by_surface: HashMap<(String, String), (RestorableAgentState, f64)>,
     by_any_workspace_surface: HashMap<String, Option<(RestorableAgentState, f64)>>,
     by_tab_id: HashMap<String, Option<(RestorableAgentState, f64)>>,
+    ended_sessions: Vec<(RestorableAgentKind, EndedHookSession)>,
 }
 
 impl RestorableAgentIndex {
@@ -582,6 +591,9 @@ impl RestorableAgentIndex {
             let Ok(file) = serde_json::from_str::<HookSessionFile>(&raw) else {
                 continue;
             };
+            index
+                .ended_sessions
+                .extend(file.ended_sessions.into_iter().map(|record| (kind, record)));
             for record in file.sessions.values() {
                 let Some(session_id) = normalized_str(&record.session_id) else {
                     continue;
@@ -592,6 +604,9 @@ impl RestorableAgentIndex {
                 let Some(surface_id) = normalized_str(&record.surface_id) else {
                     continue;
                 };
+                if index.session_ended(kind, &session_id, surface_tab_id(&surface_id)) {
+                    continue;
+                }
                 let tab_id = surface_id
                     .rsplit_once(':')
                     .map(|(_, tab_id)| tab_id.to_string());
@@ -682,6 +697,18 @@ impl RestorableAgentIndex {
             })
             .map(|(agent, _)| agent.clone())
     }
+
+    fn session_ended(&self, kind: RestorableAgentKind, session_id: &str, tab_id: &str) -> bool {
+        self.ended_sessions.iter().any(|(ended_kind, ended)| {
+            *ended_kind == kind
+                && ended.session_id.trim() == session_id.trim()
+                && surface_tab_id(ended.surface_id.trim()) == tab_id
+        })
+    }
+}
+
+fn surface_tab_id(surface_id: &str) -> &str {
+    surface_id.rsplit(':').next().unwrap_or(surface_id)
 }
 
 pub(crate) fn attach_restorable_agents_to_session(
@@ -706,6 +733,11 @@ pub fn attach_restorable_agents_to_layout(
         LayoutNodeState::Pane(pane) => {
             for tab in &mut pane.tabs {
                 if let TabContentState::Terminal { agent, .. } = &mut tab.content {
+                    if agent.as_ref().is_some_and(|agent| {
+                        index.session_ended(agent.kind, &agent.session_id, &tab.id)
+                    }) {
+                        *agent = None;
+                    }
                     if agent
                         .as_ref()
                         .is_some_and(|agent| !agent.restore_on_startup)
@@ -1649,6 +1681,100 @@ mod tests {
                 );
             }
             other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_cleanup_clears_cached_binding_after_pane_and_workspace_move() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {},
+                "ended_sessions": [{
+                    "session_id": "ended", "workspace_id": "old-workspace",
+                    "surface_id": "42:tab-a", "updated_at": 20.0
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut tab = TabState::terminal("tab-a", None);
+        let TabContentState::Terminal { agent, .. } = &mut tab.content else {
+            unreachable!()
+        };
+        *agent = Some(RestorableAgentState {
+            kind: RestorableAgentKind::Codex,
+            session_id: "ended".into(),
+            cwd: None,
+            launch_command: None,
+            restore_on_startup: true,
+        });
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(99),
+            active_tab_id: Some("tab-a".into()),
+            tabs: vec![tab],
+        });
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        attach_restorable_agents_to_layout(&mut layout, "new-workspace", &index);
+        let LayoutNodeState::Pane(pane) = layout else {
+            unreachable!()
+        };
+        let TabContentState::Terminal { agent, .. } = &pane.tabs[0].content else {
+            unreachable!()
+        };
+        assert!(
+            agent.is_none(),
+            "explicit cleanup must prevent the cached agent from resuming again"
+        );
+    }
+
+    #[test]
+    fn hook_cleanup_does_not_clear_another_kind_session_or_tab() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1, "sessions": {}, "ended_sessions": [{
+                    "session_id": "ended", "workspace_id": "workspace",
+                    "surface_id": "42:tab-a", "updated_at": 20.0
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        for (kind, session_id, tab_id) in [
+            (RestorableAgentKind::Claude, "ended", "tab-a"),
+            (RestorableAgentKind::Codex, "new-session", "tab-a"),
+            (RestorableAgentKind::Codex, "ended", "tab-b"),
+        ] {
+            let binding = RestorableAgentState {
+                kind,
+                session_id: session_id.into(),
+                cwd: None,
+                launch_command: None,
+                restore_on_startup: true,
+            };
+            let mut tab = TabState::terminal(tab_id, None);
+            let TabContentState::Terminal { agent, .. } = &mut tab.content else {
+                unreachable!()
+            };
+            *agent = Some(binding.clone());
+            let mut layout = LayoutNodeState::Pane(PaneState {
+                pane_id: Some(42),
+                active_tab_id: Some(tab_id.into()),
+                tabs: vec![tab],
+            });
+            attach_restorable_agents_to_layout(&mut layout, "workspace", &index);
+            let LayoutNodeState::Pane(pane) = layout else {
+                unreachable!()
+            };
+            let TabContentState::Terminal { agent, .. } = &pane.tabs[0].content else {
+                unreachable!()
+            };
+            assert_eq!(agent.as_ref(), Some(&binding));
         }
     }
 

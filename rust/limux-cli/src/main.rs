@@ -1172,7 +1172,9 @@ fn persist_agent_hook_session(
     let store = agent_hooks::AgentHookSessionStore::new(agent);
     match agent_hook_persistence_action(event) {
         AgentHookPersistenceAction::Remove => {
-            let result = store.remove(&session_id);
+            let (workspace_id, surface_id) =
+                agent_hook_cleanup_scope(args, payload, limux_env_value);
+            let result = store.remove(&session_id, workspace_id.as_deref(), surface_id.as_deref());
             if result.is_ok() {
                 write_agent_hook_debug(
                     agent,
@@ -1256,6 +1258,21 @@ fn persist_agent_hook_session(
         );
     }
     result
+}
+
+fn agent_hook_cleanup_scope(
+    args: &[String],
+    payload: &Value,
+    env_value: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env_value("LIMUX_WORKSPACE_ID"))
+        .or_else(|| hook_str(payload, &["workspace_id"]).map(str::to_string));
+    let surface = parse_opt(args, "--surface")
+        .or_else(|| env_value("LIMUX_SURFACE_ID"))
+        .or_else(|| env_value("LIMUX_TAB_ID"))
+        .or_else(|| hook_str(payload, &["surface_id", "tab_id"]).map(str::to_string));
+    (workspace, surface)
 }
 
 fn hook_session_id(payload: &Value) -> Option<String> {
@@ -4296,6 +4313,44 @@ mod cli_arg_tests {
         assert_eq!(
             agent_hook_persistence_action("restore-exit"),
             AgentHookPersistenceAction::Remove
+        );
+    }
+
+    #[test]
+    fn cleanup_scope_uses_current_target_and_can_fall_back_to_stable_tab_or_payload() {
+        let payload = json!({"workspace_id": "payload-workspace", "surface_id": "5:payload-tab"});
+        let current = |key: &str| match key {
+            "LIMUX_WORKSPACE_ID" => Some("current-workspace".into()),
+            "LIMUX_SURFACE_ID" => Some("7:current-tab".into()),
+            "LIMUX_TAB_ID" => Some("stable-tab".into()),
+            _ => None,
+        };
+        assert_eq!(
+            agent_hook_cleanup_scope(
+                &args(&["--workspace", "explicit", "--surface", "8:explicit-tab"]),
+                &payload,
+                current
+            ),
+            (Some("explicit".into()), Some("8:explicit-tab".into()))
+        );
+        assert_eq!(
+            agent_hook_cleanup_scope(&[], &payload, current),
+            (
+                Some("current-workspace".into()),
+                Some("7:current-tab".into())
+            )
+        );
+        assert_eq!(
+            agent_hook_cleanup_scope(&[], &json!({}), |key| (key == "LIMUX_TAB_ID")
+                .then(|| "stable-tab".into())),
+            (None, Some("stable-tab".into()))
+        );
+        assert_eq!(
+            agent_hook_cleanup_scope(&[], &payload, |_| None),
+            (
+                Some("payload-workspace".into()),
+                Some("5:payload-tab".into())
+            )
         );
     }
 

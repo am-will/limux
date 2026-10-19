@@ -88,6 +88,16 @@ struct AgentHookSessionFile {
     version: u32,
     #[serde(default)]
     sessions: BTreeMap<String, AgentHookSessionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ended_sessions: Vec<EndedAgentHookSession>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EndedAgentHookSession {
+    session_id: String,
+    workspace_id: String,
+    surface_id: String,
+    updated_at: f64,
 }
 
 pub(crate) struct AgentHookSessionStore {
@@ -140,18 +150,51 @@ impl AgentHookSessionStore {
         let _lock = self.lock()?;
         let mut file = self.load()?;
         let record = update(file.sessions.get(&session_id));
+        file.ended_sessions.retain(|ended| {
+            ended.session_id != session_id
+                || tab_identity(&ended.surface_id) != tab_identity(&record.surface_id)
+        });
         file.version = 1;
         file.sessions.insert(session_id, record);
         self.save(&file)
     }
 
-    pub(crate) fn remove(&self, session_id: &str) -> Result<()> {
+    pub(crate) fn remove(
+        &self,
+        session_id: &str,
+        workspace_id: Option<&str>,
+        surface_id: Option<&str>,
+    ) -> Result<()> {
         let Some(session_id) = normalized(session_id) else {
             return Ok(());
         };
         let _lock = self.lock()?;
         let mut file = self.load()?;
-        file.sessions.remove(&session_id);
+        let removed = file.sessions.remove(&session_id);
+        let surface_id = surface_id.and_then(normalized).or_else(|| {
+            removed
+                .as_ref()
+                .and_then(|record| normalized(&record.surface_id))
+        });
+        if let Some(surface_id) = surface_id {
+            file.ended_sessions.retain(|ended| {
+                ended.session_id != session_id
+                    || tab_identity(&ended.surface_id) != tab_identity(&surface_id)
+            });
+            file.ended_sessions.push(EndedAgentHookSession {
+                session_id,
+                workspace_id: workspace_id
+                    .and_then(normalized)
+                    .or_else(|| {
+                        removed
+                            .as_ref()
+                            .and_then(|record| normalized(&record.workspace_id))
+                    })
+                    .unwrap_or_default(),
+                surface_id,
+                updated_at: now_seconds(),
+            });
+        }
         self.save(&file)
     }
 
@@ -196,6 +239,7 @@ impl AgentHookSessionStore {
             return Ok(AgentHookSessionFile {
                 version: 1,
                 sessions: BTreeMap::new(),
+                ended_sessions: Vec::new(),
             });
         }
         let raw = fs::read_to_string(&self.path)
@@ -222,6 +266,11 @@ impl AgentHookSessionStore {
             .with_context(|| format!("failed to replace {}", self.path.display()))?;
         Ok(())
     }
+}
+
+fn tab_identity(surface_id: &str) -> &str {
+    let surface_id = surface_id.trim();
+    surface_id.rsplit(':').next().unwrap_or(surface_id)
 }
 
 pub(crate) fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -> Vec<String> {
@@ -558,6 +607,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cleanup_durably_invalidates_the_removed_binding() {
+        let dir = tempdir().unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        store.update("ended", |_| test_record("ended")).unwrap();
+        store.remove("ended", None, None).unwrap();
+        assert!(store.lookup("ended").unwrap().is_none());
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(json["ended_sessions"][0]["session_id"], "ended");
+        assert_eq!(json["ended_sessions"][0]["surface_id"], "1:ended");
+    }
+
+    #[test]
+    fn cleanup_without_a_record_keeps_scoped_invalidations_until_matching_upsert() {
+        let dir = tempdir().unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        store
+            .remove("ended", Some("old-workspace"), Some("1:tab-a"))
+            .unwrap();
+        store
+            .remove("ended", Some("other-workspace"), Some("2:tab-b"))
+            .unwrap();
+        store
+            .remove("other", Some("old-workspace"), Some("1:tab-a"))
+            .unwrap();
+        let persisted = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        assert_eq!(persisted.load().unwrap().ended_sessions.len(), 3);
+
+        // Restarting the same tab clears its cleanup after a pane/workspace
+        // change, while other sessions and tabs keep their cleanup markers.
+        persisted
+            .update("ended", |_| {
+                let mut record = test_record("ended");
+                record.workspace_id = "new-workspace".into();
+                record.surface_id = "99:tab-a".into();
+                record
+            })
+            .unwrap();
+        let ended = persisted.load().unwrap().ended_sessions;
+        assert_eq!(ended.len(), 2);
+        assert!(ended
+            .iter()
+            .any(|record| record.session_id == "ended" && record.surface_id == "2:tab-b"));
+        assert!(ended.iter().any(|record| record.session_id == "other"));
+    }
+
     fn await_marker(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !path.exists() {
@@ -641,7 +737,7 @@ mod tests {
                     record
                 })
                 .unwrap(),
-            "remove" => store.remove("remove-me").unwrap(),
+            "remove" => store.remove("remove-me", None, None).unwrap(),
             _ => panic!("unknown worker action"),
         }
     }
