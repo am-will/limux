@@ -875,6 +875,7 @@ mod tests {
         let mut config = AppConfig {
             hooks: GuiHooksConfig {
                 on_workspace_delete: crate::gui_hooks::GuiHook {
+                    enabled: false,
                     command: "cleanup.sh -y".to_string(),
                     show_terminal: true,
                     suppress_default: true,

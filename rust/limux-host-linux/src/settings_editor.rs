@@ -9,7 +9,7 @@ use crate::app_config::{
     AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UnreadColor,
     WindowControlsSide, DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS, MIN_TAB_ACTIVITY_SECONDS,
 };
-use crate::gui_hooks::GuiHookEvent;
+use crate::gui_hooks::{GuiHook, GuiHookEvent};
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
@@ -253,11 +253,11 @@ fn build_gui_hooks_group(input: &SettingsEditorInput) -> adw::PreferencesGroup {
     group
 }
 
-fn gui_hook_subtitle(command: &str) -> String {
-    if command.trim().is_empty() {
-        "Not set".to_string()
-    } else {
-        command.trim().to_string()
+fn gui_hook_subtitle(hook: &GuiHook) -> String {
+    match (hook.command.trim(), hook.enabled) {
+        ("", _) => "Not set".to_string(),
+        (command, true) => command.to_string(),
+        (command, false) => format!("Disabled: {command}"),
     }
 }
 
@@ -265,8 +265,24 @@ fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::
     let hook = input.config.borrow().hooks.get(event).clone();
     let expander = adw::ExpanderRow::builder()
         .title(event.title())
-        .subtitle(gui_hook_subtitle(&hook.command))
+        .subtitle(gui_hook_subtitle(&hook))
         .build();
+    let refresh_subtitle = {
+        let config = input.config.clone();
+        let expander = expander.clone();
+        move || expander.set_subtitle(&gui_hook_subtitle(config.borrow().hooks.get(event)))
+    };
+
+    let enabled_row = adw::ActionRow::builder()
+        .title("Enabled")
+        .subtitle("Turn the hook off without losing its command")
+        .build();
+    let enabled_switch = gtk::Switch::new();
+    enabled_switch.set_active(hook.enabled);
+    enabled_switch.set_valign(gtk::Align::Center);
+    enabled_row.add_suffix(&enabled_switch);
+    enabled_row.set_activatable_widget(Some(&enabled_switch));
+    expander.add_row(&enabled_row);
 
     let command_row = adw::ActionRow::builder().title("Command").build();
     let command_entry = gtk::Entry::builder()
@@ -305,13 +321,24 @@ fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
-        let expander = expander.clone();
+        let refresh_subtitle = refresh_subtitle.clone();
+        enabled_switch.connect_active_notify(move |switch| {
+            let enabled = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.hooks.get_mut(event).enabled = enabled;
+            });
+            refresh_subtitle();
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
         command_entry.connect_changed(move |entry| {
             let command = entry.text().trim().to_string();
-            expander.set_subtitle(&gui_hook_subtitle(&command));
             apply_config_change(&config, &*on_changed, move |c| {
                 c.hooks.get_mut(event).command = command;
             });
+            refresh_subtitle();
         });
     }
     {

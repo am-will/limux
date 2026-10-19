@@ -20,7 +20,7 @@ use crate::terminal::{TerminalCallbacks, TerminalOptions};
 pub(super) fn run_gui_hook(state: &State, event: GuiHookEvent, context: &GuiHookContext) -> bool {
     let hook = {
         let s = state.borrow();
-        let hook = s.config.borrow().hooks.configured(event).cloned();
+        let hook = s.config.borrow().hooks.active(event).cloned();
         hook
     };
     let Some(hook) = hook else {

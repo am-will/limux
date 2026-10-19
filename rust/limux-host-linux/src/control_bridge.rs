@@ -811,13 +811,14 @@ fn parse_gui_hook_request(
         }
     };
     let update = GuiHookUpdate {
+        enabled: flag("enabled")?,
         command,
         show_terminal: flag("show_terminal")?,
         suppress_default: flag("suppress_default")?,
     };
     if update == GuiHookUpdate::default() {
         return Err(BridgeError::invalid_params(format!(
-            "{method} requires command, show_terminal or suppress_default"
+            "{method} requires enabled, command, show_terminal or suppress_default"
         )));
     }
     Ok(GuiHookRequest::Set { event, update })
@@ -2411,18 +2412,19 @@ mod tests {
                 update: GuiHookUpdate {
                     command: Some("new.sh --force".to_string()),
                     show_terminal: Some(true),
-                    suppress_default: None,
+                    ..Default::default()
                 },
             }
         );
         assert_eq!(
             dispatched_gui_hook_request(
                 "gui_hook.set",
-                json!({"hook": "on_workspace_delete", "suppress_default": false}),
+                json!({"hook": "on_workspace_delete", "enabled": false, "suppress_default": false}),
             ),
             GuiHookRequest::Set {
                 event: GuiHookEvent::WorkspaceDelete,
                 update: GuiHookUpdate {
+                    enabled: Some(false),
                     suppress_default: Some(false),
                     ..Default::default()
                 },
@@ -2452,6 +2454,10 @@ mod tests {
             (
                 "gui_hook.set",
                 json!({"event": "on-workspace-create", "show_terminal": "yes"}),
+            ),
+            (
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "enabled": 0}),
             ),
             ("gui_hook.clear", json!({})),
         ] {

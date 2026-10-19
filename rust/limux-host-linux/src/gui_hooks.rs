@@ -44,8 +44,10 @@ impl GuiHookEvent {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuiHook {
+    /// A disabled hook keeps its settings but never runs.
+    pub enabled: bool,
     /// A bash command line, e.g. `~/bin/new-ws.sh --force`.
     pub command: String,
     /// Run the command in a pop-up terminal instead of in the background.
@@ -54,15 +56,33 @@ pub struct GuiHook {
     pub suppress_default: bool,
 }
 
+impl Default for GuiHook {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: String::new(),
+            show_terminal: false,
+            suppress_default: false,
+        }
+    }
+}
+
 impl GuiHook {
     pub fn is_configured(&self) -> bool {
         !self.command.trim().is_empty()
+    }
+
+    /// Whether the hook runs: it has a command and is enabled.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.is_configured()
     }
 
     fn from_value(value: &Value) -> Option<Self> {
         let hook = value.as_object()?;
         let flag = |key| hook.get(key).and_then(Value::as_bool).unwrap_or(false);
         Some(Self {
+            // Hooks saved before this switch existed were all enabled.
+            enabled: hook.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             command: hook.get("command").and_then(Value::as_str)?.to_string(),
             show_terminal: flag("show_terminal"),
             suppress_default: flag("suppress_default"),
@@ -71,6 +91,7 @@ impl GuiHook {
 
     fn to_value(&self) -> Value {
         json!({
+            "enabled": self.enabled,
             "command": self.command,
             "show_terminal": self.show_terminal,
             "suppress_default": self.suppress_default,
@@ -99,9 +120,9 @@ impl GuiHooksConfig {
         }
     }
 
-    /// The configured hook for `event`, if it has a command.
-    pub fn configured(&self, event: GuiHookEvent) -> Option<&GuiHook> {
-        Some(self.get(event)).filter(|hook| hook.is_configured())
+    /// The hook to run for `event`, if it has a command and is enabled.
+    pub fn active(&self, event: GuiHookEvent) -> Option<&GuiHook> {
+        Some(self.get(event)).filter(|hook| hook.is_active())
     }
 
     pub fn from_value(value: Option<&Value>) -> Self {
@@ -132,6 +153,7 @@ impl GuiHooksConfig {
         json!({
             "event": event.as_str(),
             "configured": hook.is_configured(),
+            "enabled": hook.enabled,
             "command": hook.command,
             "show_terminal": hook.show_terminal,
             "suppress_default": hook.suppress_default,
@@ -142,6 +164,7 @@ impl GuiHooksConfig {
 /// A change to one hook; `None` fields keep their current value.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GuiHookUpdate {
+    pub enabled: Option<bool>,
     pub command: Option<String>,
     pub show_terminal: Option<bool>,
     pub suppress_default: Option<bool>,
@@ -149,6 +172,9 @@ pub struct GuiHookUpdate {
 
 impl GuiHookUpdate {
     pub fn apply(&self, hook: &mut GuiHook) {
+        if let Some(enabled) = self.enabled {
+            hook.enabled = enabled;
+        }
         if let Some(command) = &self.command {
             hook.command = command.trim().to_string();
         }
@@ -239,6 +265,7 @@ mod tests {
 
     fn hook(command: &str, show_terminal: bool, suppress_default: bool) -> GuiHook {
         GuiHook {
+            enabled: true,
             command: command.to_string(),
             show_terminal,
             suppress_default,
@@ -258,14 +285,17 @@ mod tests {
     fn hooks_round_trip_through_settings_json() {
         let config = GuiHooksConfig {
             on_workspace_create: hook("~/bin/new.sh --force", true, false),
-            on_workspace_delete: hook("rm-ws -y", false, true),
+            on_workspace_delete: GuiHook {
+                enabled: false,
+                ..hook("rm-ws -y", false, true)
+            },
         };
         let value = config.to_value().expect("hooks are saved");
         assert_eq!(
             value,
             json!({
-                "on_workspace_create": {"command": "~/bin/new.sh --force", "show_terminal": true, "suppress_default": false},
-                "on_workspace_delete": {"command": "rm-ws -y", "show_terminal": false, "suppress_default": true},
+                "on_workspace_create": {"enabled": true, "command": "~/bin/new.sh --force", "show_terminal": true, "suppress_default": false},
+                "on_workspace_delete": {"enabled": false, "command": "rm-ws -y", "show_terminal": false, "suppress_default": true},
             })
         );
         assert_eq!(GuiHooksConfig::from_value(Some(&value)), config);
@@ -279,7 +309,44 @@ mod tests {
             "on_workspace_delete": "echo",
         })));
         assert_eq!(config, GuiHooksConfig::default());
-        assert_eq!(config.configured(GuiHookEvent::WorkspaceCreate), None);
+        assert_eq!(config.active(GuiHookEvent::WorkspaceCreate), None);
+    }
+
+    #[test]
+    fn hooks_saved_without_the_enabled_flag_are_enabled() {
+        let config = GuiHooksConfig::from_value(Some(&json!({
+            "on_workspace_create": {"command": "new.sh", "show_terminal": true},
+        })));
+        assert_eq!(config.on_workspace_create, hook("new.sh", true, false));
+        assert!(config.active(GuiHookEvent::WorkspaceCreate).is_some());
+    }
+
+    #[test]
+    fn a_disabled_hook_keeps_its_settings_but_does_not_run() {
+        let mut config = GuiHooksConfig {
+            on_workspace_create: hook("new.sh", true, true),
+            ..Default::default()
+        };
+        GuiHookUpdate {
+            enabled: Some(false),
+            ..Default::default()
+        }
+        .apply(config.get_mut(GuiHookEvent::WorkspaceCreate));
+        assert_eq!(config.active(GuiHookEvent::WorkspaceCreate), None);
+        assert_eq!(
+            config.describe(GuiHookEvent::WorkspaceCreate),
+            json!({
+                "event": "on-workspace-create",
+                "configured": true,
+                "enabled": false,
+                "command": "new.sh",
+                "show_terminal": true,
+                "suppress_default": true,
+            })
+        );
+        // A disabled hook is not a default one, so it is still saved.
+        let saved = GuiHooksConfig::from_value(config.to_value().as_ref());
+        assert_eq!(saved, config);
     }
 
     #[test]
@@ -288,7 +355,7 @@ mod tests {
             on_workspace_delete: hook("   ", true, true),
             ..Default::default()
         };
-        assert_eq!(config.configured(GuiHookEvent::WorkspaceDelete), None);
+        assert_eq!(config.active(GuiHookEvent::WorkspaceDelete), None);
     }
 
     #[test]
@@ -303,7 +370,7 @@ mod tests {
         GuiHookUpdate {
             command: Some("  new --force ".to_string()),
             show_terminal: Some(false),
-            suppress_default: None,
+            ..Default::default()
         }
         .apply(&mut current);
         assert_eq!(current, hook("new --force", false, true));
