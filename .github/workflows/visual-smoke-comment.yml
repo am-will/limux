@@ -1,0 +1,90 @@
+name: Visual smoke PR comment
+
+on:
+  workflow_run:
+    workflows: [Rust Quality]
+    types: [completed]
+
+permissions:
+  actions: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment with the visual gallery link
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const eventRun = context.payload.workflow_run;
+            const runResponse = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: eventRun.id });
+            const run = runResponse.data;
+            const workflow = await github.rest.actions.getWorkflow({ owner, repo, workflow_id: 'rust-quality.yml' });
+            if (run.workflow_id !== workflow.data.id || run.repository?.full_name !== `${owner}/${repo}`) {
+              core.info('Not a run of the trusted Rust Quality workflow in this repository.');
+              return;
+            }
+
+            let pullNumber;
+            let sourceSha;
+            let jobName;
+            if (run.event === 'pull_request') {
+              const associations = run.pull_requests || eventRun.pull_requests || [];
+              const association = associations.find(item => item.number && item.head?.sha);
+              if (!association) {
+                core.info('Rust Quality run has no pull request association.');
+                return;
+              }
+              pullNumber = association.number;
+              sourceSha = association.head.sha;
+              jobName = 'GTK host smoke';
+            } else if (run.event === 'workflow_dispatch' && run.head_branch === 'main') {
+              const match = /^Rust Quality dispatch PR #([1-9][0-9]*) at ([0-9a-f]{40})$/.exec(run.display_title || '');
+              if (!match) {
+                core.info('Trusted dispatch run title does not identify an exact PR head.');
+                return;
+              }
+              pullNumber = Number(match[1]);
+              sourceSha = match[2];
+              jobName = 'GTK visual smoke dispatch';
+            } else {
+              return;
+            }
+
+            const prResponse = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
+            const pr = prResponse.data;
+            if (pr.state !== 'open' || pr.base.repo.full_name !== `${owner}/${repo}` || pr.head.sha !== sourceSha) {
+              core.info('Skipping stale or closed PR visual run.');
+              return;
+            }
+
+            const [jobsResponse, artifactsResponse] = await Promise.all([
+              github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 }),
+              github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id, per_page: 100 }),
+            ]);
+            const visualJob = jobsResponse.data.jobs.find(job => job.name === jobName);
+            const artifact = artifactsResponse.data.artifacts.find(item => item.name === 'limux-visual-smoke');
+            if (!artifact) {
+              core.info('Visual-smoke artifact was not uploaded; no PR comment will be posted.');
+              return;
+            }
+
+            const status = visualJob?.conclusion || 'not reported';
+            const artifactUrl = `https://github.com/${owner}/${repo}/actions/runs/${run.id}/artifacts/${artifact.id}`;
+            const marker = `<!-- limux-visual-smoke:${sourceSha} -->`;
+            const body = `${marker}\nLimux visual smoke for \`${sourceSha}\`: **${status}**. [Download the screenshots and open the included HTML gallery](${artifactUrl}). [Workflow run](${run.html_url}).`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pullNumber, per_page: 100,
+            });
+            const existing = comments.find(comment => comment.user?.login === 'github-actions[bot]' && comment.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              core.info(`Updated the visual-smoke comment for PR #${pullNumber}.`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: pullNumber, body });
+              core.info(`Posted the visual-smoke comment for PR #${pullNumber}.`);
+            }
