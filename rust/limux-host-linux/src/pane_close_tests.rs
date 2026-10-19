@@ -608,3 +608,151 @@ fn inline_rename_commit_returns_the_focus_to_the_workspace() {
     pump_for(std::time::Duration::from_millis(200));
     assert_focus_within("rename committed by a click", &state, &clicked);
 }
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn tab_unread_changes_preserve_independent_workspace_notifications() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.UnreadSourcesTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    pane::add_terminal_tab_to_pane(&pane);
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    let wait = std::time::Duration::from_secs(5);
+    pump_until(wait, || handle.health().realized);
+    assert!(handle.health().realized);
+    select_workspace_by_index(&state, 0);
+
+    let target = DesktopNotificationTarget {
+        workspace_id: ws_id.clone(),
+        pane_id: None,
+        tab_id: None,
+    };
+    mark_workspace_unread_with_message(&state, &ws_id, "Workspace notice", false, target);
+    let target = DesktopNotificationTarget {
+        workspace_id: ws_id.clone(),
+        pane_id: Some(surface.pane_id),
+        tab_id: Some(surface.tab_id.clone()),
+    };
+    mark_workspace_unread_with_message(&state, &ws_id, "Tab notice", false, target);
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    assert!(handle.send_text("exit\n"));
+    pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
+    assert_eq!(pane::tab_count_in_pane(&pane), 1, "unread terminal exited");
+    let (row, notify_dot) = {
+        let s = state.borrow();
+        let workspace = s.workspaces.iter().find(|w| w.id == ws_id).unwrap();
+        assert!(
+            workspace.unread,
+            "a terminal exit must preserve the independent workspace notice"
+        );
+        (
+            workspace.sidebar_row.clone(),
+            workspace.indicator_unread_dot.clone(),
+        )
+    };
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+    assert!(notify_dot.get_visible());
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Read").emit_clicked();
+    pump_until(wait, || !notify_dot.get_visible());
+    assert!(!notify_dot.get_visible());
+    let index = state
+        .borrow()
+        .workspaces
+        .iter()
+        .position(|w| w.id == ws_id)
+        .unwrap();
+    select_workspace_by_index(&state, index);
+    pane::add_terminal_tab_to_pane(&pane);
+    assert!(pane::mark_active_tab_manual_unread_in_root(&root));
+    sync_workspace_unread(&state, &ws_id);
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    assert!(notify_dot.get_visible());
+    assert!(!pane::clear_active_tab_unread_in_root_if_not_manual(&root));
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Read").emit_clicked();
+    pump_until(wait, || !pane::workspace_has_unread_tabs(&ws_id));
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+    assert!(
+        !notify_dot.get_visible(),
+        "reading a tab-only notice clears it"
+    );
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Unread").emit_clicked();
+    pump_until(wait, || notify_dot.get_visible());
+    {
+        let s = state.borrow();
+        let workspace = s.workspaces.iter().find(|w| w.id == ws_id).unwrap();
+        assert!(workspace.manual_unread);
+        assert!(
+            !workspace.unread,
+            "manual and notification sources are separate"
+        );
+    }
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    pump_until(wait, || handle.health().realized);
+    assert!(handle.send_text("exit\n"));
+    pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
+    assert_eq!(pane::tab_count_in_pane(&pane), 1);
+    assert!(
+        state.borrow().workspaces[index].manual_unread,
+        "a terminal exit must preserve the independent manual workspace reminder"
+    );
+    assert!(notify_dot.get_visible());
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Read").emit_clicked();
+    pump_until(wait, || !notify_dot.get_visible());
+    assert!(!notify_dot.get_visible());
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+
+    pane::add_terminal_tab_to_pane(&pane);
+    let tab_id = pane::active_tab_in_pane(&pane).unwrap();
+    let pane_id = pane::active_surface_summary(&pane).unwrap().pane_id;
+    assert_eq!(
+        pane::mark_tab_unread_in_workspace(&ws_id, pane_id, &tab_id),
+        Some(true)
+    );
+    sync_workspace_unread(&state, &ws_id);
+    assert!(notify_dot.get_visible());
+    assert!(pane::close_tab_in_pane(&pane, &tab_id));
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+    assert!(
+        !notify_dot.get_visible(),
+        "closing a tab-only notice clears it"
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+    pump_until(wait, || !window.is_visible());
+}

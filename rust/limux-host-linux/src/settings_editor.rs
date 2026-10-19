@@ -534,11 +534,25 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
         unread_color_dropdown.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
             let unread_color = UnreadColor::from_dropdown_index(dropdown.selected());
-            apply_config_change(&config, &*on_changed, move |c| {
+            if unread_color == config.borrow().appearance.unread_color {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
                 c.appearance.unread_color = unread_color;
-            });
+            })
+            .appearance
+            .unread_color;
+            if dropdown.selected() != effective.dropdown_index() {
+                syncing.set(true);
+                dropdown.set_selected(effective.dropdown_index());
+                syncing.set(false);
+            }
         });
     }
     {
@@ -952,8 +966,18 @@ mod tests {
             timeout_spin.value_as_int(),
             DEFAULT_TAB_ACTIVITY_SECONDS as i32
         );
+        let unread_color = find_control(&page, "Unread indicator color")
+            .expect("settings control")
+            .downcast::<gtk::DropDown>()
+            .expect("dropdown");
+        unread_color.set_selected(UnreadColor::Rose.dropdown_index());
+        assert_eq!(
+            unread_color.selected(),
+            UnreadColor::default().dropdown_index(),
+            "rejected unread color was retained"
+        );
         assert_eq!(config.borrow().interface, Default::default());
-        assert_eq!(rejected_changes.get(), 5, "rollback must not save again");
+        assert_eq!(rejected_changes.get(), 6, "rollback must not save again");
 
         reject_changes.set(false);
         tab_activity_switch.set_active(false);

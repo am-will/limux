@@ -408,6 +408,7 @@ for regression in \
   terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
+  window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \

@@ -4501,7 +4501,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
             .workspaces
             .iter()
             .find(|workspace| workspace.id == workspace_id)
-            .is_some_and(|workspace| workspace.unread);
+            .is_some_and(|workspace| workspace.unread || workspace.manual_unread);
         workspace_unread || pane::workspace_has_unread_tabs(workspace_id)
     };
     let unread_label = if is_unread {
@@ -4593,7 +4593,6 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
                         workspace.unread = false;
                         workspace.manual_unread = false;
                     } else {
-                        workspace.unread = true;
                         workspace.manual_unread = true;
                     }
                     workspace.root.clone()
@@ -6955,13 +6954,6 @@ pub(crate) fn create_pane_for_workspace(
             move || request_session_save(&state)
         }),
         on_unread_changed: Box::new(move || {
-            if !pane::workspace_has_unread_tabs(&ws_id_unread) {
-                let mut s = state_for_unread.borrow_mut();
-                if let Some(ws) = s.workspaces.iter_mut().find(|w| w.id == ws_id_unread) {
-                    ws.unread = false;
-                    ws.manual_unread = false;
-                }
-            }
             sync_workspace_unread(&state_for_unread, &ws_id_unread);
         }),
         is_pane_visible: Box::new(move |pane_widget| {
@@ -8431,7 +8423,7 @@ fn sync_workspace_unread(state: &State, ws_id: &str) {
         let Some(workspace) = s.workspaces.iter().find(|workspace| workspace.id == ws_id) else {
             return;
         };
-        workspace.unread
+        workspace.unread || workspace.manual_unread
     };
     let tab_unread = pane::workspace_has_unread_tabs(ws_id);
     let s = state.borrow();
@@ -8474,9 +8466,7 @@ fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &str) {
         else {
             return;
         };
-        if !workspace.manual_unread {
-            workspace.unread = false;
-        }
+        workspace.unread = false;
         workspace.root.clone()
     };
     pane::clear_active_tab_unread_in_root_if_not_manual(&root);
