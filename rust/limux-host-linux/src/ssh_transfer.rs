@@ -1,6 +1,7 @@
 //! Binary image upload through OpenSSH. No local shell, staging file, or helper.
 use crate::ssh_hosts::SshTarget;
 use gio::prelude::*;
+use glib::translate::{IntoGlib, ToGlibPtr};
 use gtk4::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
@@ -40,6 +41,8 @@ fn arguments(target: &SshTarget, flatpak: bool) -> Vec<String> {
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
+            "ClearAllForwardings=yes",
+            "-o",
             "ConnectTimeout=10",
             "-o",
             "ServerAliveInterval=5",
@@ -58,6 +61,39 @@ fn arguments(target: &SshTarget, flatpak: bool) -> Vec<String> {
         format!("/bin/sh -c '{}'", UPLOAD_SCRIPT.replace('\'', "'\\''")),
     ]);
     args
+}
+
+unsafe extern "C" {
+    fn setsid() -> std::ffi::c_int;
+    fn _exit(status: std::ffi::c_int) -> !;
+}
+
+unsafe extern "C" fn detach_upload_process(_data: glib::ffi::gpointer) {
+    // Only async-signal-safe operations are allowed between fork and exec.
+    unsafe {
+        if setsid() < 0 {
+            _exit(127);
+        }
+    }
+}
+
+fn relay_diagnostics(stderr: &gio::InputStream) {
+    let log: gio::OutputStream = gio::WriteOutputStream::new(std::io::stderr()).upcast();
+    // GIO retains both streams and copies bounded chunks with worker-thread
+    // writes, so a slow launch log never blocks the GTK main loop.
+    unsafe {
+        gio::ffi::g_output_stream_splice_async(
+            log.to_glib_none().0,
+            stderr.to_glib_none().0,
+            (gio::OutputStreamSpliceFlags::CLOSE_SOURCE
+                | gio::OutputStreamSpliceFlags::CLOSE_TARGET)
+                .into_glib(),
+            glib::Priority::DEFAULT.into_glib(),
+            std::ptr::null_mut(),
+            None,
+            std::ptr::null_mut(),
+        );
+    }
 }
 
 fn remote_path(reply: &[u8]) -> Result<String, String> {
@@ -103,13 +139,28 @@ impl Upload {
         completion: Completion,
     ) -> Result<Rc<Self>, String> {
         let launcher = gio::SubprocessLauncher::new(
-            gio::SubprocessFlags::STDIN_PIPE | gio::SubprocessFlags::STDOUT_PIPE,
+            gio::SubprocessFlags::STDIN_PIPE
+                | gio::SubprocessFlags::STDOUT_PIPE
+                | gio::SubprocessFlags::STDERR_PIPE,
         );
         launcher.setenv("SSH_ASKPASS_REQUIRE", "never", true);
+        // ProxyJump SSH children do not inherit the parent's BatchMode option.
+        // Remove the GUI's controlling terminal instead of relying on options.
+        unsafe {
+            gio::ffi::g_subprocess_launcher_set_child_setup(
+                launcher.to_glib_none().0,
+                Some(detach_upload_process),
+                std::ptr::null_mut(),
+                None,
+            );
+        }
         let args: Vec<_> = args.iter().map(OsStr::new).collect();
         let process = launcher
             .spawn(&args)
             .map_err(|err| format!("Could not start SSH upload: {err}"))?;
+        // Flatpak HostCommand starts a new session but can acquire a terminal
+        // from any standard descriptor. Piping stderr keeps host SSH detached.
+        relay_diagnostics(&process.stderr_pipe().expect("stderr pipe requested"));
         let upload = Rc::new(Self {
             process,
             cancellable: gio::Cancellable::new(),
@@ -223,6 +274,7 @@ mod tests {
         assert_eq!(args.len(), boundary + 3);
         assert!(args.contains(&"BatchMode=yes".into()));
         assert!(args.contains(&"StrictHostKeyChecking=yes".into()));
+        assert!(args.contains(&"ClearAllForwardings=yes".into()));
         let host = arguments(&target, true);
         assert_eq!(
             &host[..4],
@@ -320,6 +372,104 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn upload_process_cannot_use_the_launching_terminal() {
+        use std::ffi::{c_char, c_int, c_ulong, c_void};
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_ENV: &str = "LIMUX_TEST_UPLOAD_CTTY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            assert!(
+                Command::new("/bin/sh")
+                    .args(["-c", ": </dev/tty"])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "the fixture must have a controlling terminal"
+            );
+            assert_eq!(
+                run_upload(
+                    r#"if ( : </dev/tty ) 2>/dev/null || test -t 2; then exit 17; fi
+test "$(od -An -tx1 | tr -d ' \n')" = 66697874757265 || exit 18
+printf '/tmp/limux-paste.abcdefghij/image.png\n'"#,
+                    Duration::from_secs(2),
+                    false,
+                )
+                .unwrap(),
+                "/tmp/limux-paste.abcdefghij/image.png"
+            );
+            return;
+        }
+
+        #[link(name = "util")]
+        unsafe extern "C" {
+            fn openpty(
+                master: *mut c_int,
+                slave: *mut c_int,
+                name: *mut c_char,
+                termios: *const c_void,
+                winsize: *const c_void,
+            ) -> c_int;
+            fn setsid() -> c_int;
+            fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+        }
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // openpty returns two owned descriptors on success.
+        let (master, slave) = unsafe {
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        };
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "ssh_transfer::tests::upload_process_cannot_use_the_launching_terminal",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        // The fixture, unlike the uploader, deliberately acquires a terminal.
+        unsafe {
+            command.pre_exec(|| {
+                if setsid() < 0 || ioctl(0, 0x540e, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        let output = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            // Linux returns EIO after the last slave descriptor closes.
+            let _ = master.take(64 * 1024).read_to_end(&mut output);
+            output
+        });
+        let status = child.wait().unwrap();
+        let output = output.join().unwrap();
+        assert!(status.success(), "{}", String::from_utf8_lossy(&output));
     }
 
     #[test]

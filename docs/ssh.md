@@ -129,14 +129,22 @@ existing clipboard consent handling remains in effect.
 
 Each paste starts a separate non-PTY `ssh` command, preserving the alias and
 explicit port. It uses current SSH configuration, including user-configured
-multiplexing, ProxyJump, ProxyCommand, Match commands, and forwarding. The upload
+multiplexing, ProxyJump, ProxyCommand, and Match commands. The transfer connection
+adds `ClearAllForwardings=yes` so configured local, remote, or dynamic forwards
+are not opened again alongside the interactive connection. The upload
 requires noninteractive authentication (keys/agent or an existing multiplexed
-connection). `BatchMode=yes`, `SSH_ASKPASS_REQUIRE=never`, and
-`StrictHostKeyChecking=yes` prevent background password/host-key prompts and
-reject unknown or changed host keys. Password-only interactive sessions may
-connect normally but fail to upload. No keys or passwords are saved, and no
-SSH master is created by Limux. Flatpak uses the bundled host-spawn with
-`--no-pty` to run host OpenSSH and preserve binary stdin.
+connection). The destination uses `BatchMode=yes` and
+`StrictHostKeyChecking=yes`, rejecting unknown or changed destination host keys.
+The upload runs without a controlling terminal, with piped standard streams and
+`SSH_ASKPASS_REQUIRE=never`, so OpenSSH cannot prompt in the terminal that
+launched Limux. ProxyJump and ProxyCommand retain their own configured policies
+and also need usable noninteractive authentication and host-key configuration.
+Password-only interactive sessions may connect normally but fail to upload.
+No keys or passwords are saved, and no SSH master is created by Limux. Flatpak
+uses the bundled host-spawn with `--no-pty` to run host OpenSSH and preserve
+binary stdin. Piped stderr also prevents Flatpak's host-command launcher from
+acquiring the GUI's launch terminal; SSH diagnostics are relayed to the launch
+log asynchronously.
 
 The remote command runs a fixed `/bin/sh` script using `mktemp`, `cat`, `test`,
 `printf`, `rm`, and `rmdir` from the remote account's environment. Those programs
@@ -162,8 +170,10 @@ between panes keeps the upload attached to that tab.
 
 Upload argument construction, binary preservation, permissions, malformed or
 oversized replies, nonzero exits, deadlines, cancellation, and failed-file
-cleanup are covered by `./scripts/check.sh`. The maintained GUI smoke suite also
-checks image delivery, bracketed paste, ordinary text, duplicate requests,
+cleanup are covered by `./scripts/check.sh`. An isolated PTY regression verifies
+that uploads cannot use the launching process's controlling terminal. The
+maintained GUI smoke suite also checks image delivery, bracketed paste,
+ordinary text, duplicate requests,
 context-menu errors, moving a tab, and cancellation on reconnect or close.
 
 An optional live Codex attachment test is ignored by default:
