@@ -24,6 +24,8 @@ mod clipboard;
 mod flatpak;
 mod image_paste;
 mod output_activity;
+#[cfg(test)]
+mod ssh_notification_tests;
 mod wakeup;
 use clipboard::{
     ghostty_confirm_read_clipboard_cb, ghostty_read_clipboard_cb, ghostty_write_clipboard_cb,

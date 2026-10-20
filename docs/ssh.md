@@ -83,9 +83,9 @@ OpenSSH's responsibility; their policies are not weakened.
 Persistent launches add `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and
 `ConnectTimeout=10`. They do not install helpers, change tmux global options,
 enable passthrough, or establish a separate SSH control socket. User-configured
-SSH multiplexing and forwarding still apply. Agent notification
-forwarding and helper provisioning remain a later slice of
-[the SSH proposal](https://github.com/am-will/limux/issues/135).
+SSH multiplexing and forwarding still apply. Notification helpers are installed
+only through the separate explicit action described below; opening, restoring,
+or reconnecting a workspace never installs or updates remote software.
 
 ## Validation
 
@@ -185,3 +185,118 @@ text copy/paste without submitting a model turn. Supply a private Codex home
 and tmux server, and clean up their credentials/processes afterward. This test
 requires local credentials and an SSH server; the maintained smoke suite does
 not.
+
+## Remote agent notifications and helper installation
+
+Open **Connect via SSH**, enter the destination and optional port, then choose
+**Install remote agent helper…**. Select Codex, Claude Code, or Gemini CLI and a
+**trusted Linux `limux-cli` executable**. Review the destination and description,
+then click **Install helper and configure hooks**. Merely opening either dialog
+or selecting a file makes no SSH connection. Installation does not require
+creating another workspace, and it is never repeated automatically on reconnect.
+
+Build a static helper from the source revision you trust:
+
+```sh
+./scripts/build-remote-helper.sh
+# For an ARM64 remote, with its Rust target and cross linker installed:
+TARGET=aarch64-unknown-linux-musl ./scripts/build-remote-helper.sh
+```
+
+The script prints the file to select. It builds only the CLI, with no GTK or
+Ghostty dependency, and does not install toolchains or download a remote binary.
+A native dynamically linked release CLI can also be selected, but may not run
+on a host with an older libc. The dialog checks the ELF architecture and caps
+the file at 64 MiB; the remote host must be Linux with the same x86_64 or aarch64
+architecture. These checks catch incompatible binaries and transfer corruption; they do
+**not establish that an arbitrary selected executable is trustworthy**.
+Installing explicitly authorizes executing that binary as the remote account.
+
+The upload reuses the image-transfer transport: current OpenSSH configuration,
+strict destination host-key checking, noninteractive authentication, cleared
+forwardings, detached process, and piped standard streams (including Flatpak
+host-spawn). Proxy-command trust and authentication limitations are the same.
+Installation has a 60-second transfer deadline. Closing the install dialog
+cancels the local transfer, but a remote step may already have completed; inspect
+the launch log before retrying. A network failure is not a rollback guarantee.
+
+The remote installer needs `/bin/sh`, `uname`, `mkdir`, `mktemp`, `cat`, `wc`,
+`sha256sum`, `chmod`, `grep`, `mv`, `cp`, `rm`, `rmdir`, `stat`, `id`, and `flock`.
+Those remote tools, the account's HOME/config environment and SSH configuration
+are trusted. The installer locks against another Limux helper installation,
+checks bytes and executable support before changing agent configuration, and
+publishes a complete helper at:
+
+```text
+~/.local/share/limux/ssh-helpers/<SHA256>/limux-cli
+```
+
+It does not replace `~/.local/bin/limux`, modify PATH or shell startup files,
+install a service, open a reverse tunnel, expose the local control socket, or
+change tmux options. Symlinked installation directories, configuration roots or
+files are rejected. Helper directories must belong to the remote account and
+must not be group/world writable. The selected agent's configuration is backed
+up under `ssh-helpers/backup-<agent>.<random>/` before the existing CLI installer
+merges hooks. The backup contains `config.json` (or `config-was-absent`) and
+`config-path`. The installed helper and backup paths are printed in the launch
+log. Existing Limux hooks for that agent are replaced; unrelated hooks and JSON
+settings are preserved. Other agents are not configured. Avoid concurrent edits
+to the selected agent's settings while installing.
+
+Codex uses `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json`; Claude uses
+`$CLAUDE_CONFIG_DIR/settings.json` or `~/.claude/settings.json`; Gemini uses
+`~/.gemini/settings.json`. These are the remote process's environment values,
+not the local desktop's. **Restart the agent and approve its new hooks if it
+asks.** The installer does not bypass the agent's hook trust checks. OpenCode's
+plugin-based setup is not offered by this installer.
+
+The hooks invoke the absolute helper path with `LIMUX_NOTIFY_OSC=1`. The existing
+CLI hook parser handles completion/input-needed events and emits a bounded,
+control-character-sanitized OSC 777 notification to the terminal, never to hook
+stdout. Hook stdout remains its ordinary JSON protocol. The local terminal
+receives the escape and uses Limux's existing sidebar, unread, toast and desktop
+notification policies, including Ghostty's rate limits. Local socket delivery
+remains the default; `limux notify --osc` explicitly selects terminal delivery.
+On SSH sessions, an unavailable local socket can also fall back to OSC; socket
+permission/protocol errors do not cause this fallback. Explicit OSC mode does
+not send a socket request or trust workspace/surface IDs from the remote host.
+
+Within tmux, hooks may have no controlling terminal. The helper resolves the
+session of `TMUX_PANE`, then writes to that session's attached client PTYs. It
+does not guess the most recently used client or enable passthrough. Terminal
+paths must be `/dev/pts/<number>`, non-symlink character devices owned by the
+same user. Lookups have a deadline and writes are nonblocking. Multiple clients
+attached to that session each receive the notification. With no attached client
+(or missing/invalid pane identity), delivery fails visibly on stderr; it is not
+queued and is not redirected to another session. Without tmux, `/dev/tty` is
+used. Nested multiplexers/containers with inaccessible or unrelated client PTYs
+are not covered. Desktop visibility still depends on local notification settings
+and focus; events may be suppressed by the existing rate limits.
+
+To test after installation, run the printed helper path on the remote host:
+
+```sh
+~/.local/share/limux/ssh-helpers/<SHA256>/limux-cli notify --osc 'SSH notification test'
+```
+
+To remove this agent's Limux hooks, run that same helper with
+`hooks uninstall codex` (or `claude` / `gemini`), then restart the agent. This
+preserves unrelated hooks. Restore the recorded configuration backup instead
+if you want the exact previous Limux hooks, taking care not to discard later
+edits. Delete unused helper-version directories only after no installed hooks
+reference them; backups and older helper versions are retained intentionally.
+
+`./scripts/check.sh` covers OSC sanitization, destination/path policy,
+fallback error classification, hook install/uninstall preservation, helper
+architecture/integrity checks, backups, and failure cleanup. The maintained GUI
+smoke suite runs a real CLI hook with no controlling TTY and checks its OSC reaches
+the intended Ghostty surface, plus a binary transfer/configuration fixture using
+the built CLI. These tests require no SSH server or agent credentials.
+
+The opt-in test
+`terminal::ssh_notification_tests::live_codex_completion_reaches_local_terminal`
+requires `LIMUX_NOTIFICATION_TEST_COMMAND` pointing to a disposable authenticated
+SSH/tmux/Codex session with this helper configured. Run under a private display
+and use a private Codex home/tmux server; it submits one short model turn and
+asserts that `Codex finished` reaches the local notification callback. Remove
+temporary credentials and terminate private agent daemons afterward.

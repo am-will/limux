@@ -81,6 +81,22 @@ pub fn show(
     let persistence_hint = gtk::Label::new(Some("Requires tmux on the remote host. Saved sessions reconnect when Limux starts. Close the tab to stop retries; remote sessions remain running."));
     persistence_hint.set_wrap(true);
     content.append(&persistence_hint);
+    let helper = gtk::Button::with_label("Install remote agent helper…");
+    content.append(&helper);
+    let helper_target = destination.clone();
+    let helper_port = port.clone();
+    let helper_status = status.clone();
+    let helper_parent = dialog.downgrade();
+    helper.connect_clicked(move |_| {
+        match SshTarget::parse(&helper_target.text(), &helper_port.text()) {
+            Ok(target) => {
+                if let Some(parent) = helper_parent.upgrade() {
+                    crate::ssh_helpers::show(&parent, target);
+                }
+            }
+            Err(error) => helper_status.set_text(&error),
+        }
+    });
     content.append(&status);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);

@@ -1,4 +1,4 @@
-//! Binary image upload through OpenSSH. No local shell, staging file, or helper.
+//! Bounded binary transfers through OpenSSH with no local shell or staging file.
 use crate::ssh_hosts::SshTarget;
 use gio::prelude::*;
 use glib::translate::{IntoGlib, ToGlibPtr};
@@ -22,6 +22,10 @@ printf '%s\n' "$dir/image.png"
 trap - 0 HUP INT TERM"#;
 
 fn arguments(target: &SshTarget, flatpak: bool) -> Vec<String> {
+    arguments_for_script(target, flatpak, UPLOAD_SCRIPT)
+}
+
+fn arguments_for_script(target: &SshTarget, flatpak: bool, script: &str) -> Vec<String> {
     let mut args = if flatpak {
         vec![
             "/app/bin/host-spawn".into(),
@@ -58,7 +62,7 @@ fn arguments(target: &SshTarget, flatpak: bool) -> Vec<String> {
     args.extend([
         "--".into(),
         target.destination().into(),
-        format!("/bin/sh -c '{}'", UPLOAD_SCRIPT.replace('\'', "'\\''")),
+        format!("/bin/sh -c '{}'", script.replace('\'', "'\\''")),
     ]);
     args
 }
@@ -116,6 +120,7 @@ pub struct Upload {
     completion: RefCell<Option<Completion>>,
     timer: RefCell<Option<glib::SourceId>>,
     exited: Rc<Cell<bool>>,
+    validate_reply: fn(&[u8]) -> Result<String, String>,
 }
 
 impl Upload {
@@ -132,11 +137,47 @@ impl Upload {
         Self::spawn(&args, png, Duration::from_secs(30), Box::new(completion))
     }
 
+    pub fn install_helper(
+        target: &SshTarget,
+        bytes: glib::Bytes,
+        script: &str,
+        flatpak: bool,
+        completion: impl FnOnce(Result<String, String>) + 'static,
+    ) -> Result<Rc<Self>, String> {
+        if bytes.is_empty() || bytes.len() > 64 * 1024 * 1024 {
+            return Err("Helper exceeds 64 MiB".into());
+        }
+        let args = arguments_for_script(target, flatpak, script);
+        Self::spawn_with_reply(
+            &args,
+            bytes,
+            Duration::from_secs(60),
+            Box::new(completion),
+            |reply| {
+                if reply == b"LIMUX_HELPER_INSTALLED\n" {
+                    Ok("Helper installed".into())
+                } else {
+                    Err("Invalid helper installation response; inspect the launch log".into())
+                }
+            },
+        )
+    }
+
     fn spawn(
         args: &[String],
         png: glib::Bytes,
         timeout: Duration,
         completion: Completion,
+    ) -> Result<Rc<Self>, String> {
+        Self::spawn_with_reply(args, png, timeout, completion, remote_path)
+    }
+
+    fn spawn_with_reply(
+        args: &[String],
+        png: glib::Bytes,
+        timeout: Duration,
+        completion: Completion,
+        validate_reply: fn(&[u8]) -> Result<String, String>,
     ) -> Result<Rc<Self>, String> {
         let launcher = gio::SubprocessLauncher::new(
             gio::SubprocessFlags::STDIN_PIPE
@@ -167,6 +208,7 @@ impl Upload {
             completion: RefCell::new(Some(completion)),
             timer: RefCell::new(None),
             exited: Rc::new(Cell::new(false)),
+            validate_reply,
         });
         let exited = upload.exited.clone();
         upload
@@ -176,7 +218,7 @@ impl Upload {
         *upload.timer.borrow_mut() = Some(glib::timeout_add_local_once(timeout, move || {
             if let Some(upload) = weak.upgrade() {
                 upload.timer.borrow_mut().take();
-                upload.finish(Err("SSH image upload timed out".into()));
+                upload.finish(Err("SSH transfer timed out".into()));
             }
         }));
         let stdin = upload.process.stdin_pipe().expect("stdin pipe requested");
@@ -196,12 +238,12 @@ impl Upload {
                             if result.is_ok() {
                                 upload.read_reply(Vec::new());
                             } else {
-                                upload.finish(Err("Could not finish SSH image upload".into()));
+                                upload.finish(Err("Could not finish SSH transfer".into()));
                             }
                         },
                     );
                 }
-                _ => next.finish(Err("Could not send image over SSH".into())),
+                _ => next.finish(Err("Could not send data over SSH".into())),
             },
         );
         Ok(upload)
@@ -215,7 +257,7 @@ impl Upload {
                 Ok(bytes) if bytes.is_empty() => {
                     let upload = next.clone();
                     next.process.wait_check_async(Some(&next.cancellable), move |result| {
-                        upload.finish(if result.is_ok() { remote_path(&reply) } else {
+                        upload.finish(if result.is_ok() { (upload.validate_reply)(&reply) } else {
                             Err("SSH upload failed. Check keys/agent, known_hosts, and the launch log.".into())
                         });
                     });
@@ -230,7 +272,7 @@ impl Upload {
     }
 
     pub fn cancel(&self) {
-        self.finish(Err("Image upload cancelled".into()));
+        self.finish(Err("SSH transfer cancelled".into()));
     }
 
     fn finish(&self, result: Result<String, String>) {

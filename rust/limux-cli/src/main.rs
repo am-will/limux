@@ -16,6 +16,7 @@ use tokio::net::UnixStream;
 
 mod agent_hooks;
 mod agent_team_file;
+mod terminal_notifications;
 
 const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_STATE_LOCK_RETRY: Duration = Duration::from_millis(25);
@@ -257,8 +258,8 @@ Common commands:
   browser [--surface <id|ref>|<surface>] <subcommand> ...
 
 Agent integrations:
-  notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] <title>
-  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>
+  notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
+  hooks setup [agent] [--osc] | hooks uninstall [agent] | hooks <agent> <event>
   claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]
   agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]
       Splits the active workspace into one pane per agent (caller's pane stays
@@ -906,7 +907,7 @@ async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
 /// `limux notify` — post a notification into the sidebar + toast overlay.
 ///
 /// Usage:
-///   limux notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] <title>
+///   limux notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
 ///   limux notify --title "..." --subtitle "..." --body "..."
 ///
 /// Mirrors the `cmux notify` shape (title / subtitle / body). Title is
@@ -936,6 +937,53 @@ fn notification_scope(
     (workspace, surface)
 }
 
+/// Keep local socket delivery unchanged. Remote fallback is restricted to an
+/// unavailable socket; permission/protocol errors are not bypassed via OSC.
+async fn deliver_notification(
+    client: &mut Client,
+    workspace: Option<String>,
+    params: Map<String, Value>,
+    force: bool,
+) -> Result<Value> {
+    let force = force || terminal_notifications::forced();
+    let title = params
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let subtitle = params
+        .get("subtitle")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = params
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = if subtitle.is_empty() {
+        body.to_owned()
+    } else {
+        format!("{subtitle} — {body}")
+    };
+    if !force {
+        let result = call_in_workspace_scope(
+            client,
+            workspace,
+            "notification.create",
+            Value::Object(params),
+        )
+        .await;
+        let unavailable = result
+            .as_ref()
+            .err()
+            .is_some_and(terminal_notifications::socket_unavailable);
+        if !terminal_notifications::remote() || !unavailable {
+            return result;
+        }
+    }
+    tokio::task::spawn_blocking(move || terminal_notifications::emit(&title, &body)).await??;
+    Ok(json!({"delivered": "osc"}))
+}
+
 async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     let (workspace, surface) = notification_scope(args, env_opt);
 
@@ -962,13 +1010,7 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
         params.insert("surface_id".to_string(), Value::String(surface));
     }
 
-    call_in_workspace_scope(
-        client,
-        workspace,
-        "notification.create",
-        Value::Object(params),
-    )
-    .await
+    deliver_notification(client, workspace, params, parse_flag(args, "--osc")).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,13 +1135,11 @@ async fn run_agent_hook(
             params.insert("surface_id".to_string(), Value::String(surface));
         }
 
-        let _ = call_in_workspace_scope(
-            client,
-            workspace,
-            "notification.create",
-            Value::Object(params),
-        )
-        .await;
+        if let Err(error) = deliver_notification(client, workspace, params, false).await {
+            if terminal_notifications::forced() || terminal_notifications::remote() {
+                eprintln!("limux: notification not delivered: {error:#}");
+            }
+        }
     }
 
     Ok(agent_hook_output(&event, &payload))
@@ -1475,7 +1515,7 @@ async fn run_hooks_command(
     match first {
         "setup" | "install" => {
             let target = parse_opt(args, "--agent").or_else(|| positional_arg(args, 1));
-            let installed = install_hook_targets(target.as_deref())?;
+            let installed = install_hook_targets(target.as_deref(), parse_flag(args, "--osc"))?;
             return hooks_summary_output("installed", installed, json_output);
         }
         "uninstall" => {
@@ -1491,7 +1531,7 @@ async fn run_hooks_command(
     let rest = &args[1..];
     match rest.first().map(String::as_str) {
         Some("install") => {
-            install_hook_target(agent)?;
+            install_hook_target(agent, parse_flag(rest, "--osc"))?;
             hooks_summary_output(
                 "installed",
                 vec![agent.store_name().to_string()],
@@ -1539,7 +1579,7 @@ fn hooks_summary_output(
     }
 }
 
-fn install_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
+fn install_hook_targets(target: Option<&str>, osc: bool) -> Result<Vec<String>> {
     let agents = target
         .map(|name| {
             agent_hooks::AgentKind::from_hook_name(name)
@@ -1551,7 +1591,7 @@ fn install_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
 
     let mut installed = Vec::new();
     for agent in agents {
-        install_hook_target(agent)?;
+        install_hook_target(agent, osc)?;
         installed.push(agent.store_name().to_string());
     }
     Ok(installed)
@@ -1583,11 +1623,12 @@ fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
     ]
 }
 
-fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
+fn install_hook_target(agent: agent_hooks::AgentKind, osc: bool) -> Result<()> {
     match agent {
         agent_hooks::AgentKind::Codex => install_json_hooks(
             &codex_hooks_path(),
             agent,
+            osc,
             &[
                 ("SessionStart", "session-start"),
                 ("UserPromptSubmit", "prompt-submit"),
@@ -1597,6 +1638,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         agent_hooks::AgentKind::Claude => install_json_hooks(
             &claude_settings_path(),
             agent,
+            osc,
             &[
                 ("SessionStart", "session-start"),
                 ("UserPromptSubmit", "prompt-submit"),
@@ -1605,10 +1647,14 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("SessionEnd", "session-end"),
             ],
         ),
+        agent_hooks::AgentKind::OpenCode if osc => {
+            bail!("OSC hook setup supports Codex, Claude, and Gemini")
+        }
         agent_hooks::AgentKind::OpenCode => install_opencode_plugin(),
         agent_hooks::AgentKind::Gemini => install_json_hooks(
             &gemini_settings_path(),
             agent,
+            osc,
             &[
                 ("SessionStart", "session-start"),
                 ("BeforeAgent", "prompt-submit"),
@@ -1638,6 +1684,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
 fn install_json_hooks(
     path: &Path,
     agent: agent_hooks::AgentKind,
+    osc: bool,
     events: &[(&str, &str)],
 ) -> Result<()> {
     let mut root = read_json_object(path)?;
@@ -1671,7 +1718,7 @@ fn install_json_hooks(
         let mut entry = json!({
             "hooks": [{
                 "type": "command",
-                "command": hook_command(agent, limux_event)?,
+                "command": hook_command(agent, limux_event, osc)?,
                 "statusMessage": format!("Limux {} session restore", agent.label()),
                 "timeout": hook_timeout(agent)
             }]
@@ -1755,12 +1802,17 @@ fn opencode_config_unregister_plugin() -> Result<()> {
     write_json_object(&config_path, &root)
 }
 
-fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
+fn hook_command(agent: agent_hooks::AgentKind, event: &str, osc: bool) -> Result<String> {
     let disable_var = format!(
         "LIMUX_{}_HOOKS_DISABLED",
         agent.store_name().to_ascii_uppercase()
     );
     let limux_command = hook_cli_command()?;
+    let limux_command = if osc {
+        format!("env LIMUX_NOTIFY_OSC=1 {limux_command}")
+    } else {
+        limux_command
+    };
     Ok(format!(
         "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo '{{\"continue\":true,\"suppressOutput\":false}}'",
         agent.store_name(),
@@ -4548,6 +4600,7 @@ mod cli_arg_tests {
         install_json_hooks(
             &path,
             agent_hooks::AgentKind::Claude,
+            false,
             &[("SessionStart", "session-start")],
         )
         .expect("install hooks");
@@ -4564,6 +4617,47 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn osc_hook_install_is_explicit_idempotent_and_preserves_other_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original = json!({"custom": 42, "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo independent"}]}]}});
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        for _ in 0..2 {
+            install_json_hooks(
+                &path,
+                agent_hooks::AgentKind::Codex,
+                true,
+                &[("Stop", "stop")],
+            )
+            .unwrap();
+        }
+        let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config["custom"], 42);
+        let stop = config["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2);
+        assert_eq!(stop[0], original["hooks"]["Stop"][0]);
+        assert!(stop[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("env LIMUX_NOTIFY_OSC=1"));
+        install_json_hooks(
+            &path,
+            agent_hooks::AgentKind::Codex,
+            false,
+            &[("Stop", "stop")],
+        )
+        .unwrap();
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("LIMUX_NOTIFY_OSC"));
+        uninstall_json_hooks(&path, agent_hooks::AgentKind::Codex).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn codex_hook_install_keeps_codex_schema_without_matcher() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("hooks.json");
@@ -4571,6 +4665,7 @@ mod cli_arg_tests {
         install_json_hooks(
             &path,
             agent_hooks::AgentKind::Codex,
+            false,
             &[("SessionStart", "session-start")],
         )
         .expect("install hooks");
