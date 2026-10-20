@@ -187,6 +187,15 @@ pub fn send_committed_text(surface: ghostty_surface_t, text: &str) {
     }
 }
 
+/// Ghostty's preedit length is the number of UTF-8 bytes, not GTK's cursor
+/// position (which counts characters). Using the cursor position truncates
+/// multi-byte preedit text such as Hangul in the middle of a code point.
+fn preedit_payload(preedit: &str) -> Option<(CString, usize)> {
+    let text = CString::new(preedit).ok()?;
+    let byte_len = text.as_bytes().len();
+    Some((text, byte_len))
+}
+
 fn update_ghostty_preedit(
     surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>,
     im_context: &gtk::IMContext,
@@ -195,15 +204,15 @@ fn update_ghostty_preedit(
         return;
     };
 
-    let (preedit, _, cursor_pos) = im_context.preedit_string();
+    let (preedit, _, _) = im_context.preedit_string();
     if preedit.is_empty() {
         clear_ghostty_preedit(surface);
         return;
     }
 
-    if let Ok(text) = CString::new(preedit.as_str()) {
+    if let Some((text, byte_len)) = preedit_payload(preedit.as_str()) {
         unsafe {
-            ghostty_surface_preedit(surface, text.as_ptr(), cursor_pos.max(0) as usize);
+            ghostty_surface_preedit(surface, text.as_ptr(), byte_len);
         }
     }
 }
@@ -254,5 +263,19 @@ fn register_im_signal_handlers(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preedit_payload;
+
+    #[test]
+    fn hangul_preedit_passes_full_utf8_length_to_ghostty() {
+        for (preedit, expected_len) in [("ㅎ", 3), ("한", 3), ("한글", 6)] {
+            let (text, byte_len) = preedit_payload(preedit).expect("valid preedit");
+            assert_eq!(byte_len, expected_len);
+            assert_eq!(text.to_str().unwrap(), preedit);
+        }
     }
 }
