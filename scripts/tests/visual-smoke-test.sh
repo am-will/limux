@@ -12,7 +12,7 @@ mkdir -p "$ARTIFACT_ROOT"
 ARTIFACT_ROOT="$(cd "$ARTIFACT_ROOT" && pwd)"
 
 if [ "${1:-}" != --inside ]; then
-for dependency in xvfb-run dbus-run-session xdotool metacity jq setsid import identify montage; do
+for dependency in xvfb-run dbus-run-session xdotool metacity jq setsid import identify montage convert timeout uv; do
   command -v "$dependency" >/dev/null || {
     echo "FAIL: required visual-smoke dependency is missing: $dependency" >&2
     exit 2
@@ -35,7 +35,8 @@ export LIMUX_SOURCE_ROOT="$SOURCE_ROOT" LIMUX_VISUAL_HOST="$HOST" LIMUX_VISUAL_C
 export XDG_DATA_HOME="$RUN_DIR/data" XDG_STATE_HOME="$RUN_DIR/state"
 export XDG_CONFIG_HOME="$RUN_DIR/config" XDG_CACHE_HOME="$RUN_DIR/cache"
 export XDG_RUNTIME_DIR="$RUN_DIR/runtime"
-mkdir -p "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/ghostty" \
+export HOME="$RUN_DIR/home"
+mkdir -p "$HOME" "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/ghostty" \
   "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 cat >"$RUN_DIR/dbus.conf" <<'DBUS'
@@ -65,6 +66,8 @@ export TERMINFO="$GHOSTTY_ROOT/share/terminfo"
 unset DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE DISPLAY WAYLAND_DISPLAY
 unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK GPG_AGENT_INFO LIMUX_WORKSPACE_ID LIMUX_PANE_ID LIMUX_SURFACE_ID LIMUX_TAB_ID
 unset XDG_ACTIVATION_TOKEN DESKTOP_STARTUP_ID LD_PRELOAD GDK_DPI_SCALE
+unset GDK_DEBUG GSK_DEBUG GSK_RENDERER http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 printf 'command = /bin/sh\nshell-integration = none\nfont-size = 12\n' >"$XDG_CONFIG_HOME/ghostty/config"
 
 result=0
@@ -83,7 +86,9 @@ LOG_DIR="$ARTIFACT_DIR/logs"
 mkdir -p "$LOG_DIR" "$ARTIFACT_DIR/screenshots"
 HOST_PID=""
 WM_PID=""
+BROWSER_SERVER_PID=""
 WINDOW=""
+SETTINGS_WINDOW=""
 SCENARIOS="$ARTIFACT_DIR/scenarios.txt"
 : >"$SCENARIOS"
 
@@ -107,14 +112,23 @@ resize_window() {
 }
 capture() {
   local name="$1" caption="$2" path="$ARTIFACT_DIR/screenshots/$1.png"
-  xdotool windowmap "$WINDOW" 2>/dev/null || true
-  xdotool windowraise "$WINDOW" 2>/dev/null || true
-  sleep 0.25
-  import -window "$WINDOW" "$path"
+  local target="${3:-$WINDOW}" dimensions="${4:-$EXPECTED_DIMENSIONS}" drawn=false
+  xdotool windowmap "$target" 2>/dev/null || true
+  xdotool windowraise "$target" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    sleep 0.1
+    timeout 5s import -window "$target" "$path"
+    if [ "$(convert "$path" -gravity center -crop 50%x50%+0+0 +repage \
+      -colorspace Gray -format '%[fx:mean > 0.01]' info:)" = 1 ]; then
+      drawn=true
+      break
+    fi
+  done
+  [ "$drawn" = true ] || { echo "FAIL: window remained black: $name"; return 1; }
   identify -format '%wx%h' "$path" >"$LOG_DIR/$name.dimensions"
   [ -s "$path" ] || { echo "FAIL: screenshot is empty: $name"; return 1; }
-  [ "$(cat "$LOG_DIR/$name.dimensions")" = "$EXPECTED_DIMENSIONS" ] \
-    || { echo "FAIL: $name did not render at $EXPECTED_DIMENSIONS"; return 1; }
+  [ "$(cat "$LOG_DIR/$name.dimensions")" = "$dimensions" ] \
+    || { echo "FAIL: $name did not render at $dimensions"; return 1; }
   printf '%s\t%s\t%s\n' "$name" "$caption" "screenshots/$name.png" >>"$SCENARIOS"
   echo "Captured $name ($(cat "$LOG_DIR/$name.dimensions"))"
 }
@@ -171,13 +185,14 @@ cleanup() {
   set +e
   if [ "$result" -ne 0 ]; then
     echo "FAILED (exit $result)" >"$ARTIFACT_DIR/result.txt"
-    if [ -n "$WINDOW" ]; then import -window "$WINDOW" "$ARTIFACT_DIR/failure-window.png" 2>/dev/null; fi
+    if [ -n "$WINDOW" ]; then timeout 5s import -window "$WINDOW" "$ARTIFACT_DIR/failure-window.png" 2>/dev/null; fi
+    if [ -n "$SETTINGS_WINDOW" ]; then timeout 5s import -window "$SETTINGS_WINDOW" "$ARTIFACT_DIR/failure-settings.png" 2>/dev/null; fi
     tail -n 100 "$LOG_DIR/host.stderr" "$LOG_DIR/wm.stderr" >"$LOG_DIR/failure-tail.txt" 2>/dev/null
   else
     echo "PASSED" >"$ARTIFACT_DIR/result.txt"
   fi
   write_gallery "$(cat "$ARTIFACT_DIR/result.txt")"
-  for pid in "$HOST_PID" "$WM_PID"; do
+  for pid in "$HOST_PID" "$WM_PID" "$BROWSER_SERVER_PID"; do
     [ -n "$pid" ] || continue
     kill -TERM -- "-$pid" 2>/dev/null
     for _ in $(seq 1 40); do
@@ -262,6 +277,69 @@ else
   echo 'Workspace groups unsupported by this source; optional group screenshots skipped.' \
     | tee "$LOG_DIR/groups-skipped.txt"
 fi
+
+cli select-workspace --workspace "$ORIGINAL_ID" >/dev/null
+resize_window 1320 820
+setsid uv run --no-project --offline --python /usr/bin/python3 --script \
+  "$TOOLING_ROOT/scripts/tests/visual-browser-server.py" \
+  --url-file "$RUN_DIR/browser.url" --proof-file "$LOG_DIR/browser-ready.json" \
+  >"$LOG_DIR/browser-server.stdout" 2>"$LOG_DIR/browser-server.stderr" &
+BROWSER_SERVER_PID=$!
+for _ in $(seq 1 100); do
+  kill -0 "$BROWSER_SERVER_PID" 2>/dev/null || { echo 'FAIL: browser fixture server exited'; exit 1; }
+  [ -s "$RUN_DIR/browser.url" ] && break
+  sleep 0.1
+done
+[ -s "$RUN_DIR/browser.url" ] || { echo 'FAIL: browser fixture server did not become ready'; exit 1; }
+BROWSER_URL="$(cat "$RUN_DIR/browser.url")"
+cli new-surface --workspace "$ORIGINAL_ID" --type browser --url "$BROWSER_URL" >"$LOG_DIR/browser-surface.json"
+BROWSER_SURFACE="$(jq -r '.surface_id // .surface_ref // empty' "$LOG_DIR/browser-surface.json")"
+[ -n "$BROWSER_SURFACE" ] || { echo 'FAIL: browser creation returned no surface'; exit 1; }
+for _ in $(seq 1 300); do
+  kill -0 "$HOST_PID" 2>/dev/null || { echo 'FAIL: host exited while loading the browser'; exit 1; }
+  kill -0 "$BROWSER_SERVER_PID" 2>/dev/null || { echo 'FAIL: browser fixture server exited during navigation'; exit 1; }
+  [ -s "$LOG_DIR/browser-ready.json" ] && break
+  sleep 0.1
+done
+[ -s "$LOG_DIR/browser-ready.json" ] || { echo 'FAIL: WebKit did not report a complete page with the expected JavaScript-updated DOM'; exit 1; }
+jq -e --arg url "$BROWSER_URL" \
+  '. == {url: $url, ready: "complete", text: "JavaScript updated this page: 42"}' \
+  "$LOG_DIR/browser-ready.json" >/dev/null
+cli list-panels --workspace "$ORIGINAL_ID" >"$LOG_DIR/browser-panels.json"
+jq -e --arg surface "$BROWSER_SURFACE" \
+  '.surfaces | any(.surface_id == $surface and .type == "browser" and .selected)' \
+  "$LOG_DIR/browser-panels.json" >/dev/null
+capture browser-wide 'Embedded browser with a live local website and JavaScript'
+resize_window 790 820
+capture browser-narrow 'Responsive website in a narrow browser window'
+
+resize_window 1320 820
+xdotool windowactivate --sync "$WINDOW"
+# The display scale and header layout are fixed above; wait for the actual
+# Settings toplevel before capturing rather than assuming the click succeeded.
+xdotool mousemove --window "$WINDOW" 48 18 click 1
+for _ in $(seq 1 100); do
+  SETTINGS_WINDOW="$(xdotool search --all --onlyvisible --pid "$HOST_PID" --name '^Settings$' 2>/dev/null | head -1 || true)"
+  [ -n "$SETTINGS_WINDOW" ] && break
+  sleep 0.1
+done
+[ -n "$SETTINGS_WINDOW" ] || { echo 'FAIL: Settings did not open'; exit 1; }
+xdotool windowmove "$SETTINGS_WINDOW" 200 80
+xdotool windowsize --sync "$SETTINGS_WINDOW" 1000 820
+xdotool windowactivate --sync "$SETTINGS_WINDOW"
+sleep 0.7
+capture settings-general 'Settings on the General page' "$SETTINGS_WINDOW" 1000x820
+xdotool windowactivate --sync "$SETTINGS_WINDOW" key --clearmodifiers alt+F4
+for _ in $(seq 1 50); do
+  if ! xdotool search --all --onlyvisible --pid "$HOST_PID" --name '^Settings$' >/dev/null 2>&1; then break; fi
+  sleep 0.1
+done
+if xdotool search --all --onlyvisible --pid "$HOST_PID" --name '^Settings$' >/dev/null 2>&1; then
+  echo 'FAIL: Settings did not close normally'
+  exit 1
+fi
+SETTINGS_WINDOW=""
+cli identify >"$LOG_DIR/after-settings.json"
 
 SOURCE_SHA="${LIMUX_VISUAL_SOURCE_SHA:-$(git -C "$SOURCE_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
 printf 'Result: PASS\nSource: %s\nScenarios:\n' "$SOURCE_SHA" >"$ARTIFACT_DIR/summary.txt"

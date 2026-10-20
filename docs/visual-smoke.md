@@ -5,8 +5,17 @@ Xvfb display and D-Bus session, then uses `limux-cli` to verify live terminal
 health, output readback, and split panes. It saves wide, narrow, populated, and
 split-window screenshots in an HTML gallery and contact sheet. Builds with
 workspace-group commands also capture expanded and collapsed sidebar states.
-Assertions check runtime behavior and image dimensions; they do not compare
-pixels or depend on exact fonts.
+The gallery also includes a live browser tab at wide and narrow widths and
+the General page of Settings. The browser loads a styled website from a private
+loopback HTTP server and must report its loaded URL, complete document state,
+and JavaScript-updated DOM text before capture. It does not need an external
+website or network service. Settings is closed normally, then the control
+socket is checked again.
+
+Assertions check runtime behavior and image dimensions, and reject black
+window interiors. They do not compare reference images
+or depend on exact fonts. The fixture uses `uv` with the system Python 3.12+
+and no third-party packages; CI installs the pinned `uv` version.
 
 Build Limux and Ghostty first, then run:
 

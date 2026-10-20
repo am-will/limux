@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limux browser smoke test</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #eef3fa; color: #172640; font: 17px system-ui, sans-serif; }
+  header { padding: 24px 36px; background: #172640; color: white; font-weight: 700; }
+  main { max-width: 980px; margin: 48px auto; padding: 0 32px; }
+  .label { color: #3567ad; font-size: 14px; font-weight: 700; letter-spacing: .1em; }
+  h1 { font-size: clamp(30px, 5vw, 48px); line-height: 1.1; margin: 16px 0; }
+  p { line-height: 1.6; color: #4d5d76; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin: 32px 0; }
+  article { padding: 24px; border: 1px solid #cbd8ea; border-radius: 12px; background: white; }
+  h2 { margin: 12px 0 0; font-size: 18px; }
+  .check { color: #167348; font-size: 28px; }
+  #proof { padding: 20px 24px; border-radius: 12px; background: #fff0d7; color: #705015; font-weight: 600; }
+  #proof.ready { background: #d8f4e5; color: #145d3a; }
+  footer { color: #596b85; font-size: 14px; }
+</style>
+<header>Limux / Browser</header>
+<main>
+  <div class="label">LIVE WEBSITE CHECK</div>
+  <h1>A website inside your workspace.</h1>
+  <p>This local page checks the embedded browser without relying on an external website.</p>
+  <div class="cards">
+    <article><span class="check">✓</span><h2>Page loaded</h2><p>HTML served over local HTTP.</p></article>
+    <article><span class="check">✓</span><h2>Styles rendered</h2><p>Responsive cards, colors and typography.</p></article>
+    <article><span class="check">✓</span><h2>JavaScript running</h2><p>A script updates the status below.</p></article>
+  </div>
+  <p id="proof">Waiting for JavaScript…</p>
+  <footer>Deterministic fixture · No external assets or network services</footer>
+</main>
+<script>
+  window.addEventListener("load", () => {
+    const proof = document.getElementById("proof");
+    proof.textContent = `JavaScript updated this page: ${6 * 7}`;
+    proof.classList.add("ready");
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      fetch("/ready", {
+        method: "POST",
+        body: JSON.stringify({ url: location.href, ready: document.readyState, text: proof.textContent }),
+      });
+    }));
+  });
+</script>
+</html>
