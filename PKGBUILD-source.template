@@ -9,26 +9,36 @@ url="https://github.com/am-will/limux"
 license=('MIT')
 depends=('fontconfig' 'glib2' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'pango' 'webkitgtk-6.0')
 optdepends=('wl-clipboard: Ctrl+V paste in shells & CLI tools on Wayland')
-makedepends=('git' 'libepoxy' 'rust' 'zig')
+makedepends=('git' 'libepoxy' 'rust')
 conflicts=('limux-bin' 'limux-bin-debug')
 options=(!debug !lto)
 _limux_commit=@@SOURCE_COMMIT@@
 _ghostty_commit=@@GHOSTTY_COMMIT@@
 source=(
+    "zig-x86_64-linux-0.16.0.tar.xz::https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
     "$pkgname-$pkgver::git+@@SOURCE_REPOSITORY@@#commit=$_limux_commit"
     "ghostty-$pkgver::git+https://github.com/bvolpato/ghostty.git#commit=$_ghostty_commit"
 )
-sha256sums=('SKIP' 'SKIP')
+sha256sums=(
+    '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'
+    'SKIP'
+    'SKIP'
+)
 
 prepare() {
     cd "$srcdir/$pkgname-$pkgver"
     rm -rf ghostty
     ln -s "$srcdir/ghostty-$pkgver" ghostty
+
+    # Zig's native linker cannot read the .sframe records in Arch's CRT.
+    # Use LLVM for implicit executable build steps without modifying Ghostty.
+    sed -i '/^pub const ExecutableOptions = struct {/,/^};/s/use_llvm: ?bool = null,/use_llvm: ?bool = true,/' \
+        "$srcdir/zig-x86_64-linux-0.16.0/lib/std/Build.zig"
 }
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
-    ./scripts/build-ghostty.sh
+    ZIG="$srcdir/zig-x86_64-linux-0.16.0/zig" ./scripts/build-ghostty.sh
 
     RUSTFLAGS="\
         -C link-arg=-Wl,-rpath,/usr/lib/limux \
