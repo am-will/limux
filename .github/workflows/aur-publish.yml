@@ -163,7 +163,6 @@ jobs:
             minisign \
             namcap \
             rust \
-            zig \
             webkitgtk-6.0
 
       - name: Create package builder user
