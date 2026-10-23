@@ -29,6 +29,11 @@ prepare() {
     cd "$srcdir/$pkgname-$pkgver"
     rm -rf ghostty
     ln -s "$srcdir/ghostty-$pkgver" ghostty
+
+    # Zig's native linker cannot read the .sframe records in Arch's CRT.
+    # Use LLVM for implicit executable build steps without modifying Ghostty.
+    sed -i '/^pub const ExecutableOptions = struct {/,/^};/s/use_llvm: ?bool = null,/use_llvm: ?bool = true,/' \
+        "$srcdir/zig-x86_64-linux-0.16.0/lib/std/Build.zig"
 }
 
 build() {
