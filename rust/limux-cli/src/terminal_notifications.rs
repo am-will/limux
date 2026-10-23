@@ -38,10 +38,13 @@ fn field(value: &str, limit: usize, title: bool) -> String {
 }
 
 fn sequence(title: &str, body: &str) -> String {
+    let title = field(title, 512, true);
+    // Ghostty captures at most 2048 bytes, including the parser's trailing NUL.
+    let body_limit = 2048 - "notify;".len() - title.len() - 1 - 1;
     format!(
         "\x1b]777;notify;{};{}\x07",
-        field(title, 512, true),
-        field(body, 2048, false)
+        title,
+        field(body, body_limit, false)
     )
 }
 
@@ -88,16 +91,41 @@ fn tmux(args: &[&str]) -> Result<String> {
     Ok(text)
 }
 
-fn client_ttys(pane: &str) -> Result<Vec<String>> {
+fn originating_session(context: &str) -> Result<(String, u32)> {
+    let mut fields = context.rsplitn(3, ',');
+    let session = fields.next().unwrap_or_default();
+    let pid = fields.next().unwrap_or_default();
+    let socket = fields.next().unwrap_or_default();
+    if !numeric_id(session, "") || !numeric_id(pid, "") || socket.is_empty() {
+        bail!(
+            "missing or invalid TMUX session context; refusing to guess notification destination"
+        );
+    }
+    let server_pid = pid
+        .parse::<std::num::NonZeroU32>()
+        .context("invalid TMUX server PID")?
+        .get();
+    Ok((format!("${session}"), server_pid))
+}
+
+fn client_ttys(pane: &str, context: &str) -> Result<Vec<String>> {
     if !numeric_id(pane, "%") {
         bail!("missing or invalid TMUX_PANE; refusing to guess notification destination");
     }
-    let session = tmux(&["display-message", "-p", "-t", pane, "#{session_id}"])?;
-    let session = session.trim();
-    if !numeric_id(session, "$") {
-        bail!("invalid tmux session identity");
+    let (session, server_pid) = originating_session(context)?;
+    let panes = tmux(&[
+        "list-panes",
+        "-s",
+        "-t",
+        &session,
+        "-F",
+        "#{pid}:#{pane_id}",
+    ])?;
+    let expected_pane = format!("{server_pid}:{pane}");
+    if !panes.lines().any(|candidate| candidate == expected_pane) {
+        bail!("notification pane does not belong to its originating tmux session");
     }
-    let clients = tmux(&["list-clients", "-t", session, "-F", "#{client_tty}"])?;
+    let clients = tmux(&["list-clients", "-t", &session, "-F", "#{client_tty}"])?;
     let mut paths = Vec::new();
     for tty in clients.lines() {
         if !numeric_id(tty, "/dev/pts/") {
@@ -140,9 +168,12 @@ fn open_tty(_path: &str) -> Result<File> {
 
 pub fn emit(title: &str, body: &str) -> Result<()> {
     let paths = if std::env::var_os("TMUX").is_some_and(|v| !v.is_empty()) {
-        // Agent hooks can lack /dev/tty. Resolve the originating pane's session,
-        // not tmux's most recently active client (which may belong elsewhere).
-        client_ttys(&std::env::var("TMUX_PANE").unwrap_or_default())?
+        // Agent hooks can lack /dev/tty. Keep the inherited session identity,
+        // since linked windows can place the same pane in several sessions.
+        client_ttys(
+            &std::env::var("TMUX_PANE").unwrap_or_default(),
+            &std::env::var("TMUX").context("invalid TMUX session context")?,
+        )?
     } else {
         vec!["/dev/tty".to_string()]
     };
@@ -191,7 +222,12 @@ mod tests {
             "\x1b]777;notify;a b;c;d\x07"
         );
         let result = sequence(&"é".repeat(1000), &"界".repeat(2000));
-        assert!(result.len() < 2600);
+        let payload = result
+            .strip_prefix("\x1b]777;")
+            .unwrap()
+            .strip_suffix('\x07')
+            .unwrap();
+        assert!(payload.len() < 2048);
         assert_eq!(result.matches('\x1b').count(), 1);
         assert_eq!(result.matches('\x07').count(), 1);
     }
@@ -211,6 +247,35 @@ mod tests {
         }
         assert!(!numeric_id("-a", "%"));
         assert!(!numeric_id("$1;cmd", "$"));
+    }
+    #[test]
+    fn tmux_context_keeps_the_explicit_session_and_socket_commas() {
+        assert_eq!(
+            originating_session("/tmp/tmux-1000/default,123,0").unwrap(),
+            ("$0".to_string(), 123)
+        );
+        assert_eq!(
+            originating_session("/tmp/custom,socket,123,42").unwrap(),
+            ("$42".to_string(), 123)
+        );
+        assert_eq!(
+            originating_session("relative.sock,123,0").unwrap(),
+            ("$0".to_string(), 123)
+        );
+        for context in [
+            "",
+            "fixture",
+            "/tmp/socket,123",
+            "/tmp/socket,123,$0",
+            "/tmp/socket,0,0",
+            "/tmp/socket,000,0",
+            "/tmp/socket,4294967296,0",
+            "/tmp/socket,pid,0",
+            ",123,0",
+            "/tmp/socket,123,0;cmd",
+        ] {
+            assert!(originating_session(context).is_err(), "{context}");
+        }
     }
     #[test]
     fn refuses_regular_files_and_symlinks() {

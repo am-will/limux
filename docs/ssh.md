@@ -261,16 +261,21 @@ On SSH sessions, an unavailable local socket can also fall back to OSC; socket
 permission/protocol errors do not cause this fallback. Explicit OSC mode does
 not send a socket request or trust workspace/surface IDs from the remote host.
 
-Within tmux, hooks may have no controlling terminal. The helper resolves the
-session of `TMUX_PANE`, then writes to that session's attached client PTYs. It
-does not guess the most recently used client or enable passthrough. Terminal
-paths must be `/dev/pts/<number>`, non-symlink character devices owned by the
-same user. Lookups have a deadline and writes are nonblocking. Multiple clients
-attached to that session each receive the notification. With no attached client
-(or missing/invalid pane identity), delivery fails visibly on stderr; it is not
-queued and is not redirected to another session. Without tmux, `/dev/tty` is
-used. Nested multiplexers/containers with inaccessible or unrelated client PTYs
-are not covered. Desktop visibility still depends on local notification settings
+The OSC payload plus the parser's terminating NUL stay within Ghostty's 2048-byte
+parser limit. Long fields are truncated at UTF-8 boundaries.
+
+Within tmux, hooks may have no controlling terminal. The helper uses the
+originating server and session in `TMUX`, verifies that `TMUX_PANE` belongs to
+that session, then writes to its attached client PTYs. Linked or grouped sessions
+do not change the destination. It does not guess the most recently used client
+or enable passthrough. Terminal paths must be `/dev/pts/<number>`, non-symlink
+character devices owned by the same user. Lookups have a deadline and writes are
+nonblocking. Multiple clients attached to that session each receive the
+notification. With no attached client
+(or missing, invalid, or stale session/pane context), delivery fails visibly on
+stderr. It is not queued or redirected to another session. Without tmux,
+`/dev/tty` is used. Nested multiplexers/containers with inaccessible or unrelated
+client PTYs are not covered. Desktop visibility still depends on local notification settings
 and focus; events may be suppressed by the existing rate limits.
 
 To test after installation, run the printed helper path on the remote host:
@@ -289,9 +294,11 @@ reference them; backups and older helper versions are retained intentionally.
 `./scripts/check.sh` covers OSC sanitization, destination/path policy,
 fallback error classification, hook install/uninstall preservation, helper
 architecture/integrity checks, backups, and failure cleanup. The maintained GUI
-smoke suite runs a real CLI hook with no controlling TTY and checks its OSC reaches
-the intended Ghostty surface, plus a binary transfer/configuration fixture using
-the built CLI. These tests require no SSH server or agent credentials.
+smoke suite runs real CLI hooks with no controlling TTY and checks that long ASCII
+and multibyte messages reach the intended Ghostty surface. A private real tmux
+server verifies routing with linked sessions, stale context, and detached clients.
+The suite also runs a binary transfer/configuration fixture using the built CLI.
+These tests require tmux but no SSH server or agent credentials.
 
 The opt-in test
 `terminal::ssh_notification_tests::live_codex_completion_reaches_local_terminal`

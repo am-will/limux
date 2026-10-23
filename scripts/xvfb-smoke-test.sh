@@ -119,6 +119,7 @@ command -v cargo >/dev/null || { echo "FAIL: cargo missing"; exit 2; }
 command -v jq >/dev/null || { echo "FAIL: jq missing"; exit 2; }
 command -v sed >/dev/null || { echo "FAIL: sed missing"; exit 2; }
 command -v setsid >/dev/null || { echo "FAIL: setsid missing"; exit 2; }
+command -v tmux >/dev/null || { echo "FAIL: tmux missing"; exit 2; }
 
 # --- 2. Build -------------------------------------------------------------
 if [ "$PROFILE" = "release" ]; then
@@ -392,6 +393,7 @@ fi
 for regression in \
   pane::activity_tests::real_pty_output_drives_tab_activity_lifecycle \
   terminal::ssh_notification_tests::detached_agent_hook_notifies_only_its_originating_terminal \
+  terminal::ssh_notification_tests::linked_tmux_sessions_keep_the_originating_notification_client \
   ssh_helpers::tests::helper_transfer_configures_only_selected_agent_and_keeps_backup \
   pane::ssh_reconnect_tests::image_paste_follows_moves_and_cancels_on_reconnect \
   pane::ssh_reconnect_tests::reconnect_and_deferred_tab_moves_keep_one_current_widget \
