@@ -33,6 +33,8 @@ use crate::terminal::{self, LinkOpenRequest, TerminalCallbacks};
 mod activity_tests;
 #[cfg(test)]
 mod ssh_reconnect_tests;
+#[cfg(test)]
+mod tab_overflow_tests;
 
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -554,7 +556,18 @@ pub fn create_pane(
         .build();
     tab_strip_wrapper.append(&tab_strip);
     tab_strip_wrapper.append(&tab_drag_filler);
-    tab_overlay.set_child(Some(&tab_strip_wrapper));
+    // Scrolling keeps the tab buttons from increasing the pane's minimum width.
+    let tab_viewport = gtk::Viewport::builder()
+        .hscroll_policy(gtk::ScrollablePolicy::Natural)
+        .child(&tab_strip_wrapper)
+        .build();
+    let tab_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
+        .child(&tab_viewport)
+        .build();
+    tab_overlay.set_child(Some(&tab_scroller));
 
     let drop_indicator = gtk::Box::new(gtk::Orientation::Vertical, 0);
     drop_indicator.add_css_class("limux-tab-drop-indicator");
@@ -631,7 +644,17 @@ pub fn create_pane(
         tabs: Vec::new(),
         active_tab: None,
         active_rename_tab: None,
+        reveal_queued: false,
     }));
+    {
+        let tab_strip = tab_strip.downgrade();
+        let tab_state = Rc::downgrade(&tab_state);
+        tab_scroller.hadjustment().connect_changed(move |_| {
+            if let (Some(tab_strip), Some(tab_state)) = (tab_strip.upgrade(), tab_state.upgrade()) {
+                queue_active_tab_reveal(&tab_strip, &tab_state);
+            }
+        });
+    }
     let workspace_dragging = Rc::new(Cell::new(false));
     let pane_id = pane_id_for_initial_state(initial_state);
     let internals = Rc::new(PaneInternals {
@@ -1240,6 +1263,7 @@ struct TabState {
     tabs: Vec<TabEntry>,
     active_tab: Option<String>,
     active_rename_tab: Option<String>,
+    reveal_queued: bool,
 }
 
 /// Shared internals stored on the pane outer Box for external access.
@@ -3147,12 +3171,15 @@ fn build_tab_button_from_label(
         let tab_state = internals.tab_state.clone();
         drag_source.connect_drag_begin(move |source, _drag| {
             set_tab_dragging(true);
-            if let Some(widget) = source.widget() {
-                let allocation = widget.allocation();
+            if let Some((widget, bounds)) = source.widget().and_then(|widget| {
+                let parent = drop_indicator.parent()?;
+                let bounds = widget.compute_bounds(&parent)?;
+                Some((widget, bounds))
+            }) {
                 position_indicator(
                     &tab_state,
                     &drop_indicator,
-                    (allocation.x() + allocation.width()) as f64,
+                    (bounds.x() + bounds.width()) as f64,
                 );
                 let icon = gtk::WidgetPaintable::new(Some(&widget));
                 source.set_icon(Some(&icon), 0, 0);
@@ -3659,30 +3686,36 @@ fn highlight_content_drop_zone(overlay: &gtk::Box, zone: ContentDropZone) {
 }
 
 fn position_indicator(tab_state: &Rc<RefCell<TabState>>, indicator: &gtk::Box, x: f64) {
+    let Some(viewport) = indicator.parent() else {
+        return;
+    };
     let tab_state = tab_state.borrow();
     if tab_state.tabs.is_empty() {
         indicator.set_visible(false);
         return;
     }
 
-    let mut position = 0;
+    let mut position = 0.0;
     for entry in &tab_state.tabs {
-        let allocation = entry.tab_button.allocation();
-        let left = allocation.x();
-        let right = allocation.x() + allocation.width();
-        let midpoint = allocation.x() as f64 + allocation.width() as f64 / 2.0;
+        let Some(bounds) = entry.tab_button.compute_bounds(&viewport) else {
+            continue;
+        };
+        let left = bounds.x() as f64;
+        let right = left + bounds.width() as f64;
+        let midpoint = left + bounds.width() as f64 / 2.0;
         if x < midpoint {
             position = left;
             break;
         }
         position = right;
     }
-    indicator.set_margin_start(position);
+    indicator.set_margin_start(position.clamp(0.0, viewport.width().max(0) as f64) as i32);
     indicator.set_visible(true);
 }
 
 fn insert_index_for_drop(
     tab_state: &Rc<RefCell<TabState>>,
+    viewport: &gtk::Widget,
     x: f64,
     ignored_tab_id: Option<&str>,
 ) -> usize {
@@ -3691,8 +3724,10 @@ fn insert_index_for_drop(
         if ignored_tab_id == Some(entry.id.as_str()) {
             continue;
         }
-        let allocation = entry.tab_button.allocation();
-        let midpoint = allocation.x() as f64 + allocation.width() as f64 / 2.0;
+        let Some(bounds) = entry.tab_button.compute_bounds(viewport) else {
+            continue;
+        };
+        let midpoint = bounds.x() as f64 + bounds.width() as f64 / 2.0;
         if x < midpoint {
             return idx;
         }
@@ -3770,6 +3805,7 @@ fn reorder_tab_to_index(
     state.tabs.insert(normalized_idx, entry);
     drop(state);
     rebuild_tab_strip(tab_strip, tab_state);
+    queue_active_tab_reveal(tab_strip, tab_state);
     (callbacks.on_state_changed)();
     true
 }
@@ -3944,7 +3980,7 @@ fn install_tab_strip_drop_target(tab_overlay: &gtk::Overlay, internals: &Rc<Pane
     {
         let target = Rc::downgrade(internals);
         let indicator = internals.drop_indicator.clone();
-        drop_target.connect_drop(move |_, value, x, _| {
+        drop_target.connect_drop(move |drop_target, value, x, _| {
             indicator.set_visible(false);
             let Some(target) = target.upgrade() else {
                 return false;
@@ -3955,9 +3991,13 @@ fn install_tab_strip_drop_target(tab_overlay: &gtk::Overlay, internals: &Rc<Pane
             let Some(payload) = TabDragPayload::decode(&raw) else {
                 return false;
             };
+            let Some(viewport) = drop_target.widget() else {
+                return false;
+            };
             let same_pane = payload.pane_id == target.pane_id;
             let insert_idx = insert_index_for_drop(
                 &target.tab_state,
+                &viewport,
                 x,
                 same_pane.then_some(payload.tab_id.as_str()),
             );
@@ -4121,8 +4161,62 @@ fn install_content_drop_target(internals: &Rc<PaneInternals>) {
 // Tab activation / removal
 // ---------------------------------------------------------------------------
 
+fn queue_active_tab_reveal(tab_strip: &gtk::Box, tab_state: &Rc<RefCell<TabState>>) {
+    {
+        let mut state = tab_state.borrow_mut();
+        if state.reveal_queued {
+            return;
+        }
+        state.reveal_queued = true;
+    }
+    let tab_state = Rc::downgrade(tab_state);
+    // Reordering can leave the old allocation until the next frame's layout.
+    tab_strip.add_tick_callback(move |tab_strip, _| {
+        let tab_strip = tab_strip.downgrade();
+        let tab_state = tab_state.clone();
+        glib::idle_add_local_once(move || {
+            let (Some(tab_strip), Some(tab_state)) = (tab_strip.upgrade(), tab_state.upgrade())
+            else {
+                return;
+            };
+            tab_state.borrow_mut().reveal_queued = false;
+            let Some(scroller) = tab_strip
+                .ancestor(gtk::ScrolledWindow::static_type())
+                .and_downcast::<gtk::ScrolledWindow>()
+            else {
+                return;
+            };
+            let Some(content) = tab_strip.parent() else {
+                return;
+            };
+            let bounds = {
+                let state = tab_state.borrow();
+                state
+                    .tabs
+                    .iter()
+                    .find(|tab| Some(tab.id.as_str()) == state.active_tab.as_deref())
+                    .and_then(|tab| tab.tab_button.compute_bounds(&content))
+            };
+            if let Some(bounds) = bounds.filter(|bounds| bounds.width() > 0.0) {
+                let adjustment = scroller.hadjustment();
+                if adjustment.page_size() > 0.0 {
+                    let left = bounds.x() as f64;
+                    let right = left + bounds.width() as f64;
+                    let value = adjustment
+                        .value()
+                        .max(right - adjustment.page_size())
+                        .min(left);
+                    // Cancel any focus-scroll animation left by the previous tab.
+                    adjustment.set_value(value);
+                }
+            }
+        });
+        glib::ControlFlow::Break
+    });
+}
+
 fn activate_tab(
-    _tab_strip: &gtk::Box,
+    tab_strip: &gtk::Box,
     content_stack: &gtk::Stack,
     tab_state: &Rc<RefCell<TabState>>,
     tab_id: &str,
@@ -4158,6 +4252,7 @@ fn activate_tab(
     if has_content_child {
         content_stack.set_visible_child_name(tab_id);
     }
+    queue_active_tab_reveal(tab_strip, tab_state);
 
     // Content still on its way from another pane gets focus when it arrives.
     if let Some(target) = focus_target.filter(|_| has_content_child) {

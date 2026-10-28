@@ -391,6 +391,7 @@ if [ "$GRAPHICS" = hardware ] && ! grep -Fq 'terminal GL: ' "$LOG_DIR/terminal-g
   exit 1
 fi
 for regression in \
+  pane::tab_overflow_tests::overflowing_tabs_bound_terminal_geometry_and_reveal_selection \
   pane::activity_tests::real_pty_output_drives_tab_activity_lifecycle \
   terminal::ssh_notification_tests::detached_agent_hook_notifies_only_its_originating_terminal \
   terminal::ssh_notification_tests::linked_tmux_sessions_keep_the_originating_notification_client \
