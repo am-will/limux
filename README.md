@@ -57,6 +57,13 @@ cd limux-*-linux-x86_64
 sudo ./install.sh
 ```
 
+To install into a user-writable prefix without root, use:
+```bash
+./install.sh --prefix="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+```
+Uninstall with `./install.sh --prefix="$HOME/.local" --uninstall`.
+
 **Arch Linux (AUR):**
 ```bash
 # Prebuilt release package

@@ -1,5 +1,5 @@
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib/limux"]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN/../../lib/limux"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib/limux"]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN/../../lib/limux"]

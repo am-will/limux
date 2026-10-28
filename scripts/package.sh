@@ -462,78 +462,218 @@ for arg in "$@"; do
     esac
 done
 
+case "$PREFIX" in
+    /*) ;;
+    *)
+        echo "Install prefix must be an absolute path: $PREFIX" >&2
+        exit 2
+        ;;
+esac
+
+if [[ "$PREFIX" == *[[:cntrl:]]* ]]; then
+    echo "Install prefix cannot contain control characters." >&2
+    exit 2
+fi
+
+if [[ "$PREFIX" == *"="* ]]; then
+    echo "Install prefix cannot contain '=' because desktop launchers cannot represent it." >&2
+    exit 2
+fi
+
+if [[ "$PREFIX" == *"%"* ]]; then
+    echo "Install prefix cannot contain '%' because this installer does not support it in desktop executable paths." >&2
+    exit 2
+fi
+
+PREFIX="$(realpath -m -- "$PREFIX")"
+if [ "$PREFIX" = "/" ]; then
+    echo "Install prefix cannot be the filesystem root." >&2
+    exit 2
+fi
+
+if [[ "$PREFIX" == *[[:cntrl:]]* ]]; then
+    echo "Resolved install prefix cannot contain control characters." >&2
+    exit 2
+fi
+
+if [[ "$PREFIX" == *"="* ]]; then
+    echo "Resolved install prefix cannot contain '=' because desktop launchers cannot represent it." >&2
+    exit 2
+fi
+
+if [[ "$PREFIX" == *"%"* ]]; then
+    echo "Resolved install prefix cannot contain '%' because this installer does not support it in desktop executable paths." >&2
+    exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-need_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "This operation requires root. Re-running with sudo..."
-        exec sudo "$0" "$@"
+is_system_prefix() {
+    case "$PREFIX" in
+        /usr|/usr/local) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+directory_writable_or_creatable() {
+    local dir="$1"
+
+    while [ ! -e "$dir" ] && [ ! -L "$dir" ]; do
+        local parent="${dir%/*}"
+        [ "$parent" = "$dir" ] && return 1
+        [ -n "$parent" ] || parent="/"
+        dir="$parent"
+    done
+
+    [ -d "$dir" ] && [ -w "$dir" ] && [ -x "$dir" ]
+}
+
+managed_paths_writable() {
+    local path
+    local directory
+    local source
+    local source_root="$SCRIPT_DIR/share/icons/hicolor"
+    local unwritable
+
+    for directory in \
+        "$PREFIX/bin" \
+        "$PREFIX/libexec" \
+        "$PREFIX/libexec/limux" \
+        "$PREFIX/lib" \
+        "$PREFIX/lib/limux" \
+        "$PREFIX/share" \
+        "$PREFIX/share/limux" \
+        "$PREFIX/share/applications" \
+        "$PREFIX/share/metainfo" \
+        "$PREFIX/share/icons/hicolor"; do
+        directory_writable_or_creatable "$directory" || return 1
+    done
+
+    for directory in \
+        "$PREFIX/libexec/limux" \
+        "$PREFIX/lib/limux" \
+        "$PREFIX/share/limux"; do
+        if [ -d "$directory" ]; then
+            unwritable="$(find "$directory" ! -writable -print -quit 2>/dev/null)" || return 1
+            [ -z "$unwritable" ] || return 1
+        fi
+    done
+
+    if [ -d "$source_root" ]; then
+        while IFS= read -r -d '' source; do
+            path="$PREFIX/share/icons/hicolor/${source#"$source_root"/}"
+            directory_writable_or_creatable "${path%/*}" || return 1
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                [ -w "$path" ] || return 1
+            fi
+        done < <(find "$source_root" -type f -print0)
     fi
+
+    path="$PREFIX/share/applications/dev.limux.linux.desktop"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        [ -w "$path" ] || return 1
+    fi
+}
+
+need_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        return 0
+    fi
+
+    if ! is_system_prefix && managed_paths_writable; then
+        return 0
+    fi
+
+    echo "This operation requires write access to managed files under ${PREFIX}. Re-running with sudo..."
+    exec sudo "$0" "$@"
+}
+
+limux_ldconfig_config_matches_prefix() {
+    local config="/etc/ld.so.conf.d/limux.conf"
+
+    [ -f "$config" ] || return 1
+    printf '%s\n' "$PREFIX/lib/limux" | cmp -s - "$config"
+}
+
+remove_legacy_ldconfig_config() {
+    local config="/etc/ld.so.conf.d/limux.conf"
+
+    if limux_ldconfig_config_matches_prefix; then
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "WARNING: leaving legacy Limux loader config without root: $config" >&2
+            echo "         The installer no longer needs global loader configuration." >&2
+            return 0
+        fi
+        rm -f "$config"
+        ldconfig 2>/dev/null || true
+    fi
+}
+
+desktop_exec_argument() {
+    local value="$1"
+    local escaped=""
+    local char
+    local i
+
+    for ((i = 0; i < ${#value}; i++)); do
+        char="${value:i:1}"
+        case "$char" in
+            $'\\') escaped+=$'\\\\\\\\' ;;
+            '"') escaped+=$'\\\\'; escaped+='"' ;;
+            '$'|$'\x60') escaped+=$'\\\\'; escaped+="$char" ;;
+            *) escaped+="$char" ;;
+        esac
+    done
+
+    printf '"%s"' "$escaped"
+}
+
+desktop_string_path() {
+    local value="$1"
+    local escaped=""
+    local char
+    local i
+
+    for ((i = 0; i < ${#value}; i++)); do
+        char="${value:i:1}"
+        case "$char" in
+            $'\\') escaped+=$'\\\\' ;;
+            ' ') escaped+='\s' ;;
+            *) escaped+="$char" ;;
+        esac
+    done
+
+    printf '%s' "$escaped"
 }
 
 install_desktop_file() {
     local src="$1"
     local dest="$2"
     local exec_path="$3"
+    local exec_argument
+    local try_exec_path
+    local line
 
-    sed \
-        -e "s|^Exec=.*|Exec=${exec_path}|" \
-        -e "s|^TryExec=.*|TryExec=${exec_path}|" \
-        "$src" > "$dest"
+    exec_argument="$(desktop_exec_argument "$exec_path")"
+    try_exec_path="$(desktop_string_path "$exec_path")"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            Exec=*) printf 'Exec=%s\n' "$exec_argument" ;;
+            TryExec=*) printf 'TryExec=%s\n' "$try_exec_path" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$src" > "$dest"
     chmod 644 "$dest"
 }
 
-legacy_limux_paths() {
-    local sudo_home=""
-
-    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
-    fi
-
-    printf '%s\n' \
-        "$PREFIX/libexec/limux/limux" \
-        /usr/local/libexec/limux/limux \
-        /usr/libexec/limux/limux \
-        /usr/local/bin/limux \
-        /usr/bin/limux
-
-    if [ -n "$sudo_home" ]; then
-        printf '%s\n' \
-            "$sudo_home/.local/libexec/limux/limux" \
-            "$sudo_home/.local/bin/limux"
-    fi
-}
-
-is_legacy_limux_host() {
-    local path="$1"
-    local help
-
-    [ -x "$path" ] || return 1
-    help="$("$path" --help 2>&1 || true)"
-    grep -q "limux CLI" <<< "$help" && return 1
-    grep -q "GApplication" <<< "$help" && return 0
-    "$path" --json identify >/tmp/limux-installer-probe.log 2>&1 && return 1
-    grep -q "Unknown option --json" /tmp/limux-installer-probe.log
-}
-
 clean_legacy_limux_entrypoints() {
-    local path
+    local path="$PREFIX/libexec/limux/limux"
 
-    while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        [ "$path" = "$PREFIX/bin/limux" ] && continue
-        if [ "${path%/bin/limux}" != "$path" ]; then
-            if is_legacy_limux_host "$path"; then
-                rm -f "$path"
-                echo "Removed legacy Limux host entrypoint: $path"
-            fi
-        elif [ -e "$path" ]; then
-            rm -f "$path"
-            echo "Removed legacy Limux host entrypoint: $path"
-        fi
-    done <<EOF_PATHS
-$(legacy_limux_paths)
-EOF_PATHS
+    if [ -e "$path" ]; then
+        rm -f "$path"
+        echo "Removed legacy Limux host entrypoint: $path"
+    fi
 }
 
 warn_if_limux_is_shadowed() {
@@ -541,7 +681,7 @@ warn_if_limux_is_shadowed() {
     local first
     local help
 
-    first="$(PATH="$PREFIX/bin:$PATH" command -v limux 2>/dev/null || true)"
+    first="$(command -v limux 2>/dev/null || true)"
     if [ "$first" != "$expected" ]; then
         echo "WARNING: the first limux on PATH is '$first', expected '$expected'."
         echo "         Agent/CLI commands require the Limux CLI entrypoint."
@@ -572,8 +712,7 @@ if $UNINSTALL; then
     remove_tree "$PREFIX/libexec/limux"
     remove_tree "$PREFIX/lib/limux"
     remove_tree "$PREFIX/share/limux"
-    rm -f /etc/ld.so.conf.d/limux.conf
-    ldconfig 2>/dev/null || true
+    remove_legacy_ldconfig_config
     rm -f "$PREFIX/share/applications/limux.desktop"
     rm -f "$PREFIX/share/applications/dev.limux.linux.desktop"
     rm -f "$PREFIX/share/metainfo/dev.limux.linux.metainfo.xml"
@@ -585,7 +724,9 @@ if $UNINSTALL; then
     rm -f "$PREFIX/share/icons/hicolor/scalable/actions/limux-split-vertical-symbolic.svg"
     gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
     update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
-    appstreamcli refresh-cache --force 2>/dev/null || true
+    if is_system_prefix; then
+        appstreamcli refresh-cache --force 2>/dev/null || true
+    fi
     echo "Limux uninstalled."
     exit 0
 fi
@@ -598,21 +739,24 @@ clean_legacy_limux_entrypoints
 install -Dm755 "$SCRIPT_DIR/libexec/limux/limux-host" "$PREFIX/libexec/limux/limux-host"
 rm -f "$PREFIX/lib/limux/$LEGACY_GHOSTTY_LIBRARY_NAME"
 install -Dm644 "$SCRIPT_DIR/lib/$GHOSTTY_LIBRARY_NAME" "$PREFIX/lib/limux/$GHOSTTY_LIBRARY_NAME"
+mkdir -p "$PREFIX/share"
 if [ -d "$SCRIPT_DIR/share/limux" ]; then
     cp -r "$SCRIPT_DIR/share/limux" "$PREFIX/share/"
 fi
-echo "$PREFIX/lib/limux" > /etc/ld.so.conf.d/limux.conf
-ldconfig 2>/dev/null || true
+remove_legacy_ldconfig_config
 rm -f "$PREFIX/share/applications/limux.desktop"
 mkdir -p "$PREFIX/share/applications"
 install_desktop_file "$SCRIPT_DIR/share/applications/dev.limux.linux.desktop" "$PREFIX/share/applications/dev.limux.linux.desktop" "$PREFIX/bin/limux"
 install -Dm644 "$SCRIPT_DIR/share/metainfo/dev.limux.linux.metainfo.xml" "$PREFIX/share/metainfo/dev.limux.linux.metainfo.xml"
 if [ -d "$SCRIPT_DIR/share/icons" ]; then
+    mkdir -p "$PREFIX/share/icons"
     cp -r "$SCRIPT_DIR/share/icons/hicolor" "$PREFIX/share/icons/"
 fi
 gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
 update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
-appstreamcli refresh-cache --force 2>/dev/null || true
+if is_system_prefix; then
+    appstreamcli refresh-cache --force 2>/dev/null || true
+fi
 warn_if_limux_is_shadowed
 
 echo ""
