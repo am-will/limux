@@ -36,8 +36,11 @@ chmod +x Limux-*-x86_64.AppImage
 Release AppImages are built and checked on the Ubuntu 24.04 `GLIBC_2.39`
 floor. They bundle Limux, Ghostty resources, WebKitGTK helper processes, and
 AppImage-only loader modules such as the gdk-pixbuf SVG loader. They still use
-the host GTK4 and libadwaita runtime, so older distributions may need the
-`.deb`, tarball, or a source build with matching system packages instead.
+the host GTK4 and libadwaita runtime. The release tarball, `.deb`, and RPM use
+the same Limux host binary and also require `GLIBC_2.39`; choosing one of those
+formats does not lower the glibc requirement. For an older glibc, build from
+source on the target distribution or use a release built against an older
+baseline.
 
 The embedded [AppImage type-2 runtime](https://github.com/AppImage/type2-runtime)
 statically includes FUSE 3, so the AppImage does not require a host
