@@ -27,7 +27,8 @@ Download the latest release from [GitHub Releases](https://github.com/am-will/li
 sudo dpkg -i ./limux_*_amd64.deb
 ```
 
-**AppImage** — portable across Ubuntu 24.04-era desktops and newer, no install needed:
+**AppImage** — portable across Ubuntu 24.04-era desktops and newer, with no
+Limux installation needed:
 ```bash
 chmod +x Limux-*-x86_64.AppImage
 ./Limux-*-x86_64.AppImage
@@ -45,6 +46,9 @@ statically includes FUSE 3, so the AppImage does not require a host
 `fusermount3` while retaining support for the traditional `fusermount` helper.
 The launcher also discovers host GBM and DRI driver directories, allowing the
 Ubuntu-built bundle to use Mesa correctly on Fedora- and Arch-family systems.
+The AppImage does not bundle the host's `bwrap` (`bubblewrap`) or
+`xdg-dbus-proxy`, which WebKitGTK needs for sandboxed browser processes. Install
+these tools from your distribution's packages if they are missing.
 
 AppImage runtime library paths are scoped to the Limux app process. Terminals
 spawned inside Limux restore the user's original library/loader environment so
@@ -82,7 +86,20 @@ sudo ./install.sh --uninstall
 ```bash
 # Ubuntu/Debian
 sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
+
+# AppImage WebKit sandbox helpers
+sudo apt install bubblewrap xdg-dbus-proxy
 ```
+
+Limux leaves WebKitGTK's WebProcess sandbox enabled by default. It relies on
+the system allowing unprivileged user namespaces; distribution policy or an
+AppArmor restriction can make WebKit abort the entire Limux host when opening
+or restoring a browser pane. Ubuntu 24.04's default policy requires an
+[application AppArmor allowance for user namespaces](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
+Check the WebKit and bubblewrap errors and configure the application's policy
+before using browser panes. As a last-resort compatibility workaround, start
+Limux with `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` to disable WebKit's
+process sandbox. This reduces browser isolation.
 
 On Wayland, also install `wl-clipboard` (`apt install wl-clipboard`, `dnf install wl-clipboard` or `pacman -S wl-clipboard`). `Ctrl+Shift+V` is Limux's own paste, but plain `Ctrl+V` goes to the program running in the terminal, and some programs read the clipboard themselves (fish's `Ctrl+V`, for example). Without `wl-paste` they fall back to X11 tools like `xclip`, and depending on the compositor the X11 clipboard may not have what you copied in Limux, so `Ctrl+V` pastes something older than `Ctrl+Shift+V`.
 

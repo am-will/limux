@@ -37,20 +37,25 @@ GitHub release triggers Linux package, RPM, and AUR automation.
 
 `./scripts/smoke-release-artifacts.sh <version> all [artifact-directory]`
 checks all four exact packages without rebuilding or installing them. It needs
-`uv`, Weston, D-Bus, Mesa software rendering, and the package runtime dependencies.
-In addition to file/linkage checks, each extracted package runs in a private
-Wayland session with isolated XDG directories and a control socket. The check
-requires a healthy terminal, executed shell input and screen readback, and an
-embedded browser that loads a loopback page and sends its JavaScript callback.
+`uv`, Weston, D-Bus, Mesa software rendering, `bwrap`, `xdg-dbus-proxy`, and the
+package runtime dependencies. The build host must allow unprivileged user
+namespaces. In addition to file/linkage checks, each extracted package runs in
+a private Wayland session with isolated XDG directories and a control socket.
+The check requires a healthy terminal, executed shell input and screen
+readback, and an embedded browser that loads a loopback page and sends its
+JavaScript callback.
 
 AppImage checks launch its extracted `AppRun` unchanged, including the bundled
 WebKit process paths and library environment. Tarball, Debian, and RPM checks
 use their packaged host and Ghostty library with host GTK/WebKit dependencies.
 The harness does not add sandbox-bypass overrides or use the desktop session.
-It preserves the packaged host's sandbox policy, which currently disables the
-WebKit sandbox by default. A passing smoke does not prove sandbox-enabled
-operation. These checks run on the Ubuntu build host; they do not replace
-cross-distribution testing, particularly the NixOS graphics environment.
+It preserves the packaged host's sandbox policy and checks that the WebKit web
+process has seccomp filtering, `NoNewPrivs`, and a separate user namespace. A
+browser load without those process restrictions is a failed check. If a build
+runner blocks unprivileged user namespaces, fix that runner's policy rather
+than rerunning the check with the sandbox disabled. These checks run on the
+Ubuntu build host; they do not replace cross-distribution testing, particularly
+the NixOS graphics environment.
 
 ## Rebuild release assets
 

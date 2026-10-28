@@ -66,6 +66,88 @@ def child_pids(pid):
     return children
 
 
+def descendants(root_pid):
+    pending = [root_pid]
+    seen = {root_pid}
+    while pending:
+        pid = pending.pop()
+        try:
+            children = child_pids(pid)
+        except PermissionError as error:
+            raise RuntimeError(
+                f"cannot enumerate child processes below PID {pid}; "
+                f"WebKit sandbox verification is blocked by /proc permissions: {error}"
+            ) from error
+        for child in children - seen:
+            seen.add(child)
+            pending.append(child)
+    return seen - {root_pid}
+
+
+def verify_webkit_sandbox(host_pid):
+    web_processes = []
+    for pid in descendants(host_pid):
+        try:
+            executable = Path(os.readlink(f"/proc/{pid}/exe")).name
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            try:
+                comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except PermissionError as error:
+                raise RuntimeError(
+                    f"cannot identify child PID {pid}; WebKit sandbox verification "
+                    f"is blocked by /proc permissions: {error}"
+                ) from error
+            if "WebKitWeb" in comm:
+                web_processes.append(pid)
+            continue
+        if "WebKitWebProcess" in executable:
+            web_processes.append(pid)
+    if not web_processes:
+        raise RuntimeError(
+            "could not locate the WebKitWebProcess below the packaged host; "
+            "its sandbox state could not be verified"
+        )
+
+    host_user_namespace = os.stat("/proc/self/ns/user").st_ino
+    inspected = False
+    for pid in web_processes:
+        try:
+            status = Path(f"/proc/{pid}/status").read_text()
+            user_namespace = os.stat(f"/proc/{pid}/ns/user").st_ino
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as error:
+            raise RuntimeError(
+                f"cannot inspect WebKitWebProcess {pid} sandbox state through /proc: {error}"
+            ) from error
+        inspected = True
+        fields = {
+            line.split(":", 1)[0]: line.split(":", 1)[1].strip()
+            for line in status.splitlines()
+            if ":" in line
+        }
+        sandbox = {
+            "NoNewPrivs": fields.get("NoNewPrivs"),
+            "Seccomp": fields.get("Seccomp"),
+            "separate_user_namespace": user_namespace != host_user_namespace,
+        }
+        if (
+            sandbox["NoNewPrivs"] != "1"
+            or sandbox["Seccomp"] != "2"
+            or not sandbox["separate_user_namespace"]
+        ):
+            raise RuntimeError(
+                f"WebKitWebProcess {pid} did not enter the default sandbox: {sandbox}"
+            )
+        print(f"WebKitWebProcess {pid} sandbox: {sandbox}", flush=True)
+    if not inspected:
+        raise RuntimeError("WebKitWebProcess exited before sandbox inspection")
+
+
 @contextlib.contextmanager
 def child_subreaper():
     libc = ctypes.CDLL(None, use_errno=True)
@@ -398,7 +480,8 @@ def run(args, root):
         )
         host_env = env.copy()
         print(
-            "Browser smoke uses the packaged host's default sandbox policy.", flush=True
+            "Browser smoke verifies the packaged host's default WebKit sandbox.",
+            flush=True,
         )
         if args.appimage:
             command = [str(prefix / "AppRun")]
@@ -407,7 +490,7 @@ def run(args, root):
             host_env["GHOSTTY_RESOURCES_DIR"] = str(prefix / "share/limux/ghostty")
             host_env["TERMINFO"] = str(prefix / "share/limux/terminfo")
             command = [str(prefix / "libexec/limux/limux-host")]
-        start(["dbus-run-session", "--", *command], "host", host_env)
+        host_process = start(["dbus-run-session", "--", *command], "host", host_env)
 
         def control(*command):
             result = subprocess.run(
@@ -477,6 +560,7 @@ def run(args, root):
             processes,
             "packaged browser page load and JavaScript callback",
         )
+        verify_webkit_sandbox(host_process.pid)
         if not healthy():
             raise RuntimeError("terminal became unhealthy after browser load")
         print(
@@ -524,7 +608,13 @@ def main():
         require_pidfd_support()
     except RuntimeError as error:
         parser.error(str(error))
-    for tool in ("weston", "dbus-run-session", "fusermount3"):
+    for tool in (
+        "weston",
+        "dbus-run-session",
+        "fusermount3",
+        "bwrap",
+        "xdg-dbus-proxy",
+    ):
         if shutil.which(tool) is None:
             parser.error(f"missing runtime dependency: {tool}")
     root = Path(tempfile.mkdtemp(prefix="limux-package-runtime-"))
