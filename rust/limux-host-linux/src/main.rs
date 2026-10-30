@@ -238,12 +238,6 @@ fn main() {
     prepare_ghostty_runtime();
     sanitize_terminal_child_env();
 
-    // WebKitGTK's bubblewrap sandbox requires unprivileged user namespaces,
-    // which may not be available. Disable it to prevent crashes on launch.
-    if std::env::var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_err() {
-        std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
-    }
-
     // Initialize Ghostty before GTK app starts
     terminal::init_ghostty();
 
