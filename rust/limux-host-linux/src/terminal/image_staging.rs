@@ -157,16 +157,30 @@ pub(crate) fn host_cleanup_arguments(path: &str) -> Option<Vec<String>> {
     ])
 }
 
-fn spawn_host_cleanup(path: &str) {
+pub(super) fn spawn_host_cleanup(path: &str) {
     let Some(arguments) = host_cleanup_arguments(path) else {
         return;
     };
-    let _ = std::process::Command::new(&arguments[0])
-        .args(&arguments[1..])
+    // Outside Flatpak the staged file is on this machine, so the same
+    // validated command can run through the local shell.
+    let (program, args): (&str, &[String]) = if super::flatpak::enabled() {
+        (&arguments[0], &arguments[1..])
+    } else {
+        ("/bin/sh", &arguments[4..])
+    };
+    let mut child = match std::process::Command::new(program)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 #[cfg(test)]

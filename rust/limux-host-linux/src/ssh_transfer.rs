@@ -187,6 +187,9 @@ pub struct Upload {
     exited: Rc<Cell<bool>>,
     validate_reply: fn(&[u8]) -> Result<String, String>,
     messages: &'static TransferMessages,
+    /// When set, a path that was printed and then not delivered is deleted.
+    host_cleanup: Option<fn(&str)>,
+    abandoned: Cell<bool>,
 }
 
 impl Upload {
@@ -203,6 +206,7 @@ impl Upload {
 
     pub fn stage_on_host(
         png: glib::Bytes,
+        cleanup: fn(&str),
         completion: impl FnOnce(Result<String, String>) + 'static,
     ) -> Result<Rc<Self>, String> {
         validate_clipboard_png(png.as_ref())?;
@@ -213,6 +217,7 @@ impl Upload {
             Box::new(completion),
             host_stage_path,
             &HOST_STAGE,
+            Some(cleanup),
         )
     }
 
@@ -240,6 +245,7 @@ impl Upload {
                 }
             },
             &SSH_TRANSFER,
+            None,
         )
     }
 
@@ -249,7 +255,15 @@ impl Upload {
         timeout: Duration,
         completion: Completion,
     ) -> Result<Rc<Self>, String> {
-        Self::spawn_with_reply(args, png, timeout, completion, remote_path, &SSH_TRANSFER)
+        Self::spawn_with_reply(
+            args,
+            png,
+            timeout,
+            completion,
+            remote_path,
+            &SSH_TRANSFER,
+            None,
+        )
     }
 
     fn spawn_with_reply(
@@ -259,6 +273,7 @@ impl Upload {
         completion: Completion,
         validate_reply: fn(&[u8]) -> Result<String, String>,
         messages: &'static TransferMessages,
+        host_cleanup: Option<fn(&str)>,
     ) -> Result<Rc<Self>, String> {
         let launcher = gio::SubprocessLauncher::new(
             gio::SubprocessFlags::STDIN_PIPE
@@ -291,6 +306,8 @@ impl Upload {
             exited: Rc::new(Cell::new(false)),
             validate_reply,
             messages,
+            host_cleanup,
+            abandoned: Cell::new(false),
         });
         let exited = upload.exited.clone();
         upload
@@ -343,8 +360,18 @@ impl Upload {
                     let upload = next.clone();
                     next.process
                         .wait_check_async(Some(&next.cancellable), move |result| {
+                            let parsed = (upload.validate_reply)(&reply);
+                            if upload.abandoned.get() {
+                                if let Ok(path) = parsed {
+                                    if let Some(cleanup) = upload.host_cleanup {
+                                        cleanup(&path);
+                                    }
+                                }
+                                upload.finish(Err(upload.messages.cancelled.into()));
+                                return;
+                            }
                             upload.finish(if result.is_ok() {
-                                (upload.validate_reply)(&reply)
+                                parsed
                             } else {
                                 Err(upload.messages.failed.into())
                             });
@@ -364,6 +391,12 @@ impl Upload {
     }
 
     fn finish(&self, result: Result<String, String>) {
+        if result.is_err() && self.host_cleanup.is_some() {
+            // The reply read must keep running. The script disarms its own
+            // cleanup after printing the path, so only that reply can name
+            // the file a cancelled save has to delete.
+            self.abandoned.set(true);
+        }
         let Some(completion) = self.completion.borrow_mut().take() else {
             return;
         };
@@ -383,7 +416,9 @@ impl Upload {
                     }
                 });
             }
-            self.cancellable.cancel();
+            if self.host_cleanup.is_none() {
+                self.cancellable.cancel();
+            }
         }
         completion(result);
     }
@@ -470,6 +505,12 @@ mod tests {
         run_transfer(script, timeout, cancel, &SSH_TRANSFER, remote_path)
     }
 
+    /// The default GLib context can be owned by only one thread.
+    fn context_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap()
+    }
+
     fn run_transfer(
         script: &str,
         timeout: Duration,
@@ -477,8 +518,7 @@ mod tests {
         messages: &'static TransferMessages,
         validate: fn(&[u8]) -> Result<String, String>,
     ) -> Result<String, String> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = LOCK.lock().unwrap();
+        let _lock = context_lock();
         let context = glib::MainContext::default();
         let _guard = context.acquire().unwrap();
         let results = Rc::new(RefCell::new(Vec::new()));
@@ -490,6 +530,7 @@ mod tests {
             Box::new(move |result| output.borrow_mut().push(result)),
             validate,
             messages,
+            None,
         )
         .unwrap();
         if cancel {
@@ -610,6 +651,106 @@ mod tests {
             host_stage_path,
         )
         .is_err());
+    }
+
+    #[test]
+    fn cancelled_host_save_deletes_a_path_printed_before_delivery() {
+        let script = r#"set -eu
+umask 077
+dir=$(mktemp -d /tmp/limux-paste.XXXXXXXXXX)
+trap 'rm -f "$dir/image.png"; rmdir "$dir"' 0
+trap 'exit 1' HUP INT TERM
+cat > "$dir/image.png"
+printf '%s\n' "$dir/image.png"
+trap - 0 HUP INT TERM
+exec sleep 30
+"#;
+        let _lock = context_lock();
+        let context = glib::MainContext::default();
+        let _guard = context.acquire().unwrap();
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let output = results.clone();
+        let before = std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().starts_with("limux-paste."))
+            .collect::<Vec<_>>();
+        let upload = Upload::spawn_with_reply(
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            glib::Bytes::from_static(b"fixture"),
+            Duration::from_secs(5),
+            Box::new(move |result| output.borrow_mut().push(result)),
+            host_stage_path,
+            &HOST_STAGE,
+            Some(delete_local_host_paste),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let created = loop {
+            let mut found = std::fs::read_dir("/tmp").unwrap().filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                if before.iter().any(|existing| existing == &name) {
+                    return None;
+                }
+                let name = name.to_string_lossy();
+                name.starts_with("limux-paste.").then(|| entry.path())
+            });
+            if let Some(path) = found.next() {
+                break path;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host script did not create a paste directory"
+            );
+            for _ in 0..20 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        upload.cancel();
+        let file = created.join("image.png");
+        let gone = std::time::Instant::now() + Duration::from_secs(5);
+        while created.exists() && std::time::Instant::now() < gone {
+            for _ in 0..20 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !created.exists() && !file.exists(),
+            "cancelled host save left {}",
+            created.display()
+        );
+        let result = results.borrow();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].as_ref().unwrap_err().contains("cancelled"));
+    }
+
+    fn delete_local_host_paste(path: &str) {
+        let Some(path) = validated_paste_path(path) else {
+            return;
+        };
+        let directory = path.trim_end_matches("/image.png");
+        let script = format!("rm -f -- '{path}'; rmdir -- '{directory}'");
+        if let Ok(mut child) = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 
     #[test]

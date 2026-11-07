@@ -146,8 +146,10 @@ Limux exits, so an agent can read it later. Delivered files are not deleted
 automatically and there is no age-based cleaner. Remove the directory when
 finished, or let the system's temporary-file policy reclaim `/tmp`. A failure
 inserts nothing and shows an error. A file that was saved but not delivered is
-removed. If host-spawn is killed before it prints the path, the script's traps
-try to clean up; an abrupt kill can still leave a private temporary file.
+removed, including when the host script has already printed the path and Limux
+cancels before inserting it. If host-spawn is killed before that path is
+printed, its traps try to clean up; an abrupt kill can still leave a private
+temporary file.
 
 A one-shot SSH tab has no saved target, so Paste stages the file locally. A
 manually typed `ssh`, container command, or other remote process in an ordinary

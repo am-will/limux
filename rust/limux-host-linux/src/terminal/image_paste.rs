@@ -281,13 +281,17 @@ pub(super) fn try_begin(
                     }
                 }
                 ImagePasteDestination::Local if flatpak => {
-                    match Upload::stage_on_host(png, move |result| match result {
-                        Ok(path) => match StagedImage::host(path.clone()) {
-                            Ok(staged) => deliver_staged(ticket, staged, path),
+                    match Upload::stage_on_host(
+                        png,
+                        super::image_staging::spawn_host_cleanup,
+                        move |result| match result {
+                            Ok(path) => match StagedImage::host(path.clone()) {
+                                Ok(staged) => deliver_staged(ticket, staged, path),
+                                Err(error) => complete(ticket, Err(error)),
+                            },
                             Err(error) => complete(ticket, Err(error)),
                         },
-                        Err(error) => complete(ticket, Err(error)),
-                    }) {
+                    ) {
                         Ok(upload) => store_upload(ticket, upload),
                         Err(error) => complete(ticket, Err(error)),
                     }
