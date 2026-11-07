@@ -78,6 +78,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            apparmor \
+            apparmor-utils \
             blueprint-compiler \
             build-essential \
             gettext \
@@ -92,6 +94,9 @@ jobs:
 
       - name: Run repository quality checks
         run: ./scripts/check.sh
+
+      - name: Check exact-path AppArmor profile generation
+        run: ./scripts/tests/test-apparmor-profile.sh
 
   gtk-host-smoke:
     name: GTK host smoke
@@ -123,7 +128,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            apparmor \
+            apparmor-utils \
             blueprint-compiler \
+            bubblewrap \
             build-essential \
             gettext \
             jq \
@@ -144,6 +152,7 @@ jobs:
             x11-utils \
             xdotool \
             xinput \
+            xdg-dbus-proxy \
             xvfb
 
       - name: Build libghostty for embedding
@@ -155,7 +164,7 @@ jobs:
       - name: Run live GTK host smoke test
         env:
           LIMUX_SMOKE_PROFILE: debug
-        run: ./scripts/xvfb-smoke-test.sh
+        run: ./scripts/ci-webkit-sandbox.sh -- ./scripts/xvfb-smoke-test.sh
 
       - name: Check X11 input-seat removal
         run: uv run scripts/tests/test-input-seat-removal.py
@@ -190,7 +199,7 @@ jobs:
         env:
           LIMUX_VISUAL_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/limux-visual-smoke
           LIMUX_VISUAL_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: ./scripts/tests/visual-smoke-test.sh
+        run: ./scripts/ci-webkit-sandbox.sh -- ./scripts/tests/visual-smoke-test.sh
 
       - name: Upload visual smoke gallery
         id: visual-gallery
@@ -287,7 +296,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            apparmor \
+            apparmor-utils \
             blueprint-compiler \
+            bubblewrap \
             build-essential \
             dbus-x11 \
             gettext \
@@ -303,6 +315,7 @@ jobs:
             util-linux \
             xauth \
             xdotool \
+            xdg-dbus-proxy \
             xvfb
 
       - name: Build libghostty from requested PR source
@@ -320,7 +333,7 @@ jobs:
           LIMUX_TEST_ROOT: ${{ github.workspace }}/source
           LIMUX_VISUAL_SOURCE_SHA: ${{ steps.pr.outputs.head_sha }}
           LIMUX_VISUAL_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/limux-visual-smoke
-        run: tooling/scripts/tests/visual-smoke-test.sh
+        run: tooling/scripts/ci-webkit-sandbox.sh -- tooling/scripts/tests/visual-smoke-test.sh
 
       - name: Upload visual smoke gallery
         id: visual-gallery

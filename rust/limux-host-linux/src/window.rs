@@ -872,6 +872,27 @@ fn surface_health_row(
             row.insert("realized".to_string(), serde_json::Value::Bool(false));
             row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
         }
+    } else if surface.kind == "browser" {
+        let availability = crate::browser_sandbox::availability();
+        row.insert(
+            "healthy".to_string(),
+            serde_json::Value::Bool(availability.is_ok()),
+        );
+        row.insert(
+            "realized".to_string(),
+            serde_json::Value::Bool(availability.is_ok()),
+        );
+        row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
+        row.insert(
+            "sandboxed".to_string(),
+            serde_json::Value::Bool(availability.as_ref().is_ok_and(|status| status.sandboxed)),
+        );
+        if let Err(error) = availability {
+            row.insert(
+                "error".to_string(),
+                serde_json::Value::String(error.clone()),
+            );
+        }
     } else {
         row.insert("healthy".to_string(), serde_json::Value::Bool(true));
         row.insert("realized".to_string(), serde_json::Value::Bool(true));
@@ -6347,6 +6368,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             if browser {
+                if let Some(error) = crate::browser_sandbox::unavailable_reason() {
+                    let _ = reply.send(Err(BridgeError::internal(error)));
+                    return;
+                }
                 pane::add_browser_tab_to_pane_with_uri(&pane_widget, url.as_deref());
             } else {
                 pane::add_terminal_tab_to_pane(&pane_widget);

@@ -329,6 +329,10 @@ populate_tree() {
     # Ghostty resources required for named themes and shell integration
     cp -r "$GHOSTTY_SHARE_DIR"/. "$ghostty_resdir"
     copy_ghostty_terminfo_entries "$GHOSTTY_TERMINFO_DIR" "$ghostty_datadir/terminfo"
+    install -m755 "$ROOT_DIR/scripts/install-apparmor-profile.sh" "$ghostty_datadir/install-apparmor-profile.sh"
+    if [ "$prefix" = /usr ]; then
+        install -Dm644 "$ROOT_DIR/scripts/apparmor/dev.limux.linux" "$dest/etc/apparmor.d/dev.limux.linux"
+    fi
 
     # Desktop file. Use the absolute CLI path so desktop launchers do not
     # accidentally resolve an older GTK host binary named `limux` from PATH.
@@ -422,6 +426,7 @@ cp "$GHOSTTY_SO" "$TARBALL_STAGE/lib/$GHOSTTY_LIBRARY_NAME"
 strip --strip-debug "$TARBALL_STAGE/lib/$GHOSTTY_LIBRARY_NAME"
 cp -r "$GHOSTTY_SHARE_DIR"/. "$TARBALL_STAGE/share/limux/ghostty"
 copy_ghostty_terminfo_entries "$GHOSTTY_TERMINFO_DIR" "$TARBALL_STAGE/share/limux/terminfo"
+install -m755 "$ROOT_DIR/scripts/install-apparmor-profile.sh" "$TARBALL_STAGE/share/limux/install-apparmor-profile.sh"
 cp "$DESKTOP_FILE" "$TARBALL_STAGE/share/applications/dev.limux.linux.desktop"
 cp "$METADATA_FILE" "$TARBALL_STAGE/share/metainfo/dev.limux.linux.metainfo.xml"
 
@@ -708,6 +713,9 @@ remove_tree() {
 if $UNINSTALL; then
     need_root "$@"
     echo "Uninstalling Limux..."
+    if is_system_prefix && [ -x "$PREFIX/share/limux/install-apparmor-profile.sh" ]; then
+        "$PREFIX/share/limux/install-apparmor-profile.sh" --remove "$PREFIX/libexec/limux/limux-host"
+    fi
     rm -f "$PREFIX/bin/limux"
     remove_tree "$PREFIX/libexec/limux"
     remove_tree "$PREFIX/lib/limux"
@@ -743,6 +751,16 @@ mkdir -p "$PREFIX/share"
 if [ -d "$SCRIPT_DIR/share/limux" ]; then
     cp -r "$SCRIPT_DIR/share/limux" "$PREFIX/share/"
 fi
+if is_system_prefix; then
+    "$PREFIX/share/limux/install-apparmor-profile.sh" --install "$PREFIX/libexec/limux/limux-host"
+elif "$PREFIX/share/limux/install-apparmor-profile.sh" --render "$PREFIX/libexec/limux/limux-host" >/dev/null 2>&1; then
+    echo 'If distribution policy blocks the browser sandbox, an administrator can install its allowance:'
+    printf '  sudo %q --install %q\n' "$PREFIX/share/limux/install-apparmor-profile.sh" "$PREFIX/libexec/limux/limux-host"
+else
+    echo 'If distribution policy blocks the browser sandbox, this path needs an administrator-written AppArmor profile.'
+    echo 'Automatic profile setup supports only letters, digits, /, _, ., +, and - in the host path.'
+    echo 'Use a supported install path to generate its allowance automatically.'
+fi
 remove_legacy_ldconfig_config
 rm -f "$PREFIX/share/applications/limux.desktop"
 mkdir -p "$PREFIX/share/applications"
@@ -767,7 +785,7 @@ echo "  Library: $PREFIX/lib/limux/$GHOSTTY_LIBRARY_NAME"
 echo "  App:     limux"
 echo ""
 echo "System dependencies (install if missing):"
-echo "  sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4"
+echo "  sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4 bubblewrap xdg-dbus-proxy"
 INSTALL_EOF
 
 chmod 755 "$TARBALL_STAGE/install.sh"
@@ -791,6 +809,7 @@ echo "/usr/lib/limux" > "$DEB_ROOT/etc/ld.so.conf.d/limux.conf"
 # Control file
 INSTALLED_SIZE=$(du -sk "$DEB_ROOT" | cut -f1)
 mkdir -p "$DEB_ROOT/DEBIAN"
+printf '%s\n' /etc/apparmor.d/dev.limux.linux > "$DEB_ROOT/DEBIAN/conffiles"
 cat > "$DEB_ROOT/DEBIAN/control" << EOF
 Package: limux
 Version: ${VERSION}
@@ -798,7 +817,7 @@ Section: utils
 Priority: optional
 Architecture: ${DEB_ARCH}
 Installed-Size: ${INSTALLED_SIZE}
-Depends: libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4
+Depends: libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4, bubblewrap, xdg-dbus-proxy
 Recommends: wl-clipboard
 Maintainer: Will R <will@limux.dev>
 Description: GPU-accelerated terminal workspace manager for Linux
@@ -824,6 +843,10 @@ is_legacy_limux_host() {
 }
 
 ldconfig 2>/dev/null || true
+if command -v apparmor_parser >/dev/null && command -v aa-enabled >/dev/null \
+   && aa-enabled --quiet && [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+    apparmor_parser --replace /etc/apparmor.d/dev.limux.linux
+fi
 rm -f /usr/libexec/limux/limux
 rm -f /usr/local/libexec/limux/limux
 if is_legacy_limux_host /usr/local/bin/limux; then
@@ -836,6 +859,16 @@ update-desktop-database /usr/share/applications 2>/dev/null || true
 appstreamcli refresh-cache --force 2>/dev/null || true
 EOF
 chmod 755 "$DEB_ROOT/DEBIAN/postinst"
+
+cat > "$DEB_ROOT/DEBIAN/prerm" << 'EOF'
+#!/bin/bash
+set -e
+if [ "$1" = remove ] && command -v apparmor_parser >/dev/null \
+   && command -v aa-enabled >/dev/null && aa-enabled --quiet; then
+    apparmor_parser --remove /etc/apparmor.d/dev.limux.linux || true
+fi
+EOF
+chmod 755 "$DEB_ROOT/DEBIAN/prerm"
 
 # Post-remove: clean up
 cat > "$DEB_ROOT/DEBIAN/postrm" << 'EOF'
@@ -877,6 +910,9 @@ cp "$HOST_BINARY" "$APPDIR/usr/libexec/limux/limux-host"
 strip "$APPDIR/usr/bin/limux"
 strip "$APPDIR/usr/libexec/limux/limux-host"
 chmod 755 "$APPDIR/usr/bin/limux" "$APPDIR/usr/libexec/limux/limux-host"
+install -m755 "$ROOT_DIR/scripts/appimage-webkit-runtime.sh" "$APPDIR/usr/libexec/limux/appimage-webkit-runtime.sh"
+install -m755 "$ROOT_DIR/scripts/appimage-host-launcher.sh" "$APPDIR/usr/libexec/limux/appimage-host-launcher.sh"
+install -m755 "$ROOT_DIR/scripts/install-apparmor-profile.sh" "$APPDIR/usr/share/limux/install-apparmor-profile.sh"
 assert_cli_entrypoint "$APPDIR/usr/bin/limux" "AppImage usr/bin/limux"
 
 # Shared library
@@ -1113,9 +1149,10 @@ if [ -f "${PIXBUF_DIR}/loaders.cache.template" ] && [ -d "${PIXBUF_DIR}/loaders"
 fi
 unset PIXBUF_DIR
 
-export WEBKIT_EXEC_PATH="${HERE}/usr/lib/webkitgtk-6.0"
-export WEBKIT_INJECTED_BUNDLE_PATH="${HERE}/usr/lib/webkitgtk-6.0/injected-bundle"
-exec "${HERE}/usr/bin/limux" "$@"
+if [ ! -f "${LIMUX_HOST_BIN:-}" ]; then
+    export LIMUX_HOST_BIN="$HERE/usr/libexec/limux/appimage-host-launcher.sh"
+fi
+exec "$HERE/usr/bin/limux" "$@"
 APPRUN_EOF
 chmod 755 "$APPDIR/AppRun"
 
