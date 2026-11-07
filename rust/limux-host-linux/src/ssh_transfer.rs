@@ -1,4 +1,5 @@
-//! Bounded binary transfers through OpenSSH with no local shell or staging file.
+//! Bounded binary transfers through OpenSSH, and Flatpak host image staging.
+//! Neither path keeps a local staging file or launches a login shell.
 use crate::ssh_hosts::SshTarget;
 use gio::prelude::*;
 use glib::translate::{IntoGlib, ToGlibPtr};
@@ -100,17 +101,81 @@ fn relay_diagnostics(stderr: &gio::InputStream) {
     }
 }
 
-fn remote_path(reply: &[u8]) -> Result<String, String> {
-    let text = std::str::from_utf8(reply).map_err(|_| "Invalid SSH upload response")?;
-    let path = text
-        .strip_suffix('\n')
-        .ok_or("Invalid SSH upload response")?;
+#[derive(Clone, Copy)]
+struct TransferMessages {
+    start: &'static str,
+    timeout: &'static str,
+    finish: &'static str,
+    send: &'static str,
+    response: &'static str,
+    failed: &'static str,
+    cancelled: &'static str,
+}
+
+const SSH_TRANSFER: TransferMessages = TransferMessages {
+    start: "Could not start SSH upload",
+    timeout: "SSH transfer timed out",
+    finish: "Could not finish SSH transfer",
+    send: "Could not send data over SSH",
+    response: "Invalid or failed SSH upload response",
+    failed: "SSH upload failed. Check keys/agent, known_hosts, and the launch log.",
+    cancelled: "SSH transfer cancelled",
+};
+
+const HOST_STAGE: TransferMessages = TransferMessages {
+    start: "Could not save the clipboard image",
+    timeout: "Saving the clipboard image timed out",
+    finish: "Could not finish saving the clipboard image",
+    send: "Could not write the clipboard image",
+    response: "Invalid image staging response",
+    failed: "Could not save the clipboard image",
+    cancelled: "Image paste cancelled",
+};
+
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+pub(crate) fn validate_clipboard_png(png: &[u8]) -> Result<(), String> {
+    if png.len() > MAX_PNG_BYTES || !png.starts_with(PNG_MAGIC) {
+        Err("Clipboard image is invalid or exceeds 32 MiB".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Accept only `/tmp/limux-paste.<10 alphanumeric>/image.png`.
+pub(crate) fn validated_paste_path(path: &str) -> Option<String> {
     let token = path
         .strip_prefix("/tmp/limux-paste.")
         .and_then(|value| value.strip_suffix("/image.png"))
-        .filter(|value| value.len() == 10 && value.bytes().all(|c| c.is_ascii_alphanumeric()))
-        .ok_or("Invalid SSH upload response")?;
-    Ok(format!("/tmp/limux-paste.{token}/image.png"))
+        .filter(|value| {
+            value.len() == 10 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })?;
+    Some(format!("/tmp/limux-paste.{token}/image.png"))
+}
+
+fn parse_paste_reply(reply: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(reply).ok()?;
+    let path = text.strip_suffix('\n')?;
+    validated_paste_path(path)
+}
+
+fn remote_path(reply: &[u8]) -> Result<String, String> {
+    parse_paste_reply(reply).ok_or_else(|| "Invalid SSH upload response".into())
+}
+
+fn host_stage_path(reply: &[u8]) -> Result<String, String> {
+    parse_paste_reply(reply).ok_or_else(|| "Invalid image staging response".into())
+}
+
+pub(crate) fn host_stage_arguments() -> Vec<String> {
+    vec![
+        "/app/bin/host-spawn".into(),
+        "--no-pty".into(),
+        "--cwd=/".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        UPLOAD_SCRIPT.into(),
+    ]
 }
 
 type Completion = Box<dyn FnOnce(Result<String, String>)>;
@@ -121,6 +186,7 @@ pub struct Upload {
     timer: RefCell<Option<glib::SourceId>>,
     exited: Rc<Cell<bool>>,
     validate_reply: fn(&[u8]) -> Result<String, String>,
+    messages: &'static TransferMessages,
 }
 
 impl Upload {
@@ -130,11 +196,24 @@ impl Upload {
         flatpak: bool,
         completion: impl FnOnce(Result<String, String>) + 'static,
     ) -> Result<Rc<Self>, String> {
-        if png.len() > MAX_PNG_BYTES || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
-            return Err("Clipboard image is invalid or exceeds 32 MiB".into());
-        }
+        validate_clipboard_png(png.as_ref())?;
         let args = arguments(target, flatpak);
         Self::spawn(&args, png, Duration::from_secs(30), Box::new(completion))
+    }
+
+    pub fn stage_on_host(
+        png: glib::Bytes,
+        completion: impl FnOnce(Result<String, String>) + 'static,
+    ) -> Result<Rc<Self>, String> {
+        validate_clipboard_png(png.as_ref())?;
+        Self::spawn_with_reply(
+            &host_stage_arguments(),
+            png,
+            Duration::from_secs(30),
+            Box::new(completion),
+            host_stage_path,
+            &HOST_STAGE,
+        )
     }
 
     pub fn install_helper(
@@ -160,6 +239,7 @@ impl Upload {
                     Err("Invalid helper installation response; inspect the launch log".into())
                 }
             },
+            &SSH_TRANSFER,
         )
     }
 
@@ -169,7 +249,7 @@ impl Upload {
         timeout: Duration,
         completion: Completion,
     ) -> Result<Rc<Self>, String> {
-        Self::spawn_with_reply(args, png, timeout, completion, remote_path)
+        Self::spawn_with_reply(args, png, timeout, completion, remote_path, &SSH_TRANSFER)
     }
 
     fn spawn_with_reply(
@@ -178,6 +258,7 @@ impl Upload {
         timeout: Duration,
         completion: Completion,
         validate_reply: fn(&[u8]) -> Result<String, String>,
+        messages: &'static TransferMessages,
     ) -> Result<Rc<Self>, String> {
         let launcher = gio::SubprocessLauncher::new(
             gio::SubprocessFlags::STDIN_PIPE
@@ -198,7 +279,7 @@ impl Upload {
         let args: Vec<_> = args.iter().map(OsStr::new).collect();
         let process = launcher
             .spawn(&args)
-            .map_err(|err| format!("Could not start SSH upload: {err}"))?;
+            .map_err(|err| format!("{}: {err}", messages.start))?;
         // Flatpak HostCommand starts a new session but can acquire a terminal
         // from any standard descriptor. Piping stderr keeps host SSH detached.
         relay_diagnostics(&process.stderr_pipe().expect("stderr pipe requested"));
@@ -209,6 +290,7 @@ impl Upload {
             timer: RefCell::new(None),
             exited: Rc::new(Cell::new(false)),
             validate_reply,
+            messages,
         });
         let exited = upload.exited.clone();
         upload
@@ -218,7 +300,7 @@ impl Upload {
         *upload.timer.borrow_mut() = Some(glib::timeout_add_local_once(timeout, move || {
             if let Some(upload) = weak.upgrade() {
                 upload.timer.borrow_mut().take();
-                upload.finish(Err("SSH transfer timed out".into()));
+                upload.finish(Err(upload.messages.timeout.into()));
             }
         }));
         let stdin = upload.process.stdin_pipe().expect("stdin pipe requested");
@@ -238,12 +320,12 @@ impl Upload {
                             if result.is_ok() {
                                 upload.read_reply(Vec::new());
                             } else {
-                                upload.finish(Err("Could not finish SSH transfer".into()));
+                                upload.finish(Err(upload.messages.finish.into()));
                             }
                         },
                     );
                 }
-                _ => next.finish(Err("Could not send data over SSH".into())),
+                _ => next.finish(Err(next.messages.send.into())),
             },
         );
         Ok(upload)
@@ -252,27 +334,33 @@ impl Upload {
     fn read_reply(self: &Rc<Self>, mut reply: Vec<u8>) {
         let stdout = self.process.stdout_pipe().expect("stdout pipe requested");
         let next = self.clone();
-        stdout.read_bytes_async(MAX_REPLY_BYTES + 1, glib::Priority::DEFAULT, Some(&self.cancellable), move |result| {
-            match result {
+        stdout.read_bytes_async(
+            MAX_REPLY_BYTES + 1,
+            glib::Priority::DEFAULT,
+            Some(&self.cancellable),
+            move |result| match result {
                 Ok(bytes) if bytes.is_empty() => {
                     let upload = next.clone();
-                    next.process.wait_check_async(Some(&next.cancellable), move |result| {
-                        upload.finish(if result.is_ok() { (upload.validate_reply)(&reply) } else {
-                            Err("SSH upload failed. Check keys/agent, known_hosts, and the launch log.".into())
+                    next.process
+                        .wait_check_async(Some(&next.cancellable), move |result| {
+                            upload.finish(if result.is_ok() {
+                                (upload.validate_reply)(&reply)
+                            } else {
+                                Err(upload.messages.failed.into())
+                            });
                         });
-                    });
                 }
                 Ok(bytes) if reply.len() + bytes.len() <= MAX_REPLY_BYTES => {
                     reply.extend_from_slice(&bytes);
                     next.read_reply(reply);
                 }
-                _ => next.finish(Err("Invalid or failed SSH upload response".into())),
-            }
-        });
+                _ => next.finish(Err(next.messages.response.into())),
+            },
+        );
     }
 
     pub fn cancel(&self) {
-        self.finish(Err("SSH transfer cancelled".into()));
+        self.finish(Err(self.messages.cancelled.into()));
     }
 
     fn finish(&self, result: Result<String, String>) {
@@ -331,6 +419,36 @@ mod tests {
     }
 
     #[test]
+    fn host_stage_arguments_use_a_fixed_script_without_ssh_or_a_pty() {
+        let args = host_stage_arguments();
+        assert_eq!(
+            &args[..5],
+            [
+                "/app/bin/host-spawn",
+                "--no-pty",
+                "--cwd=/",
+                "/bin/sh",
+                "-c"
+            ]
+        );
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[5], UPLOAD_SCRIPT);
+        assert!(args.iter().all(|arg| arg != "ssh" && arg != "--pty"));
+    }
+
+    #[test]
+    fn clipboard_png_limit_rejects_a_byte_past_32_mib() {
+        assert!(validate_clipboard_png(b"\x89PNG\r\n\x1a\nrest").is_ok());
+        assert!(validate_clipboard_png(b"not a png").is_err());
+        let mut oversized = vec![0_u8; MAX_PNG_BYTES + 1];
+        oversized[..PNG_MAGIC.len()].copy_from_slice(PNG_MAGIC);
+        assert!(validate_clipboard_png(&oversized).is_err());
+        let mut boundary = vec![0_u8; MAX_PNG_BYTES];
+        boundary[..PNG_MAGIC.len()].copy_from_slice(PNG_MAGIC);
+        assert!(validate_clipboard_png(&boundary).is_ok());
+    }
+
+    #[test]
     fn only_private_upload_paths_are_accepted() {
         assert_eq!(
             remote_path(b"/tmp/limux-paste.aB01234567/image.png\n").unwrap(),
@@ -349,17 +467,29 @@ mod tests {
     }
 
     fn run_upload(script: &str, timeout: Duration, cancel: bool) -> Result<String, String> {
+        run_transfer(script, timeout, cancel, &SSH_TRANSFER, remote_path)
+    }
+
+    fn run_transfer(
+        script: &str,
+        timeout: Duration,
+        cancel: bool,
+        messages: &'static TransferMessages,
+        validate: fn(&[u8]) -> Result<String, String>,
+    ) -> Result<String, String> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = LOCK.lock().unwrap();
         let context = glib::MainContext::default();
         let _guard = context.acquire().unwrap();
         let results = Rc::new(RefCell::new(Vec::new()));
         let output = results.clone();
-        let upload = Upload::spawn(
+        let upload = Upload::spawn_with_reply(
             &["/bin/sh".into(), "-c".into(), script.into()],
             glib::Bytes::from_static(b"fixture"),
             timeout,
             Box::new(move |result| output.borrow_mut().push(result)),
+            validate,
+            messages,
         )
         .unwrap();
         if cancel {
@@ -417,6 +547,72 @@ mod tests {
     }
 
     #[test]
+    fn host_stage_transfer_reports_staging_failures() {
+        let path = "/tmp/limux-paste.abcdefghij/image.png";
+        assert_eq!(
+            run_transfer(
+                &format!("cat >/dev/null; printf '%s\\n' '{path}'"),
+                Duration::from_secs(2),
+                false,
+                &HOST_STAGE,
+                host_stage_path,
+            )
+            .unwrap(),
+            path
+        );
+        assert!(run_transfer(
+            "exec sleep 60",
+            Duration::from_millis(40),
+            false,
+            &HOST_STAGE,
+            host_stage_path,
+        )
+        .unwrap_err()
+        .contains("timed out"));
+        assert!(run_transfer(
+            "exec sleep 60",
+            Duration::from_secs(2),
+            true,
+            &HOST_STAGE,
+            host_stage_path,
+        )
+        .unwrap_err()
+        .contains("cancelled"));
+        assert!(run_transfer(
+            "cat >/dev/null; printf 'not-a-path\\n'",
+            Duration::from_secs(2),
+            false,
+            &HOST_STAGE,
+            host_stage_path,
+        )
+        .is_err());
+        assert!(run_transfer(
+            "cat >/dev/null; printf '\\n'",
+            Duration::from_secs(2),
+            false,
+            &HOST_STAGE,
+            host_stage_path,
+        )
+        .is_err());
+        assert!(run_transfer(
+            "cat >/dev/null; head -c 4096 /dev/zero",
+            Duration::from_secs(2),
+            false,
+            &HOST_STAGE,
+            host_stage_path,
+        )
+        .is_err());
+        assert!(run_transfer(
+            &format!("cat >/dev/null; printf '%s\\n' '{path}'; exit 17"),
+            Duration::from_secs(2),
+            false,
+            &HOST_STAGE,
+            host_stage_path,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn upload_process_cannot_use_the_launching_terminal() {
         use std::ffi::{c_char, c_int, c_ulong, c_void};
         use std::io::Read;
@@ -434,13 +630,20 @@ mod tests {
                     .success(),
                 "the fixture must have a controlling terminal"
             );
-            assert_eq!(
-                run_upload(
-                    r#"if ( : </dev/tty ) 2>/dev/null || test -t 2; then exit 17; fi
+            let script = r#"if ( : </dev/tty ) 2>/dev/null || test -t 2; then exit 17; fi
 test "$(od -An -tx1 | tr -d ' \n')" = 66697874757265 || exit 18
-printf '/tmp/limux-paste.abcdefghij/image.png\n'"#,
+printf '/tmp/limux-paste.abcdefghij/image.png\n'"#;
+            assert_eq!(
+                run_upload(script, Duration::from_secs(2), false).unwrap(),
+                "/tmp/limux-paste.abcdefghij/image.png"
+            );
+            assert_eq!(
+                run_transfer(
+                    script,
                     Duration::from_secs(2),
                     false,
+                    &HOST_STAGE,
+                    host_stage_path,
                 )
                 .unwrap(),
                 "/tmp/limux-paste.abcdefghij/image.png"
