@@ -2450,7 +2450,16 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         sidebar_list.connect_row_activated(move |_, row| {
-            sidebar_groups::activate_header_row(&state, row);
+            let idx = state
+                .borrow()
+                .workspaces
+                .iter()
+                .position(|workspace| &workspace.sidebar_row == row);
+            if let Some(idx) = idx {
+                switch_workspace(&state, idx);
+            } else {
+                sidebar_groups::activate_header_row(&state, row);
+            }
         });
     }
 
@@ -5335,8 +5344,6 @@ fn install_workspace_row_interactions(
             if n_press == 2 {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 begin_workspace_inline_rename(&state, &workspace_id);
-            } else if n_press == 1 {
-                clear_visible_tab_unread(&state, &workspace_id);
             }
         });
     }
