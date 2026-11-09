@@ -1488,19 +1488,9 @@ fn make_terminal_callbacks(
     let pane_id = internals.pane_id;
 
     TerminalCallbacks {
-        image_paste_target: Box::new({
+        image_paste_destination: Box::new({
             let tab_id = tab_id.to_string();
-            move || {
-                let pane = terminal_tab_owner(&tab_id)?;
-                let tabs = pane.tab_state.borrow();
-                let entry = tabs.tabs.iter().find(|entry| entry.id == tab_id)?;
-                match &entry.kind {
-                    TabKind::Terminal { state } => {
-                        state.ssh.as_ref().map(|ssh| ssh.target().clone())
-                    }
-                    _ => None,
-                }
-            }
+            move || image_paste_destination_for_tab(&tab_id)
         }),
         on_output_activity: Rc::new({
             let tab_state = Rc::downgrade(&internals.tab_state);
@@ -1793,6 +1783,23 @@ fn remove_terminal_tab(internals: &Rc<PaneInternals>, tab_id: &str) {
         &internals.pane_outer,
         PaneEmptyReason::ClosedLastTab,
     );
+}
+
+fn image_paste_destination_for_tab(tab_id: &str) -> Result<terminal::ImagePasteDestination, ()> {
+    let pane = terminal_tab_owner(tab_id).ok_or(())?;
+    let tabs = pane.tab_state.borrow();
+    let entry = tabs
+        .tabs
+        .iter()
+        .find(|entry| entry.id == tab_id)
+        .ok_or(())?;
+    match &entry.kind {
+        TabKind::Terminal { state } => Ok(match state.ssh.as_ref() {
+            Some(ssh) => terminal::ImagePasteDestination::Ssh(ssh.target().clone()),
+            None => terminal::ImagePasteDestination::Local,
+        }),
+        _ => Err(()),
+    }
 }
 
 // Resolve by tab identity on each callback: tabs can move during backoff.

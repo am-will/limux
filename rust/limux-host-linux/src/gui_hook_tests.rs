@@ -237,6 +237,69 @@ fn gui_actions_run_their_hooks_and_socket_requests_do_not() {
     // after-create hook once it exists, and is told its id.
     set_hook(OnWorkspaceCreate, true, false);
     set_hook(AfterWorkspaceCreate, true, false);
+
+    // The explicit folder action remains available when the quick + action
+    // skips its prompt. Cancelling does not run hooks or create a workspace.
+    let open_folder_button = state
+        .borrow()
+        .top_bar_open_folder_btn_ref
+        .as_ref()
+        .unwrap()
+        .clone();
+    let before = workspace_ids(&state);
+    open_folder_button.emit_clicked();
+    folder_prompt().close();
+    pump_for(Duration::from_millis(100));
+    assert_eq!(workspace_ids(&state), before);
+    log.expect_none();
+
+    // Choosing a folder through the new action creates and selects it.
+    let folder = temp.path().join("chosen-from-folder-action");
+    std::fs::create_dir_all(&folder).unwrap();
+    open_folder_button.emit_clicked();
+    let prompt = folder_prompt();
+    let entry = find_descendant::<gtk::Entry>(prompt.upcast_ref(), &|_| true).unwrap();
+    entry.set_text(&folder.to_string_lossy());
+    find_descendant::<gtk::Button>(prompt.upcast_ref(), &|button| {
+        button.label().as_deref() == Some("Open")
+    })
+    .expect("Open button")
+    .emit_clicked();
+    let created = new_workspace(&before, &workspace_ids(&state));
+    let (active, created_folder, created_cwd) = {
+        let state = state.borrow();
+        let workspace = state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == created)
+            .unwrap();
+        let cwd = workspace.cwd.borrow().clone();
+        (
+            state.workspaces[state.active_idx].id.clone(),
+            workspace.folder_path.clone(),
+            cwd,
+        )
+    };
+    assert_eq!(active, created);
+    assert_eq!(created_folder.as_deref(), folder.to_str());
+    assert_eq!(created_cwd.as_deref(), folder.to_str());
+    let runs = log.expect(&[OnWorkspaceCreate, AfterWorkspaceCreate]);
+    for run in runs.values() {
+        assert_eq!(run.folder, folder.to_str().unwrap());
+    }
+
+    // The ordinary + button keeps its fast home-folder behavior.
+    let before = workspace_ids(&state);
+    let new_workspace_button = state.borrow().new_ws_btn.clone();
+    new_workspace_button.emit_clicked();
+    let created = new_workspace(&before, &workspace_ids(&state));
+    let runs = log.expect(&[OnWorkspaceCreate, AfterWorkspaceCreate]);
+    assert_eq!(
+        runs["on-workspace-create"].folder,
+        dirs::home_dir().unwrap().to_str().unwrap()
+    );
+    assert_eq!(runs["after-workspace-create"].id, created);
+
     let before = workspace_ids(&state);
     add_workspace_from_gui(&state);
     let created = new_workspace(&before, &workspace_ids(&state));

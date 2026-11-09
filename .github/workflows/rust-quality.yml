@@ -178,7 +178,7 @@ jobs:
       - name: Check existing-window activation
         run: ./scripts/tests/test-window-activate.sh
 
-      - name: Check inline rename focus after application switching
+      - name: Check workspace row clicks and inline rename focus after switching
         timeout-minutes: 3
         env:
           LIMUX_TEST_ARTIFACT_DIR: ${{ runner.temp }}/limux-rename-focus

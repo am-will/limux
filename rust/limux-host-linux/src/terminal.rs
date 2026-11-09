@@ -23,6 +23,7 @@ use crate::shortcut_config::NormalizedShortcut;
 mod clipboard;
 mod flatpak;
 mod image_paste;
+mod image_staging;
 mod output_activity;
 #[cfg(test)]
 mod ssh_notification_tests;
@@ -30,6 +31,7 @@ mod wakeup;
 use clipboard::{
     ghostty_confirm_read_clipboard_cb, ghostty_read_clipboard_cb, ghostty_write_clipboard_cb,
 };
+pub(crate) use image_paste::ImagePasteDestination;
 
 // ---------------------------------------------------------------------------
 // Global Ghostty app singleton
@@ -1404,7 +1406,9 @@ pub struct TerminalCallbacks {
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
     pub identity: Box<IdentityCallback>,
-    pub image_paste_target: Box<dyn Fn() -> Option<crate::ssh_hosts::SshTarget>>,
+    /// `Err` means the originating tab no longer exists. That must not become a
+    /// local save. Terminals that were never pane tabs are local.
+    pub image_paste_destination: Box<dyn Fn() -> Result<image_paste::ImagePasteDestination, ()>>,
     pub hover_focus: Box<dyn Fn() -> bool>,
     pub copy_selection_to_clipboard: Box<dyn Fn() -> bool>,
 }
@@ -1413,7 +1417,7 @@ impl TerminalCallbacks {
     pub(crate) fn disconnected() -> Self {
         Self {
             on_output_activity: Rc::new(|_| {}),
-            image_paste_target: Box::new(|| None),
+            image_paste_destination: Box::new(|| Ok(image_paste::ImagePasteDestination::Local)),
             on_title_changed: Box::new(|_| {}),
             on_pwd_changed: Box::new(|_| {}),
             on_desktop_notification: Box::new(|_, _, _| {}),

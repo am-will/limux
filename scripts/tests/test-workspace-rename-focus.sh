@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Exercise terminal focus after an inline workspace rename is interrupted by
-# another X11 application, then test that an intentional click still wins.
+# Exercise workspace row clicks and terminal focus after an inline workspace
+# rename is interrupted by another X11 application.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -128,6 +128,61 @@ for _ in $(seq 1 50); do
     '.workspaces | any(.workspace_ref == $id and .selected)' >/dev/null; then break; fi
   sleep 0.1
 done
+
+# A workspace notification subtitle used to be cleared on mouse press. That
+# collapsed the row before GTK completed selection on release, so clicks on
+# the subtitle could acknowledge it without switching workspaces.
+OTHER_WORKSPACE_REF="$(cli --json list-workspaces | jq -r '.workspaces[] | select(.name == "Other") | .workspace_ref')"
+if [ -z "$OTHER_WORKSPACE_REF" ] || [ "$OTHER_WORKSPACE_REF" = null ]; then
+  echo 'FAIL: initial workspace ref is missing'
+  exit 1
+fi
+wait_for_selected_workspace() {
+  local workspace_ref=$1
+  for _ in $(seq 1 50); do
+    if cli --json list-workspaces | jq -e --arg ref "$workspace_ref" \
+      '.workspaces | any(.workspace_ref == $ref and .selected)' >/dev/null \
+      && cli --json identify | jq -e --arg ref "$workspace_ref" \
+        '.focused.workspace_ref == $ref' >/dev/null; then return; fi
+    sleep 0.1
+  done
+  echo "FAIL: workspace did not become selected: $workspace_ref"
+  cli --json list-workspaces
+  exit 1
+}
+click_workspace_row_at() {
+  local y=$1
+  xdotool mousemove --window "$WINDOW" 100 "$y" mousedown 1
+  sleep 0.25
+  xdotool mouseup 1
+}
+
+# Exercise the subtitle itself with a delayed release so any press-time row
+# reflow happens before GTK handles the release.
+cli notify --workspace "$OTHER_WORKSPACE_REF" --subtitle 'Confirmed: click regression' 'LAB' >/dev/null
+sleep 0.3
+if command -v import >/dev/null; then import -window "$WINDOW" "$RUN_DIR/workspace-subtitle-before.png" || true; fi
+xdotool windowactivate --sync "$WINDOW"
+click_workspace_row_at 90
+wait_for_selected_workspace "$OTHER_WORKSPACE_REF"
+if command -v import >/dev/null; then import -window "$WINDOW" "$RUN_DIR/workspace-subtitle-after.png" || true; fi
+echo 'PASS: clicking a workspace notification subtitle selects that workspace'
+
+# Restore the second workspace, notify the first one again, then click the
+# workspace name. This covers the ordinary label area as well.
+cli select-workspace --workspace "$WORKSPACE_ID" >/dev/null
+wait_for_selected_workspace "$WORKSPACE_ID"
+cli notify --workspace "$OTHER_WORKSPACE_REF" --subtitle 'Confirmed: name click regression' 'LAB' >/dev/null
+sleep 0.3
+if command -v import >/dev/null; then import -window "$WINDOW" "$RUN_DIR/workspace-name-before.png" || true; fi
+click_workspace_row_at 58
+wait_for_selected_workspace "$OTHER_WORKSPACE_REF"
+echo 'PASS: clicking a workspace name selects that workspace'
+
+# Leave the original test setup active for the rename and focus checks below.
+cli select-workspace --workspace "$WORKSPACE_ID" >/dev/null
+wait_for_selected_workspace "$WORKSPACE_ID"
+
 cli --json --id-format both list-panels --workspace "$WORKSPACE_ID" >"$RUN_DIR/created-panels.json"
 FIRST_SURFACE="$(jq -r '.surfaces[] | select(.type == "terminal") | .surface_id' "$RUN_DIR/created-panels.json" | head -1)"
 [ -n "$FIRST_SURFACE" ] || { echo 'FAIL: created workspace has no terminal surface'; exit 1; }

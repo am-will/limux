@@ -133,6 +133,8 @@ and `surface-health` reports `sandboxed: false` when it is used.
 
 On Wayland, also install `wl-clipboard` (`apt install wl-clipboard`, `dnf install wl-clipboard` or `pacman -S wl-clipboard`). `Ctrl+Shift+V` is Limux's own paste, but plain `Ctrl+V` goes to the program running in the terminal, and some programs read the clipboard themselves (fish's `Ctrl+V`, for example). Without `wl-paste` they fall back to X11 tools like `xclip`, and depending on the compositor the X11 clipboard may not have what you copied in Limux, so `Ctrl+V` pastes something older than `Ctrl+Shift+V`.
 
+Limux Paste (Ctrl+Shift+V, or Paste in the terminal menu) can also turn a copied image into a file. In a local terminal it saves a private PNG at `/tmp/limux-paste.<random>/image.png` and inserts that path plus a space, so a local Codex or Claude Code composer can attach it. The file stays until you delete it or the system cleans `/tmp`. A persistent SSH tab uploads the image to that host instead. Paste does not press Enter. An `ssh` or container command you type yourself is not detected; use a persistent SSH tab when the file has to land on another machine. The Flatpak build writes a local image on the host. See [docs/ssh.md](docs/ssh.md) for the path, lifetime, and limits.
+
 ## Build from source
 
 ### Prerequisites
@@ -345,9 +347,13 @@ Most host-owned defaults use `Ctrl+Alt` so plain terminal `Ctrl` editing keys pa
 
 ### Workspace And Pane
 
+Use **+** for a workspace in your home folder. Select the folder icon beside it
+to open a workspace from a chosen folder. To make **+** ask for a folder each
+time, enable **Settings → General → Ask for folder on new workspace**.
+
 | Shortcut | Action |
 |---|---|
-| `Ctrl+Alt+Shift+N` | New workspace (folder picker) |
+| `Ctrl+Alt+Shift+N` | New workspace (uses the configured folder prompt) |
 | `Ctrl+Alt+Shift+W` | Close workspace |
 | `Ctrl+Alt+Shift+Left/Right` | Cycle tabs in focused pane |
 | `Ctrl+Alt+Shift+D` | Split down |
