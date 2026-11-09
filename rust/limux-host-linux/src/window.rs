@@ -96,6 +96,7 @@ pub(crate) struct AppState {
     top_bar_close_btn: Option<gtk::Button>,
     sidebar_toggle: Option<gtk::ToggleButton>,
     top_bar_new_ws_btn_ref: Option<gtk::Button>,
+    top_bar_open_folder_btn_ref: Option<gtk::Button>,
     top_bar_settings_btn: Option<gtk::Button>,
     sidebar_header: gtk::Box,
     sidebar_header_handle: gtk::WindowHandle,
@@ -2043,10 +2044,11 @@ pub fn build_window(app: &adw::Application) {
         .build();
 
     let top_bar_new_ws_btn: gtk::Button;
+    let top_bar_open_folder_btn: gtk::Button;
     let top_bar_settings_btn: gtk::Button;
 
     // The top bar itself is a WindowHandle so empty space drags the window,
-    // while child buttons (sidebar toggle, workspace pills, +) stay clickable.
+    // while the sidebar toggle, workspace pills, and action buttons stay clickable.
     let top_bar_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -2083,6 +2085,16 @@ pub fn build_window(app: &adw::Application) {
     new_ws.set_tooltip_text(Some("New workspace"));
     top_bar_content.append(&new_ws);
     top_bar_new_ws_btn = new_ws;
+
+    let open_folder = gtk::Button::from_icon_name("folder-open-symbolic");
+    open_folder.add_css_class("flat");
+    open_folder.add_css_class("limux-top-bar-btn");
+    open_folder.set_focus_on_click(false);
+    open_folder.set_valign(gtk::Align::Center);
+    open_folder.set_tooltip_text(Some("Open Folder as Workspace"));
+    open_folder.update_property(&[gtk::accessible::Property::Label("Open Folder as Workspace")]);
+    top_bar_content.append(&open_folder);
+    top_bar_open_folder_btn = open_folder;
 
     // Workspace indicator pills (takes the rest of the space)
     top_bar_content.append(&indicator_scroll);
@@ -2253,6 +2265,7 @@ pub fn build_window(app: &adw::Application) {
         top_bar_close_btn: Some(close_btn.clone()),
         sidebar_toggle: Some(sidebar_toggle),
         top_bar_new_ws_btn_ref: Some(top_bar_new_ws_btn.clone()),
+        top_bar_open_folder_btn_ref: Some(top_bar_open_folder_btn.clone()),
         top_bar_settings_btn: Some(top_bar_settings_btn.clone()),
         sidebar_header: sidebar_header.clone(),
         sidebar_header_handle: sidebar_header_handle.clone(),
@@ -2467,6 +2480,13 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         new_ws_btn.connect_clicked(move |_| {
             add_workspace_from_gui(&state);
+        });
+    }
+
+    {
+        let state = state.clone();
+        top_bar_open_folder_btn.connect_clicked(move |_| {
+            show_workspace_path_dialog(&state);
         });
     }
 
@@ -3834,9 +3854,9 @@ fn active_workspace_leading_pane(state: &State) -> Option<gtk::Widget> {
     Some(first_leaf_pane(&root))
 }
 
-/// Reparent the dock toggle, + button, and window-controls into the top bar
-/// or the sidebar header (or, in the top-bar-off + sidebar-closed case, park
-/// the dock toggle on the active workspace's leading pane).
+/// Reparent the dock toggle, workspace actions, and window controls into the
+/// top bar or sidebar header (or park the dock toggle on the active pane when
+/// both the top bar and sidebar are hidden).
 /// The top-bar widgets resolved from `AppState`, after confirming the optional
 /// ones exist. Grouped so the per-layout helpers take a single ref instead of a
 /// dozen individual widget arguments.
@@ -3846,6 +3866,7 @@ struct TopBarWidgets {
     dock: gtk::ToggleButton,
     settings: gtk::Button,
     new_ws: gtk::Button,
+    open_folder: gtk::Button,
     minimize: gtk::Button,
     maximize: gtk::Button,
     close: gtk::Button,
@@ -3859,8 +3880,8 @@ pub(crate) fn apply_top_bar_mode(state: &State) {
     apply_top_bar_mode_impl(state, true);
 }
 
-/// Lays out the dock toggle / settings / new-workspace / window controls into
-/// the top bar, the sidebar header, or the leading pane depending on config and
+/// Lays out the dock toggle, settings, workspace actions, and window controls
+/// in the top bar, sidebar header, or leading pane depending on config and
 /// sidebar visibility. `allow_retry` guards a single idle re-run used by the
 /// collapsed-sidebar layout when the leading pane is momentarily missing during
 /// a workspace rebuild; the retry runs with `false` so it can never loop.
@@ -3874,6 +3895,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
             Some(dock),
             Some(settings),
             Some(new_ws),
+            Some(open_folder),
             Some(minimize),
             Some(maximize),
             Some(close),
@@ -3883,6 +3905,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
             s.sidebar_toggle.clone(),
             s.top_bar_settings_btn.clone(),
             s.top_bar_new_ws_btn_ref.clone(),
+            s.top_bar_open_folder_btn_ref.clone(),
             s.top_bar_minimize_btn.clone(),
             s.top_bar_maximize_btn.clone(),
             s.top_bar_close_btn.clone(),
@@ -3896,6 +3919,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
             dock,
             settings,
             new_ws,
+            open_folder,
             minimize,
             maximize,
             close,
@@ -3954,6 +3978,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     detach(&widgets.dock);
     detach(&widgets.settings);
     detach(&widgets.new_ws);
+    detach(&widgets.open_folder);
     detach(&widgets.minimize);
     detach(&widgets.maximize);
     detach(&widgets.close);
@@ -3995,6 +4020,7 @@ fn toolbar_layout_matches(
             widgets.dock.upcast_ref::<gtk::Widget>(),
             widgets.settings.upcast_ref(),
             widgets.new_ws.upcast_ref(),
+            widgets.open_folder.upcast_ref(),
             widgets.minimize.upcast_ref(),
             widgets.maximize.upcast_ref(),
             widgets.close.upcast_ref(),
@@ -4005,10 +4031,11 @@ fn toolbar_layout_matches(
 
 /// Classic layout: everything back in the top bar, controls at the chosen side.
 fn layout_top_bar_visible(w: &TopBarWidgets, controls_side: app_config::WindowControlsSide) {
-    // dock | settings | new_ws | indicator_box | [controls at side]
+    // dock | settings | new_ws | open_folder | indicator_box | [controls at side]
     w.content.append(&w.dock);
     w.content.append(&w.settings);
     w.content.append(&w.new_ws);
+    w.content.append(&w.open_folder);
     w.content.append(&w.indicator_scroll);
 
     match controls_side {
@@ -4043,7 +4070,7 @@ fn layout_sidebar_header(w: &TopBarWidgets, controls_side: app_config::WindowCon
 
     match controls_side {
         app_config::WindowControlsSide::Left => {
-            // close | min | max || spacer || dock | settings | + (new_ws)
+            // close | min | max || spacer || dock | settings | + | folder
             w.sidebar_header.append(&w.close);
             w.sidebar_header.append(&w.minimize);
             w.sidebar_header.append(&w.maximize);
@@ -4051,12 +4078,14 @@ fn layout_sidebar_header(w: &TopBarWidgets, controls_side: app_config::WindowCon
             w.sidebar_header.append(&w.dock);
             w.sidebar_header.append(&w.settings);
             w.sidebar_header.append(&w.new_ws);
+            w.sidebar_header.append(&w.open_folder);
         }
         app_config::WindowControlsSide::Right => {
-            // dock | settings | + || spacer || min | max | close
+            // dock | settings | + | folder || spacer || min | max | close
             w.sidebar_header.append(&w.dock);
             w.sidebar_header.append(&w.settings);
             w.sidebar_header.append(&w.new_ws);
+            w.sidebar_header.append(&w.open_folder);
             w.sidebar_header.append(&spacer);
             w.sidebar_header.append(&w.minimize);
             w.sidebar_header.append(&w.maximize);
