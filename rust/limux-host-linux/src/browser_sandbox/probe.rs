@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::{fs::MetadataExt, process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use webkit6::prelude::*;
 
@@ -21,6 +22,52 @@ const RLIMIT_CORE: u32 = 4;
 const WNOHANG: i32 = 1;
 const SYS_PIDFD_OPEN: std::ffi::c_long = 434;
 const SYS_PIDFD_SEND_SIGNAL: std::ffi::c_long = 424;
+static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn request_cancellation(signal: i32) {
+    TERMINATION_SIGNAL.store(signal, Ordering::Relaxed);
+}
+
+fn install_cancellation_handlers() -> Result<(), String> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = request_cancellation as *const () as usize;
+    action.sa_flags = libc::SA_RESTART;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaddset(&mut action.sa_mask, libc::SIGINT);
+        libc::sigaddset(&mut action.sa_mask, libc::SIGTERM);
+    }
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(format!(
+                "Could not handle browser check cancellation: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    // This disposable supervisor must receive cancellation even if its caller
+    // blocked these signals. WebView children inherit the unblocked mask.
+    let error =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &action.sa_mask, std::ptr::null_mut()) };
+    if error != 0 {
+        return Err(format!(
+            "Could not unblock browser check cancellation: {}",
+            std::io::Error::from_raw_os_error(error)
+        ));
+    }
+    check_cancellation()
+}
+
+fn check_cancellation() -> Result<(), String> {
+    let signal = TERMINATION_SIGNAL.load(Ordering::Relaxed);
+    if signal == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Browser startup check interrupted by signal {signal}."
+        ))
+    }
+}
 
 #[repr(C)]
 struct ResourceLimit {
@@ -124,6 +171,7 @@ fn require_prepared_runtime() -> Result<(), String> {
 
 fn supervise() -> Result<(), String> {
     require_prepared_runtime()?;
+    install_cancellation_handlers()?;
     // Only this disposable supervisor adopts WebKit helpers, never the GUI host.
     if unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
         return Err(format!(
@@ -142,7 +190,7 @@ fn supervise() -> Result<(), String> {
         .map_err(|error| format!("Could not launch WebKit check: {error}"))?;
     let result = wait_for_browser(&mut child, &directory.0);
     let cleanup = cleanup(&mut child, &directory.0);
-    match result.and(cleanup) {
+    match result.and(cleanup).and_then(|()| check_cancellation()) {
         Ok(()) => Ok(()),
         Err(error) => {
             let log = fs::read_to_string(directory.0.join("stderr")).unwrap_or_default();
@@ -180,6 +228,7 @@ fn wait_for_readiness(
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
+        check_cancellation()?;
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             return Err(format!("WebKit startup check exited with {status}."));
         }
@@ -451,7 +500,134 @@ fn webview_probe() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn interrupted_supervisor_cleans_up_detached_helpers() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "browser_sandbox::probe::tests::interrupted_supervisor_fixture_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated supervisor interruption regression fixture"]
+    fn interrupted_supervisor_fixture_child() {
+        assert_eq!(unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
+        struct Fixture {
+            child: Child,
+            directory: tempfile::TempDir,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = cleanup(&mut self.child, self.directory.path());
+            }
+        }
+        for (signal, blocked) in [
+            (libc::SIGINT, false),
+            (libc::SIGTERM, false),
+            (libc::SIGTERM, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let report = directory.path().join("fixture-ready");
+            let mut command = own_command(false, None).unwrap();
+            command
+                .env("TMPDIR", directory.path())
+                .env("LIMUX_TEST_PROBE_INTERRUPT", &report)
+                .env_remove("LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .process_group(0);
+            if blocked {
+                unsafe {
+                    command.pre_exec(|| {
+                        let mut mask = std::mem::zeroed();
+                        libc::sigemptyset(&mut mask);
+                        libc::sigaddset(&mut mask, libc::SIGTERM);
+                        let error =
+                            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+                        if error == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(error))
+                        }
+                    });
+                }
+            }
+            let mut fixture = Fixture {
+                child: command.spawn().unwrap(),
+                directory,
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !report.is_file() {
+                assert!(Instant::now() < deadline, "fixture did not become ready");
+                assert!(fixture.child.try_wait().unwrap().is_none());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let report = fs::read_to_string(report).unwrap();
+            let mut lines = report.lines();
+            let probe_directory = PathBuf::from(lines.next().unwrap());
+            let pids = lines
+                .map(|pid| pid.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(pids.len(), 2);
+            for pid in &pids {
+                assert!(Path::new(&format!("/proc/{pid}")).exists());
+            }
+            let target = if signal == libc::SIGINT {
+                -(fixture.child.id() as i32)
+            } else {
+                fixture.child.id() as i32
+            };
+            assert_eq!(unsafe { kill(target, signal) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let status = loop {
+                if let Some(status) = fixture.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "interrupted supervisor did not exit"
+                );
+                // Repeated cancellation must leave the cleanup path running.
+                unsafe {
+                    kill(target, signal);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert!(
+                !probe_directory.exists(),
+                "probe directory survived cancellation"
+            );
+            for pid in pids {
+                assert!(
+                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    "helper {pid} survived cancellation"
+                );
+            }
+            assert_eq!(status.code(), Some(1));
+            let mut diagnostic = String::new();
+            fixture
+                .child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut diagnostic)
+                .unwrap();
+            assert!(diagnostic.contains("interrupted"), "{diagnostic}");
+        }
+    }
 
     #[test]
     fn unprepared_appimage_runtime_skips_browser_startup() {
@@ -618,6 +794,46 @@ mod tests {
     #[test]
     #[ignore = "internal browser probe subprocess"]
     fn webview_probe_child() {
+        if let Some(report) = std::env::var_os("LIMUX_TEST_PROBE_INTERRUPT") {
+            let directory = PathBuf::from(std::env::var_os(TOKEN).unwrap());
+            let mut helper = Command::new("setsid")
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    "printf '%s' \"$$\" > \"$1/helper\"; exec sleep 30",
+                    "probe",
+                ])
+                .arg(&directory)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let helper_pid = loop {
+                if let Ok(pid) = fs::read_to_string(directory.join("helper")) {
+                    if let Ok(pid) = pid.parse::<u32>() {
+                        break pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "detached helper did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let report = PathBuf::from(report);
+            let temporary_report = report.with_extension("tmp");
+            fs::write(
+                &temporary_report,
+                format!(
+                    "{}\n{}\n{helper_pid}\n",
+                    directory.display(),
+                    std::process::id()
+                ),
+            )
+            .unwrap();
+            fs::rename(temporary_report, report).unwrap();
+            let _ = helper.wait();
+            std::process::exit(0);
+        }
         std::process::exit(finish(webview_probe()));
     }
 }
