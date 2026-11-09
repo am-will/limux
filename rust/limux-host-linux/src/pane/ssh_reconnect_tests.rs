@@ -104,6 +104,35 @@ impl Fixture {
         id
     }
 
+    fn add_local(&self, pane: usize, command: &str) -> String {
+        *self.panes[pane].callbacks.initial_command.borrow_mut() = Some(command.to_string());
+        add_terminal_tab_inner(
+            &self.panes[pane],
+            Some(self.directory.path().to_str().unwrap()),
+            Some(TerminalTabOptions {
+                id: None,
+                custom_name: None,
+                pinned: false,
+                cwd: Some(self.directory.path().to_str().unwrap()),
+                agent: None,
+                ssh: None,
+            }),
+        );
+        let id = self.panes[pane]
+            .tab_state
+            .borrow()
+            .active_tab
+            .clone()
+            .unwrap();
+        pump_until(|| {
+            let (_, handle) =
+                terminal_handle_for_surface(self.panes[pane].pane_outer.upcast_ref(), Some(&id))
+                    .unwrap();
+            handle.health().realized && !handle.health().process_exited
+        });
+        id
+    }
+
     fn generation(&self, pane: usize, id: &str) -> Rc<()> {
         let tabs = self.panes[pane].tab_state.borrow();
         let entry = tabs.tabs.iter().find(|entry| entry.id == id).unwrap();
@@ -143,6 +172,11 @@ fn pump_until(condition: impl Fn() -> bool) {
         pump_for(Duration::from_millis(10));
     }
     assert!(condition(), "GTK reconnect condition timed out");
+}
+
+#[test]
+fn missing_tab_is_not_a_local_image_destination() {
+    assert!(image_paste_destination_for_tab("missing-tab").is_err());
 }
 
 #[test]
@@ -439,4 +473,211 @@ else:
         before,
         "closed terminal received late input"
     );
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn image_payloads(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8(bytes.to_vec()).expect("pty input is utf-8");
+    let mut payloads = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("\u{1b}[200~") {
+        rest = &rest[start + "\u{1b}[200~".len()..];
+        let end = rest
+            .find("\u{1b}[201~")
+            .expect("bracketed paste terminator");
+        let payload = &rest[..end];
+        if let Some(path) = payload.strip_suffix(' ') {
+            if path.starts_with("/tmp/limux-paste.") {
+                assert!(!path.ends_with(' '), "{payload:?}");
+                assert!(!path.contains('\n') && !path.contains('\r'), "{payload:?}");
+                payloads.push(path.to_string());
+            }
+        }
+        rest = &rest[end + "\u{1b}[201~".len()..];
+    }
+    payloads
+}
+
+fn click_context_paste(handle: &terminal::TerminalHandle) {
+    fn paste_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.label().as_deref() == Some("Paste") {
+                return Some(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(button) = paste_button(&widget) {
+                return Some(button);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+    let menu = handle.build_context_menu_for_test();
+    paste_button(menu.upcast_ref())
+        .expect("Paste menu action")
+        .emit_clicked();
+    menu.unparent();
+}
+
+fn assert_private_png(path: &str, png: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::read(path).unwrap(), png);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(std::path::Path::new(path).parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn local_image_paste_inserts_one_private_path() {
+    let fixture = Fixture::new();
+    let root = fixture.directory.path();
+    let script_path = root.join("record-local.py");
+    std::fs::write(
+        &script_path,
+        r#"#!/usr/bin/python3
+import os, sys, tty
+tty.setraw(0)
+os.write(1, b'\x1b[?2004hREADY')
+path = os.path.join(sys.argv[1], 'input-' + os.environ['LIMUX_TAB_ID'])
+while True:
+    data = os.read(0, 4096)
+    if not data:
+        break
+    with open(path, 'ab') as handle:
+        handle.write(data)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let command = format!(
+        "{} {}",
+        shell_quote(script_path.to_str().unwrap()),
+        shell_quote(root.to_str().unwrap())
+    );
+    let id = fixture.add_local(0, &command);
+    assert_eq!(
+        image_paste_destination_for_tab(&id),
+        Ok(terminal::ImagePasteDestination::Local)
+    );
+    let (_, handle) =
+        terminal_handle_for_surface(fixture.panes[0].pane_outer.upcast_ref(), Some(&id)).unwrap();
+    pump_until(|| {
+        handle
+            .read_viewport_text()
+            .is_some_and(|text| text.contains("READY"))
+    });
+    let clipboard = gtk::gdk::Display::default().unwrap().clipboard();
+    let texture = gtk::gdk::MemoryTexture::new(
+        1,
+        1,
+        gtk::gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from_static(&[12, 34, 56, 255]),
+        4,
+    );
+    let png = texture.save_to_png_bytes();
+    clipboard.set_texture(&texture);
+    assert!(handle.perform_binding_action("paste_from_clipboard"));
+    assert!(handle.perform_binding_action("paste_from_clipboard"));
+    let input = root.join(format!("input-{id}"));
+    pump_until(|| input.exists());
+    pump_for(Duration::from_millis(200));
+    let pasted = std::fs::read(&input).unwrap();
+    assert!(!pasted.contains(&b'\r'), "paste inserted Enter");
+    let paths = image_payloads(&pasted);
+    assert_eq!(paths.len(), 1, "duplicate paste inserted {pasted:?}");
+    assert_private_png(&paths[0], png.as_ref());
+    let viewport = handle.read_viewport_text().unwrap_or_default();
+    assert!(
+        !viewport.contains("persistent SSH") && !viewport.contains("Image upload requires"),
+        "{viewport}"
+    );
+
+    assert!(move_tab_to_pane(
+        fixture.panes[0].pane_outer.upcast_ref(),
+        &id,
+        fixture.panes[1].pane_outer.upcast_ref()
+    ));
+    assert_eq!(
+        image_paste_destination_for_tab(&id),
+        Ok(terminal::ImagePasteDestination::Local)
+    );
+    clipboard.set_text("ordinary text");
+    let (_, handle) =
+        terminal_handle_for_surface(fixture.panes[1].pane_outer.upcast_ref(), Some(&id)).unwrap();
+    handle.perform_binding_action("paste_from_clipboard");
+    pump_until(|| {
+        std::fs::read(&input)
+            .unwrap()
+            .ends_with(b"ordinary text\x1b[201~")
+    });
+
+    // A GValue texture does not advertise image MIME types. Offer the PNG
+    // bytes beside text, which is how a copied screenshot arrives.
+    let beside = "should-not-appear".to_value();
+    let provider = gtk::gdk::ContentProvider::new_union(&[
+        gtk::gdk::ContentProvider::for_bytes("image/png", &png),
+        gtk::gdk::ContentProvider::for_value(&beside),
+    ]);
+    clipboard.set_content(Some(&provider)).unwrap();
+    handle.perform_binding_action("paste_from_clipboard");
+    pump_until(|| image_payloads(&std::fs::read(&input).unwrap()).len() == 2);
+    let mixed = std::fs::read(&input).unwrap();
+    assert!(!String::from_utf8_lossy(&mixed).contains("should-not-appear"));
+    assert_private_png(&image_payloads(&mixed)[1], png.as_ref());
+
+    let rejected = std::fs::read(&input).unwrap();
+    let wide = 4096_i32;
+    let tall = 4097_i32;
+    let stride = (wide * 4) as usize;
+    let pixels = glib::Bytes::from_owned(vec![0_u8; stride * tall as usize]);
+    let oversized = gtk::gdk::MemoryTexture::new(
+        wide,
+        tall,
+        gtk::gdk::MemoryFormat::R8g8b8a8,
+        &pixels,
+        stride,
+    );
+    clipboard.set_texture(&oversized);
+    handle.perform_binding_action("paste_from_clipboard");
+    pump_for(Duration::from_millis(400));
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        rejected,
+        "oversized image inserted a path"
+    );
+
+    clipboard.set_texture(&texture);
+    click_context_paste(&handle);
+    pump_until(|| image_payloads(&std::fs::read(&input).unwrap()).len() == 3);
+    let final_input = std::fs::read(&input).unwrap();
+    assert!(!final_input.contains(&b'\r'));
+    let paths = image_payloads(&final_input);
+    assert_eq!(paths.len(), 3);
+    for path in &paths {
+        assert_private_png(path, png.as_ref());
+    }
+    remove_terminal_tab(&fixture.panes[1], &id);
+    pump_for(Duration::from_millis(200));
+    assert!(image_paste_destination_for_tab(&id).is_err());
+    for path in &paths {
+        assert_eq!(std::fs::read(path).unwrap(), png.as_ref());
+        let directory = std::path::Path::new(path).parent().unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 }

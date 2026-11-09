@@ -397,6 +397,7 @@ for regression in \
   terminal::ssh_notification_tests::linked_tmux_sessions_keep_the_originating_notification_client \
   ssh_helpers::tests::helper_transfer_configures_only_selected_agent_and_keeps_backup \
   pane::ssh_reconnect_tests::image_paste_follows_moves_and_cancels_on_reconnect \
+  pane::ssh_reconnect_tests::local_image_paste_inserts_one_private_path \
   pane::ssh_reconnect_tests::reconnect_and_deferred_tab_moves_keep_one_current_widget \
   pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
   pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \

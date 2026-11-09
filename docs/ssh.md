@@ -108,24 +108,62 @@ normal detach/exit stops retries, missing tmux leaves an error, and closing a
 tab during an outage stops new SSH processes. Do not disrupt shared SSH masters
 or other users' tmux sessions when simulating a lost connection.
 
-## Clipboard image transfer
+## Clipboard images
 
-In a **persistent SSH tab**, copy an image to the desktop clipboard and use
-Limux's **Paste** shortcut (default Ctrl+Shift+V) or the terminal context menu's
-**Paste** action. Limux encodes the image as PNG, uploads it asynchronously to
-the tab's saved SSH destination, then pastes the remote filename followed by a
-space. Bracketed paste is preserved; no Enter key or agent prompt is submitted.
-Agents such as Codex can recognize the path as an image attachment. Ordinary
-text continues through Ghostty's existing clipboard path.
+Limux's **Paste** shortcut (default Ctrl+Shift+V) and the terminal context
+menu's **Paste** action share one implementation. Plain Ctrl+V stays with the
+program in the terminal, and Ghostty-only custom paste bindings do not invoke
+this action. Terminal-initiated OSC 52 clipboard reads never create files or
+start an upload; existing clipboard consent handling remains in effect.
 
-This requires actual clipboard image data, not a copied filename, file-manager
-URI, or drag-and-drop. Local terminals, one-shot SSH tabs, and nested `ssh`
-commands have no supported upload destination. In a nested SSH/container
-session, the path still belongs to the persistent tab's original SSH host;
-Limux does not infer or follow nested destinations. Use the agent on that host
-with access to its `/tmp`. Ghostty-only custom paste bindings do not invoke this
-Limux action. Terminal-initiated OSC 52 clipboard reads cannot start an upload;
-existing clipboard consent handling remains in effect.
+Paste needs actual clipboard image data. A copied filename, file-manager URI,
+or drag-and-drop is not treated as a bitmap. When both an image and text are
+present, Paste uses the image. Ordinary text, with no image, continues through
+Ghostty's existing clipboard path. The inserted filename is followed by one
+space. Bracketed paste is preserved, and Paste does not press Enter or submit
+a prompt. Agents such as Codex and Claude Code can recognize that path as an
+image attachment; a shell only receives the filename.
+
+Destination comes from the tab's saved metadata. A persistent SSH target wins.
+A terminal tab without one is local. A missing tab is an error and is never
+treated as local. Limux does not infer a destination from shell text, process
+names, announced working directories, or container state.
+
+### Local terminals
+
+A local paste encodes the clipboard image as PNG and writes
+`/tmp/limux-paste.<10 letters or digits>/image.png`. The directory is mode
+0700 and the file is mode 0600, regardless of umask. The path is always under
+`/tmp`, not `$TMPDIR`, the working directory, or a project name. Native builds
+write that file directly. Flatpak builds run the same fixed script through
+`/app/bin/host-spawn --no-pty --cwd=/`, because the terminal is a host process
+and cannot read a sandbox-private `/tmp`. The script uses `mktemp`, `cat`,
+`test`, `printf`, `rm`, and `rmdir`. It is not a login shell, an SSH
+connection, or a downloaded helper. Paste inserts the host path.
+
+The file remains after the path is inserted, including after the tab closes or
+Limux exits, so an agent can read it later. Delivered files are not deleted
+automatically and there is no age-based cleaner. Remove the directory when
+finished, or let the system's temporary-file policy reclaim `/tmp`. A failure
+inserts nothing and shows an error. A file that was saved but not delivered is
+removed, including when the host script has already printed the path and Limux
+cancels before inserting it. If host-spawn is killed before that path is
+printed, its traps try to clean up; an abrupt kill can still leave a private
+temporary file.
+
+A one-shot SSH tab has no saved target, so Paste stages the file locally. A
+manually typed `ssh`, container command, or other remote process in an ordinary
+tab is not detected either. The inserted path is on the local machine (the
+Flatpak host, in a Flatpak build), which that nested environment may not see.
+Use a persistent SSH tab when the file must be created on a saved remote host.
+
+### Persistent SSH tabs
+
+In a **persistent SSH tab**, Paste encodes the image as PNG, uploads it
+asynchronously to the tab's saved SSH destination, then pastes the remote
+filename followed by a space. In a nested SSH or container session inside that
+tab, the path still belongs to the persistent tab's original SSH host. Use the
+agent on that host with access to its `/tmp`.
 
 Each paste starts a separate non-PTY `ssh` command, preserving the alias and
 explicit port. It uses current SSH configuration, including user-configured
@@ -160,13 +198,15 @@ file policy clean them up. The remote script attempts cleanup on failure and
 signals; abrupt disconnection can still leave a partial or completed file.
 Limux does not recursively clean remote directories on tab close.
 
-Images are limited to 16,777,216 pixels and 32 MiB of encoded PNG. One upload
-per terminal and four across the application may be pending. Uploads have a
-30-second deadline, with a 45-second overall clipboard/paste deadline. Status
-and errors appear in the terminal; SSH diagnostics go to the launch log. Failed
-uploads insert nothing. Closing or reconnecting cancels the pending upload;
-late callbacks cannot paste into a replacement terminal. Moving the same tab
-between panes keeps the upload attached to that tab.
+Images are limited to 16,777,216 pixels and 32 MiB of encoded PNG. One image
+paste per terminal and four across the application may be pending. Every image
+paste has a 45-second overall deadline. SSH uploads and Flatpak host saves also
+have a 30-second transfer deadline. Status and errors appear in the terminal;
+SSH diagnostics go to the launch log. Failures insert nothing. Closing,
+replacing, or reconnecting a terminal cancels its pending paste; late callbacks
+cannot paste into another terminal. Moving the same tab between panes keeps
+the in-flight paste attached to that tab. A successful local save says "Image
+ready"; a successful SSH upload says "Image uploaded".
 
 Upload argument construction, binary preservation, permissions, malformed or
 oversized replies, nonzero exits, deadlines, cancellation, and failed-file
