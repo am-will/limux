@@ -505,10 +505,29 @@ mod tests {
         run_transfer(script, timeout, cancel, &SSH_TRANSFER, remote_path)
     }
 
-    /// The default GLib context can be owned by only one thread.
-    fn context_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap()
+    fn in_context_subprocess(name: &str) -> bool {
+        const CHILD_ENV: &str = "LIMUX_TEST_TRANSFER_CONTEXT";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            return true;
+        }
+        // Local callbacks and fallback timers can outlive transfer completion.
+        // A fresh process keeps their default context on the creating thread.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("ssh_transfer::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
     }
 
     fn run_transfer(
@@ -518,7 +537,6 @@ mod tests {
         messages: &'static TransferMessages,
         validate: fn(&[u8]) -> Result<String, String>,
     ) -> Result<String, String> {
-        let _lock = context_lock();
         let context = glib::MainContext::default();
         let _guard = context.acquire().unwrap();
         let results = Rc::new(RefCell::new(Vec::new()));
@@ -557,6 +575,9 @@ mod tests {
 
     #[test]
     fn asynchronous_upload_checks_exit_status_and_bounds_output() {
+        if !in_context_subprocess("asynchronous_upload_checks_exit_status_and_bounds_output") {
+            return;
+        }
         let path = "/tmp/limux-paste.abcdefghij/image.png";
         assert_eq!(
             run_upload(
@@ -589,6 +610,9 @@ mod tests {
 
     #[test]
     fn host_stage_transfer_reports_staging_failures() {
+        if !in_context_subprocess("host_stage_transfer_reports_staging_failures") {
+            return;
+        }
         let path = "/tmp/limux-paste.abcdefghij/image.png";
         assert_eq!(
             run_transfer(
@@ -655,6 +679,9 @@ mod tests {
 
     #[test]
     fn cancelled_host_save_deletes_a_path_printed_before_delivery() {
+        if !in_context_subprocess("cancelled_host_save_deletes_a_path_printed_before_delivery") {
+            return;
+        }
         let script = r#"set -eu
 umask 077
 dir=$(mktemp -d /tmp/limux-paste.XXXXXXXXXX)
@@ -665,7 +692,6 @@ printf '%s\n' "$dir/image.png"
 trap - 0 HUP INT TERM
 exec sleep 30
 "#;
-        let _lock = context_lock();
         let context = glib::MainContext::default();
         let _guard = context.acquire().unwrap();
         let results = Rc::new(RefCell::new(Vec::new()));
@@ -860,6 +886,9 @@ printf '/tmp/limux-paste.abcdefghij/image.png\n'"#;
 
     #[test]
     fn stalled_and_cancelled_uploads_terminate_without_injection() {
+        if !in_context_subprocess("stalled_and_cancelled_uploads_terminate_without_injection") {
+            return;
+        }
         assert!(
             run_upload("exec sleep 60", Duration::from_millis(40), false)
                 .unwrap_err()

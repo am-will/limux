@@ -130,14 +130,22 @@ verify_appimage_webkit_paths() {
             echo "ERROR: AppImage WebKitGTK library retains host process path: $library" >&2
             exit 1
         fi
-        if ! grep -aFq "usr/lib/webkitgtk-6.0" "$library"; then
-            echo "ERROR: AppImage WebKitGTK library lacks relocated process path: $library" >&2
+        if ! grep -aFq "/proc/limux-wk-XXXXX" "$library"; then
+            echo "ERROR: AppImage WebKitGTK library lacks absolute runtime placeholder: $library" >&2
             exit 1
         fi
     done < <(find "$app_root/usr/lib" -maxdepth 1 -type f -name 'libwebkitgtk-6.0.so*' -print0)
 
     if [ "$found" != 1 ]; then
         echo "ERROR: AppImage does not contain bundled WebKitGTK library" >&2
+        exit 1
+    fi
+    if [ ! -f "$app_root/usr/libexec/limux/appimage-webkit-runtime.sh" ]; then
+        echo 'ERROR: AppImage WebKit sandbox runtime launcher is missing' >&2
+        exit 1
+    fi
+    if [ ! -x "$app_root/usr/libexec/limux/appimage-host-launcher.sh" ]; then
+        echo 'ERROR: AppImage GUI launcher is missing or not executable' >&2
         exit 1
     fi
 }

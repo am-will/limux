@@ -1,0 +1,8 @@
+# Allow WebKitGTK to construct its own sandbox on Ubuntu 24.04 and later.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile limux /usr/libexec/limux/limux-host flags=(unconfined) {
+  userns,
+  include if exists <local/dev.limux.linux>
+}

@@ -27,7 +27,8 @@ Download the latest release from [GitHub Releases](https://github.com/am-will/li
 sudo dpkg -i ./limux_*_amd64.deb
 ```
 
-**AppImage** — portable across Ubuntu 24.04-era desktops and newer, no install needed:
+**AppImage** — portable across Ubuntu 24.04-era desktops and newer, with no
+Limux installation needed:
 ```bash
 chmod +x Limux-*-x86_64.AppImage
 ./Limux-*-x86_64.AppImage
@@ -48,6 +49,12 @@ statically includes FUSE 3, so the AppImage does not require a host
 `fusermount3` while retaining support for the traditional `fusermount` helper.
 The launcher also discovers host GBM and DRI driver directories, allowing the
 Ubuntu-built bundle to use Mesa correctly on Fedora- and Arch-family systems.
+The AppImage does not bundle the host's `bwrap` (`bubblewrap`) or
+`xdg-dbus-proxy`, which WebKitGTK needs for sandboxed browser processes. Install
+these tools from your distribution's packages if they are missing.
+The launcher creates private WebKit helper paths under `/tmp` and keeps their
+executables in `${XDG_CACHE_HOME:-$HOME/.cache}/limux`. The cache must allow
+execution; `/tmp` may be mounted with `noexec`. Both are removed on exit.
 
 AppImage runtime library paths are scoped to the Limux app process. Terminals
 spawned inside Limux restore the user's original library/loader environment so
@@ -92,7 +99,37 @@ sudo ./install.sh --uninstall
 ```bash
 # Ubuntu/Debian
 sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
+
+# AppImage WebKit sandbox helpers
+sudo apt install bubblewrap xdg-dbus-proxy
 ```
+
+Limux enables WebKit's browser sandbox by default. Before opening browser views,
+it checks real WebKit startup in a disposable process. If the sandbox cannot
+start, browser tabs show an explanation and retain their saved state. Terminals
+remain available. The check normally completes quickly; a failed startup can
+take fifteen seconds plus up to two seconds for helper cleanup.
+
+Ubuntu 24.04 and later require an
+[application AppArmor allowance for user namespaces](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
+The Debian and RPM packages include an allowance for the installed host.
+Tarball installs into `/usr` or `/usr/local` register their host path when
+AppArmor is active. User and custom-prefix installs print administrator
+instructions instead. Paths with special characters require a manually written
+profile. For a source build, an administrator can register the exact executable:
+
+```bash
+sudo ./scripts/install-apparmor-profile.sh --install "$(realpath target/debug/limux)"
+```
+
+For a portable AppImage, pass its absolute executable path instead. The helper
+is also included at `share/limux/install-apparmor-profile.sh` in native packages.
+Moving the executable requires updating its allowance; use `--remove` with the
+old path to remove it. Restart Limux after changing the policy.
+
+An explicitly inherited `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` still
+disables browser isolation. Limux does not select this workaround automatically,
+and `surface-health` reports `sandboxed: false` when it is used.
 
 On Wayland, also install `wl-clipboard` (`apt install wl-clipboard`, `dnf install wl-clipboard` or `pacman -S wl-clipboard`). `Ctrl+Shift+V` is Limux's own paste, but plain `Ctrl+V` goes to the program running in the terminal, and some programs read the clipboard themselves (fish's `Ctrl+V`, for example). Without `wl-paste` they fall back to X11 tools like `xclip`, and depending on the compositor the X11 clipboard may not have what you copied in Limux, so `Ctrl+V` pastes something older than `Ctrl+Shift+V`.
 

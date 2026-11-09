@@ -181,8 +181,9 @@ copy_appimage_library_closure() {
 
 patch_appimage_webkit_paths() {
     local appdir="$1"
-    local relative_runtime="usr/lib/webkitgtk-6.0/"
-    local relative_bundle="usr/lib/webkitgtk-6.0/injected-bundle/"
+    # An unprepared library must name a path where users cannot create helpers.
+    local runtime_placeholder="/proc/limux-wk-XXXXX/"
+    local bundle_placeholder="/proc/limux-wk-XXXXX/injected-bundle/"
     local file
     local replacements
     local process_path_patched=0
@@ -190,15 +191,15 @@ patch_appimage_webkit_paths() {
     while IFS= read -r file; do
         # Distro WebKitGTK embeds absolute paths and does not reliably honor
         # WEBKIT_EXEC_PATH outside developer builds.
-        binary_replace_c_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}/injected-bundle/" "$relative_bundle" >/dev/null
+        binary_replace_c_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}/injected-bundle/" "$bundle_placeholder" >/dev/null
 
-        replacements="$(binary_replace_c_string "$file" "${WEBKITGTK_PROCESS_DIR%/}" "${relative_runtime%/}")"
+        replacements="$(binary_replace_c_string "$file" "${WEBKITGTK_PROCESS_DIR%/}" "${runtime_placeholder%/}")"
         if [ "$replacements" -gt 0 ]; then
             process_path_patched=1
         fi
 
         if [ "$WEBKITGTK_RUNTIME_DIR" != "$WEBKITGTK_PROCESS_DIR" ]; then
-            binary_replace_c_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}" "${relative_runtime%/}" >/dev/null
+            binary_replace_c_string "$file" "${WEBKITGTK_RUNTIME_DIR%/}" "${runtime_placeholder%/}" >/dev/null
         fi
     done < <(find "$appdir/usr/lib" -type f \( -perm -0100 -o -name '*.so*' \) | sort)
 

@@ -10,6 +10,8 @@ Vendor:     Will R <will@limux.dev>
 ExclusiveArch: x86_64 aarch64
 AutoReq:    yes
 Requires:   webkitgtk6.0
+Requires:   bubblewrap
+Requires:   xdg-dbus-proxy
 Source0:    limux-%{version}.tar.gz
 
 %description
@@ -39,6 +41,10 @@ is_legacy_limux_host() {
 }
 
 ldconfig 2>/dev/null || true
+if command -v apparmor_parser >/dev/null && command -v aa-enabled >/dev/null \
+   && aa-enabled --quiet && [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+    apparmor_parser --replace /etc/apparmor.d/dev.limux.linux || exit 1
+fi
 rm -f %{_libexecdir}/limux/limux
 rm -f /usr/local/libexec/limux/limux
 if is_legacy_limux_host /usr/local/bin/limux; then
@@ -48,6 +54,12 @@ rm -f %{_datadir}/applications/limux.desktop
 gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor 2>/dev/null || true
 update-desktop-database %{_datadir}/applications 2>/dev/null || true
 appstreamcli refresh-cache --force 2>/dev/null || true
+
+%preun
+if [ "$1" -eq 0 ] && command -v apparmor_parser >/dev/null \
+   && command -v aa-enabled >/dev/null && aa-enabled --quiet; then
+    apparmor_parser --remove /etc/apparmor.d/dev.limux.linux || true
+fi
 
 %postun
 ldconfig 2>/dev/null || true
@@ -64,5 +76,6 @@ appstreamcli refresh-cache --force 2>/dev/null || true
 %{_datadir}/metainfo/dev.limux.linux.metainfo.xml
 %{_datadir}/icons/hicolor/
 %{_sysconfdir}/ld.so.conf.d/limux.conf
+%config(noreplace) %{_sysconfdir}/apparmor.d/dev.limux.linux
 
 %changelog

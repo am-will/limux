@@ -13,7 +13,7 @@ if [ "${1:-}" != --inside ]; then
   export XDG_CONFIG_HOME="$RUN_DIR/config" XDG_DATA_HOME="$RUN_DIR/data"
   export XDG_STATE_HOME="$RUN_DIR/state" XDG_CACHE_HOME="$RUN_DIR/cache" XDG_RUNTIME_DIR="$RUN_DIR/runtime"
   export LIMUX_AGENT_HOOK_STATE_DIR="$RUN_DIR/agent-state"
-  mkdir -p "$HOME" "$XDG_CONFIG_HOME/ghostty" "$XDG_CONFIG_HOME/zsh" "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$RUN_DIR/services" "$RUN_DIR/project" "$RUN_DIR/host-bin" "$LIMUX_AGENT_HOOK_STATE_DIR"
+  mkdir -p "$HOME" "$XDG_CONFIG_HOME/ghostty" "$XDG_CONFIG_HOME/zsh" "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR/limux" "$RUN_DIR/services" "$RUN_DIR/project" "$RUN_DIR/host-bin" "$LIMUX_AGENT_HOOK_STATE_DIR"
   export PATH="$RUN_DIR/host-bin:$PATH"
   cat >"$HOME/.profile" <<'PROFILE'
 export PATH="$LIMUX_FLATPAK_TEST_DIR/host-bin:$PATH"
@@ -59,7 +59,7 @@ DBUS
 fi
 CLI="${LIMUX_TEST_CLI:-$ROOT_DIR/target/debug/limux-cli}"
 [ -x "$CLI" ] || { echo "Build limux-cli first, or set LIMUX_TEST_CLI" >&2; exit 2; }
-SOCKET="$RUN_DIR/limux.sock"
+SOCKET="$XDG_RUNTIME_DIR/limux/limux.sock"
 HOST_PID=""
 FIXTURE="$(mktemp -t limux-flatpak-host-fixture-XXXXXX)"
 RESTORED_AGENT="$(mktemp -t limux-flatpak-restored-agent-XXXXXX)"
@@ -140,7 +140,7 @@ set -eu
 [ "$FLATPAK_CONFIGURED_VALUE" = 'a b "$HOME"=done' ]
 [ -n "$LIMUX_WORKSPACE_ID" ] && [ -n "$LIMUX_PANE_ID" ]
 [ -n "$LIMUX_TAB_ID" ] && [ -n "$LIMUX_SURFACE_ID" ]
-[ "$LIMUX_SOCKET" = "$LIMUX_FLATPAK_TEST_DIR/limux.sock" ]
+[ "$LIMUX_SOCKET" = "$LIMUX_FLATPAK_TEST_DIR/runtime/limux/limux.sock" ]
 printf '%s\n' "$PWD" >"$LIMUX_FLATPAK_TEST_DIR/host-pwd"
 tty >"$LIMUX_FLATPAK_TEST_DIR/host-tty"
 tput colors >"$LIMUX_FLATPAK_TEST_DIR/host-colors"

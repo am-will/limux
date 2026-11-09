@@ -16,6 +16,7 @@ cargo test --locked --workspace -- --test-threads=1
 ./scripts/tests/test-package-entrypoint.sh
 ./scripts/tests/test-user-prefix-install.sh
 ./scripts/tests/test-package-svg-loader.sh
+./scripts/tests/test-appimage-launcher.sh
 ./scripts/tests/test-aur-source-package.sh
 ./scripts/tests/test-smoke-child-count.sh
 ./scripts/tests/test-ghostty-provenance.sh
