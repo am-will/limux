@@ -5,16 +5,19 @@
 Limux has **two control servers**:
 
 1. **Standalone `limux-control-server` binary** — uses `limux_core::Dispatcher`
-   + `ControlState` and supports the **full** command vocabulary. Used for
-   tests and for CLI calls when the GUI isn't running.
+   + `ControlState` and supports the core command vocabulary defined in
+   `limux_protocol::methods::CORE_COMMAND_NAMES`. Used for tests and for CLI
+   calls when the GUI isn't running.
 
-2. **Embedded bridge inside `limux-host-linux`** — `control_bridge.rs` only
-   routes a narrow subset of methods to the GTK main loop. Supports
-   `system.ping`, `system.identify`, `window.activate`, `workspace.{current,list,create,
-   select,rename,close}`, `pane.list`, `pane.surfaces`, `surface.list`,
-   `pane.create` for terminal self-spawn, `surface.send_text`,
-   `surface.send_key`, `surface.read_text`, `surface.health`, and
-   `notification.create`. It still does **NOT** support browser commands.
+2. **Embedded bridge inside `limux-host-linux`** — `control_bridge.rs` routes
+   methods to the GTK main loop, including `system.{ping,identify,capabilities}`,
+   `window.activate`, `workspace.{current,list,create,select,rename,close,set_color,set_group}`,
+   `workspace.group_{list,create,rename,set_color,set_collapsed,delete}`,
+   `pane.{list,surfaces,create,focus}`,
+   `surface.{list,create,close,focus,send_text,send_key,read_text,health}`,
+   `tab.action`, `gui_hook.{list,set,clear}`, and `notification.create`.
+   Canonical method metadata and aliases are cataloged in
+   `rust/limux-protocol/src/methods.rs`.
 
 When the GUI is running, the CLI targets the bridge via the runtime
 socket. `list-panes` / `list-panels`, terminal `new-pane --command ...`,
@@ -78,12 +81,13 @@ into a `notify` (and, where useful, an inline `send`). Drop-in for
 `limux agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>]
 [--no-launch] [--dry-run]`:
 
-- Calls `workspace.create` once per agent with `name=<agent>`, `cwd=<shared>`,
-  `command=<agent CLI>` so each workspace launches the agent automatically.
-- Bridge now passes `allow_name=true` to `parse_optional_workspace_target`
-  for `surface.send_text` and `notification.create`, so peers address each
-  other by workspace name (`limux send --workspace claude …`) instead of
-  needing to swap UUIDs.
+- Splits the active workspace into peer terminal panes via `pane.create` and
+  launches each requested agent CLI inside the shared `cwd` once `AGENTS.md`
+  is published.
+- Bridge passes `allow_name=true` to `parse_optional_workspace_target`
+  for `surface.send_text` and `notification.create`, and peers can target each
+  other directly by surface ID (`limux send --surface <peer-surface-id> …`) or
+  workspace name.
 - Writes `AGENTS.md` in the shared cwd documenting:
     - the peers table (agent → workspace name → workspace ID → launch cmd),
     - the `<agent-msg from="…" to="…" id="…" reply-to="…" ts="…">` envelope,

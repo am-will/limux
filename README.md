@@ -230,7 +230,8 @@ without writing files or contacting the host.
 
 Checked-in hook templates live in [`hooks/`](hooks/). They mirror
 `limux hooks setup` for Codex, Claude Code, and Gemini CLI; OpenCode is
-omitted until its hook integration is ready.
+omitted from default `limux hooks setup` and can be installed explicitly with
+`limux hooks setup opencode`.
 
 Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
 and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build

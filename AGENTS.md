@@ -7,18 +7,19 @@ that generated file documents the runtime agent message protocol.
 ## What Limux Is
 
 Limux is a GTK4 + libadwaita terminal workspace manager for Linux. Terminal
-rendering is embedded Ghostty (`libghostty.so`), and external automation drives
-the running app through a Unix socket and the `limux-cli` crate.
+rendering is embedded Ghostty (`libghostty-internal.so`), and external
+automation drives the running app through a Unix socket and the `limux-cli`
+crate.
 
 ## Crates
 
 | Crate | Role |
 |---|---|
-| `limux-protocol` | JSON request/response envelope types. |
+| `limux-protocol` | JSON request/response envelope types and canonical RPC method registry (`methods.rs`). |
 | `limux-core` | In-process command dispatcher and state engine. Core IDs are `u64`. |
 | `limux-control` | Unix socket path, auth, framing, and standalone control server. |
 | `limux-ghostty-sys` | Raw FFI bindings to `ghostty/include/ghostty.h`. |
-| `limux-host-linux` | GTK host binary, window/pane/tab UI, terminal integration, live control bridge. |
+| `limux-host-linux` | GTK host binary, window/pane/tab UI (`window/`, `pane/`, `terminal/`), live control bridge. |
 | `limux-cli` | User-facing CLI and agent integration commands. |
 
 ## Binaries
@@ -73,10 +74,13 @@ There are two control-server paths:
   and `ControlState` without the GTK host.
 
 When fixing user-visible CLI behavior, verify the production GTK bridge path,
-not only the standalone dispatcher. The live bridge supports workspace, pane,
-surface, terminal send/key/read/health, notification, and terminal pane-create
-commands. Browser command bridge parity remains separate work; check
-`docs/cmux-parity-plan.md` before changing agent or browser automation.
+not only the standalone dispatcher. The live bridge supports system
+capabilities/identify, window activation, workspace and workspace-group
+management, pane/surface focus and lifecycle, terminal send/key/read/health,
+tab actions, GUI lifecycle hooks (`gui_hook.*`), notifications, and terminal
+pane-create commands. Canonical RPC method specs and CLI aliases live in
+`rust/limux-protocol/src/methods.rs`; check `docs/cmux-parity-plan.md` before
+changing agent or browser automation.
 
 ## IDs And Env
 
