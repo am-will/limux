@@ -19,10 +19,9 @@ Run the quality gate before *and* after your changes:
 ./scripts/check.sh   # fmt --check, clippy -D warnings, test --workspace
 ```
 
-> **Heads-up:** as of this writing one test is failing
-> (`cli_arg_tests::hook_session_id_falls_back_to_transcript_stem`,
-> assertion at `rust/limux-cli/src/main.rs:3893`). Don't assume a clean
-> baseline — run the gate first to see the current state.
+> **Heads-up:** when running `cargo test` or `cargo clippy` directly outside
+> `./scripts/check.sh`, include `ghostty/zig-out/lib` in `LD_LIBRARY_PATH` and
+> verify `libghostty-internal.so` provenance with `./scripts/check-ghostty.sh`.
 
 ## The two-binary gotcha
 
@@ -51,10 +50,11 @@ rg -n "PaneCallbacks \{"                           rust/limux-host-linux/src/win
 | New agent in `agent-team` | `agent_launch_command` in `rust/limux-cli/src/main.rs` |
 | Generated AGENTS.md template | `build_agents_md` in `rust/limux-cli/src/main.rs` |
 | New CLI subcommand | dispatch match in `rust/limux-cli/src/main.rs` |
+| Canonical RPC method registry | `rust/limux-protocol/src/methods.rs` |
 | GUI bridge routing | `rust/limux-host-linux/src/control_bridge.rs` |
 | Full-vocabulary control (no GUI) | `limux-core::Dispatcher` + `ControlState` |
-| Pane / surface UI state | `rust/limux-host-linux/src/window.rs` (`PaneCallbacks`) |
-| Terminal IME / dead-key / compose | `rust/limux-host-linux/src/ime/` (`state.rs` state machine, `routing.rs` decide_routing / is_compose_initiator, `contexts.rs` GTK + ghostty wiring) |
+| Pane / surface UI state | `rust/limux-host-linux/src/window.rs` (`PaneCallbacks`), `window/` (`session_persistence.rs`, `navigation_notifications.rs`, `sidebar_groups.rs`, `gui_hooks.rs`), `pane/` (`tab_header.rs`, `drag_drop.rs`) |
+| Terminal IME / context menu / keys | `rust/limux-host-linux/src/ime/` (`state.rs`, `routing.rs`, `contexts.rs`) and `rust/limux-host-linux/src/terminal/` (`context_menu.rs`, `input_keys.rs`) |
 | Agent-hook installers + templates | `hooks/` + `limux hooks setup` |
 | Packaging (AppImage / AUR) | `scripts/package.sh`, `scripts/appimage-webkit.sh`, `PKGBUILD.template` |
 
@@ -88,15 +88,16 @@ rg -n "PaneCallbacks \{"                           rust/limux-host-linux/src/win
   aborts. The terminal pane pairs `IMMulticontext` with a parallel
   `IMContextSimple` that drives libxkbcommon's compose tables; for
   compose initiators (`XK_dead_*`, `Multi_key`) and in-flight
-  compose sequences, `filter_key_event` in `ime.rs` bypasses the
+  compose sequences, `filter_key_event` in `ime/` bypasses the
   multicontext entirely. Preserve that bypass when touching keyboard
   routing.
 - **A popover opened on hover must not be autohide.** An autohide
   popover takes a GTK grab, and the next click is spent dismissing it
   instead of reaching what it hit — every context-menu item below an
   open submenu then needs two clicks. Both hover-opened popovers in
-  `terminal.rs` (`build_submenu_button`, the OSC 8 link preview) call
-  `set_autohide(false)` and are closed explicitly; keep it that way.
+  `terminal/context_menu.rs` (`build_submenu_button`) and `terminal.rs`
+  (the OSC 8 link preview) call `set_autohide(false)` and are closed
+  explicitly; keep it that way.
 - **Clippy is a hard gate** (`-D warnings`). Fix lints, don't suppress.
 - **Don't commit** `target/` or other build artifacts.
 
