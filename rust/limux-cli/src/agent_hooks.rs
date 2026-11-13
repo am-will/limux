@@ -6,9 +6,9 @@ pub(crate) use limux_control::agent_sessions::{
     AgentKind, AgentLaunchCommand as AgentLaunchCommandRecord,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, TryLockError};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -52,6 +52,7 @@ struct EndedAgentHookSession {
 
 pub(crate) struct AgentHookSessionStore {
     path: PathBuf,
+    session_dir: PathBuf,
 }
 
 impl AgentHookSessionStore {
@@ -61,16 +62,19 @@ impl AgentHookSessionStore {
 
     pub(crate) fn new_for_agent_name(agent: &str) -> Self {
         let filename = format!("{}-hook-sessions.json", safe_store_name(agent));
+        let session_dir = session_persistence_dir();
         if let Some(dir) =
             std::env::var_os("LIMUX_AGENT_HOOK_STATE_DIR").filter(|value| !value.is_empty())
         {
             let dir = PathBuf::from(dir);
             return Self {
                 path: dir.join(filename),
+                session_dir,
             };
         }
         Self {
             path: state_dir().join(filename),
+            session_dir,
         }
     }
 
@@ -78,6 +82,7 @@ impl AgentHookSessionStore {
     pub(crate) fn new_for_dir(agent: &str, dir: &Path) -> Self {
         Self {
             path: dir.join(format!("{}-hook-sessions.json", safe_store_name(agent))),
+            session_dir: dir.to_path_buf(),
         }
     }
 
@@ -106,7 +111,8 @@ impl AgentHookSessionStore {
             ended.session_id != session_id
                 || tab_identity(&ended.surface_id) != tab_identity(&record.surface_id)
         });
-        prune_ended_sessions(&mut file.ended_sessions, now_seconds());
+        let session_refs = SessionReferences::load(&self.session_dir);
+        prune_ended_sessions(&mut file.ended_sessions, now_seconds(), &session_refs);
         file.version = 1;
         file.sessions.insert(session_id, record);
         self.save(&file)
@@ -149,7 +155,8 @@ impl AgentHookSessionStore {
                 updated_at: now,
             });
         }
-        prune_ended_sessions(&mut file.ended_sessions, now);
+        let session_refs = SessionReferences::load(&self.session_dir);
+        prune_ended_sessions(&mut file.ended_sessions, now, &session_refs);
         self.save(&file)
     }
 
@@ -248,14 +255,162 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn prune_ended_sessions(ended: &mut Vec<EndedAgentHookSession>, now: f64) {
+enum SessionReferences {
+    Known {
+        tab_ids: BTreeSet<String>,
+        session_ids: BTreeSet<String>,
+    },
+    Unknown,
+}
+
+impl SessionReferences {
+    fn load(session_dir: &Path) -> Self {
+        let entries = match fs::read_dir(session_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Self::Known {
+                    tab_ids: BTreeSet::new(),
+                    session_ids: BTreeSet::new(),
+                };
+            }
+            Err(_) => return Self::Unknown,
+        };
+
+        let mut candidate_paths = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return Self::Unknown;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == "session.json"
+                || (name.starts_with("session-recovery-") && name.ends_with(".json"))
+            {
+                candidate_paths.push(entry.path());
+            }
+        }
+
+        let mut tab_ids = BTreeSet::new();
+        let mut session_ids = BTreeSet::new();
+        for path in candidate_paths {
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(_) => return Self::Unknown,
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                return Self::Unknown;
+            };
+            if collect_session_value_references(&value, &mut tab_ids, &mut session_ids).is_err() {
+                return Self::Unknown;
+            }
+        }
+
+        Self::Known {
+            tab_ids,
+            session_ids,
+        }
+    }
+
+    fn is_referenced(&self, entry: &EndedAgentHookSession) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Known {
+                tab_ids,
+                session_ids,
+            } => {
+                let tab_id = tab_identity(&entry.surface_id);
+                (!tab_id.is_empty() && tab_ids.contains(tab_id))
+                    || session_ids.contains(entry.session_id.trim())
+            }
+        }
+    }
+}
+
+fn collect_session_value_references(
+    value: &serde_json::Value,
+    tab_ids: &mut BTreeSet<String>,
+    session_ids: &mut BTreeSet<String>,
+) -> std::result::Result<(), ()> {
+    let root = value.as_object().ok_or(())?;
+    let Some(workspaces) = root.get("workspaces") else {
+        return Ok(());
+    };
+    for workspace in workspaces.as_array().ok_or(())? {
+        let workspace_obj = workspace.as_object().ok_or(())?;
+        let layout = workspace_obj.get("layout").ok_or(())?;
+        collect_layout_value_references(layout, tab_ids, session_ids)?;
+    }
+    Ok(())
+}
+
+fn collect_layout_value_references(
+    layout: &serde_json::Value,
+    tab_ids: &mut BTreeSet<String>,
+    session_ids: &mut BTreeSet<String>,
+) -> std::result::Result<(), ()> {
+    let layout_obj = layout.as_object().ok_or(())?;
+    match layout_obj.get("kind").and_then(serde_json::Value::as_str) {
+        Some("pane") => {
+            if let Some(tabs) = layout_obj.get("tabs") {
+                for tab in tabs.as_array().ok_or(())? {
+                    let tab_obj = tab.as_object().ok_or(())?;
+                    if let Some(id) = tab_obj
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(normalized)
+                    {
+                        tab_ids.insert(id);
+                    }
+                    if let Some(agent) = tab_obj.get("agent").filter(|value| !value.is_null()) {
+                        let agent_obj = agent.as_object().ok_or(())?;
+                        if let Some(session_id) = agent_obj
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(normalized)
+                        {
+                            session_ids.insert(session_id);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some("split") => {
+            collect_layout_value_references(
+                layout_obj.get("start").ok_or(())?,
+                tab_ids,
+                session_ids,
+            )?;
+            collect_layout_value_references(layout_obj.get("end").ok_or(())?, tab_ids, session_ids)
+        }
+        _ => Err(()),
+    }
+}
+
+fn prune_ended_sessions(
+    ended: &mut Vec<EndedAgentHookSession>,
+    now: f64,
+    refs: &SessionReferences,
+) {
     if now > 0.0 {
         let cutoff = now - ENDED_SESSION_RETENTION_SECS;
-        ended.retain(|entry| entry.updated_at <= 0.0 || entry.updated_at >= cutoff);
+        ended.retain(|entry| {
+            refs.is_referenced(entry) || entry.updated_at <= 0.0 || entry.updated_at >= cutoff
+        });
     }
     if ended.len() > MAX_ENDED_SESSIONS {
-        let drop_count = ended.len() - MAX_ENDED_SESSIONS;
-        ended.drain(0..drop_count);
+        let mut drop_budget = ended.len() - MAX_ENDED_SESSIONS;
+        ended.retain(|entry| {
+            if drop_budget > 0 && !refs.is_referenced(entry) {
+                drop_budget -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -316,6 +471,19 @@ fn state_dir() -> PathBuf {
     }
     if let Some(home) = dirs::home_dir() {
         return home.join(".local/state/limux");
+    }
+    PathBuf::from(".limux")
+}
+
+fn session_persistence_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LIMUX_SESSION_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        return data_dir.join("limux");
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".local/share/limux");
     }
     PathBuf::from(".limux")
 }
@@ -418,6 +586,147 @@ mod tests {
         let persisted = store.load().unwrap();
         assert_eq!(persisted.ended_sessions.len(), MAX_ENDED_SESSIONS);
         assert_eq!(persisted.ended_sessions[0].session_id, "sess-20");
+    }
+
+    #[test]
+    fn ended_sessions_retain_tombstones_for_open_session_tabs_across_cap_and_cutoff() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("session.json"),
+            serde_json::json!({
+                "version": 1,
+                "workspaces": [{
+                    "id": "ws",
+                    "name": "Workspace 1",
+                    "layout": {
+                        "kind": "split",
+                        "orientation": "horizontal",
+                        "ratio": 0.5,
+                        "start": {
+                            "kind": "pane",
+                            "pane_id": 1,
+                            "active_tab_id": "tab-open",
+                            "tabs": [{
+                                "id": "tab-open",
+                                "tab_kind": "terminal",
+                                "cwd": "/tmp"
+                            }]
+                        },
+                        "end": {
+                            "kind": "pane",
+                            "pane_id": 2,
+                            "active_tab_id": "tab-other",
+                            "tabs": [{
+                                "id": "tab-other",
+                                "tab_kind": "terminal",
+                                "agent": {
+                                    "kind": "codex",
+                                    "session_id": "sess-persisted",
+                                    "restore_on_startup": true
+                                }
+                            }]
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        let stale_file = AgentHookSessionFile {
+            version: 1,
+            sessions: BTreeMap::new(),
+            ended_sessions: vec![
+                EndedAgentHookSession {
+                    session_id: "sess-open".to_string(),
+                    workspace_id: "ws".to_string(),
+                    surface_id: "1:tab-open".to_string(),
+                    updated_at: 10.0,
+                },
+                EndedAgentHookSession {
+                    session_id: "sess-persisted".to_string(),
+                    workspace_id: "ws".to_string(),
+                    surface_id: "2:closed-tab".to_string(),
+                    updated_at: 10.0,
+                },
+                EndedAgentHookSession {
+                    session_id: "sess-stale-unreferenced".to_string(),
+                    workspace_id: "ws".to_string(),
+                    surface_id: "3:tab-closed".to_string(),
+                    updated_at: 10.0,
+                },
+            ],
+        };
+        store.save(&stale_file).unwrap();
+
+        for i in 0..(MAX_ENDED_SESSIONS + 20) {
+            let sid = format!("sess-extra-{i}");
+            let surf = format!("9:tab-extra-{i}");
+            store.remove(&sid, Some("ws"), Some(&surf)).unwrap();
+        }
+
+        let persisted = store.load().unwrap();
+        assert_eq!(persisted.ended_sessions.len(), MAX_ENDED_SESSIONS);
+        assert!(persisted
+            .ended_sessions
+            .iter()
+            .any(|entry| entry.session_id == "sess-open"));
+        assert!(persisted
+            .ended_sessions
+            .iter()
+            .any(|entry| entry.session_id == "sess-persisted"));
+        assert!(!persisted
+            .ended_sessions
+            .iter()
+            .any(|entry| entry.session_id == "sess-stale-unreferenced"));
+
+        // Once the open tabs are closed and session.json no longer references them,
+        // subsequent updates prune those stale tombstones normally.
+        fs::write(
+            dir.path().join("session.json"),
+            r#"{"version":1,"workspaces":[]}"#,
+        )
+        .unwrap();
+        store
+            .remove("sess-final", Some("ws"), Some("9:tab-final"))
+            .unwrap();
+        let after_close = store.load().unwrap();
+        assert!(!after_close
+            .ended_sessions
+            .iter()
+            .any(|entry| entry.session_id == "sess-open"));
+        assert!(!after_close
+            .ended_sessions
+            .iter()
+            .any(|entry| entry.session_id == "sess-persisted"));
+    }
+
+    #[test]
+    fn ended_sessions_fail_closed_when_session_file_is_unparseable() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("session.json"), "{corrupt").unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        store
+            .save(&AgentHookSessionFile {
+                version: 1,
+                sessions: BTreeMap::new(),
+                ended_sessions: vec![EndedAgentHookSession {
+                    session_id: "sess-keep".to_string(),
+                    workspace_id: "ws".to_string(),
+                    surface_id: "1:tab-keep".to_string(),
+                    updated_at: 10.0,
+                }],
+            })
+            .unwrap();
+        store
+            .remove("sess-new", Some("ws"), Some("1:tab-new"))
+            .unwrap();
+        let persisted = store.load().unwrap();
+        assert!(persisted
+            .ended_sessions
+            .iter()
+            .any(|entry| entry.session_id == "sess-keep"));
     }
 
     #[test]

@@ -1,10 +1,11 @@
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::workspace_color::WorkspaceColor;
 
@@ -527,7 +528,9 @@ pub struct RestorableAgentIndex {
 
 impl RestorableAgentIndex {
     pub fn load() -> Self {
-        Self::load_from_dir(&agent_hook_state_dir())
+        let index = Self::load_from_dir(&agent_hook_state_dir());
+        sync_cached_ended_agent_bindings(&index);
+        index
     }
 
     pub fn load_from_dir(dir: &Path) -> Self {
@@ -658,6 +661,46 @@ impl RestorableAgentIndex {
 
 fn surface_tab_id(surface_id: &str) -> &str {
     surface_id.rsplit(':').next().unwrap_or(surface_id)
+}
+
+type EndedAgentBindingKey = (RestorableAgentKind, String, String);
+
+fn cached_ended_agent_bindings() -> &'static Mutex<HashSet<EndedAgentBindingKey>> {
+    static ENDED: OnceLock<Mutex<HashSet<EndedAgentBindingKey>>> = OnceLock::new();
+    ENDED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn sync_cached_ended_agent_bindings(index: &RestorableAgentIndex) {
+    let Ok(mut guard) = cached_ended_agent_bindings().lock() else {
+        return;
+    };
+    for (kind, ended) in &index.ended_sessions {
+        let session_id = ended.session_id.trim();
+        let tab_id = surface_tab_id(ended.surface_id.trim());
+        if !session_id.is_empty() && !tab_id.is_empty() {
+            guard.insert((*kind, session_id.to_string(), tab_id.to_string()));
+        }
+    }
+    for ((_, surface_id), (active, _)) in &index.by_surface {
+        let session_id = active.session_id.trim();
+        let tab_id = surface_tab_id(surface_id.trim());
+        guard.remove(&(active.kind, session_id.to_string(), tab_id.to_string()));
+    }
+}
+
+pub(crate) fn is_cached_ended_agent_binding(
+    kind: RestorableAgentKind,
+    session_id: &str,
+    tab_id: &str,
+) -> bool {
+    let Ok(guard) = cached_ended_agent_bindings().lock() else {
+        return false;
+    };
+    guard.contains(&(
+        kind,
+        session_id.trim().to_string(),
+        tab_id.trim().to_string(),
+    ))
 }
 
 pub(crate) fn attach_restorable_agents_to_session(
@@ -1961,5 +2004,60 @@ mod tests {
             "cd '/tmp/agy-repo' && 'env' 'AGY_CONFIG_DIR=/tmp/agy-cfg' 'agy' '--conversation' 'conv-99' '--model' 'gemini-2.5-pro'"
         ));
         assert!(command.contains("hooks agy cleanup"));
+    }
+
+    #[test]
+    fn cached_ended_agent_bindings_track_cleanup_and_clear_on_resume() {
+        let dir = tempdir().expect("tempdir");
+        let tab_id = new_tab_id();
+        let surface_id = format!("4:{tab_id}");
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {},
+                "ended_sessions": [{
+                    "session_id": "sess-cache-1",
+                    "workspace_id": "ws-1",
+                    "surface_id": surface_id,
+                    "updated_at": 10.0
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write ended codex state");
+
+        let ended_index = RestorableAgentIndex::load_from_dir(dir.path());
+        sync_cached_ended_agent_bindings(&ended_index);
+        assert!(is_cached_ended_agent_binding(
+            RestorableAgentKind::Codex,
+            "sess-cache-1",
+            &tab_id
+        ));
+
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {
+                    "sess-cache-1": {
+                        "session_id": "sess-cache-1",
+                        "workspace_id": "ws-1",
+                        "surface_id": surface_id,
+                        "updated_at": 20.0
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write resumed codex state");
+
+        let resumed_index = RestorableAgentIndex::load_from_dir(dir.path());
+        sync_cached_ended_agent_bindings(&resumed_index);
+        assert!(!is_cached_ended_agent_binding(
+            RestorableAgentKind::Codex,
+            "sess-cache-1",
+            &tab_id
+        ));
     }
 }

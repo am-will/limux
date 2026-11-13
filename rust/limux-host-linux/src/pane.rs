@@ -298,8 +298,9 @@ struct TerminalTabState {
     generation: Rc<()>,
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
-    /// Preserve restored bindings even when no external hook record remains.
-    agent: Option<Box<RestorableAgentState>>,
+    /// Preserve restored bindings even when no external hook record remains,
+    /// until cleanup invalidates the binding.
+    agent: Rc<RefCell<Option<RestorableAgentState>>>,
 }
 
 #[derive(Clone)]
@@ -2092,10 +2093,9 @@ fn add_terminal_tab_inner(
                     generation: Rc::new(()),
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
-                    agent: options
-                        .as_ref()
-                        .and_then(|value| value.agent.clone())
-                        .map(Box::new),
+                    agent: Rc::new(RefCell::new(
+                        options.as_ref().and_then(|value| value.agent.clone()),
+                    )),
                 },
             },
         });
@@ -2514,11 +2514,22 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
         .iter()
         .map(|entry| {
             let content = match &entry.kind {
-                TabKind::Terminal { state } => TabContentState::Terminal {
-                    cwd: state.cwd.borrow().clone(),
-                    agent: state.agent.as_deref().cloned(),
-                    ssh: state.ssh.clone().map(Box::new),
-                },
+                TabKind::Terminal { state } => {
+                    if state.agent.borrow().as_ref().is_some_and(|agent| {
+                        crate::layout_state::is_cached_ended_agent_binding(
+                            agent.kind,
+                            &agent.session_id,
+                            &entry.id,
+                        )
+                    }) {
+                        *state.agent.borrow_mut() = None;
+                    }
+                    TabContentState::Terminal {
+                        cwd: state.cwd.borrow().clone(),
+                        agent: state.agent.borrow().clone(),
+                        ssh: state.ssh.clone().map(Box::new),
+                    }
+                }
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
                 },
