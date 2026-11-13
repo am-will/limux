@@ -260,8 +260,8 @@ Common commands:
 Agent integrations:
   notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
   hooks setup [agent] [--osc] | hooks uninstall [agent] | hooks <agent> <event>
-  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]
-  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]
+  claude-hook | opencode-hook | gemini-hook | agy-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]
+  agent-team [--agents codex,claude[,opencode,gemini,agy]] [--cwd <path>] [--no-launch] [--dry-run]
       Splits the active workspace into one pane per agent (caller's pane stays
       as the orchestrator on the left, peers stack down the right), launches
       each CLI in its pane, and writes AGENTS.md describing the <agent-msg>
@@ -1048,8 +1048,15 @@ fn hook_str<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
 fn parse_hook_event(args: &[String], payload: &Value) -> String {
     parse_opt(args, "--event")
         .or_else(|| trailing_title(args))
-        .or_else(|| hook_str(payload, &["hook_event_name", "event"]).map(str::to_owned))
+        .or_else(|| {
+            hook_str(payload, &["hook_event_name", "hookEventName", "event"]).map(str::to_owned)
+        })
         .unwrap_or_else(|| "event".to_string())
+}
+
+fn agy_stop_suppresses_notification(payload: &Value) -> bool {
+    payload.get("fullyIdle").and_then(Value::as_bool) == Some(false)
+        || hook_str(payload, &["terminationReason"]) == Some("USER_CANCELED")
 }
 
 /// Run an agent hook: read JSON from stdin, synthesize a notification.
@@ -1096,12 +1103,18 @@ async fn run_agent_hook(
                 .unwrap_or("waiting for input")
                 .to_owned(),
         )),
-        "Stop" | "stop" | "finished" => Some((
-            format!("{agent_label} finished"),
-            hook_str(&payload, &["message", "reason"])
-                .unwrap_or("task complete")
-                .to_owned(),
-        )),
+        "Stop" | "stop" | "finished" => {
+            if agent == agent_hooks::AgentKind::Agy && agy_stop_suppresses_notification(&payload) {
+                None
+            } else {
+                Some((
+                    format!("{agent_label} finished"),
+                    hook_str(&payload, &["message", "reason"])
+                        .unwrap_or("task complete")
+                        .to_owned(),
+                ))
+            }
+        }
         "SessionStart" | "session-start" | "SessionEnd" | "session-end" | "UserPromptSubmit"
         | "prompt-submit" | "PreToolUse" | "PostToolUse" | "SubagentStop" | "subagent-stop"
         | "Cleanup" | "cleanup" | "restore-exit" => None,
@@ -1114,12 +1127,15 @@ async fn run_agent_hook(
     };
 
     if let Some((title, body)) = notification_title_body {
-        let subtitle = hook_str(&payload, &["session_id"])
-            .map(|s| {
-                // Show only a short prefix of the session id to keep sidebar tidy.
-                s.chars().take(8).collect::<String>()
-            })
-            .unwrap_or_default();
+        let subtitle = hook_str(
+            &payload,
+            &["session_id", "conversationId", "sessionId", "sessionID"],
+        )
+        .map(|s| {
+            // Show only a short prefix of the session id to keep sidebar tidy.
+            s.chars().take(8).collect::<String>()
+        })
+        .unwrap_or_default();
 
         let (workspace, surface) = notification_scope(args, env_opt);
 
@@ -1142,11 +1158,28 @@ async fn run_agent_hook(
         }
     }
 
-    Ok(agent_hook_output(&event, &payload))
+    Ok(agent_hook_output(agent, &event, &payload))
 }
 
-fn agent_hook_output(event: &str, payload: &Value) -> Value {
+fn agent_hook_output(agent: agent_hooks::AgentKind, event: &str, payload: &Value) -> Value {
     let canonical_event = canonical_hook_event_name(event);
+    if agent == agent_hooks::AgentKind::Agy {
+        return match canonical_event {
+            Some("Stop") => json!({ "decision": "allow" }),
+            Some("SessionStart") => match hook_additional_context(payload) {
+                Some(context) => json!({
+                    "injectSteps": [{
+                        "systemMessage": {
+                            "systemMessage": context
+                        }
+                    }]
+                }),
+                None => json!({}),
+            },
+            _ => json!({}),
+        };
+    }
+
     let mut output = Map::new();
     output.insert("continue".to_string(), Value::Bool(true));
     output.insert("suppressOutput".to_string(), Value::Bool(false));
@@ -1208,7 +1241,7 @@ fn persist_agent_hook_session(
     payload: &Value,
     event: &str,
 ) -> Result<()> {
-    let Some(session_id) = hook_session_id(payload) else {
+    let Some(session_id) = hook_session_id(agent, payload) else {
         write_agent_hook_debug(
             agent,
             event,
@@ -1279,16 +1312,28 @@ fn persist_agent_hook_session(
         return Ok(());
     };
 
+    let ancestor_pid = agent_ancestor_pid(agent);
+    let proc_args = ancestor_pid.and_then(proc_cmdline_args);
+    let proc_cwd = ancestor_pid.and_then(proc_cwd_path);
+    let proc_env = ancestor_pid.and_then(proc_allowed_environment);
+
     let result = store.update(&session_id, |existing| {
         let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
             .map(str::to_string)
+            .or_else(|| proc_cwd.clone())
             .or_else(|| existing.and_then(|record| record.cwd.clone()));
         let pid = hook_str(payload, &["pid"])
             .and_then(|value| value.parse::<u32>().ok())
-            .or_else(|| agent_ancestor_pid(agent))
+            .or(ancestor_pid)
             .or_else(|| existing.and_then(|record| record.pid));
-        let launch_command = agent_hooks::launch_record_from_env(agent, cwd.as_deref())
-            .or_else(|| existing.and_then(|record| record.launch_command.clone()));
+        let launch_command = agent_hooks::launch_record_from_context(
+            agent,
+            cwd.as_deref(),
+            proc_args.as_deref(),
+            proc_cwd.as_deref(),
+            proc_env.as_ref(),
+        )
+        .or_else(|| existing.and_then(|record| record.launch_command.clone()));
 
         agent_hooks::AgentHookSessionRecord {
             session_id: session_id.clone(),
@@ -1328,13 +1373,27 @@ fn agent_hook_cleanup_scope(
     (workspace, surface)
 }
 
-fn hook_session_id(payload: &Value) -> Option<String> {
-    hook_str(payload, &["session_id", "sessionId", "sessionID"])
-        .map(str::to_string)
-        .or_else(|| limux_env_value("CLAUDE_CODE_SESSION_ID"))
-        .or_else(|| limux_env_value("CLAUDE_SESSION_ID"))
-        .or_else(|| hook_session_id_from_transcript(payload))
-        .filter(|value| !value.trim().is_empty())
+fn hook_session_id(agent: agent_hooks::AgentKind, payload: &Value) -> Option<String> {
+    hook_session_id_with_env(agent, payload, limux_env_value)
+}
+
+fn hook_session_id_with_env(
+    agent: agent_hooks::AgentKind,
+    payload: &Value,
+    env_value: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    hook_str(
+        payload,
+        &["session_id", "sessionId", "sessionID", "conversationId"],
+    )
+    .map(str::to_string)
+    .or_else(|| {
+        (agent == agent_hooks::AgentKind::Claude)
+            .then(|| env_value("CLAUDE_CODE_SESSION_ID").or_else(|| env_value("CLAUDE_SESSION_ID")))
+            .flatten()
+    })
+    .or_else(|| hook_session_id_from_transcript(payload))
+    .filter(|value| !value.trim().is_empty())
 }
 
 fn hook_session_id_from_transcript(payload: &Value) -> Option<String> {
@@ -1342,11 +1401,22 @@ fn hook_session_id_from_transcript(payload: &Value) -> Option<String> {
         payload,
         &["transcript_path", "transcriptPath", "transcript"],
     )?;
-    Path::new(transcript)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
+    let path = Path::new(transcript);
+    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+    if matches!(stem, "transcript" | "transcript_full") {
+        let components: Vec<&str> = path
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect();
+        if let Some(idx) = components.iter().rposition(|part| *part == "brain") {
+            return components
+                .get(idx + 1)
+                .map(|value| (*value).to_string())
+                .filter(|value| !value.trim().is_empty() && !value.starts_with('.'));
+        }
+        return None;
+    }
+    Some(stem.to_string()).filter(|value| !value.trim().is_empty())
 }
 
 fn payload_keys(payload: &Value) -> Vec<String> {
@@ -1356,15 +1426,36 @@ fn payload_keys(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn agent_hook_debug_enabled() -> bool {
+    env::var_os("LIMUX_HOOK_DEBUG")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 fn write_agent_hook_debug(
     agent: agent_hooks::AgentKind,
     event: &str,
     outcome: &str,
     details: &Value,
 ) {
+    if !agent_hook_debug_enabled() {
+        return;
+    }
     let Some(dir) = agent_hook_debug_dir() else {
         return;
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .is_err()
+        {
+            return;
+        }
+    }
+    #[cfg(not(unix))]
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -1383,7 +1474,7 @@ fn write_agent_hook_debug(
 }
 
 fn agent_hook_debug_dir() -> Option<PathBuf> {
-    if let Some(dir) = env::var_os("LIMUX_AGENT_HOOK_STATE_DIR") {
+    if let Some(dir) = env::var_os("LIMUX_AGENT_HOOK_STATE_DIR").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     dirs::state_dir()
@@ -1393,9 +1484,14 @@ fn agent_hook_debug_dir() -> Option<PathBuf> {
 
 fn append_debug_line(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     file.write_all(bytes)
@@ -1411,14 +1507,13 @@ fn limux_env_value(name: &str) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn agent_ancestor_pid(agent: agent_hooks::AgentKind) -> Option<u32> {
-    let needle = agent.store_name();
     let mut pid = std::process::id();
     for _ in 0..8 {
         let parent = proc_parent_pid(pid)?;
         if parent <= 1 || parent == pid {
             return None;
         }
-        if proc_identity_contains(parent, needle) {
+        if proc_matches_pid(parent, agent) {
             return Some(parent);
         }
         pid = parent;
@@ -1432,23 +1527,58 @@ fn agent_ancestor_pid(_agent: agent_hooks::AgentKind) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn proc_identity_contains(pid: u32, needle: &str) -> bool {
-    let needle = needle.to_ascii_lowercase();
-    proc_cmdline(pid)
-        .or_else(|| fs::read_to_string(format!("/proc/{pid}/comm")).ok())
-        .map(|value| value.to_ascii_lowercase().contains(&needle))
-        .unwrap_or(false)
+fn proc_matches_pid(pid: u32, agent: agent_hooks::AgentKind) -> bool {
+    let args = proc_cmdline_args(pid).unwrap_or_default();
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+    limux_control::agent_sessions::proc_matches_agent(&args, comm.as_deref(), agent)
 }
 
 #[cfg(target_os = "linux")]
-fn proc_cmdline(pid: u32) -> Option<String> {
+fn proc_cmdline_args(pid: u32) -> Option<Vec<String>> {
     let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let parts = raw
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
-        .filter_map(|part| std::str::from_utf8(part).ok())
+        .filter_map(|part| std::str::from_utf8(part).ok().map(str::to_string))
         .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join(" "))
+    (!parts.is_empty()).then_some(parts)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cmdline_args(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_cwd_path(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cwd_path(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_allowed_environment(pid: u32) -> Option<BTreeMap<String, String>> {
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(allowed_environment_from_environ(&environ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_allowed_environment(_pid: u32) -> Option<BTreeMap<String, String>> {
+    None
+}
+
+fn allowed_environment_from_environ(environ: &[u8]) -> BTreeMap<String, String> {
+    let pairs = environ
+        .split(|byte| *byte == 0)
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .filter_map(|entry| entry.split_once('='));
+    agent_hooks::filter_allowed_environment(pairs)
 }
 
 #[cfg(target_os = "linux")]
@@ -1620,6 +1750,7 @@ fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
         agent_hooks::AgentKind::Codex,
         agent_hooks::AgentKind::Claude,
         agent_hooks::AgentKind::Gemini,
+        agent_hooks::AgentKind::Agy,
     ]
 }
 
@@ -1648,7 +1779,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind, osc: bool) -> Result<()> {
             ],
         ),
         agent_hooks::AgentKind::OpenCode if osc => {
-            bail!("OSC hook setup supports Codex, Claude, and Gemini")
+            bail!("OSC hook setup supports Codex, Claude, Gemini, and Antigravity")
         }
         agent_hooks::AgentKind::OpenCode => install_opencode_plugin(),
         agent_hooks::AgentKind::Gemini => install_json_hooks(
@@ -1662,6 +1793,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind, osc: bool) -> Result<()> {
                 ("SessionEnd", "session-end"),
             ],
         ),
+        agent_hooks::AgentKind::Agy => install_agy_hooks(&agy_hooks_path(), osc),
     }
 }
 
@@ -1678,7 +1810,77 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             opencode_config_unregister_plugin()
         }
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
+        agent_hooks::AgentKind::Agy => uninstall_agy_hooks(&agy_hooks_path()),
     }
+}
+
+fn install_agy_hooks(path: &Path, osc: bool) -> Result<()> {
+    let mut root = read_json_object(path)?;
+    let marker = hook_marker(agent_hooks::AgentKind::Agy);
+    prune_agy_limux_entries(&mut root, marker);
+    root.insert(
+        "limux".to_string(),
+        json!({
+            "SessionStart": [{
+                "type": "command",
+                "command": hook_command_with_fallback(
+                    agent_hooks::AgentKind::Agy,
+                    "session-start",
+                    osc,
+                    "{}",
+                )?,
+                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
+            }],
+            "Stop": [{
+                "type": "command",
+                "command": hook_command_with_fallback(
+                    agent_hooks::AgentKind::Agy,
+                    "stop",
+                    osc,
+                    "{\"decision\":\"allow\"}",
+                )?,
+                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
+            }]
+        }),
+    );
+    write_json_object(path, &root)
+}
+
+fn uninstall_agy_hooks(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root = read_json_object(path)?;
+    let marker = hook_marker(agent_hooks::AgentKind::Agy);
+    prune_agy_limux_entries(&mut root, marker);
+    write_json_object(path, &root)
+}
+
+fn prune_agy_limux_entries(root: &mut Map<String, Value>, marker: &str) {
+    for group in root.values_mut() {
+        if let Some(events) = group.as_object_mut() {
+            for handlers in events.values_mut() {
+                if let Some(entries) = handlers.as_array_mut() {
+                    entries.retain(|entry| !json_value_contains(entry, marker));
+                }
+            }
+            events.retain(|_, handlers| {
+                handlers
+                    .as_array()
+                    .map(|entries| !entries.is_empty())
+                    .unwrap_or(true)
+            });
+        }
+    }
+    root.retain(|name, group| {
+        if name == "limux" && json_value_contains(group, marker) {
+            return false;
+        }
+        group
+            .as_object()
+            .map(|events| !events.is_empty())
+            .unwrap_or(true)
+    });
 }
 
 fn install_json_hooks(
@@ -1734,7 +1936,7 @@ fn install_json_hooks(
 
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
-        agent_hooks::AgentKind::Claude => 5,
+        agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Agy => 5,
         agent_hooks::AgentKind::Codex | agent_hooks::AgentKind::Gemini => 5000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
@@ -1803,6 +2005,20 @@ fn opencode_config_unregister_plugin() -> Result<()> {
 }
 
 fn hook_command(agent: agent_hooks::AgentKind, event: &str, osc: bool) -> Result<String> {
+    hook_command_with_fallback(
+        agent,
+        event,
+        osc,
+        "{\"continue\":true,\"suppressOutput\":false}",
+    )
+}
+
+fn hook_command_with_fallback(
+    agent: agent_hooks::AgentKind,
+    event: &str,
+    osc: bool,
+    fallback_json: &str,
+) -> Result<String> {
     let disable_var = format!(
         "LIMUX_{}_HOOKS_DISABLED",
         agent.store_name().to_ascii_uppercase()
@@ -1814,9 +2030,10 @@ fn hook_command(agent: agent_hooks::AgentKind, event: &str, osc: bool) -> Result
         limux_command
     };
     Ok(format!(
-        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo '{{\"continue\":true,\"suppressOutput\":false}}'",
+        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo {}",
         agent.store_name(),
-        event
+        event,
+        shell_single_quote(fallback_json)
     ))
 }
 
@@ -1860,6 +2077,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Codex => "hooks codex",
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
+        agent_hooks::AgentKind::Agy => "hooks agy",
     }
 }
 
@@ -1902,31 +2120,57 @@ fn json_value_contains(value: &Value, needle: &str) -> bool {
     }
 }
 
-fn codex_hooks_path() -> PathBuf {
-    env::var_os("CODEX_HOME")
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn codex_hooks_path() -> PathBuf {
+    non_empty_env_path("CODEX_HOME")
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .unwrap_or_else(|| PathBuf::from(".codex"))
         .join("hooks.json")
 }
 
 fn claude_settings_path() -> PathBuf {
-    env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
+    non_empty_env_path("CLAUDE_CONFIG_DIR")
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
         .unwrap_or_else(|| PathBuf::from(".claude"))
         .join("settings.json")
 }
 
+fn gemini_config_dir_from(gemini_env: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    gemini_env
+        .or_else(|| home.map(|home| home.join(".gemini")))
+        .unwrap_or_else(|| PathBuf::from(".gemini"))
+}
+
 fn gemini_settings_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".gemini/settings.json")
+    gemini_config_dir_from(non_empty_env_path("GEMINI_CONFIG_DIR"), dirs::home_dir())
+        .join("settings.json")
+}
+
+fn agy_hooks_path_from(
+    agy_env: Option<PathBuf>,
+    gemini_env: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    agy_env
+        .unwrap_or_else(|| gemini_config_dir_from(gemini_env, home).join("config"))
+        .join("hooks.json")
+}
+
+fn agy_hooks_path() -> PathBuf {
+    agy_hooks_path_from(
+        non_empty_env_path("AGY_CONFIG_DIR"),
+        non_empty_env_path("GEMINI_CONFIG_DIR"),
+        dirs::home_dir(),
+    )
 }
 
 fn opencode_config_dir() -> PathBuf {
-    env::var_os("OPENCODE_CONFIG_DIR")
-        .map(PathBuf::from)
+    non_empty_env_path("OPENCODE_CONFIG_DIR")
         .or_else(|| dirs::home_dir().map(|home| home.join(".config/opencode")))
         .unwrap_or_else(|| PathBuf::from(".config/opencode"))
 }
@@ -2132,6 +2376,7 @@ fn agent_launch_command(agent: &str) -> Option<(&'static str, String)> {
         "claude" | "claude-code" => Some(("claude", "claude".to_string())),
         "opencode" => Some(("opencode", "opencode".to_string())),
         "gemini" | "gemini-cli" => Some(("gemini", "gemini".to_string())),
+        "agy" | "antigravity" | "antigravity-cli" => Some(("agy", "agy".to_string())),
         _ => None,
     }
 }
@@ -3938,11 +4183,12 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
-        "claude-hook" | "opencode-hook" | "gemini-hook" => {
+        "claude-hook" | "opencode-hook" | "gemini-hook" | "agy-hook" => {
             let agent = match command {
                 "claude-hook" => agent_hooks::AgentKind::Claude,
                 "opencode-hook" => agent_hooks::AgentKind::OpenCode,
                 "gemini-hook" => agent_hooks::AgentKind::Gemini,
+                "agy-hook" => agent_hooks::AgentKind::Agy,
                 _ => unreachable!(),
             };
             let payload = run_agent_hook(client, agent, args).await?;
@@ -4533,6 +4779,7 @@ mod cli_arg_tests {
                 agent_hooks::AgentKind::Codex,
                 agent_hooks::AgentKind::Claude,
                 agent_hooks::AgentKind::Gemini,
+                agent_hooks::AgentKind::Agy,
             ]
         );
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
@@ -4561,7 +4808,11 @@ mod cli_arg_tests {
 
     #[test]
     fn stop_hook_output_matches_codex_schema_shape() {
-        let output = agent_hook_output("stop", &json!({ "session_id": "session-a" }));
+        let output = agent_hook_output(
+            agent_hooks::AgentKind::Codex,
+            "stop",
+            &json!({ "session_id": "session-a" }),
+        );
 
         assert_eq!(
             output,
@@ -4575,6 +4826,7 @@ mod cli_arg_tests {
     #[test]
     fn session_start_hook_output_uses_camel_case_specific_output() {
         let output = agent_hook_output(
+            agent_hooks::AgentKind::Claude,
             "session-start",
             &json!({ "additionalContext": "Limux session restore tracking active." }),
         );
@@ -4589,6 +4841,117 @@ mod cli_arg_tests {
                     "additionalContext": "Limux session restore tracking active."
                 }
             })
+        );
+    }
+
+    #[test]
+    fn agy_hook_output_matches_antigravity_schema() {
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
+                "stop",
+                &json!({ "conversationId": "conv-1" }),
+            ),
+            json!({ "decision": "allow" })
+        );
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
+                "session-start",
+                &json!({ "conversationId": "conv-1" }),
+            ),
+            json!({})
+        );
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
+                "session-start",
+                &json!({
+                    "conversationId": "conv-1",
+                    "additionalContext": "Injected context"
+                }),
+            ),
+            json!({
+                "injectSteps": [{
+                    "systemMessage": {
+                        "systemMessage": "Injected context"
+                    }
+                }]
+            })
+        );
+        assert!(agy_stop_suppresses_notification(
+            &json!({ "terminationReason": "USER_CANCELED" })
+        ));
+        assert!(agy_stop_suppresses_notification(
+            &json!({ "fullyIdle": false })
+        ));
+        assert!(!agy_stop_suppresses_notification(
+            &json!({ "terminationReason": "NO_TOOL_CALL", "fullyIdle": true })
+        ));
+    }
+
+    #[test]
+    fn agy_hook_install_and_uninstall_preserve_other_named_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hooks.json");
+        let original = json!({
+            "my-linter": {
+                "PostToolUse": [{
+                    "matcher": "write_file",
+                    "type": "command",
+                    "command": "echo lint"
+                }]
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        install_agy_hooks(&path, true).expect("install agy hooks");
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(installed["my-linter"], original["my-linter"]);
+        assert_eq!(installed["limux"]["SessionStart"][0]["timeout"], 5);
+        assert!(installed["limux"]["SessionStart"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("env LIMUX_NOTIFY_OSC=1"));
+        assert!(installed["limux"]["SessionStart"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hooks agy session-start"));
+        assert!(installed["limux"]["Stop"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("{\"decision\":\"allow\"}"));
+
+        uninstall_agy_hooks(&path).expect("uninstall agy hooks");
+        let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, original);
+    }
+
+    #[test]
+    fn gemini_and_agy_config_paths_honor_env_overrides() {
+        assert_eq!(
+            gemini_config_dir_from(
+                Some(PathBuf::from("/custom/gemini")),
+                Some(PathBuf::from("/home/u"))
+            )
+            .join("settings.json"),
+            PathBuf::from("/custom/gemini/settings.json")
+        );
+        assert_eq!(
+            agy_hooks_path_from(
+                Some(PathBuf::from("/custom/agy")),
+                Some(PathBuf::from("/custom/gemini")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/custom/agy/hooks.json")
+        );
+        assert_eq!(
+            agy_hooks_path_from(
+                None,
+                Some(PathBuf::from("/custom/gemini")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/custom/gemini/config/hooks.json")
         );
     }
 
@@ -4711,7 +5074,7 @@ mod cli_arg_tests {
         });
 
         assert_eq!(
-            hook_session_id(&payload).as_deref(),
+            hook_session_id_with_env(agent_hooks::AgentKind::Claude, &payload, |_| None).as_deref(),
             Some("268746f1-5a8f-471c-85db-dc50649c2f9c")
         );
     }
@@ -4724,8 +5087,44 @@ mod cli_arg_tests {
         });
 
         assert_eq!(
-            hook_session_id(&payload).as_deref(),
+            hook_session_id_with_env(agent_hooks::AgentKind::Claude, &payload, |_| None).as_deref(),
             Some("explicit-session")
+        );
+    }
+
+    #[test]
+    fn hook_session_id_isolates_claude_env_and_supports_agy_conversation_id() {
+        let claude_env = |name: &str| {
+            (name == "CLAUDE_CODE_SESSION_ID").then(|| "claude-parent-session".to_string())
+        };
+        assert_eq!(
+            hook_session_id_with_env(agent_hooks::AgentKind::Claude, &json!({}), claude_env)
+                .as_deref(),
+            Some("claude-parent-session")
+        );
+        assert_eq!(
+            hook_session_id_with_env(agent_hooks::AgentKind::Codex, &json!({}), claude_env),
+            None
+        );
+        assert_eq!(
+            hook_session_id_with_env(
+                agent_hooks::AgentKind::Agy,
+                &json!({ "conversationId": "agy-conv-42" }),
+                claude_env
+            )
+            .as_deref(),
+            Some("agy-conv-42")
+        );
+        assert_eq!(
+            hook_session_id_with_env(
+                agent_hooks::AgentKind::Agy,
+                &json!({
+                    "transcriptPath": "/home/u/.gemini/antigravity-cli/brain/fe490dbf-794d-4c6d-8aa0-71d50673e523/.system_generated/logs/transcript.jsonl"
+                }),
+                |_| None
+            )
+            .as_deref(),
+            Some("fe490dbf-794d-4c6d-8aa0-71d50673e523")
         );
     }
 }
@@ -4799,6 +5198,9 @@ mod agent_team_tests {
             "opencode",
             "gemini",
             "gemini-cli",
+            "agy",
+            "antigravity",
+            "antigravity-cli",
         ] {
             assert!(
                 agent_launch_command(agent).is_some(),

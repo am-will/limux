@@ -1,73 +1,23 @@
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, TryLockError};
 #[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+pub(crate) use limux_control::agent_sessions::build_resume_command;
+pub(crate) use limux_control::agent_sessions::{
+    filter_allowed_environment, normalize_captured_process_args, sanitize_launch_arguments,
+    AgentKind, AgentLaunchCommand as AgentLaunchCommandRecord,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::{self, File, TryLockError};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const STORE_LOCK_RETRY: Duration = Duration::from_millis(10);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AgentKind {
-    Claude,
-    Codex,
-    OpenCode,
-    Gemini,
-}
-
-impl AgentKind {
-    pub(crate) fn from_hook_name(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "opencode" | "open-code" => Some(Self::OpenCode),
-            "gemini" => Some(Self::Gemini),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn store_name(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Gemini => "gemini",
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Claude => "Claude",
-            Self::Codex => "Codex",
-            Self::OpenCode => "OpenCode",
-            Self::Gemini => "Gemini",
-        }
-    }
-
-    fn fallback_executable(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Gemini => "gemini",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct AgentLaunchCommandRecord {
-    pub(crate) executable: String,
-    pub(crate) arguments: Vec<String>,
-    #[serde(default)]
-    pub(crate) cwd: Option<String>,
-    #[serde(default)]
-    pub(crate) environment: BTreeMap<String, String>,
-    pub(crate) captured_at: f64,
-}
+const MAX_ENDED_SESSIONS: usize = 256;
+const ENDED_SESSION_RETENTION_SECS: f64 = 30.0 * 86_400.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AgentHookSessionRecord {
@@ -111,7 +61,9 @@ impl AgentHookSessionStore {
 
     pub(crate) fn new_for_agent_name(agent: &str) -> Self {
         let filename = format!("{}-hook-sessions.json", safe_store_name(agent));
-        if let Some(dir) = std::env::var_os("LIMUX_AGENT_HOOK_STATE_DIR") {
+        if let Some(dir) =
+            std::env::var_os("LIMUX_AGENT_HOOK_STATE_DIR").filter(|value| !value.is_empty())
+        {
             let dir = PathBuf::from(dir);
             return Self {
                 path: dir.join(filename),
@@ -154,6 +106,7 @@ impl AgentHookSessionStore {
             ended.session_id != session_id
                 || tab_identity(&ended.surface_id) != tab_identity(&record.surface_id)
         });
+        prune_ended_sessions(&mut file.ended_sessions, now_seconds());
         file.version = 1;
         file.sessions.insert(session_id, record);
         self.save(&file)
@@ -171,6 +124,7 @@ impl AgentHookSessionStore {
         let _lock = self.lock()?;
         let mut file = self.load()?;
         let removed = file.sessions.remove(&session_id);
+        let now = now_seconds();
         let surface_id = surface_id.and_then(normalized).or_else(|| {
             removed
                 .as_ref()
@@ -192,25 +146,25 @@ impl AgentHookSessionStore {
                     })
                     .unwrap_or_default(),
                 surface_id,
-                updated_at: now_seconds(),
+                updated_at: now,
             });
         }
+        prune_ended_sessions(&mut file.ended_sessions, now);
         self.save(&file)
     }
 
     fn lock(&self) -> Result<File> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+            ensure_private_dir(parent)?;
         }
         // Keep a stable sibling inode: the JSON is replaced by rename, and
         // unlinking the lock file would let another writer lock a different inode.
         let lock_path = self.path.with_extension("lock");
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut opts = File::options();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let lock = opts
             .open(&lock_path)
             .with_context(|| format!("failed to open {}", lock_path.display()))?;
         let deadline = Instant::now() + STORE_LOCK_TIMEOUT;
@@ -254,17 +208,54 @@ impl AgentHookSessionStore {
 
     fn save(&self, file: &AgentHookSessionFile) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+            ensure_private_dir(parent)?;
         }
         let temp = self
             .path
             .with_extension(format!("json.{}.tmp", std::process::id()));
         let json = serde_json::to_vec_pretty(file).context("failed to encode hook store")?;
-        fs::write(&temp, json).with_context(|| format!("failed to write {}", temp.display()))?;
+        write_private_file(&temp, &json)?;
         fs::rename(&temp, &self.path)
             .with_context(|| format!("failed to replace {}", self.path.display()))?;
         Ok(())
+    }
+}
+
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))
+    }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut opts = File::options();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn prune_ended_sessions(ended: &mut Vec<EndedAgentHookSession>, now: f64) {
+    if now > 0.0 {
+        let cutoff = now - ENDED_SESSION_RETENTION_SECS;
+        ended.retain(|entry| entry.updated_at <= 0.0 || entry.updated_at >= cutoff);
+    }
+    if ended.len() > MAX_ENDED_SESSIONS {
+        let drop_count = ended.len() - MAX_ENDED_SESSIONS;
+        ended.drain(0..drop_count);
     }
 }
 
@@ -273,139 +264,27 @@ fn tab_identity(surface_id: &str) -> &str {
     surface_id.rsplit(':').next().unwrap_or(surface_id)
 }
 
-pub(crate) fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -> Vec<String> {
-    if arguments.is_empty() {
-        return vec![kind.fallback_executable().to_string()];
-    }
-
-    let mut result = Vec::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        let arg = &arguments[index];
-        if index == 0 {
-            result.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        if is_resume_selector(kind, arg) {
-            index += 1;
-            if index < arguments.len() && !arguments[index].starts_with('-') {
-                index += 1;
-            }
-            continue;
-        }
-        if option_takes_secret_value(arg) {
-            index += 1;
-            if index < arguments.len() && !arguments[index].starts_with('-') {
-                index += 1;
-            }
-            continue;
-        }
-        if option_is_secret_assignment(arg) {
-            index += 1;
-            continue;
-        }
-        if option_takes_safe_value(arg) {
-            result.push(arg.clone());
-            if index + 1 < arguments.len() {
-                result.push(arguments[index + 1].clone());
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if option_is_safe_flag_or_assignment(arg) {
-            result.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-
-    if result.is_empty() {
-        vec![kind.fallback_executable().to_string()]
-    } else {
-        result
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn build_resume_command(
-    kind: AgentKind,
-    session_id: &str,
-    launch: Option<&AgentLaunchCommandRecord>,
-    cwd: Option<&str>,
-) -> Option<String> {
-    let session_id = normalized(session_id)?;
-    let fallback = kind.fallback_executable().to_string();
-    let raw_args = launch
-        .map(|launch| launch.arguments.clone())
-        .filter(|args| !args.is_empty())
-        .unwrap_or_else(|| vec![fallback.clone()]);
-    let sanitized = sanitize_launch_arguments(kind, &raw_args);
-    let executable = launch
-        .and_then(|launch| normalized(&launch.executable))
-        .or_else(|| sanitized.first().cloned())
-        .unwrap_or(fallback);
-    let preserved_tail = sanitized
-        .get(1..)
-        .map(|tail| tail.to_vec())
-        .unwrap_or_default();
-
-    let mut parts = vec![executable];
-    match kind {
-        AgentKind::Codex => {
-            parts.push("resume".to_string());
-            parts.extend(preserved_tail);
-            parts.push(session_id);
-        }
-        AgentKind::OpenCode => {
-            parts.push("--session".to_string());
-            parts.push(session_id);
-            parts.extend(preserved_tail);
-        }
-        AgentKind::Claude | AgentKind::Gemini => {
-            parts.push("--resume".to_string());
-            parts.push(session_id);
-            parts.extend(preserved_tail);
-        }
-    }
-
-    let command = parts
-        .iter()
-        .map(|part| shell_single_quote(part))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let cwd = cwd.and_then(normalized).or_else(|| {
-        launch
-            .and_then(|launch| launch.cwd.as_deref())
-            .and_then(normalized)
-    });
-    Some(match cwd {
-        Some(cwd) => format!("cd {} && {command}", shell_single_quote(&cwd)),
-        None => command,
-    })
-}
-
-pub(crate) fn launch_record_from_env(
+pub(crate) fn launch_record_from_context(
     kind: AgentKind,
     payload_cwd: Option<&str>,
+    proc_args: Option<&[String]>,
+    proc_cwd: Option<&str>,
+    proc_env: Option<&BTreeMap<String, String>>,
 ) -> Option<AgentLaunchCommandRecord> {
     let args = std::env::var("LIMUX_AGENT_LAUNCH_ARGV")
         .ok()
         .map(split_nul_or_space_separated)
         .filter(|args| !args.is_empty())
+        .or_else(|| proc_args.and_then(|raw| normalize_captured_process_args(kind, raw)))
         .unwrap_or_else(|| vec![kind.fallback_executable().to_string()]);
     let sanitized = sanitize_launch_arguments(kind, &args);
     let executable = std::env::var("LIMUX_AGENT_LAUNCH_EXECUTABLE")
         .ok()
         .and_then(|value| normalized(&value))
         .or_else(|| sanitized.first().cloned())?;
+    let mut environment = proc_env.cloned().unwrap_or_default();
+    environment.extend(filter_allowed_environment(std::env::vars()));
+
     Some(AgentLaunchCommandRecord {
         executable,
         arguments: sanitized,
@@ -413,13 +292,14 @@ pub(crate) fn launch_record_from_env(
             .ok()
             .and_then(|value| normalized(&value))
             .or_else(|| payload_cwd.and_then(normalized))
+            .or_else(|| proc_cwd.and_then(normalized))
             .or_else(|| {
                 std::env::var("PWD")
                     .ok()
                     .and_then(|value| normalized(&value))
             }),
-        environment: selected_environment(),
-        captured_at: now_seconds(),
+        environment,
+        captured_at: Some(now_seconds()),
     })
 }
 
@@ -452,82 +332,6 @@ fn normalized(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-#[cfg(test)]
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
-    match kind {
-        AgentKind::Codex => arg == "resume" || arg == "--resume" || arg.starts_with("--resume="),
-        AgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
-        AgentKind::Claude | AgentKind::Gemini => {
-            arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
-        }
-    }
-}
-
-fn option_takes_secret_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--api-key"
-            | "--apikey"
-            | "--token"
-            | "--auth-token"
-            | "--password"
-            | "--credential"
-            | "--credentials"
-    )
-}
-
-fn option_is_secret_assignment(arg: &str) -> bool {
-    let lower = arg.to_ascii_lowercase();
-    lower.starts_with("--api-key=")
-        || lower.starts_with("--apikey=")
-        || lower.starts_with("--token=")
-        || lower.starts_with("--auth-token=")
-        || lower.starts_with("--password=")
-        || lower.starts_with("--credential=")
-        || lower.starts_with("--credentials=")
-}
-
-fn option_takes_safe_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--model"
-            | "-m"
-            | "--config"
-            | "-c"
-            | "--profile"
-            | "--sandbox"
-            | "--approval-policy"
-            | "--cwd"
-            | "--cd"
-            | "--working-directory"
-            | "--config-dir"
-            | "--home"
-    )
-}
-
-fn option_is_safe_flag_or_assignment(arg: &str) -> bool {
-    if matches!(
-        arg,
-        "--dangerously-bypass-approvals-and-sandbox"
-            | "--dangerously-skip-permissions"
-            | "--full-auto"
-            | "--search"
-            | "--no-search"
-            | "--yolo"
-    ) {
-        return true;
-    }
-
-    let Some((name, _)) = arg.split_once('=') else {
-        return false;
-    };
-    option_takes_safe_value(name)
-}
-
 fn split_nul_or_space_separated(raw: String) -> Vec<String> {
     if raw.contains('\0') {
         raw.split('\0').filter_map(normalized).collect::<Vec<_>>()
@@ -536,24 +340,6 @@ fn split_nul_or_space_separated(raw: String) -> Vec<String> {
             .filter_map(normalized)
             .collect::<Vec<_>>()
     }
-}
-
-fn selected_environment() -> BTreeMap<String, String> {
-    let allowlist: BTreeSet<&'static str> = [
-        "CODEX_HOME",
-        "CLAUDE_CONFIG_DIR",
-        "OPENCODE_CONFIG_DIR",
-        "GEMINI_CONFIG_DIR",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_SMALL_FAST_MODEL",
-    ]
-    .into_iter()
-    .collect();
-
-    std::env::vars()
-        .filter(|(key, value)| allowlist.contains(key.as_str()) && !value.trim().is_empty())
-        .collect()
 }
 
 #[cfg(test)]
@@ -580,7 +366,7 @@ mod tests {
                 ],
                 cwd: Some("/tmp/project".to_string()),
                 environment: Default::default(),
-                captured_at: 10.0,
+                captured_at: Some(10.0),
             }),
             updated_at: 11.0,
         };
@@ -621,6 +407,20 @@ mod tests {
     }
 
     #[test]
+    fn ended_sessions_are_bounded_to_recent_entries() {
+        let dir = tempdir().unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        for i in 0..(MAX_ENDED_SESSIONS + 20) {
+            let sid = format!("sess-{i}");
+            let surf = format!("1:tab-{i}");
+            store.remove(&sid, Some("ws"), Some(&surf)).unwrap();
+        }
+        let persisted = store.load().unwrap();
+        assert_eq!(persisted.ended_sessions.len(), MAX_ENDED_SESSIONS);
+        assert_eq!(persisted.ended_sessions[0].session_id, "sess-20");
+    }
+
+    #[test]
     fn cleanup_without_a_record_keeps_scoped_invalidations_until_matching_upsert() {
         let dir = tempdir().unwrap();
         let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
@@ -652,6 +452,48 @@ mod tests {
             .iter()
             .any(|record| record.session_id == "ended" && record.surface_id == "2:tab-b"));
         assert!(ended.iter().any(|record| record.session_id == "other"));
+    }
+
+    #[test]
+    fn launch_record_captures_ancestor_proc_args_cwd_and_env() {
+        let proc_args = vec![
+            "/usr/local/bin/agy".to_string(),
+            "--model".to_string(),
+            "gemini-2.5-pro".to_string(),
+            "--effort".to_string(),
+            "high".to_string(),
+            "--api-key".to_string(),
+            "super-secret".to_string(),
+            "initial prompt".to_string(),
+        ];
+        let mut proc_env = BTreeMap::new();
+        proc_env.insert("AGY_CONFIG_DIR".to_string(), "/tmp/agy-cfg".to_string());
+
+        let record = launch_record_from_context(
+            AgentKind::Agy,
+            None,
+            Some(&proc_args),
+            Some("/tmp/proc-cwd"),
+            Some(&proc_env),
+        )
+        .expect("launch record");
+
+        assert_eq!(record.executable, "/usr/local/bin/agy");
+        assert_eq!(
+            record.arguments,
+            vec![
+                "/usr/local/bin/agy",
+                "--model",
+                "gemini-2.5-pro",
+                "--effort",
+                "high",
+            ]
+        );
+        assert_eq!(record.cwd.as_deref(), Some("/tmp/proc-cwd"));
+        assert_eq!(
+            record.environment.get("AGY_CONFIG_DIR").map(String::as_str),
+            Some("/tmp/agy-cfg")
+        );
     }
 
     fn await_marker(path: &Path) {
@@ -838,7 +680,7 @@ mod tests {
             ],
             cwd: Some("/tmp/project one".to_string()),
             environment: Default::default(),
-            captured_at: 20.0,
+            captured_at: Some(20.0),
         };
 
         let command = build_resume_command(

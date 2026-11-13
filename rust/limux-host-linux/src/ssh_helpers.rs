@@ -11,7 +11,7 @@ const MAX_HELPER_BYTES: usize = 64 * 1024 * 1024;
 
 fn prepare(path: &std::path::Path, agent: &str) -> Result<(Vec<u8>, String), String> {
     use std::io::Read;
-    if !matches!(agent, "codex" | "claude" | "gemini") {
+    if !matches!(agent, "codex" | "claude" | "gemini" | "agy") {
         return Err("Unsupported agent".into());
     }
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -63,7 +63,8 @@ pub fn show(parent: &gtk::Window, target: SshTarget) {
     info.set_wrap(true);
     info.set_xalign(0.0);
     content.append(&info);
-    let agent = gtk::DropDown::from_strings(&["Codex", "Claude Code", "Gemini CLI"]);
+    let agent =
+        gtk::DropDown::from_strings(&["Codex", "Claude Code", "Gemini CLI", "Antigravity (agy)"]);
     content.append(&agent);
     let choose = gtk::Button::with_label("Choose helper executable…");
     content.append(&choose);
@@ -127,7 +128,7 @@ pub fn show(parent: &gtk::Window, target: SshTarget) {
         let Some(path) = selected.borrow().clone() else {
             return;
         };
-        let agent_name = ["codex", "claude", "gemini"][agent.selected() as usize];
+        let agent_name = ["codex", "claude", "gemini", "agy"][agent.selected() as usize];
         install.set_sensitive(false);
         choose.set_sensitive(false);
         agent.set_sensitive(false);
@@ -346,6 +347,58 @@ mod tests {
                 .status
                 .success()
         );
+    }
+
+    #[test]
+    fn installer_supports_agy_and_rejects_symlinked_gemini_parent() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let home = tempfile::tempdir().unwrap();
+        let helper = b"#!/bin/sh\nif [ \"$1\" = --help ]; then echo 'hooks setup [agent] [--osc]'; else test \"$1 $2 $3 $4\" = 'hooks setup agy --osc' || exit 19; mkdir -p \"$GEMINI_CONFIG_DIR/config\"; echo installed > \"$GEMINI_CONFIG_DIR/config/hooks.json\"; fi\n";
+        let mut checksum = glib::Checksum::new(glib::ChecksumType::Sha256).unwrap();
+        checksum.update(helper);
+        let hash = checksum.string().unwrap();
+
+        let run_agy = |home_dir: &std::path::Path| {
+            let mut child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    INSTALL_SCRIPT,
+                    "installer",
+                    &hash,
+                    std::env::consts::ARCH,
+                    "agy",
+                    &helper.len().to_string(),
+                ])
+                .env("HOME", home_dir)
+                .env("AGY_CONFIG_DIR", "")
+                .env("GEMINI_CONFIG_DIR", "")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let _ = child.stdin.take().unwrap().write_all(helper);
+            child.wait_with_output().unwrap()
+        };
+
+        let result = run_agy(home.path());
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".gemini/config/hooks.json")).unwrap(),
+            "installed\n"
+        );
+
+        let home2 = tempfile::tempdir().unwrap();
+        let target_dir = home2.path().join("redirected");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::os::unix::fs::symlink(&target_dir, home2.path().join(".gemini")).unwrap();
+        assert!(!run_agy(home2.path()).status.success());
     }
     #[test]
     #[ignore = "requires built limux-cli; runs in maintained GUI harness"]
