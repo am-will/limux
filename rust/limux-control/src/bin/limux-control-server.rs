@@ -1,7 +1,10 @@
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use limux_control::socket_path::{resolve_socket_path, SocketMode};
+use limux_control::socket_path::{
+    default_runtime_dir, ensure_private_dir, resolve_socket_path, SocketMode,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,11 +48,16 @@ async fn main() -> anyhow::Result<()> {
         if let Some(log_path) = derive_debug_log_path(&socket) {
             std::env::set_var("LIMUX_DEBUG_LOG", &log_path);
             if let Some(parent) = log_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if parent == default_runtime_dir().as_path() {
+                    let _ = ensure_private_dir(parent);
+                } else {
+                    let _ = std::fs::create_dir_all(parent);
+                }
             }
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o600)
                 .open(&log_path);
         }
     }
@@ -62,8 +70,10 @@ fn derive_debug_log_path(socket: &std::path::Path) -> Option<PathBuf> {
     let file_name = socket.file_name()?.to_string_lossy();
     let stem = file_name.strip_suffix(".sock").unwrap_or(&file_name);
     let log_name = format!("{stem}.log");
+    let fallback_dir = default_runtime_dir();
     let parent = socket
         .parent()
-        .unwrap_or_else(|| std::path::Path::new("/tmp"));
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(fallback_dir.as_path());
     Some(parent.join(log_name))
 }

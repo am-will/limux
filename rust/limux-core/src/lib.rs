@@ -3716,6 +3716,61 @@ fn estimate_changed_pixels(previous: &str, current: &str) -> u64 {
     ((diff as u64).saturating_mul(64)).max(24)
 }
 
+fn core_private_runtime_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    let euid = std::fs::metadata("/proc/self")
+        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+        .unwrap_or(0);
+    #[cfg(not(unix))]
+    let euid = 0_u32;
+
+    let candidate = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|dir| {
+            #[cfg(unix)]
+            {
+                std::fs::symlink_metadata(dir)
+                    .map(|meta| {
+                        meta.file_type().is_dir()
+                            && !meta.file_type().is_symlink()
+                            && std::os::unix::fs::MetadataExt::uid(&meta) == euid
+                    })
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                dir.is_dir()
+            }
+        })
+        .map(|dir| dir.join("limux"))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("limux-{euid}")));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        let _ = builder.create(&candidate);
+        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+            if meta.file_type().is_dir()
+                && !meta.file_type().is_symlink()
+                && std::os::unix::fs::MetadataExt::uid(&meta) == euid
+                && (meta.permissions().mode() & 0o777) != 0o700
+            {
+                let _ =
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::create_dir_all(&candidate);
+    }
+
+    candidate
+}
+
 fn debug_log_path() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("LIMUX_DEBUG_LOG") {
         let trimmed = path.trim();
@@ -3723,7 +3778,7 @@ fn debug_log_path() -> std::path::PathBuf {
             return std::path::PathBuf::from(trimmed);
         }
     }
-    std::path::PathBuf::from("/tmp/limux-debug.log")
+    core_private_runtime_dir().join("limux-debug.log")
 }
 
 fn append_debug_log(event: &str) {
@@ -3731,11 +3786,14 @@ fn append_debug_log(event: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(path) {
         let _ = std::io::Write::write_all(&mut file, event.as_bytes());
         let _ = std::io::Write::write_all(&mut file, b"\n");
     }
@@ -6033,14 +6091,18 @@ fn handle_command(
         "browser.is_webview_focused" => Ok(
             json!({ "focused": state.browser.focused, "is_webview_focused": state.browser.focused }),
         ),
-        "browser.screenshot" => Ok(json!({
-            "ok": true,
-            "format": "png",
-            "bytes": 256,
-            "path": "/tmp/limux-browser-shot.png",
-            "url": "file:///tmp/limux-browser-shot.png",
-            "png_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        })),
+        "browser.screenshot" => {
+            let shot_path = core_private_runtime_dir().join("limux-browser-shot.png");
+            let shot_str = shot_path.to_string_lossy().into_owned();
+            Ok(json!({
+                "ok": true,
+                "format": "png",
+                "bytes": 256,
+                "path": shot_str,
+                "url": format!("file://{}", shot_path.display()),
+                "png_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }))
+        }
         "browser.back" => {
             if state.browser.history_index > 0 {
                 state.browser.history_index -= 1;

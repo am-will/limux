@@ -22,39 +22,50 @@ pub(crate) fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn terminal_command_accepts_posix_source(configured_command: Option<&str>) -> bool {
-    let fallback_shell = std::env::var_os("SHELL");
-    terminal_command_accepts_posix_source_with_fallback(
-        configured_command,
-        fallback_shell.as_deref(),
-    )
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AutostartShellKind {
+    Posix,
+    Fish,
+    Nushell,
 }
 
-fn terminal_command_accepts_posix_source_with_fallback(
+pub(crate) fn terminal_command_autostart_shell(
+    configured_command: Option<&str>,
+) -> Option<AutostartShellKind> {
+    let fallback_shell = std::env::var_os("SHELL");
+    terminal_command_autostart_shell_with_fallback(configured_command, fallback_shell.as_deref())
+}
+
+fn terminal_command_autostart_shell_with_fallback(
     configured_command: Option<&str>,
     fallback_shell: Option<&OsStr>,
-) -> bool {
+) -> Option<AutostartShellKind> {
     match configured_command {
-        Some(command) => command_launches_interactive_shell(command),
-        None => fallback_shell
-            .map(|shell| command_launches_interactive_shell(&shell.to_string_lossy()))
+        Some(command) => classify_interactive_shell(command),
+        None => match fallback_shell {
+            Some(shell) => classify_interactive_shell(&shell.to_string_lossy()),
             // Ghostty falls back to the user's passwd shell when SHELL is
-            // absent, so the default command remains an interactive shell.
-            .unwrap_or(true),
+            // absent, so the default command remains a POSIX-compatible shell.
+            None => Some(AutostartShellKind::Posix),
+        },
     }
 }
 
-pub(crate) fn terminal_commands_accept_posix_source(
+pub(crate) fn terminal_commands_autostart_shell(
     command: Option<&str>,
     initial_command: Option<&str>,
-) -> bool {
-    terminal_command_accepts_posix_source(command)
-        && initial_command
-            .map(|command| terminal_command_accepts_posix_source(Some(command)))
-            .unwrap_or(true)
+) -> Option<AutostartShellKind> {
+    let primary = terminal_command_autostart_shell(command)?;
+    match initial_command {
+        Some(initial) => {
+            let initial_kind = terminal_command_autostart_shell(Some(initial))?;
+            (primary == initial_kind).then_some(primary)
+        }
+        None => Some(primary),
+    }
 }
 
-fn command_launches_interactive_shell(command: &str) -> bool {
+fn classify_interactive_shell(command: &str) -> Option<AutostartShellKind> {
     let command = command.trim();
     let command = command
         .strip_prefix("direct:")
@@ -71,16 +82,36 @@ fn command_launches_interactive_shell(command: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
 
-    let supported_shell = matches!(name, "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh");
-
-    supported_shell && arguments.all(is_interactive_shell_argument)
+    match name {
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" => arguments
+            .all(is_interactive_posix_or_nu_argument)
+            .then_some(AutostartShellKind::Posix),
+        "fish" => arguments
+            .all(is_interactive_fish_argument)
+            .then_some(AutostartShellKind::Fish),
+        "nu" => arguments
+            .all(is_interactive_posix_or_nu_argument)
+            .then_some(AutostartShellKind::Nushell),
+        _ => None,
+    }
 }
 
-fn is_interactive_shell_argument(argument: &str) -> bool {
+fn is_interactive_posix_or_nu_argument(argument: &str) -> bool {
     matches!(argument, "-i" | "--interactive" | "-l" | "--login")
         || argument.strip_prefix('-').is_some_and(|flags| {
             !flags.is_empty() && flags.chars().all(|flag| matches!(flag, 'i' | 'l'))
         })
+}
+
+fn is_interactive_fish_argument(argument: &str) -> bool {
+    matches!(
+        argument,
+        "-i" | "--interactive" | "-l" | "--login" | "-P" | "--private"
+    ) || argument.strip_prefix('-').is_some_and(|flags| {
+        !flags.is_empty()
+            && !flags.starts_with('-')
+            && flags.chars().all(|flag| matches!(flag, 'i' | 'l' | 'P'))
+    })
 }
 
 /// Read background-opacity from the Ghostty config file.
@@ -107,8 +138,9 @@ pub fn read_font_size() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_launches_interactive_shell, read_ghostty_value,
-        terminal_command_accepts_posix_source_with_fallback, terminal_commands_accept_posix_source,
+        classify_interactive_shell, read_ghostty_value,
+        terminal_command_autostart_shell_with_fallback, terminal_commands_autostart_shell,
+        AutostartShellKind,
     };
     use std::ffi::OsStr;
 
@@ -130,18 +162,19 @@ mod tests {
             "direct:/bin/bash -lc exec-vim",
             "shell:/usr/bin/zsh -c nvim",
             "/bin/fish script.fish",
-            "fish --login",
-            "nu",
+            "fish -c ls",
+            "nu -c ls",
+            "nu script.nu",
             "elvish",
             "xonsh",
             "",
         ] {
-            assert!(!command_launches_interactive_shell(command), "{command}");
+            assert_eq!(classify_interactive_shell(command), None, "{command}");
         }
     }
 
     #[test]
-    fn terminal_command_classification_accepts_supported_shells() {
+    fn terminal_command_classification_accepts_posix_fish_and_nushell() {
         for command in [
             "/bin/bash",
             "direct:/usr/bin/zsh -l",
@@ -149,34 +182,81 @@ mod tests {
             "'sh'",
             "ksh -il",
         ] {
-            assert!(command_launches_interactive_shell(command), "{command}");
+            assert_eq!(
+                classify_interactive_shell(command),
+                Some(AutostartShellKind::Posix),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "fish",
+            "/usr/bin/fish --login",
+            "direct:/usr/bin/fish -ilP",
+            "fish --private --interactive",
+        ] {
+            assert_eq!(
+                classify_interactive_shell(command),
+                Some(AutostartShellKind::Fish),
+                "{command}"
+            );
+        }
+
+        for command in ["nu", "/usr/bin/nu -l", "direct:/usr/bin/nu --login -i"] {
+            assert_eq!(
+                classify_interactive_shell(command),
+                Some(AutostartShellKind::Nushell),
+                "{command}"
+            );
         }
     }
 
     #[test]
     fn absent_command_uses_shell_fallback() {
-        assert!(terminal_command_accepts_posix_source_with_fallback(
-            None,
-            Some(OsStr::new("/bin/zsh"))
-        ));
-        assert!(!terminal_command_accepts_posix_source_with_fallback(
-            None,
-            Some(OsStr::new("/usr/bin/fish"))
-        ));
-        assert!(terminal_command_accepts_posix_source_with_fallback(
-            None, None
-        ));
+        assert_eq!(
+            terminal_command_autostart_shell_with_fallback(None, Some(OsStr::new("/bin/zsh"))),
+            Some(AutostartShellKind::Posix)
+        );
+        assert_eq!(
+            terminal_command_autostart_shell_with_fallback(None, Some(OsStr::new("/usr/bin/fish"))),
+            Some(AutostartShellKind::Fish)
+        );
+        assert_eq!(
+            terminal_command_autostart_shell_with_fallback(None, Some(OsStr::new("/usr/bin/nu"))),
+            Some(AutostartShellKind::Nushell)
+        );
+        assert_eq!(
+            terminal_command_autostart_shell_with_fallback(None, None),
+            Some(AutostartShellKind::Posix)
+        );
     }
 
     #[test]
-    fn initial_command_must_also_be_an_interactive_posix_shell() {
-        assert!(terminal_commands_accept_posix_source(
-            Some("direct:/bin/bash"),
-            Some("direct:/bin/zsh -l")
-        ));
-        assert!(!terminal_commands_accept_posix_source(
-            Some("direct:/bin/bash"),
-            Some("direct:/usr/bin/vim")
-        ));
+    fn initial_command_must_match_autostart_shell_family() {
+        assert_eq!(
+            terminal_commands_autostart_shell(Some("direct:/bin/bash"), Some("direct:/bin/zsh -l")),
+            Some(AutostartShellKind::Posix)
+        );
+        assert_eq!(
+            terminal_commands_autostart_shell(
+                Some("direct:/usr/bin/fish"),
+                Some("direct:/usr/bin/fish -l")
+            ),
+            Some(AutostartShellKind::Fish)
+        );
+        assert_eq!(
+            terminal_commands_autostart_shell(
+                Some("direct:/usr/bin/fish"),
+                Some("direct:/bin/bash")
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_commands_autostart_shell(
+                Some("direct:/bin/bash"),
+                Some("direct:/usr/bin/vim")
+            ),
+            None
+        );
     }
 }
