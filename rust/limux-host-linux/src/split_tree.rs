@@ -159,7 +159,7 @@ impl SplitNode {
         &self,
         target: &gtk::Widget,
         axis: gtk::Orientation,
-    ) -> Option<Rc<RefCell<f64>>> {
+    ) -> Option<(Rc<RefCell<f64>>, SplitChildSide)> {
         match self {
             SplitNode::Leaf { .. } => None,
             SplitNode::Split {
@@ -169,12 +169,15 @@ impl SplitNode {
                 right,
             } => {
                 if left.contains_pane(target) {
-                    left.nearest_split_ratio_for_pane(target, axis)
-                        .or_else(|| (*orientation == axis).then(|| ratio.clone()))
+                    left.nearest_split_ratio_for_pane(target, axis).or_else(|| {
+                        (*orientation == axis).then(|| (ratio.clone(), SplitChildSide::Start))
+                    })
                 } else if right.contains_pane(target) {
                     right
                         .nearest_split_ratio_for_pane(target, axis)
-                        .or_else(|| (*orientation == axis).then(|| ratio.clone()))
+                        .or_else(|| {
+                            (*orientation == axis).then(|| (ratio.clone(), SplitChildSide::End))
+                        })
                 } else {
                     None
                 }
@@ -207,9 +210,19 @@ impl SplitNode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SplitTreeContainer — manages async widget-tree rebuild lifecycle
-// ---------------------------------------------------------------------------
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitChildSide {
+    Start,
+    End,
+}
+
+fn apply_pane_resize_delta(current_ratio: f64, side: SplitChildSide, raw_delta: f64) -> f64 {
+    let signed_delta = match side {
+        SplitChildSide::Start => raw_delta,
+        SplitChildSide::End => -raw_delta,
+    };
+    layout_state::clamp_split_ratio(current_ratio + signed_delta)
+}
 
 /// Manages the workspace's split layout following Ghostty's atomic rebuild
 /// pattern. Holds a SplitNode data model (source of truth) and a gtk::Box
@@ -466,7 +479,7 @@ impl SplitTreeContainer {
         if !self.contains(target) {
             return false;
         }
-        let Some(ratio_cell) = self
+        let Some((ratio_cell, side)) = self
             .tree
             .borrow()
             .nearest_split_ratio_for_pane(target, axis)
@@ -486,7 +499,7 @@ impl SplitTreeContainer {
             ancestor = widget.parent();
         }
 
-        let delta = if let Some(ref paned) = matched_paned {
+        let raw_delta = if let Some(ref paned) = matched_paned {
             let extent = if axis == gtk::Orientation::Horizontal {
                 paned.width()
             } else {
@@ -501,7 +514,7 @@ impl SplitTreeContainer {
             signed_units * 0.02
         };
 
-        let updated = layout_state::clamp_split_ratio(*ratio_cell.borrow() + delta);
+        let updated = apply_pane_resize_delta(*ratio_cell.borrow(), side, raw_delta);
         *ratio_cell.borrow_mut() = updated;
 
         if let Some(paned) = matched_paned {
@@ -1168,6 +1181,17 @@ mod tests {
     }
 
     #[test]
+    fn pane_resize_delta_grows_requested_side_for_start_and_end_children() {
+        // Positive delta (right/down) grows a Start child by increasing split ratio,
+        // and grows an End child by decreasing split ratio.
+        assert!((apply_pane_resize_delta(0.5, SplitChildSide::Start, 0.1) - 0.6).abs() < 1e-9);
+        assert!((apply_pane_resize_delta(0.5, SplitChildSide::End, 0.1) - 0.4).abs() < 1e-9);
+        // Negative delta (left/up) shrinks a Start child and shrinks an End child.
+        assert!((apply_pane_resize_delta(0.5, SplitChildSide::Start, -0.1) - 0.4).abs() < 1e-9);
+        assert!((apply_pane_resize_delta(0.5, SplitChildSide::End, -0.1) - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
     #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
     fn split_node_swaps_leaf_panes_and_locates_nearest_split_ratio() {
         if gtk::init().is_err() {
@@ -1204,14 +1228,28 @@ mod tests {
         tree.collect_panes(&mut after);
         assert_eq!(after, vec![c.clone(), b.clone(), a.clone()]);
 
-        let found_vertical = tree
+        let (found_vertical, vertical_side) = tree
             .nearest_split_ratio_for_pane(&b, gtk::Orientation::Vertical)
             .expect("vertical ancestor split");
         assert!(Rc::ptr_eq(&found_vertical, &inner_ratio));
+        assert_eq!(vertical_side, SplitChildSide::Start);
 
-        let found_horizontal = tree
+        let (found_vertical_end, vertical_end_side) = tree
+            .nearest_split_ratio_for_pane(&a, gtk::Orientation::Vertical)
+            .expect("vertical ancestor split for swapped end leaf");
+        assert!(Rc::ptr_eq(&found_vertical_end, &inner_ratio));
+        assert_eq!(vertical_end_side, SplitChildSide::End);
+
+        let (found_horizontal, horizontal_side) = tree
             .nearest_split_ratio_for_pane(&b, gtk::Orientation::Horizontal)
             .expect("horizontal ancestor split");
         assert!(Rc::ptr_eq(&found_horizontal, &outer_ratio));
+        assert_eq!(horizontal_side, SplitChildSide::End);
+
+        let (found_horizontal_start, horizontal_start_side) = tree
+            .nearest_split_ratio_for_pane(&c, gtk::Orientation::Horizontal)
+            .expect("horizontal ancestor split for swapped start leaf");
+        assert!(Rc::ptr_eq(&found_horizontal_start, &outer_ratio));
+        assert_eq!(horizontal_start_side, SplitChildSide::Start);
     }
 }

@@ -1241,17 +1241,53 @@ pub fn navigate_browser_surface(
     *uri_cell.borrow_mut() = Some(url.to_string());
     #[cfg(feature = "webkit")]
     {
-        if let Some(url_entry) = content
+        type PremapNavSlot = Rc<RefCell<Option<String>>>;
+        const PREMAP_NAV_KEY: &str = "limux-premap-nav-url";
+
+        let url_entry = content
             .first_child()
             .and_then(|nav| nav.last_child())
-            .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
-        {
-            url_entry.set_text(url);
+            .and_then(|widget| widget.downcast::<gtk::Entry>().ok());
+        if let Some(ref entry) = url_entry {
+            entry.set_text(url);
         }
         if let Some(webview) = content
             .last_child()
             .and_then(|widget| widget.downcast::<webkit6::WebView>().ok())
         {
+            if !content.is_mapped() {
+                let existing_slot = unsafe {
+                    content
+                        .data::<PremapNavSlot>(PREMAP_NAV_KEY)
+                        .map(|p| p.as_ref().clone())
+                };
+                match existing_slot {
+                    Some(slot) if slot.borrow().is_some() => {
+                        *slot.borrow_mut() = Some(url.to_string());
+                    }
+                    None if webview.uri().is_none() => {
+                        let slot: PremapNavSlot = Rc::new(RefCell::new(Some(url.to_string())));
+                        unsafe {
+                            content.set_data(PREMAP_NAV_KEY, slot.clone());
+                        }
+                        let webview_weak = webview.downgrade();
+                        let entry_weak = url_entry.as_ref().map(|entry| entry.downgrade());
+                        let saved_uri = uri_cell.clone();
+                        content.connect_map(move |_| {
+                            if let Some(pending_url) = slot.borrow_mut().take() {
+                                *saved_uri.borrow_mut() = Some(pending_url.clone());
+                                if let Some(entry) = entry_weak.as_ref().and_then(|e| e.upgrade()) {
+                                    entry.set_text(&pending_url);
+                                }
+                                if let Some(wv) = webview_weak.upgrade() {
+                                    wv.load_uri(&pending_url);
+                                }
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
             webview.load_uri(url);
         }
     }
@@ -1272,6 +1308,63 @@ pub fn tab_ids_in_pane(pane_widget: &gtk::Widget) -> Vec<String> {
         .iter()
         .map(|entry| entry.id.clone())
         .collect()
+}
+
+pub(crate) fn preserved_active_tab_for_batch_move<'a>(
+    source_active_tab: Option<&'a str>,
+    tabs_to_move: &[String],
+) -> Option<&'a str> {
+    source_active_tab.filter(|active| tabs_to_move.iter().any(|tab_id| tab_id == active))
+}
+
+pub fn move_tabs_preserving_active(
+    source_pane: &gtk::Widget,
+    tabs_to_move: &[String],
+    dest_pane: &gtk::Widget,
+) -> bool {
+    let source_active = active_tab_in_pane(source_pane);
+    let preserved_active =
+        preserved_active_tab_for_batch_move(source_active.as_deref(), tabs_to_move)
+            .map(str::to_owned);
+    let mut moved_any = false;
+    for tab_id in tabs_to_move {
+        if move_tab_to_pane(source_pane, tab_id, dest_pane) {
+            moved_any = true;
+        }
+    }
+    if moved_any {
+        if let Some(active_tab_id) = preserved_active.as_deref() {
+            let _ = activate_tab_in_pane(dest_pane, active_tab_id);
+        }
+    }
+    moved_any
+}
+
+#[cfg(test)]
+mod batch_move_tests {
+    use super::preserved_active_tab_for_batch_move;
+
+    #[test]
+    fn batch_move_preserves_source_active_tab_when_included_in_moved_set() {
+        let tabs = vec![
+            "tab-a".to_string(),
+            "tab-b".to_string(),
+            "tab-c".to_string(),
+        ];
+        assert_eq!(
+            preserved_active_tab_for_batch_move(Some("tab-a"), &tabs),
+            Some("tab-a")
+        );
+        assert_eq!(
+            preserved_active_tab_for_batch_move(Some("tab-b"), &tabs),
+            Some("tab-b")
+        );
+        assert_eq!(
+            preserved_active_tab_for_batch_move(Some("tab-other"), &tabs),
+            None
+        );
+        assert_eq!(preserved_active_tab_for_batch_move(None, &tabs), None);
+    }
 }
 
 // ---------------------------------------------------------------------------

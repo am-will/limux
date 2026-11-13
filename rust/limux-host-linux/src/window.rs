@@ -6007,10 +6007,14 @@ fn break_tabs_into_new_workspace(
     let Some(first_tab_id) = tabs_to_move.first() else {
         return Err(BridgeError::not_found("surface not found"));
     };
-    let Some(title) = pane::tab_title(source_pane, first_tab_id) else {
+    let active_seed_tab = pane::active_tab_in_pane(source_pane);
+    let seed_tab_id =
+        pane::preserved_active_tab_for_batch_move(active_seed_tab.as_deref(), tabs_to_move)
+            .unwrap_or(first_tab_id.as_str());
+    let Some(title) = pane::tab_title(source_pane, seed_tab_id) else {
         return Err(BridgeError::not_found("surface not found"));
     };
-    let tab_cwd = pane::tab_working_directory(source_pane, first_tab_id);
+    let tab_cwd = pane::tab_working_directory(source_pane, seed_tab_id);
     let (seed, previous_active_workspace_id, shortcuts) = {
         let app_state = state.borrow();
         let source = app_state
@@ -6137,12 +6141,7 @@ fn break_tabs_into_new_workspace(
     sidebar_groups::sync_row_visibility(state);
 
     let dest_widget: gtk::Widget = dest_pane.upcast();
-    let mut moved_any = false;
-    for tab_id in tabs_to_move {
-        if pane::move_tab_to_pane(source_pane, tab_id, &dest_widget) {
-            moved_any = true;
-        }
-    }
+    let moved_any = pane::move_tabs_preserving_active(source_pane, tabs_to_move, &dest_widget);
     if !moved_any {
         close_workspace_by_id_internal(
             state,
@@ -7293,9 +7292,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let _ = reply.send(Err(BridgeError::not_found("source pane has no surfaces")));
                 return;
             }
-            for tab_id in &tab_ids {
-                let _ = pane::move_tab_to_pane(&source_pane_widget, tab_id, &dest_pane_widget);
-            }
+            let _ =
+                pane::move_tabs_preserving_active(&source_pane_widget, &tab_ids, &dest_pane_widget);
             request_session_save(state);
 
             let response = serde_json::json!({
