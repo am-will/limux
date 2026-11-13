@@ -1167,6 +1167,113 @@ pub fn terminal_handle_for_surface(
     ))
 }
 
+pub fn browser_target_for_surface(
+    pane_widget: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<(String, String, BrowserShortcutTarget)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    let browser_tab_ids = tab_state.tabs.iter().filter_map(|entry| {
+        matches!(entry.kind, TabKind::Browser { .. }).then_some(entry.id.as_str())
+    });
+    let tab_id = select_terminal_tab(
+        internals.pane_id,
+        browser_tab_ids,
+        tab_state.active_tab.as_deref(),
+        surface_hint,
+    )?;
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+    let TabKind::Browser { state } = &entry.kind else {
+        return None;
+    };
+    Some((
+        composite_surface_id(internals.pane_id, tab_id),
+        entry.title_label.label().to_string(),
+        BrowserShortcutTarget {
+            uri: state.uri.clone(),
+            handles: state.handles.clone(),
+        },
+    ))
+}
+
+pub fn browser_target_for_root(
+    root: &gtk::Widget,
+) -> Option<(String, String, BrowserShortcutTarget)> {
+    pane_internals_for_root(root)
+        .into_iter()
+        .find_map(|internals| {
+            let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+            browser_target_for_surface(&pane_widget, None)
+        })
+}
+
+pub fn navigate_browser_surface(
+    pane_widget: &gtk::Widget,
+    surface_hint: Option<&str>,
+    url: &str,
+) -> Option<(String, String)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let (surface_id, title, content, uri_cell, callbacks) = {
+        let tab_state = internals.tab_state.borrow();
+        let browser_tab_ids = tab_state.tabs.iter().filter_map(|entry| {
+            matches!(entry.kind, TabKind::Browser { .. }).then_some(entry.id.as_str())
+        });
+        let tab_id = select_terminal_tab(
+            internals.pane_id,
+            browser_tab_ids,
+            tab_state.active_tab.as_deref(),
+            surface_hint,
+        )?;
+        let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+        let TabKind::Browser { state } = &entry.kind else {
+            return None;
+        };
+        let callbacks = state.callbacks.borrow().clone();
+        (
+            composite_surface_id(internals.pane_id, tab_id),
+            entry.title_label.label().to_string(),
+            entry.content.clone(),
+            state.uri.clone(),
+            callbacks,
+        )
+    };
+
+    *uri_cell.borrow_mut() = Some(url.to_string());
+    #[cfg(feature = "webkit")]
+    {
+        if let Some(url_entry) = content
+            .first_child()
+            .and_then(|nav| nav.last_child())
+            .and_then(|widget| widget.downcast::<gtk::Entry>().ok())
+        {
+            url_entry.set_text(url);
+        }
+        if let Some(webview) = content
+            .last_child()
+            .and_then(|widget| widget.downcast::<webkit6::WebView>().ok())
+        {
+            webview.load_uri(url);
+        }
+    }
+    #[cfg(not(feature = "webkit"))]
+    let _ = &content;
+
+    (callbacks.on_state_changed)();
+    Some((surface_id, title))
+}
+
+pub fn tab_ids_in_pane(pane_widget: &gtk::Widget) -> Vec<String> {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return Vec::new();
+    };
+    let tab_state = internals.tab_state.borrow();
+    tab_state
+        .tabs
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Internal tab state
 // ---------------------------------------------------------------------------
