@@ -80,6 +80,11 @@ impl Client {
         let stream = UnixStream::connect(&self.socket)
             .await
             .with_context(|| format!("failed to connect to socket {}", self.socket.display()))?;
+        limux_control::auth::verify_server_peer(
+            &stream,
+            limux_control::auth::SocketControlMode::from_env(),
+        )
+        .with_context(|| format!("untrusted server on socket {}", self.socket.display()))?;
         let (reader_half, mut writer_half) = stream.into_split();
 
         let mut payload = serde_json::to_string(&request).context("failed to encode request")?;
@@ -516,7 +521,7 @@ fn trailing_title(args: &[String]) -> Option<String> {
     }
 }
 
-fn wait_signal_path(name: &str) -> PathBuf {
+fn wait_signal_path(name: &str) -> Result<PathBuf> {
     let sanitized: String = name
         .chars()
         .map(|ch| {
@@ -527,7 +532,9 @@ fn wait_signal_path(name: &str) -> PathBuf {
             }
         })
         .collect();
-    PathBuf::from(format!("/tmp/limux-wait-for-{}.sig", sanitized))
+    let dir = limux_control::socket_path::ensure_private_runtime_subdir("wait-for")
+        .context("failed to prepare private wait-for directory")?;
+    Ok(dir.join(format!("wait-for-{sanitized}.sig")))
 }
 
 fn read_json_map(path: &str) -> BTreeMap<String, String> {
@@ -536,17 +543,27 @@ fn read_json_map(path: &str) -> BTreeMap<String, String> {
 }
 
 fn write_json_map(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let encoded = serde_json::to_string_pretty(map).context("failed to encode json map")?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        limux_control::socket_path::ensure_private_dir(parent)
+            .with_context(|| format!("failed to prepare {}", parent.display()))?;
     }
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), nonce));
-    fs::write(&tmp, encoded).with_context(|| format!("failed to write {}", tmp.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    file.write_all(encoded.as_bytes())
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
 }
@@ -558,9 +575,18 @@ fn socket_state_namespace(socket: &Path) -> String {
 }
 
 fn cli_state_dir(socket: &Path) -> PathBuf {
-    env::temp_dir()
-        .join("limux-cli")
+    limux_control::socket_path::default_runtime_dir()
+        .join("cli")
         .join(socket_state_namespace(socket))
+}
+
+fn ensure_cli_state_dir(socket: &Path) -> Result<PathBuf> {
+    let base = limux_control::socket_path::ensure_private_runtime_subdir("cli")
+        .context("failed to prepare private CLI state directory")?;
+    let dir = base.join(socket_state_namespace(socket));
+    limux_control::socket_path::ensure_private_dir(&dir)
+        .with_context(|| format!("failed to prepare {}", dir.display()))?;
+    Ok(dir)
 }
 
 fn cli_state_path(socket: &Path, kind: &str) -> PathBuf {
@@ -582,14 +608,16 @@ impl Drop for CliStateLock {
 }
 
 fn acquire_cli_state_lock(socket: &Path, kind: &str) -> Result<CliStateLock> {
-    let dir = cli_state_dir(socket);
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let _dir = ensure_cli_state_dir(socket)?;
     let lock_path = cli_state_lock_path(socket, kind);
     let deadline = Instant::now() + CLI_STATE_LOCK_TIMEOUT;
     loop {
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&lock_path)
         {
             Ok(_) => return Ok(CliStateLock { path: lock_path }),
@@ -3264,18 +3292,31 @@ async fn run_browser(
             let mut payload =
                 browser_call(client, Some(sid), "browser.screenshot", Map::new()).await?;
             let out = parse_opt(&browser_args, "--out");
-            let mut path = get_string(&payload, &["path"])
-                .unwrap_or_else(|| "/tmp/limux-browser-shot.png".to_string());
+            let mut path = match get_string(&payload, &["path"]) {
+                Some(path) => path,
+                None => limux_control::socket_path::ensure_private_runtime_dir()
+                    .context("failed to prepare private screenshot directory")?
+                    .join("limux-browser-shot.png")
+                    .to_string_lossy()
+                    .into_owned(),
+            };
             if let Some(out_path) = out {
                 path = out_path;
             }
             if !Path::new(&path).exists() {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
                 if let Some(parent) = Path::new(&path).parent() {
                     fs::create_dir_all(parent).with_context(|| {
                         format!("failed to create screenshot directory {}", parent.display())
                     })?;
                 }
-                fs::write(&path, [])
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)
                     .with_context(|| format!("failed to create screenshot {}", path))?;
             }
             let url = format!("file://{}", path);
@@ -3650,9 +3691,20 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             let timeout = parse_opt(args, "--timeout")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(5);
-            let path = wait_signal_path(&name);
+            let path = wait_signal_path(&name)?;
             if signal {
-                fs::write(&path, b"1").context("failed to write wait-for signal")?;
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .context("failed to create wait-for signal")?;
+                file.write_all(b"1")
+                    .context("failed to write wait-for signal")?;
                 Ok(json!({"ok": true, "name": name}))
             } else {
                 let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -5267,5 +5319,50 @@ mod new_pane_tests {
                 "type": "terminal"
             })
         );
+    }
+
+    #[test]
+    fn cli_runtime_paths_avoid_shared_tmp_and_enforce_private_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let signal_path = super::wait_signal_path("agent/ready").expect("wait_signal_path");
+        assert!(
+            signal_path.starts_with(limux_control::socket_path::default_runtime_dir()),
+            "unexpected signal path: {}",
+            signal_path.display()
+        );
+        assert_ne!(
+            signal_path.parent(),
+            Some(std::path::Path::new("/tmp")),
+            "signal path must not live directly in /tmp"
+        );
+        let signal_parent_mode = std::fs::symlink_metadata(signal_path.parent().unwrap())
+            .expect("signal dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(signal_parent_mode, 0o700);
+
+        let fake_socket = limux_control::socket_path::default_runtime_dir().join("test-cli.sock");
+        super::with_locked_json_map(&fake_socket, "hooks-test", |map, path| {
+            map.insert("pane-focus-in".to_string(), "echo ok".to_string());
+            super::write_json_map(path, map)
+        })
+        .expect("with_locked_json_map");
+        let state_path = super::cli_state_path(&fake_socket, "hooks-test");
+        assert!(state_path.starts_with(limux_control::socket_path::default_runtime_dir()));
+        let state_mode = std::fs::symlink_metadata(&state_path)
+            .expect("state file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(state_mode, 0o600);
+        let state_dir_mode = std::fs::symlink_metadata(state_path.parent().unwrap())
+            .expect("state dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(state_dir_mode, 0o700);
+        let _ = std::fs::remove_file(&state_path);
     }
 }

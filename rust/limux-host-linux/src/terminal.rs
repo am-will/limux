@@ -49,7 +49,8 @@ unsafe impl Sync for GhosttyState {}
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
-static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
+static CURRENT_AUTOSTART_SHELL_KIND: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(1);
 static GHOSTTY_WAKEUP: LazyLock<wakeup::Wakeup> = LazyLock::new(wakeup::Wakeup::default);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
 
@@ -755,7 +756,25 @@ fn load_ghostty_config() -> ghostty_config_t {
     }
 }
 
-fn load_command_accepts_shell_input(config: ghostty_config_t) -> bool {
+fn encode_autostart_shell_kind(kind: Option<crate::ghostty_config::AutostartShellKind>) -> u8 {
+    match kind {
+        None => 0,
+        Some(crate::ghostty_config::AutostartShellKind::Posix) => 1,
+        Some(crate::ghostty_config::AutostartShellKind::Fish) => 2,
+        Some(crate::ghostty_config::AutostartShellKind::Nushell) => 3,
+    }
+}
+
+fn decode_autostart_shell_kind(raw: u8) -> Option<crate::ghostty_config::AutostartShellKind> {
+    match raw {
+        1 => Some(crate::ghostty_config::AutostartShellKind::Posix),
+        2 => Some(crate::ghostty_config::AutostartShellKind::Fish),
+        3 => Some(crate::ghostty_config::AutostartShellKind::Nushell),
+        _ => None,
+    }
+}
+
+fn load_autostart_shell_kind(config: ghostty_config_t) -> u8 {
     let contents = serialized_config(config);
 
     let command = contents
@@ -766,10 +785,10 @@ fn load_command_accepts_shell_input(config: ghostty_config_t) -> bool {
         .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "initial-command"))
         .filter(|command| !command.trim().is_empty());
 
-    crate::ghostty_config::terminal_commands_accept_posix_source(
+    encode_autostart_shell_kind(crate::ghostty_config::terminal_commands_autostart_shell(
         command.as_deref(),
         initial_command.as_deref(),
-    )
+    ))
 }
 
 fn serialized_config(config: ghostty_config_t) -> Option<String> {
@@ -796,8 +815,7 @@ pub fn init_ghostty() {
         let config = load_ghostty_config();
         let background_opacity = load_background_opacity(config);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
-        CURRENT_COMMAND_ACCEPTS_SHELL_INPUT
-            .store(load_command_accepts_shell_input(config), Ordering::Relaxed);
+        CURRENT_AUTOSTART_SHELL_KIND.store(load_autostart_shell_kind(config), Ordering::Relaxed);
 
         let runtime_config = ghostty_runtime_config_s {
             userdata: ptr::null_mut(),
@@ -832,9 +850,9 @@ pub fn ghostty_background_opacity() -> f64 {
         .unwrap_or(1.0)
 }
 
-pub fn terminal_command_accepts_shell_input() -> bool {
+pub(crate) fn terminal_autostart_shell_kind() -> Option<crate::ghostty_config::AutostartShellKind> {
     init_ghostty();
-    CURRENT_COMMAND_ACCEPTS_SHELL_INPUT.load(Ordering::Relaxed)
+    decode_autostart_shell_kind(CURRENT_AUTOSTART_SHELL_KIND.load(Ordering::Relaxed))
 }
 
 fn load_background_opacity(config: ghostty_config_t) -> f64 {
@@ -1236,8 +1254,8 @@ unsafe extern "C" fn ghostty_action_cb(
         GHOSTTY_ACTION_RELOAD_CONFIG => {
             let config = load_ghostty_config();
             CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
-            CURRENT_COMMAND_ACCEPTS_SHELL_INPUT
-                .store(load_command_accepts_shell_input(config), Ordering::Relaxed);
+            CURRENT_AUTOSTART_SHELL_KIND
+                .store(load_autostart_shell_kind(config), Ordering::Relaxed);
             match target.tag {
                 GHOSTTY_TARGET_APP => unsafe {
                     ghostty_app_update_config(app, config);
