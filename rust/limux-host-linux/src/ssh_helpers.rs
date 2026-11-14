@@ -422,13 +422,7 @@ mod tests {
                 std::env::var("PATH").unwrap()
             ),
         );
-        let cli = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("limux-cli");
+        let cli = crate::layout_state::test_limux_cli_path();
         let (bytes, script) = prepare(&cli, "codex").unwrap();
         let context = glib::MainContext::default();
         let _guard = context.acquire().unwrap();
