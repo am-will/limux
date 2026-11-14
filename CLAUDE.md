@@ -50,7 +50,7 @@ rg -n "PaneCallbacks \{"                           rust/limux-host-linux/src/win
 | New agent in `agent-team` | `agent_launch_command` in `rust/limux-cli/src/main.rs` |
 | Generated AGENTS.md template | `build_agents_md` in `rust/limux-cli/src/main.rs` |
 | New CLI subcommand | dispatch match in `rust/limux-cli/src/main.rs` |
-| Canonical RPC method registry | `rust/limux-protocol/src/methods.rs` |
+| Canonical RPC method registry | `rust/limux-protocol/src/methods.rs` (`CORE_COMMAND_NAMES`, `GTK_BRIDGE_COMMAND_NAMES`, `wire_aliases`, `cli_subcommands`) |
 | GUI bridge routing | `rust/limux-host-linux/src/control_bridge.rs` |
 | Full-vocabulary control (no GUI) | `limux-core::Dispatcher` + `ControlState` |
 | Pane / surface UI state | `rust/limux-host-linux/src/window.rs` (`PaneCallbacks`), `window/` (`session_persistence.rs`, `navigation_notifications.rs`, `sidebar_groups.rs`, `gui_hooks.rs`), `pane/` (`tab_header.rs`, `drag_drop.rs`) |

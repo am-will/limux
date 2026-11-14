@@ -18,43 +18,7 @@ use serde_json::{json, Map, Value};
 use crate::gui_hooks::{GuiHookEvent, GuiHookUpdate};
 use crate::workspace_color::WorkspaceColor;
 
-const METHODS: &[&str] = &[
-    "system.ping",
-    "system.identify",
-    "system.capabilities",
-    "window.activate",
-    "workspace.current",
-    "workspace.list",
-    "workspace.create",
-    "workspace.select",
-    "workspace.rename",
-    "workspace.set_color",
-    "workspace.set_group",
-    "workspace.group_list",
-    "workspace.group_create",
-    "workspace.group_rename",
-    "workspace.group_set_color",
-    "workspace.group_set_collapsed",
-    "workspace.group_delete",
-    "workspace.close",
-    "pane.list",
-    "pane.surfaces",
-    "pane.create",
-    "surface.list",
-    "surface.health",
-    "surface.read_text",
-    "surface.send_text",
-    "surface.send_key",
-    "surface.create",
-    "surface.close",
-    "surface.focus",
-    "pane.focus",
-    "tab.action",
-    "notification.create",
-    "gui_hook.list",
-    "gui_hook.set",
-    "gui_hook.clear",
-];
+const METHODS: &[&str] = &limux_protocol::methods::GTK_BRIDGE_COMMAND_NAMES;
 
 const PARSE_ERROR_CODE: i64 = -32700;
 const INVALID_PARAMS_CODE: i64 = -32602;
@@ -367,13 +331,22 @@ impl BridgeError {
     }
 }
 
+fn normalize_wire_request(mut request: V2Request) -> V2Request {
+    if let Some(canonical) = limux_protocol::methods::canonical_wire_method_name(&request.method) {
+        if request.method != canonical {
+            request.method = canonical.to_string();
+        }
+    }
+    request
+}
+
 fn parse_request(input: &str) -> Result<V2Request, BridgeError> {
     if let Ok(request) = serde_json::from_str::<V2Request>(input) {
-        return Ok(request);
+        return Ok(normalize_wire_request(request));
     }
 
     match parse_v1_command_envelope(input) {
-        Ok(v1) => Ok(v1.into_v2_request(None)),
+        Ok(v1) => Ok(normalize_wire_request(v1.into_v2_request(None))),
         Err(error) => Err(BridgeError::new(
             PARSE_ERROR_CODE,
             format!("invalid request payload: {error}"),
@@ -903,13 +876,14 @@ fn handle_method(
     params: Value,
     dispatch: &dyn Fn(ControlCommand),
 ) -> V2Response {
+    let method = limux_protocol::methods::canonical_wire_method_name(method).unwrap_or(method);
     let params = match params_object(&params) {
         Ok(params) => params,
         Err(error) => return error_response(id, error),
     };
 
     let queued = match method {
-        "system.ping" | "ping" => return V2Response::success(id, json!({ "pong": true })),
+        "system.ping" => return V2Response::success(id, json!({ "pong": true })),
         "system.capabilities" => {
             return V2Response::success(id, json!({ "commands": METHODS, "methods": METHODS }));
         }
@@ -951,11 +925,11 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CurrentWorkspace { reply }, rx)
         }
-        "workspace.list" | "list-workspaces" => {
+        "workspace.list" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListWorkspaces { reply }, rx)
         }
-        "pane.list" | "list-panes" => {
+        "pane.list" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -978,7 +952,7 @@ fn handle_method(
                 rx,
             )
         }
-        "pane.create" | "new-pane" => {
+        "pane.create" => {
             let request = match parse_create_pane_request(params) {
                 Ok(request) => request,
                 Err(error) => return error_response(id, error),
@@ -986,7 +960,7 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CreatePane { request, reply }, rx)
         }
-        "surface.list" | "list-panels" => {
+        "surface.list" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -994,7 +968,7 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListSurfaces { target, reply }, rx)
         }
-        "surface.health" | "surface-health" => {
+        "surface.health" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1014,7 +988,7 @@ fn handle_method(
                 rx,
             )
         }
-        "surface.read_text" | "read-screen" | "capture-pane" => {
+        "surface.read_text" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1033,7 +1007,7 @@ fn handle_method(
                 rx,
             )
         }
-        "workspace.create" | "new-workspace" => {
+        "workspace.create" => {
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::CreateWorkspace {
@@ -1045,7 +1019,7 @@ fn handle_method(
                 rx,
             )
         }
-        "workspace.select" | "workspace.activate" | "activate-workspace" => {
+        "workspace.select" => {
             let target = match parse_required_workspace_target(params, true, method) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1053,7 +1027,7 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::SelectWorkspace { target, reply }, rx)
         }
-        "workspace.rename" | "rename-workspace" => {
+        "workspace.rename" => {
             let Some(title) = optional_string(params, &["title", "name"]) else {
                 return error_response(
                     id,
@@ -1074,7 +1048,7 @@ fn handle_method(
                 rx,
             )
         }
-        "workspace.set_color" | "set-workspace-color" => {
+        "workspace.set_color" => {
             let color = match parse_workspace_color(params) {
                 Ok(color) => color,
                 Err(error) => return error_response(id, error),
@@ -1094,28 +1068,13 @@ fn handle_method(
             )
         }
         "workspace.group_list"
-        | "list-groups"
         | "workspace.group_create"
-        | "create-group"
         | "workspace.group_rename"
-        | "rename-group"
         | "workspace.group_set_color"
-        | "set-group-color"
         | "workspace.group_set_collapsed"
         | "workspace.group_delete"
-        | "delete-group"
-        | "workspace.set_group"
-        | "set-workspace-group" => {
-            let canonical = match method {
-                "list-groups" => "workspace.group_list",
-                "create-group" => "workspace.group_create",
-                "rename-group" => "workspace.group_rename",
-                "set-group-color" => "workspace.group_set_color",
-                "delete-group" => "workspace.group_delete",
-                "set-workspace-group" => "workspace.set_group",
-                method => method,
-            };
-            let request = match parse_group_request(canonical, params) {
+        | "workspace.set_group" => {
+            let request = match parse_group_request(method, params) {
                 Ok(request) => request,
                 Err(error) => return error_response(id, error),
             };
@@ -1130,7 +1089,7 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::GuiHook { request, reply }, rx)
         }
-        "workspace.close" | "close-workspace" => {
+        "workspace.close" => {
             let target = match parse_optional_workspace_target(params, false) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1138,7 +1097,7 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CloseWorkspace { target, reply }, rx)
         }
-        "surface.send_text" | "send-text" | "send" => {
+        "surface.send_text" => {
             let Some(text) = params
                 .get("text")
                 .and_then(Value::as_str)
@@ -1171,7 +1130,7 @@ fn handle_method(
                 rx,
             )
         }
-        "surface.create" | "new-surface" => {
+        "surface.create" => {
             let target = match parse_lifecycle_workspace_target(params) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1196,7 +1155,7 @@ fn handle_method(
                 rx,
             )
         }
-        "surface.close" | "close-surface" => {
+        "surface.close" => {
             let target = match parse_lifecycle_workspace_target(params) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1215,7 +1174,7 @@ fn handle_method(
                 rx,
             )
         }
-        "surface.focus" | "focus-surface" => {
+        "surface.focus" => {
             let target = match parse_lifecycle_workspace_target(params) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1234,7 +1193,7 @@ fn handle_method(
                 rx,
             )
         }
-        "pane.focus" | "focus-pane" => {
+        "pane.focus" => {
             let target = match parse_lifecycle_workspace_target(params) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -1253,7 +1212,7 @@ fn handle_method(
                 rx,
             )
         }
-        "tab.action" | "tab-action" => {
+        "tab.action" => {
             let Some(action) = optional_string(params, &["action"]) else {
                 return error_response(
                     id,
@@ -1292,7 +1251,7 @@ fn handle_method(
                 rx,
             )
         }
-        "surface.send_key" | "send-key" => {
+        "surface.send_key" => {
             let Some(key) = optional_string(params, &["key"]) else {
                 return error_response(
                     id,
@@ -1318,7 +1277,7 @@ fn handle_method(
                 rx,
             )
         }
-        "notification.create" | "notify" => {
+        "notification.create" => {
             // Title is required; subtitle and body are optional. This mirrors
             // cmux notify's shape (title/subtitle/body) and maps onto the
             // existing sidebar unread pipeline.
@@ -2489,6 +2448,87 @@ mod tests {
                 group_request_error(method, params.clone()),
                 INVALID_PARAMS_CODE,
                 "{method} {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn gtk_bridge_commands_and_wire_aliases_match_protocol_registry() {
+        for &canonical in &limux_protocol::methods::GTK_BRIDGE_COMMAND_NAMES {
+            let parsed =
+                parse_request(&json!({ "id": 1, "method": canonical, "params": {} }).to_string())
+                    .expect("canonical GTK bridge request should parse");
+            assert_eq!(parsed.method, canonical);
+
+            let response = dispatch_request(
+                &json!({ "id": 1, "method": canonical, "params": {} }).to_string(),
+                &|command| command.respond(Ok(json!({}))),
+            );
+            assert_ne!(
+                response.error.as_ref().map(|error| error.code),
+                Some(UNKNOWN_METHOD_CODE),
+                "GTK bridge method {canonical} returned unknown method"
+            );
+        }
+
+        for spec in &limux_protocol::methods::ALL_METHOD_SPECS {
+            if spec.in_gtk_bridge {
+                for &alias in spec.wire_aliases {
+                    let parsed = parse_request(
+                        &json!({ "id": 1, "method": alias, "params": {} }).to_string(),
+                    )
+                    .expect("wire alias should parse");
+                    assert_eq!(parsed.method, spec.name, "wire alias {alias}");
+
+                    let response = dispatch_request(
+                        &json!({ "id": 1, "method": alias, "params": {} }).to_string(),
+                        &|command| command.respond(Ok(json!({}))),
+                    );
+                    assert_ne!(
+                        response.error.as_ref().map(|error| error.code),
+                        Some(UNKNOWN_METHOD_CODE),
+                        "wire alias {alias} for {} returned unknown method",
+                        spec.name
+                    );
+                }
+            } else {
+                let response = dispatch_request(
+                    &json!({ "id": 1, "method": spec.name, "params": {} }).to_string(),
+                    &|command| panic!("core-only method {} reached GTK: {command:?}", spec.name),
+                );
+                assert_eq!(
+                    response.error.as_ref().map(|error| error.code),
+                    Some(UNKNOWN_METHOD_CODE),
+                    "core-only method {} should not be handled by GTK bridge",
+                    spec.name
+                );
+            }
+
+            for &subcommand in spec.cli_subcommands {
+                if spec.wire_aliases.contains(&subcommand) {
+                    continue;
+                }
+                let response = dispatch_request(
+                    &json!({ "id": 1, "method": subcommand, "params": {} }).to_string(),
+                    &|command| panic!("CLI-only subcommand {subcommand} reached GTK: {command:?}"),
+                );
+                assert_eq!(
+                    response.error.as_ref().map(|error| error.code),
+                    Some(UNKNOWN_METHOD_CODE),
+                    "CLI-only subcommand {subcommand} should return UNKNOWN_METHOD_CODE on raw socket"
+                );
+            }
+        }
+
+        for cli_only in ["identify", "next-window", "activate", "select-workspace"] {
+            let response = dispatch_request(
+                &json!({ "id": 1, "method": cli_only, "params": {} }).to_string(),
+                &|command| panic!("CLI-only subcommand {cli_only} reached GTK: {command:?}"),
+            );
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(UNKNOWN_METHOD_CODE),
+                "{cli_only}"
             );
         }
     }

@@ -17,33 +17,56 @@ pub enum MethodCategory {
 pub struct MethodSpec {
     pub name: &'static str,
     pub category: MethodCategory,
-    pub aliases: &'static [&'static str],
     pub in_core: bool,
+    pub in_gtk_bridge: bool,
+    pub wire_aliases: &'static [&'static str],
+    pub cli_subcommands: &'static [&'static str],
 }
 
-const fn core_spec(
+const fn core_only_spec(
     name: &'static str,
     category: MethodCategory,
-    aliases: &'static [&'static str],
+    cli_subcommands: &'static [&'static str],
 ) -> MethodSpec {
     MethodSpec {
         name,
         category,
-        aliases,
         in_core: true,
+        in_gtk_bridge: false,
+        wire_aliases: &[],
+        cli_subcommands,
     }
 }
 
-const fn host_spec(
+const fn shared_spec(
     name: &'static str,
     category: MethodCategory,
-    aliases: &'static [&'static str],
+    wire_aliases: &'static [&'static str],
+    cli_subcommands: &'static [&'static str],
 ) -> MethodSpec {
     MethodSpec {
         name,
         category,
-        aliases,
+        in_core: true,
+        in_gtk_bridge: true,
+        wire_aliases,
+        cli_subcommands,
+    }
+}
+
+const fn gtk_bridge_only_spec(
+    name: &'static str,
+    category: MethodCategory,
+    wire_aliases: &'static [&'static str],
+    cli_subcommands: &'static [&'static str],
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        category,
         in_core: false,
+        in_gtk_bridge: true,
+        wire_aliases,
+        cli_subcommands,
     }
 }
 
@@ -231,348 +254,518 @@ pub const HOST_ONLY_COMMAND_NAMES: [&str; 12] = [
     "gui_hook.clear",
 ];
 
+pub const GTK_BRIDGE_COMMAND_NAMES: [&str; 35] = [
+    "system.ping",
+    "system.identify",
+    "system.capabilities",
+    "window.activate",
+    "workspace.list",
+    "workspace.current",
+    "workspace.create",
+    "workspace.select",
+    "workspace.rename",
+    "workspace.close",
+    "workspace.set_color",
+    "workspace.set_group",
+    "workspace.group_list",
+    "workspace.group_create",
+    "workspace.group_rename",
+    "workspace.group_set_color",
+    "workspace.group_set_collapsed",
+    "workspace.group_delete",
+    "pane.list",
+    "pane.surfaces",
+    "pane.create",
+    "pane.focus",
+    "surface.list",
+    "surface.create",
+    "surface.focus",
+    "surface.close",
+    "surface.health",
+    "surface.read_text",
+    "surface.send_text",
+    "surface.send_key",
+    "notification.create",
+    "tab.action",
+    "gui_hook.list",
+    "gui_hook.set",
+    "gui_hook.clear",
+];
+
 pub const ALL_METHOD_SPECS: [MethodSpec; 178] = [
-    core_spec("system.ping", MethodCategory::System, &["ping"]),
-    core_spec("system.identify", MethodCategory::System, &["identify"]),
-    core_spec(
-        "system.capabilities",
+    shared_spec("system.ping", MethodCategory::System, &["ping"], &[]),
+    shared_spec(
+        "system.identify",
         MethodCategory::System,
-        &["capabilities"],
+        &[],
+        &["identify"],
     ),
-    core_spec("app.focus_override.set", MethodCategory::App, &[]),
-    core_spec("app.simulate_active", MethodCategory::App, &[]),
-    core_spec("window.list", MethodCategory::Window, &["list-windows"]),
-    core_spec("window.current", MethodCategory::Window, &[]),
-    core_spec("window.create", MethodCategory::Window, &["new-window"]),
-    core_spec("window.focus", MethodCategory::Window, &["focus-window"]),
-    core_spec("window.close", MethodCategory::Window, &["close-window"]),
-    host_spec("window.activate", MethodCategory::Window, &["activate"]),
-    core_spec(
+    shared_spec("system.capabilities", MethodCategory::System, &[], &[]),
+    core_only_spec("app.focus_override.set", MethodCategory::App, &[]),
+    core_only_spec("app.simulate_active", MethodCategory::App, &[]),
+    core_only_spec("window.list", MethodCategory::Window, &[]),
+    core_only_spec("window.current", MethodCategory::Window, &[]),
+    core_only_spec("window.create", MethodCategory::Window, &[]),
+    core_only_spec("window.focus", MethodCategory::Window, &[]),
+    core_only_spec("window.close", MethodCategory::Window, &[]),
+    gtk_bridge_only_spec(
+        "window.activate",
+        MethodCategory::Window,
+        &[],
+        &["activate"],
+    ),
+    shared_spec(
         "workspace.list",
         MethodCategory::Workspace,
         &["list-workspaces"],
+        &["list-workspaces"],
     ),
-    core_spec("workspace.current", MethodCategory::Workspace, &[]),
-    core_spec(
+    shared_spec("workspace.current", MethodCategory::Workspace, &[], &[]),
+    shared_spec(
         "workspace.create",
         MethodCategory::Workspace,
         &["new-workspace"],
+        &["new-workspace"],
     ),
-    core_spec(
+    shared_spec(
         "workspace.select",
         MethodCategory::Workspace,
-        &[
-            "workspace.activate",
-            "activate-workspace",
-            "select-workspace",
-        ],
+        &["workspace.activate", "activate-workspace"],
+        &["select-workspace"],
     ),
-    core_spec(
+    core_only_spec(
         "workspace.next",
         MethodCategory::Workspace,
-        &["next-workspace"],
+        &["next-window"],
     ),
-    core_spec(
+    core_only_spec(
         "workspace.previous",
         MethodCategory::Workspace,
-        &["previous-workspace"],
+        &["previous-window"],
     ),
-    core_spec(
+    core_only_spec(
         "workspace.last",
         MethodCategory::Workspace,
-        &["last-workspace"],
+        &["last-window"],
     ),
-    core_spec(
+    shared_spec(
         "workspace.rename",
         MethodCategory::Workspace,
         &["rename-workspace"],
+        &["rename-workspace", "rename-window"],
     ),
-    core_spec("workspace.reorder", MethodCategory::Workspace, &[]),
-    core_spec(
+    core_only_spec("workspace.reorder", MethodCategory::Workspace, &[]),
+    shared_spec(
         "workspace.close",
         MethodCategory::Workspace,
         &["close-workspace"],
+        &["close-workspace"],
     ),
-    core_spec("workspace.move_to_window", MethodCategory::Workspace, &[]),
-    core_spec("workspace.action", MethodCategory::Workspace, &[]),
-    host_spec(
+    core_only_spec("workspace.move_to_window", MethodCategory::Workspace, &[]),
+    core_only_spec("workspace.action", MethodCategory::Workspace, &[]),
+    gtk_bridge_only_spec(
         "workspace.set_color",
         MethodCategory::Workspace,
         &["set-workspace-color"],
+        &["set-workspace-color"],
     ),
-    host_spec(
+    gtk_bridge_only_spec(
         "workspace.set_group",
         MethodCategory::Workspace,
         &["set-workspace-group"],
+        &["set-workspace-group"],
     ),
-    host_spec(
+    gtk_bridge_only_spec(
         "workspace.group_list",
         MethodCategory::Workspace,
         &["list-groups"],
+        &["list-groups"],
     ),
-    host_spec(
+    gtk_bridge_only_spec(
         "workspace.group_create",
         MethodCategory::Workspace,
         &["create-group"],
+        &["create-group"],
     ),
-    host_spec(
+    gtk_bridge_only_spec(
         "workspace.group_rename",
         MethodCategory::Workspace,
         &["rename-group"],
+        &["rename-group"],
     ),
-    host_spec(
+    gtk_bridge_only_spec(
         "workspace.group_set_color",
         MethodCategory::Workspace,
         &["set-group-color"],
+        &["set-group-color"],
     ),
-    host_spec(
+    gtk_bridge_only_spec(
         "workspace.group_set_collapsed",
         MethodCategory::Workspace,
         &[],
+        &["collapse-group", "expand-group"],
     ),
-    host_spec(
+    gtk_bridge_only_spec(
         "workspace.group_delete",
         MethodCategory::Workspace,
         &["delete-group"],
+        &["delete-group"],
     ),
-    core_spec("pane.list", MethodCategory::Pane, &["list-panes"]),
-    core_spec("pane.surfaces", MethodCategory::Pane, &[]),
-    core_spec("pane.create", MethodCategory::Pane, &["new-pane"]),
-    core_spec("pane.focus", MethodCategory::Pane, &["focus-pane"]),
-    core_spec("pane.swap", MethodCategory::Pane, &["swap-pane"]),
-    core_spec("pane.break", MethodCategory::Pane, &["break-pane"]),
-    core_spec("pane.join", MethodCategory::Pane, &["join-pane"]),
-    core_spec("pane.last", MethodCategory::Pane, &["last-pane"]),
-    core_spec("pane.resize", MethodCategory::Pane, &["resize-pane"]),
-    core_spec("surface.list", MethodCategory::Surface, &["list-panels"]),
-    core_spec("surface.current", MethodCategory::Surface, &[]),
-    core_spec("surface.create", MethodCategory::Surface, &["new-surface"]),
-    core_spec("surface.split", MethodCategory::Surface, &["new-split"]),
-    core_spec("surface.focus", MethodCategory::Surface, &["focus-surface"]),
-    core_spec("surface.close", MethodCategory::Surface, &["close-surface"]),
-    core_spec("surface.move", MethodCategory::Surface, &[]),
-    core_spec("surface.reorder", MethodCategory::Surface, &[]),
-    core_spec("surface.drag_to_split", MethodCategory::Surface, &[]),
-    core_spec("surface.refresh", MethodCategory::Surface, &[]),
-    core_spec(
+    shared_spec(
+        "pane.list",
+        MethodCategory::Pane,
+        &["list-panes"],
+        &["list-panes"],
+    ),
+    shared_spec("pane.surfaces", MethodCategory::Pane, &[], &[]),
+    shared_spec(
+        "pane.create",
+        MethodCategory::Pane,
+        &["new-pane"],
+        &["new-pane"],
+    ),
+    shared_spec(
+        "pane.focus",
+        MethodCategory::Pane,
+        &["focus-pane"],
+        &["focus-pane"],
+    ),
+    core_only_spec("pane.swap", MethodCategory::Pane, &[]),
+    core_only_spec("pane.break", MethodCategory::Pane, &["break-pane"]),
+    core_only_spec("pane.join", MethodCategory::Pane, &["join-pane"]),
+    core_only_spec("pane.last", MethodCategory::Pane, &["last-pane"]),
+    core_only_spec("pane.resize", MethodCategory::Pane, &["resize-pane"]),
+    shared_spec(
+        "surface.list",
+        MethodCategory::Surface,
+        &["list-panels"],
+        &["list-panels"],
+    ),
+    core_only_spec("surface.current", MethodCategory::Surface, &[]),
+    shared_spec(
+        "surface.create",
+        MethodCategory::Surface,
+        &["new-surface"],
+        &["new-surface"],
+    ),
+    core_only_spec("surface.split", MethodCategory::Surface, &[]),
+    shared_spec(
+        "surface.focus",
+        MethodCategory::Surface,
+        &["focus-surface"],
+        &["focus-surface"],
+    ),
+    shared_spec(
+        "surface.close",
+        MethodCategory::Surface,
+        &["close-surface"],
+        &["close-surface"],
+    ),
+    core_only_spec("surface.move", MethodCategory::Surface, &[]),
+    core_only_spec("surface.reorder", MethodCategory::Surface, &[]),
+    core_only_spec("surface.drag_to_split", MethodCategory::Surface, &[]),
+    core_only_spec("surface.refresh", MethodCategory::Surface, &[]),
+    shared_spec(
         "surface.health",
         MethodCategory::Surface,
         &["surface-health"],
+        &["surface-health"],
     ),
-    core_spec(
+    shared_spec(
         "surface.read_text",
         MethodCategory::Surface,
         &["read-screen", "capture-pane"],
+        &["read-screen", "capture-pane"],
     ),
-    core_spec(
+    shared_spec(
         "surface.send_text",
         MethodCategory::Surface,
         &["send-text", "send"],
+        &["send"],
     ),
-    core_spec("surface.send_key", MethodCategory::Surface, &["send-key"]),
-    core_spec("surface.trigger_flash", MethodCategory::Surface, &[]),
-    core_spec(
+    shared_spec(
+        "surface.send_key",
+        MethodCategory::Surface,
+        &["send-key"],
+        &["send-key"],
+    ),
+    core_only_spec("surface.trigger_flash", MethodCategory::Surface, &[]),
+    core_only_spec(
         "surface.clear_history",
         MethodCategory::Surface,
         &["clear-history"],
     ),
-    core_spec("surface.action", MethodCategory::Surface, &[]),
-    core_spec(
+    core_only_spec("surface.action", MethodCategory::Surface, &[]),
+    shared_spec(
         "notification.create",
         MethodCategory::Notification,
         &["notify"],
+        &["notify"],
     ),
-    core_spec(
+    core_only_spec(
         "notification.create_for_surface",
         MethodCategory::Notification,
         &[],
     ),
-    core_spec("notification.list", MethodCategory::Notification, &[]),
-    core_spec("notification.clear", MethodCategory::Notification, &[]),
-    core_spec("tab.action", MethodCategory::Tab, &["tab-action"]),
-    host_spec("gui_hook.list", MethodCategory::GuiHook, &[]),
-    host_spec("gui_hook.set", MethodCategory::GuiHook, &[]),
-    host_spec("gui_hook.clear", MethodCategory::GuiHook, &[]),
-    core_spec(
+    core_only_spec("notification.list", MethodCategory::Notification, &[]),
+    core_only_spec("notification.clear", MethodCategory::Notification, &[]),
+    shared_spec(
+        "tab.action",
+        MethodCategory::Tab,
+        &["tab-action"],
+        &["tab-action", "rename-tab"],
+    ),
+    gtk_bridge_only_spec("gui_hook.list", MethodCategory::GuiHook, &[], &[]),
+    gtk_bridge_only_spec("gui_hook.set", MethodCategory::GuiHook, &[], &[]),
+    gtk_bridge_only_spec("gui_hook.clear", MethodCategory::GuiHook, &[], &[]),
+    core_only_spec(
         "browser.open_split",
         MethodCategory::Browser,
-        &["browser.open-split"],
+        &["open-browser"],
     ),
-    core_spec("browser.navigate", MethodCategory::Browser, &[]),
-    core_spec("browser.url.get", MethodCategory::Browser, &[]),
-    core_spec("browser.eval", MethodCategory::Browser, &[]),
-    core_spec("browser.wait", MethodCategory::Browser, &[]),
-    core_spec("browser.click", MethodCategory::Browser, &[]),
-    core_spec("browser.fill", MethodCategory::Browser, &[]),
-    core_spec("browser.get.text", MethodCategory::Browser, &[]),
-    core_spec("browser.get.value", MethodCategory::Browser, &[]),
-    core_spec("browser.get.title", MethodCategory::Browser, &[]),
-    core_spec("browser.snapshot", MethodCategory::Browser, &[]),
-    core_spec("browser.focus_webview", MethodCategory::Browser, &[]),
-    core_spec("browser.is_webview_focused", MethodCategory::Browser, &[]),
-    core_spec("browser.screenshot", MethodCategory::Browser, &[]),
-    core_spec("browser.back", MethodCategory::Browser, &[]),
-    core_spec("browser.forward", MethodCategory::Browser, &[]),
-    core_spec("browser.reload", MethodCategory::Browser, &[]),
-    core_spec("browser.focus", MethodCategory::Browser, &[]),
-    core_spec("browser.hover", MethodCategory::Browser, &[]),
-    core_spec("browser.dblclick", MethodCategory::Browser, &[]),
-    core_spec("browser.press", MethodCategory::Browser, &[]),
-    core_spec("browser.keydown", MethodCategory::Browser, &[]),
-    core_spec("browser.keyup", MethodCategory::Browser, &[]),
-    core_spec("browser.type", MethodCategory::Browser, &[]),
-    core_spec("browser.check", MethodCategory::Browser, &[]),
-    core_spec("browser.uncheck", MethodCategory::Browser, &[]),
-    core_spec("browser.select", MethodCategory::Browser, &[]),
-    core_spec("browser.scroll", MethodCategory::Browser, &[]),
-    core_spec("browser.scroll_into_view", MethodCategory::Browser, &[]),
-    core_spec("browser.get.attr", MethodCategory::Browser, &[]),
-    core_spec("browser.get.box", MethodCategory::Browser, &[]),
-    core_spec("browser.get.count", MethodCategory::Browser, &[]),
-    core_spec("browser.get.html", MethodCategory::Browser, &[]),
-    core_spec("browser.get.styles", MethodCategory::Browser, &[]),
-    core_spec("browser.is.checked", MethodCategory::Browser, &[]),
-    core_spec("browser.is.enabled", MethodCategory::Browser, &[]),
-    core_spec("browser.is.visible", MethodCategory::Browser, &[]),
-    core_spec("browser.find.role", MethodCategory::Browser, &[]),
-    core_spec("browser.find.text", MethodCategory::Browser, &[]),
-    core_spec("browser.find.label", MethodCategory::Browser, &[]),
-    core_spec("browser.find.placeholder", MethodCategory::Browser, &[]),
-    core_spec("browser.find.alt", MethodCategory::Browser, &[]),
-    core_spec("browser.find.title", MethodCategory::Browser, &[]),
-    core_spec("browser.find.testid", MethodCategory::Browser, &[]),
-    core_spec("browser.find.first", MethodCategory::Browser, &[]),
-    core_spec("browser.find.last", MethodCategory::Browser, &[]),
-    core_spec("browser.find.nth", MethodCategory::Browser, &[]),
-    core_spec("browser.highlight", MethodCategory::Browser, &[]),
-    core_spec("browser.viewport.set", MethodCategory::Browser, &[]),
-    core_spec("browser.geolocation.set", MethodCategory::Browser, &[]),
-    core_spec("browser.offline.set", MethodCategory::Browser, &[]),
-    core_spec("browser.trace.start", MethodCategory::Browser, &[]),
-    core_spec("browser.trace.stop", MethodCategory::Browser, &[]),
-    core_spec("browser.network.route", MethodCategory::Browser, &[]),
-    core_spec("browser.network.unroute", MethodCategory::Browser, &[]),
-    core_spec("browser.network.requests", MethodCategory::Browser, &[]),
-    core_spec("browser.screencast.start", MethodCategory::Browser, &[]),
-    core_spec("browser.screencast.stop", MethodCategory::Browser, &[]),
-    core_spec("browser.input_mouse", MethodCategory::Browser, &[]),
-    core_spec("browser.input_keyboard", MethodCategory::Browser, &[]),
-    core_spec("browser.input_touch", MethodCategory::Browser, &[]),
-    core_spec("browser.addscript", MethodCategory::Browser, &[]),
-    core_spec("browser.addinitscript", MethodCategory::Browser, &[]),
-    core_spec("browser.addstyle", MethodCategory::Browser, &[]),
-    core_spec("browser.console.list", MethodCategory::Browser, &[]),
-    core_spec("browser.console.clear", MethodCategory::Browser, &[]),
-    core_spec("browser.errors.list", MethodCategory::Browser, &[]),
-    core_spec("browser.cookies.get", MethodCategory::Browser, &[]),
-    core_spec("browser.cookies.set", MethodCategory::Browser, &[]),
-    core_spec("browser.cookies.clear", MethodCategory::Browser, &[]),
-    core_spec("browser.storage.get", MethodCategory::Browser, &[]),
-    core_spec("browser.storage.set", MethodCategory::Browser, &[]),
-    core_spec("browser.storage.clear", MethodCategory::Browser, &[]),
-    core_spec("browser.tab.list", MethodCategory::Browser, &[]),
-    core_spec("browser.tab.new", MethodCategory::Browser, &[]),
-    core_spec("browser.tab.switch", MethodCategory::Browser, &[]),
-    core_spec("browser.tab.close", MethodCategory::Browser, &[]),
-    core_spec("browser.frame.main", MethodCategory::Browser, &[]),
-    core_spec("browser.frame.select", MethodCategory::Browser, &[]),
-    core_spec("browser.dialog.accept", MethodCategory::Browser, &[]),
-    core_spec("browser.dialog.dismiss", MethodCategory::Browser, &[]),
-    core_spec("browser.download.wait", MethodCategory::Browser, &[]),
-    core_spec("browser.state.save", MethodCategory::Browser, &[]),
-    core_spec("browser.state.load", MethodCategory::Browser, &[]),
-    core_spec("debug.app.activate", MethodCategory::Debug, &[]),
-    core_spec("debug.bonsplit_underflow.count", MethodCategory::Debug, &[]),
-    core_spec("debug.bonsplit_underflow.reset", MethodCategory::Debug, &[]),
-    core_spec(
+    core_only_spec(
+        "browser.navigate",
+        MethodCategory::Browser,
+        &["navigate-browser"],
+    ),
+    core_only_spec("browser.url.get", MethodCategory::Browser, &[]),
+    core_only_spec("browser.eval", MethodCategory::Browser, &[]),
+    core_only_spec("browser.wait", MethodCategory::Browser, &[]),
+    core_only_spec("browser.click", MethodCategory::Browser, &[]),
+    core_only_spec("browser.fill", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.text", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.value", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.title", MethodCategory::Browser, &[]),
+    core_only_spec("browser.snapshot", MethodCategory::Browser, &[]),
+    core_only_spec("browser.focus_webview", MethodCategory::Browser, &[]),
+    core_only_spec("browser.is_webview_focused", MethodCategory::Browser, &[]),
+    core_only_spec("browser.screenshot", MethodCategory::Browser, &[]),
+    core_only_spec("browser.back", MethodCategory::Browser, &["browser-back"]),
+    core_only_spec(
+        "browser.forward",
+        MethodCategory::Browser,
+        &["browser-forward"],
+    ),
+    core_only_spec(
+        "browser.reload",
+        MethodCategory::Browser,
+        &["browser-reload"],
+    ),
+    core_only_spec("browser.focus", MethodCategory::Browser, &[]),
+    core_only_spec("browser.hover", MethodCategory::Browser, &[]),
+    core_only_spec("browser.dblclick", MethodCategory::Browser, &[]),
+    core_only_spec("browser.press", MethodCategory::Browser, &[]),
+    core_only_spec("browser.keydown", MethodCategory::Browser, &[]),
+    core_only_spec("browser.keyup", MethodCategory::Browser, &[]),
+    core_only_spec("browser.type", MethodCategory::Browser, &[]),
+    core_only_spec("browser.check", MethodCategory::Browser, &[]),
+    core_only_spec("browser.uncheck", MethodCategory::Browser, &[]),
+    core_only_spec("browser.select", MethodCategory::Browser, &[]),
+    core_only_spec("browser.scroll", MethodCategory::Browser, &[]),
+    core_only_spec("browser.scroll_into_view", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.attr", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.box", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.count", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.html", MethodCategory::Browser, &[]),
+    core_only_spec("browser.get.styles", MethodCategory::Browser, &[]),
+    core_only_spec("browser.is.checked", MethodCategory::Browser, &[]),
+    core_only_spec("browser.is.enabled", MethodCategory::Browser, &[]),
+    core_only_spec("browser.is.visible", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.role", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.text", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.label", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.placeholder", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.alt", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.title", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.testid", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.first", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.last", MethodCategory::Browser, &[]),
+    core_only_spec("browser.find.nth", MethodCategory::Browser, &[]),
+    core_only_spec("browser.highlight", MethodCategory::Browser, &[]),
+    core_only_spec("browser.viewport.set", MethodCategory::Browser, &[]),
+    core_only_spec("browser.geolocation.set", MethodCategory::Browser, &[]),
+    core_only_spec("browser.offline.set", MethodCategory::Browser, &[]),
+    core_only_spec("browser.trace.start", MethodCategory::Browser, &[]),
+    core_only_spec("browser.trace.stop", MethodCategory::Browser, &[]),
+    core_only_spec("browser.network.route", MethodCategory::Browser, &[]),
+    core_only_spec("browser.network.unroute", MethodCategory::Browser, &[]),
+    core_only_spec("browser.network.requests", MethodCategory::Browser, &[]),
+    core_only_spec("browser.screencast.start", MethodCategory::Browser, &[]),
+    core_only_spec("browser.screencast.stop", MethodCategory::Browser, &[]),
+    core_only_spec("browser.input_mouse", MethodCategory::Browser, &[]),
+    core_only_spec("browser.input_keyboard", MethodCategory::Browser, &[]),
+    core_only_spec("browser.input_touch", MethodCategory::Browser, &[]),
+    core_only_spec("browser.addscript", MethodCategory::Browser, &[]),
+    core_only_spec("browser.addinitscript", MethodCategory::Browser, &[]),
+    core_only_spec("browser.addstyle", MethodCategory::Browser, &[]),
+    core_only_spec("browser.console.list", MethodCategory::Browser, &[]),
+    core_only_spec("browser.console.clear", MethodCategory::Browser, &[]),
+    core_only_spec("browser.errors.list", MethodCategory::Browser, &[]),
+    core_only_spec("browser.cookies.get", MethodCategory::Browser, &[]),
+    core_only_spec("browser.cookies.set", MethodCategory::Browser, &[]),
+    core_only_spec("browser.cookies.clear", MethodCategory::Browser, &[]),
+    core_only_spec("browser.storage.get", MethodCategory::Browser, &[]),
+    core_only_spec("browser.storage.set", MethodCategory::Browser, &[]),
+    core_only_spec("browser.storage.clear", MethodCategory::Browser, &[]),
+    core_only_spec("browser.tab.list", MethodCategory::Browser, &[]),
+    core_only_spec("browser.tab.new", MethodCategory::Browser, &[]),
+    core_only_spec("browser.tab.switch", MethodCategory::Browser, &[]),
+    core_only_spec("browser.tab.close", MethodCategory::Browser, &[]),
+    core_only_spec("browser.frame.main", MethodCategory::Browser, &[]),
+    core_only_spec("browser.frame.select", MethodCategory::Browser, &[]),
+    core_only_spec("browser.dialog.accept", MethodCategory::Browser, &[]),
+    core_only_spec("browser.dialog.dismiss", MethodCategory::Browser, &[]),
+    core_only_spec("browser.download.wait", MethodCategory::Browser, &[]),
+    core_only_spec("browser.state.save", MethodCategory::Browser, &[]),
+    core_only_spec("browser.state.load", MethodCategory::Browser, &[]),
+    core_only_spec("debug.app.activate", MethodCategory::Debug, &[]),
+    core_only_spec("debug.bonsplit_underflow.count", MethodCategory::Debug, &[]),
+    core_only_spec("debug.bonsplit_underflow.reset", MethodCategory::Debug, &[]),
+    core_only_spec(
         "debug.command_palette.rename_input.delete_backward",
         MethodCategory::Debug,
         &[],
     ),
-    core_spec(
+    core_only_spec(
         "debug.command_palette.rename_input.interact",
         MethodCategory::Debug,
         &[],
     ),
-    core_spec(
+    core_only_spec(
         "debug.command_palette.rename_input.select_all",
         MethodCategory::Debug,
         &[],
     ),
-    core_spec(
+    core_only_spec(
         "debug.command_palette.rename_input.selection",
         MethodCategory::Debug,
         &[],
     ),
-    core_spec(
+    core_only_spec(
         "debug.command_palette.rename_tab.open",
         MethodCategory::Debug,
         &[],
     ),
-    core_spec("debug.command_palette.results", MethodCategory::Debug, &[]),
-    core_spec(
+    core_only_spec("debug.command_palette.results", MethodCategory::Debug, &[]),
+    core_only_spec(
         "debug.command_palette.selection",
         MethodCategory::Debug,
         &[],
     ),
-    core_spec("debug.command_palette.toggle", MethodCategory::Debug, &[]),
-    core_spec("debug.command_palette.visible", MethodCategory::Debug, &[]),
-    core_spec("debug.empty_panel.count", MethodCategory::Debug, &[]),
-    core_spec("debug.empty_panel.reset", MethodCategory::Debug, &[]),
-    core_spec("debug.flash.count", MethodCategory::Debug, &[]),
-    core_spec("debug.flash.reset", MethodCategory::Debug, &[]),
-    core_spec("debug.layout", MethodCategory::Debug, &[]),
-    core_spec("debug.notification.focus", MethodCategory::Debug, &[]),
-    core_spec("debug.panel_snapshot", MethodCategory::Debug, &[]),
-    core_spec("debug.panel_snapshot.reset", MethodCategory::Debug, &[]),
-    core_spec("debug.portal.stats", MethodCategory::Debug, &[]),
-    core_spec("debug.shortcut.set", MethodCategory::Debug, &[]),
-    core_spec("debug.shortcut.simulate", MethodCategory::Debug, &[]),
-    core_spec("debug.sidebar.visible", MethodCategory::Debug, &[]),
-    core_spec("debug.terminal.is_focused", MethodCategory::Debug, &[]),
-    core_spec("debug.terminal.read_text", MethodCategory::Debug, &[]),
-    core_spec("debug.terminal.render_stats", MethodCategory::Debug, &[]),
-    core_spec("debug.type", MethodCategory::Debug, &[]),
-    core_spec("debug.window.screenshot", MethodCategory::Debug, &[]),
+    core_only_spec("debug.command_palette.toggle", MethodCategory::Debug, &[]),
+    core_only_spec("debug.command_palette.visible", MethodCategory::Debug, &[]),
+    core_only_spec("debug.empty_panel.count", MethodCategory::Debug, &[]),
+    core_only_spec("debug.empty_panel.reset", MethodCategory::Debug, &[]),
+    core_only_spec("debug.flash.count", MethodCategory::Debug, &[]),
+    core_only_spec("debug.flash.reset", MethodCategory::Debug, &[]),
+    core_only_spec("debug.layout", MethodCategory::Debug, &[]),
+    core_only_spec("debug.notification.focus", MethodCategory::Debug, &[]),
+    core_only_spec("debug.panel_snapshot", MethodCategory::Debug, &[]),
+    core_only_spec("debug.panel_snapshot.reset", MethodCategory::Debug, &[]),
+    core_only_spec("debug.portal.stats", MethodCategory::Debug, &[]),
+    core_only_spec("debug.shortcut.set", MethodCategory::Debug, &[]),
+    core_only_spec("debug.shortcut.simulate", MethodCategory::Debug, &[]),
+    core_only_spec("debug.sidebar.visible", MethodCategory::Debug, &[]),
+    core_only_spec("debug.terminal.is_focused", MethodCategory::Debug, &[]),
+    core_only_spec("debug.terminal.read_text", MethodCategory::Debug, &[]),
+    core_only_spec("debug.terminal.render_stats", MethodCategory::Debug, &[]),
+    core_only_spec("debug.type", MethodCategory::Debug, &[]),
+    core_only_spec("debug.window.screenshot", MethodCategory::Debug, &[]),
 ];
 
-pub fn resolve_method_spec(method_or_alias: &str) -> Option<&'static MethodSpec> {
-    let needle = method_or_alias.trim();
-    if needle.is_empty() {
+pub fn resolve_wire_method_spec(method_or_wire_alias: &str) -> Option<&'static MethodSpec> {
+    if method_or_wire_alias.is_empty() {
+        return None;
+    }
+    ALL_METHOD_SPECS.iter().find(|spec| {
+        spec.name == method_or_wire_alias || spec.wire_aliases.contains(&method_or_wire_alias)
+    })
+}
+
+pub fn canonical_wire_method_name(method_or_wire_alias: &str) -> Option<&'static str> {
+    resolve_wire_method_spec(method_or_wire_alias).map(|spec| spec.name)
+}
+
+pub fn resolve_cli_subcommand_spec(subcommand: &str) -> Option<&'static MethodSpec> {
+    if subcommand.is_empty() {
         return None;
     }
     ALL_METHOD_SPECS
         .iter()
-        .find(|spec| spec.name == needle || spec.aliases.contains(&needle))
-}
-
-pub fn canonical_method_name(method_or_alias: &str) -> Option<&'static str> {
-    resolve_method_spec(method_or_alias).map(|spec| spec.name)
+        .find(|spec| spec.cli_subcommands.contains(&subcommand))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::{
-        canonical_method_name, resolve_method_spec, MethodCategory, ALL_METHOD_SPECS,
-        CORE_COMMAND_NAMES, HOST_ONLY_COMMAND_NAMES,
+        canonical_wire_method_name, resolve_cli_subcommand_spec, resolve_wire_method_spec,
+        MethodCategory, ALL_METHOD_SPECS, CORE_COMMAND_NAMES, GTK_BRIDGE_COMMAND_NAMES,
+        HOST_ONLY_COMMAND_NAMES,
     };
 
     #[test]
-    fn method_specs_match_core_and_host_command_sets_without_duplicates() {
-        let mut seen_tokens = HashSet::new();
+    fn method_specs_match_core_and_gtk_bridge_sets_without_duplicates() {
+        let mut seen_names = HashSet::new();
+        let mut seen_wire_tokens = HashMap::new();
+        let mut seen_cli_subcommands = HashMap::new();
+
         for spec in &ALL_METHOD_SPECS {
+            assert!(!spec.name.is_empty(), "method spec name must not be empty");
             assert!(
-                seen_tokens.insert(spec.name),
+                spec.in_core || spec.in_gtk_bridge,
+                "method {} must belong to core, GTK bridge, or both",
+                spec.name
+            );
+            assert!(
+                seen_names.insert(spec.name),
                 "duplicate method name {}",
                 spec.name
             );
-            for alias in spec.aliases {
+            assert!(
+                seen_wire_tokens.insert(spec.name, spec.name).is_none(),
+                "method name {} collides with a wire alias",
+                spec.name
+            );
+
+            for &alias in spec.wire_aliases {
+                assert!(!alias.is_empty(), "empty wire alias on {}", spec.name);
                 assert!(
-                    seen_tokens.insert(*alias),
-                    "duplicate method alias {alias} on {}",
+                    spec.in_gtk_bridge,
+                    "wire alias {alias} on {} requires GTK bridge support",
                     spec.name
+                );
+                assert!(
+                    seen_wire_tokens.insert(alias, spec.name).is_none(),
+                    "duplicate wire alias {alias} on {}",
+                    spec.name
+                );
+            }
+
+            for &subcommand in spec.cli_subcommands {
+                assert!(
+                    !subcommand.is_empty(),
+                    "empty cli subcommand on {}",
+                    spec.name
+                );
+                assert!(
+                    seen_cli_subcommands.insert(subcommand, spec.name).is_none(),
+                    "duplicate cli subcommand {subcommand} on {}",
+                    spec.name
+                );
+            }
+        }
+
+        for (&subcommand, &cli_owner) in &seen_cli_subcommands {
+            assert!(
+                !seen_names.contains(subcommand),
+                "cli subcommand {subcommand} must not equal a canonical RPC method name"
+            );
+            if let Some(&wire_owner) = seen_wire_tokens.get(subcommand) {
+                assert_eq!(
+                    cli_owner, wire_owner,
+                    "token {subcommand} maps to {cli_owner} on CLI but {wire_owner} on wire"
                 );
             }
         }
@@ -584,29 +777,131 @@ mod tests {
             .collect();
         assert_eq!(core_from_specs.as_slice(), &CORE_COMMAND_NAMES);
 
-        let host_from_specs: Vec<&str> = ALL_METHOD_SPECS
+        let host_only_from_specs: Vec<&str> = ALL_METHOD_SPECS
             .iter()
             .filter(|spec| !spec.in_core)
             .map(|spec| spec.name)
             .collect();
-        assert_eq!(host_from_specs.as_slice(), &HOST_ONLY_COMMAND_NAMES);
+        assert_eq!(host_only_from_specs.as_slice(), &HOST_ONLY_COMMAND_NAMES);
+
+        let gtk_bridge_from_specs: Vec<&str> = ALL_METHOD_SPECS
+            .iter()
+            .filter(|spec| spec.in_gtk_bridge)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(gtk_bridge_from_specs.as_slice(), &GTK_BRIDGE_COMMAND_NAMES);
     }
 
     #[test]
-    fn aliases_resolve_to_canonical_method_and_category() {
-        assert_eq!(canonical_method_name("ping"), Some("system.ping"));
+    fn wire_aliases_and_cli_subcommands_resolve_distinctly() {
+        assert_eq!(canonical_wire_method_name("ping"), Some("system.ping"));
+        assert_eq!(resolve_cli_subcommand_spec("ping"), None);
+
+        assert_eq!(canonical_wire_method_name("identify"), None);
         assert_eq!(
-            canonical_method_name("capture-pane"),
-            Some("surface.read_text")
+            resolve_cli_subcommand_spec("identify").map(|spec| spec.name),
+            Some("system.identify")
         );
+
+        assert_eq!(canonical_wire_method_name("activate"), None);
         assert_eq!(
-            canonical_method_name("workspace.activate"),
+            resolve_cli_subcommand_spec("activate").map(|spec| spec.name),
+            Some("window.activate")
+        );
+
+        assert_eq!(
+            canonical_wire_method_name("workspace.activate"),
             Some("workspace.select")
         );
         assert_eq!(
-            resolve_method_spec("list-groups").map(|spec| (spec.name, spec.category, spec.in_core)),
-            Some(("workspace.group_list", MethodCategory::Workspace, false))
+            canonical_wire_method_name("activate-workspace"),
+            Some("workspace.select")
         );
-        assert_eq!(canonical_method_name("unknown.method"), None);
+        assert_eq!(canonical_wire_method_name("select-workspace"), None);
+        assert_eq!(
+            resolve_cli_subcommand_spec("select-workspace").map(|spec| spec.name),
+            Some("workspace.select")
+        );
+
+        assert_eq!(canonical_wire_method_name("next-window"), None);
+        assert_eq!(
+            resolve_cli_subcommand_spec("next-window").map(|spec| spec.name),
+            Some("workspace.next")
+        );
+        assert_eq!(
+            resolve_cli_subcommand_spec("previous-window").map(|spec| spec.name),
+            Some("workspace.previous")
+        );
+        assert_eq!(
+            resolve_cli_subcommand_spec("last-window").map(|spec| spec.name),
+            Some("workspace.last")
+        );
+
+        assert_eq!(
+            resolve_cli_subcommand_spec("collapse-group").map(|spec| spec.name),
+            Some("workspace.group_set_collapsed")
+        );
+        assert_eq!(
+            resolve_cli_subcommand_spec("expand-group").map(|spec| spec.name),
+            Some("workspace.group_set_collapsed")
+        );
+        assert_eq!(
+            resolve_cli_subcommand_spec("rename-window").map(|spec| spec.name),
+            Some("workspace.rename")
+        );
+        assert_eq!(
+            resolve_cli_subcommand_spec("rename-tab").map(|spec| spec.name),
+            Some("tab.action")
+        );
+
+        assert_eq!(
+            canonical_wire_method_name("capture-pane"),
+            Some("surface.read_text")
+        );
+        assert_eq!(
+            canonical_wire_method_name("send-text"),
+            Some("surface.send_text")
+        );
+        assert_eq!(resolve_cli_subcommand_spec("send-text"), None);
+        assert_eq!(
+            resolve_cli_subcommand_spec("send").map(|spec| spec.name),
+            Some("surface.send_text")
+        );
+
+        assert_eq!(
+            resolve_wire_method_spec("list-groups").map(|spec| (
+                spec.name,
+                spec.category,
+                spec.in_core,
+                spec.in_gtk_bridge,
+            )),
+            Some((
+                "workspace.group_list",
+                MethodCategory::Workspace,
+                false,
+                true
+            ))
+        );
+
+        for removed in [
+            "capabilities",
+            "list-windows",
+            "new-window",
+            "focus-window",
+            "close-window",
+            "next-workspace",
+            "previous-workspace",
+            "last-workspace",
+            "swap-pane",
+            "new-split",
+            "browser.open-split",
+        ] {
+            assert_eq!(canonical_wire_method_name(removed), None, "{removed}");
+            assert_eq!(resolve_cli_subcommand_spec(removed), None, "{removed}");
+        }
+
+        assert_eq!(canonical_wire_method_name(""), None);
+        assert_eq!(resolve_cli_subcommand_spec(""), None);
+        assert_eq!(canonical_wire_method_name("unknown.method"), None);
     }
 }

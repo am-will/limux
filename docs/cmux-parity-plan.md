@@ -10,14 +10,16 @@ Limux has **two control servers**:
    calls when the GUI isn't running.
 
 2. **Embedded bridge inside `limux-host-linux`** — `control_bridge.rs` routes
-   methods to the GTK main loop, including `system.{ping,identify,capabilities}`,
-   `window.activate`, `workspace.{current,list,create,select,rename,close,set_color,set_group}`,
+   the live GTK command set defined in
+   `limux_protocol::methods::GTK_BRIDGE_COMMAND_NAMES` to the GTK main loop,
+   including `system.{ping,identify,capabilities}`, `window.activate`,
+   `workspace.{current,list,create,select,rename,close,set_color,set_group}`,
    `workspace.group_{list,create,rename,set_color,set_collapsed,delete}`,
    `pane.{list,surfaces,create,focus}`,
    `surface.{list,create,close,focus,send_text,send_key,read_text,health}`,
    `tab.action`, `gui_hook.{list,set,clear}`, and `notification.create`.
-   Canonical method metadata and aliases are cataloged in
-   `rust/limux-protocol/src/methods.rs`.
+   Canonical method metadata, socket `wire_aliases`, and `cli_subcommands` are
+   cataloged in `rust/limux-protocol/src/methods.rs`.
 
 When the GUI is running, the CLI targets the bridge via the runtime
 socket. `list-panes` / `list-panels`, terminal `new-pane --command ...`,

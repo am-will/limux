@@ -6943,4 +6943,39 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn dispatcher_recognizes_every_core_command_and_rejects_host_only_commands() {
+        let dispatcher = Dispatcher::new();
+
+        for &method in &limux_protocol::methods::CORE_COMMAND_NAMES {
+            let params = if method == "browser.download.wait" {
+                json!({ "timeout_ms": 0 })
+            } else {
+                json!({})
+            };
+            let response = dispatcher.dispatch(request(method, params)).await;
+            if let Some(error) = response.error {
+                assert_ne!(
+                    error.code, -32601,
+                    "core method {method} returned unknown method code: {}",
+                    error.message
+                );
+                assert!(
+                    !error.message.contains("unknown method")
+                        && !error.message.contains("unknown command"),
+                    "core method {method} returned unknown command message: {}",
+                    error.message
+                );
+            }
+        }
+
+        for &method in &limux_protocol::methods::HOST_ONLY_COMMAND_NAMES {
+            let response = dispatcher.dispatch(request(method, json!({}))).await;
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("host-only method {method} should fail in core"));
+            assert_eq!(error.code, -32601, "{method}");
+        }
+    }
 }
