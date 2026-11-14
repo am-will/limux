@@ -42,7 +42,7 @@ prepare_appimage_webkit_runtime() {
         echo 'ERROR: AppImage WebKit cache does not permit executable files.' >&2
         return 1
     fi
-    export LD_LIBRARY_PATH="$LIMUX_WEBKIT_LIBRARY_DIR:$LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH="$LIMUX_WEBKIT_LIBRARY_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export WEBKIT_EXEC_PATH="$LIMUX_WEBKIT_RUNTIME_DIR"
     export WEBKIT_INJECTED_BUNDLE_PATH="$LIMUX_WEBKIT_RUNTIME_DIR/injected-bundle"
 }

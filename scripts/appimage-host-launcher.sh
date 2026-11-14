@@ -5,21 +5,27 @@ unset LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE
 
 # shellcheck source=scripts/appimage-webkit-runtime.sh
 source "$HERE/usr/libexec/limux/appimage-webkit-runtime.sh"
+LIMUX_CHILD_PID=""
+# shellcheck disable=SC2317
+forward_signal() {
+    if [ -n "$LIMUX_CHILD_PID" ]; then
+        kill -s "$1" "$LIMUX_CHILD_PID" 2>/dev/null || true
+    else
+        cleanup_appimage_webkit_runtime
+        trap - EXIT "$1"
+        kill -s "$1" "$$"
+    fi
+}
 trap cleanup_appimage_webkit_runtime EXIT
+trap 'forward_signal TERM' TERM
+trap 'forward_signal INT' INT
+trap 'forward_signal HUP' HUP
 if ! prepare_appimage_webkit_runtime "$HERE"; then
     export LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE=1
     echo 'WARNING: could not prepare the sandboxed AppImage WebKit runtime; browser views are unavailable.' >&2
     cleanup_appimage_webkit_runtime
 fi
 
-LIMUX_CHILD_PID=""
-# shellcheck disable=SC2317
-forward_signal() {
-    [ -z "$LIMUX_CHILD_PID" ] || kill -s "$1" "$LIMUX_CHILD_PID" 2>/dev/null || true
-}
-trap 'forward_signal TERM' TERM
-trap 'forward_signal INT' INT
-trap 'forward_signal HUP' HUP
 env --default-signal=INT,QUIT "$HERE/usr/libexec/limux/limux-host" "$@" <&0 &
 LIMUX_CHILD_PID=$!
 wait "$LIMUX_CHILD_PID"

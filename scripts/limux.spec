@@ -41,6 +41,14 @@ is_legacy_limux_host() {
 }
 
 ldconfig 2>/dev/null || true
+legacy_apparmor_profile="/etc/apparmor.d/limux-8c15f0a5f176c1d3593ba948"
+if [ -f "$legacy_apparmor_profile" ]; then
+    if command -v apparmor_parser >/dev/null && command -v aa-enabled >/dev/null \
+       && aa-enabled --quiet; then
+        apparmor_parser --remove "$legacy_apparmor_profile" || true
+    fi
+    rm -f "$legacy_apparmor_profile"
+fi
 if command -v apparmor_parser >/dev/null && command -v aa-enabled >/dev/null \
    && aa-enabled --quiet && [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
     apparmor_parser --replace /etc/apparmor.d/dev.limux.linux || exit 1

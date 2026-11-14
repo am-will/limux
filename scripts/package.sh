@@ -843,6 +843,14 @@ is_legacy_limux_host() {
 }
 
 ldconfig 2>/dev/null || true
+legacy_apparmor_profile="/etc/apparmor.d/limux-8c15f0a5f176c1d3593ba948"
+if [ -f "$legacy_apparmor_profile" ]; then
+    if command -v apparmor_parser >/dev/null && command -v aa-enabled >/dev/null \
+       && aa-enabled --quiet; then
+        apparmor_parser --remove "$legacy_apparmor_profile" || true
+    fi
+    rm -f "$legacy_apparmor_profile"
+fi
 if command -v apparmor_parser >/dev/null && command -v aa-enabled >/dev/null \
    && aa-enabled --quiet && [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
     apparmor_parser --replace /etc/apparmor.d/dev.limux.linux
@@ -1105,7 +1113,7 @@ else
     export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH=""
 fi
 
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/share}"
 
 # Host Mesa loaders use distro-specific GBM and DRI module paths. Discover

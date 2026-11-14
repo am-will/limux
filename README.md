@@ -104,11 +104,12 @@ sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 sudo apt install bubblewrap xdg-dbus-proxy
 ```
 
-Limux enables WebKit's browser sandbox by default. Before opening browser views,
-it checks real WebKit startup in a disposable process. If the sandbox cannot
-start, browser tabs show an explanation and retain their saved state. Terminals
-remain available. The check normally completes quickly; a failed startup can
-take fifteen seconds plus up to two seconds for helper cleanup.
+Limux enables WebKit's browser sandbox by default. At host startup, Limux checks
+real WebKit startup in a disposable process before allowing in-app browser views.
+If the sandbox cannot start, browser tabs show an explanation and retain their
+saved state. Terminals remain available. The check normally completes quickly; a
+failed startup can take fifteen seconds plus up to two seconds for helper
+cleanup.
 
 Ubuntu 24.04 and later require an
 [application AppArmor allowance for user namespaces](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).

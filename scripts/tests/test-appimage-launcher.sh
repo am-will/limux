@@ -29,6 +29,7 @@ cat > "$APP/usr/libexec/limux/limux-host" <<'HOST'
 #!/bin/sh
 printf '%s' "${WEBKIT_EXEC_PATH:-}" > "$LIMUX_LAUNCHER_TEST_DIR/runtime"
 printf '%s' "${LIMUX_HOST_BIN-unset}" > "$LIMUX_LAUNCHER_TEST_DIR/override"
+printf '%s' "${LD_LIBRARY_PATH-unset}" > "$LIMUX_LAUNCHER_TEST_DIR/ld_library_path"
 if [ "$LIMUX_LAUNCHER_TEST_MODE" = once ]; then
     IFS= read -r input
     printf '%s' "$input"
@@ -41,7 +42,26 @@ HOST
 chmod 755 "$APP/usr/libexec/limux/limux-host"
 
 export LIMUX_LAUNCHER_TEST_DIR="$TEST_DIR" XDG_CACHE_HOME="$TEST_DIR/cache"
+(
+    set -euo pipefail
+    unset LD_LIBRARY_PATH
+    # shellcheck source=scripts/appimage-webkit-runtime.sh
+    source "$APP/usr/libexec/limux/appimage-webkit-runtime.sh"
+    trap cleanup_appimage_webkit_runtime EXIT
+    prepare_appimage_webkit_runtime "$APP"
+    [ "$LD_LIBRARY_PATH" = "$LIMUX_WEBKIT_LIBRARY_DIR" ]
+    [[ "$LD_LIBRARY_PATH" != *: ]]
+    cleanup_appimage_webkit_runtime
+
+    export LD_LIBRARY_PATH="/existing/lib"
+    prepare_appimage_webkit_runtime "$APP"
+    [ "$LD_LIBRARY_PATH" = "$LIMUX_WEBKIT_LIBRARY_DIR:/existing/lib" ]
+    [[ "$LD_LIBRARY_PATH" != *: ]]
+)
+rm -rf "$XDG_CACHE_HOME"
+
 unset LIMUX_HOST_BIN
+unset LD_LIBRARY_PATH
 "$APP/AppRun" --help > "$TEST_DIR/help"
 grep -qF 'limux CLI' "$TEST_DIR/help"
 [ ! -e "$XDG_CACHE_HOME/limux" ]
@@ -58,6 +78,8 @@ once() {
 once
 [ "$(cat "$TEST_DIR/override")" = unset ]
 [ ! -e "$(cat "$TEST_DIR/runtime")" ]
+[[ "$(cat "$TEST_DIR/ld_library_path")" != *: ]]
+[[ "$(cat "$TEST_DIR/ld_library_path")" != *::* ]]
 once --socket-mode runtime --id-format refs
 [ "$(cat "$TEST_DIR/override")" = unset ]
 [ ! -e "$(cat "$TEST_DIR/runtime")" ]
