@@ -349,6 +349,7 @@ struct BrowserTabState {
 pub struct BrowserShortcutTarget {
     uri: Rc<RefCell<Option<String>>>,
     handles: BrowserHandles,
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
 }
 
 #[derive(Clone)]
@@ -1192,6 +1193,7 @@ pub fn browser_target_for_surface(
         BrowserShortcutTarget {
             uri: state.uri.clone(),
             handles: state.handles.clone(),
+            callbacks: state.callbacks.clone(),
         },
     ))
 }
@@ -2924,28 +2926,42 @@ pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
         })
 }
 
+fn pane_summary_from_internals(internals: &PaneInternals) -> PaneSummary {
+    let pane_id = internals.pane_id;
+    let tab_state = internals.tab_state.borrow();
+    let active_surface_id = tab_state
+        .active_tab
+        .as_deref()
+        .map(|tab_id| composite_surface_id(pane_id, tab_id))
+        .or_else(|| {
+            tab_state
+                .tabs
+                .first()
+                .map(|entry| composite_surface_id(pane_id, &entry.id))
+        });
+    PaneSummary {
+        pane_id,
+        surface_count: tab_state.tabs.len(),
+        active_surface_id,
+    }
+}
+
+pub fn pane_summary_for_widget(pane_widget: &gtk::Widget) -> Option<PaneSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    Some(pane_summary_from_internals(&internals))
+}
+
+pub fn pane_summaries_for_widgets(pane_widgets: &[gtk::Widget]) -> Vec<PaneSummary> {
+    pane_widgets
+        .iter()
+        .filter_map(pane_summary_for_widget)
+        .collect()
+}
+
 pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
     pane_internals_for_root(root)
         .into_iter()
-        .map(|internals| {
-            let pane_id = internals.pane_id;
-            let tab_state = internals.tab_state.borrow();
-            let active_surface_id = tab_state
-                .active_tab
-                .as_deref()
-                .map(|tab_id| composite_surface_id(pane_id, tab_id))
-                .or_else(|| {
-                    tab_state
-                        .tabs
-                        .first()
-                        .map(|entry| composite_surface_id(pane_id, &entry.id))
-                });
-            PaneSummary {
-                pane_id,
-                surface_count: tab_state.tabs.len(),
-                active_surface_id,
-            }
-        })
+        .map(|internals| pane_summary_from_internals(&internals))
         .collect()
 }
 
@@ -2964,14 +2980,14 @@ pub(crate) fn pane_widget_for_workspace(workspace_id: &str, pane_id: u32) -> Opt
         .then(|| internals.pane_outer.clone().upcast())
 }
 
-pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
-    let mut surfaces = Vec::new();
-
-    for internals in pane_internals_for_root(root) {
-        let pane_id = internals.pane_id;
-        let tab_state = internals.tab_state.borrow();
-        let active_tab = tab_state.active_tab.as_deref();
-        for entry in &tab_state.tabs {
+fn surface_summaries_from_internals(internals: &PaneInternals) -> Vec<SurfaceSummary> {
+    let pane_id = internals.pane_id;
+    let tab_state = internals.tab_state.borrow();
+    let active_tab = tab_state.active_tab.as_deref();
+    let mut surfaces = tab_state
+        .tabs
+        .iter()
+        .map(|entry| {
             let selected = active_tab
                 .map(|current| current == entry.id)
                 .unwrap_or_else(|| {
@@ -2989,7 +3005,7 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
                 }
                 TabKind::Keybinds => ("keybinds".to_string(), None, None),
             };
-            surfaces.push(SurfaceSummary {
+            SurfaceSummary {
                 pane_id,
                 tab_id: entry.id.clone(),
                 surface_id: composite_surface_id(pane_id, &entry.id),
@@ -2998,16 +3014,33 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
                 selected,
                 cwd,
                 uri,
-            });
-        }
-    }
-
+            }
+        })
+        .collect::<Vec<_>>();
     surfaces.sort_by(|left, right| {
-        left.pane_id
-            .cmp(&right.pane_id)
-            .then_with(|| right.selected.cmp(&left.selected))
+        right
+            .selected
+            .cmp(&left.selected)
             .then_with(|| left.surface_id.cmp(&right.surface_id))
     });
+    surfaces
+}
+
+pub fn surface_summaries_for_widgets(pane_widgets: &[gtk::Widget]) -> Vec<SurfaceSummary> {
+    let mut surfaces = Vec::new();
+    for widget in pane_widgets {
+        if let Some(internals) = find_pane_internals(widget) {
+            surfaces.extend(surface_summaries_from_internals(&internals));
+        }
+    }
+    surfaces
+}
+
+pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
+    let mut surfaces = Vec::new();
+    for internals in pane_internals_for_root(root) {
+        surfaces.extend(surface_summaries_from_internals(&internals));
+    }
     surfaces
 }
 
@@ -3085,6 +3118,7 @@ pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarg
             }) => FocusedShortcutTarget::Browser(BrowserShortcutTarget {
                 uri: state.uri.clone(),
                 handles: state.handles.clone(),
+                callbacks: state.callbacks.clone(),
             }),
             Some(TabEntry {
                 kind: TabKind::Keybinds,
@@ -4517,9 +4551,15 @@ impl BrowserLoadState {
         }
     }
 
-    fn record_explicit_navigation(&self, url: &str) {
+    fn record_explicit_navigation(&self, url: &str, current_webview_uri: Option<&str>) {
         *self.pending_first_map_uri.borrow_mut() = None;
-        self.restoring.set(is_non_blank_browser_uri(Some(url)));
+        self.restoring.set(
+            is_non_blank_browser_uri(Some(url)) && !is_non_blank_browser_uri(current_webview_uri),
+        );
+    }
+
+    fn clear_restoring(&self) {
+        self.restoring.set(false);
     }
 
     fn take_first_map_uri(&self) -> Option<String> {
@@ -4532,6 +4572,52 @@ impl BrowserLoadState {
         }
         self.restoring.set(false);
         true
+    }
+}
+
+#[cfg(feature = "webkit")]
+fn step_webview_history(
+    webview: &webkit6::WebView,
+    url_entry: Option<&gtk::Entry>,
+    load_state: &BrowserLoadState,
+    saved_uri: &RefCell<Option<String>>,
+    callbacks: &RefCell<Rc<PaneCallbacks>>,
+    forward: bool,
+) {
+    let can_step = if forward {
+        webview.can_go_forward()
+    } else {
+        webview.can_go_back()
+    };
+    if !can_step {
+        return;
+    }
+    let target_item = webview.back_forward_list().and_then(|list| {
+        if forward {
+            list.forward_item()
+        } else {
+            list.back_item()
+        }
+    });
+    let target_uri = target_item.map(|item| {
+        item.uri()
+            .filter(|uri| !uri.is_empty())
+            .map(|uri| uri.to_string())
+            .unwrap_or_else(|| "about:blank".to_string())
+    });
+    load_state.clear_restoring();
+    if let Some(uri) = target_uri {
+        if let Some(entry) = url_entry {
+            entry.set_text(&uri);
+        }
+        *saved_uri.borrow_mut() = Some(uri);
+        let callbacks = callbacks.borrow().clone();
+        (callbacks.on_state_changed)();
+    }
+    if forward {
+        webview.go_forward();
+    } else {
+        webview.go_back();
     }
 }
 
@@ -4561,11 +4647,11 @@ impl BrowserShortcutTarget {
     }
 
     pub fn go_back(&self) -> bool {
-        self.handles.go_back()
+        self.handles.go_back(&self.uri, &self.callbacks)
     }
 
     pub fn go_forward(&self) -> bool {
-        self.handles.go_forward()
+        self.handles.go_forward(&self.uri, &self.callbacks)
     }
 
     pub fn reload(&self) -> bool {
@@ -4619,7 +4705,9 @@ impl BrowserHandles {
     }
 
     fn navigate(&self, url: &str) {
-        self.load_state.record_explicit_navigation(url);
+        let current_uri = self.webview.uri();
+        self.load_state
+            .record_explicit_navigation(url, current_uri.as_deref());
         self.url_entry.set_text(url);
         self.webview.load_uri(url);
     }
@@ -4648,13 +4736,35 @@ impl BrowserHandles {
         true
     }
 
-    fn go_back(&self) -> bool {
-        self.webview.go_back();
+    fn go_back(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        step_webview_history(
+            &self.webview,
+            Some(&self.url_entry),
+            &self.load_state,
+            saved_uri,
+            callbacks,
+            false,
+        );
         true
     }
 
-    fn go_forward(&self) -> bool {
-        self.webview.go_forward();
+    fn go_forward(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        step_webview_history(
+            &self.webview,
+            Some(&self.url_entry),
+            &self.load_state,
+            saved_uri,
+            callbacks,
+            true,
+        );
         true
     }
 
@@ -4792,11 +4902,19 @@ impl BrowserHandles {
         false
     }
 
-    fn go_back(&self) -> bool {
+    fn go_back(
+        &self,
+        _saved_uri: &RefCell<Option<String>>,
+        _callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
         false
     }
 
-    fn go_forward(&self) -> bool {
+    fn go_forward(
+        &self,
+        _saved_uri: &RefCell<Option<String>>,
+        _callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
         false
     }
 
@@ -5020,19 +5138,44 @@ fn create_browser_widget(
     nav_bar.append(&reload_btn);
     nav_bar.append(&url_entry);
 
+    let load_state = BrowserLoadState::new(initial_uri);
     {
         let webview = webview.downgrade();
+        let url_entry = url_entry.downgrade();
+        let saved_uri = saved_uri.clone();
+        let callbacks = callbacks.clone();
+        let load_state = load_state.clone();
         back_btn.connect_clicked(move |_| {
             if let Some(webview) = webview.upgrade() {
-                webview.go_back();
+                let entry = url_entry.upgrade();
+                step_webview_history(
+                    &webview,
+                    entry.as_ref(),
+                    &load_state,
+                    &saved_uri,
+                    &callbacks,
+                    false,
+                );
             }
         });
     }
     {
         let webview = webview.downgrade();
+        let url_entry = url_entry.downgrade();
+        let saved_uri = saved_uri.clone();
+        let callbacks = callbacks.clone();
+        let load_state = load_state.clone();
         fwd_btn.connect_clicked(move |_| {
             if let Some(webview) = webview.upgrade() {
-                webview.go_forward();
+                let entry = url_entry.upgrade();
+                step_webview_history(
+                    &webview,
+                    entry.as_ref(),
+                    &load_state,
+                    &saved_uri,
+                    &callbacks,
+                    true,
+                );
             }
         });
     }
@@ -5044,16 +5187,29 @@ fn create_browser_widget(
             }
         });
     }
-    let load_state = BrowserLoadState::new(initial_uri);
     {
         let webview = webview.downgrade();
+        let saved_uri = saved_uri.clone();
+        let callbacks = callbacks.clone();
         let load_state = load_state.clone();
         url_entry.connect_activate(move |entry| {
             if let Some(webview) = webview.upgrade() {
                 let url = normalize_browser_entry_input(&entry.text());
-                load_state.record_explicit_navigation(&url);
+                let current_uri = webview.uri();
+                load_state.record_explicit_navigation(&url, current_uri.as_deref());
+                entry.set_text(&url);
+                *saved_uri.borrow_mut() = Some(url.clone());
+                let callbacks = callbacks.borrow().clone();
+                (callbacks.on_state_changed)();
                 webview.load_uri(&url);
             }
+        });
+    }
+    {
+        let load_state = load_state.clone();
+        webview.connect_load_failed(move |_, _, _, _| {
+            load_state.clear_restoring();
+            false
         });
     }
     {
@@ -6377,7 +6533,7 @@ mod tests {
         let restored = super::BrowserLoadState::new(Some("https://restored.example/docs"));
         assert!(!restored.accept_notified_uri(""));
         assert!(!restored.accept_notified_uri("about:blank"));
-        restored.record_explicit_navigation("https://explicit.example/page");
+        restored.record_explicit_navigation("https://explicit.example/page", None);
         assert_eq!(
             restored.take_first_map_uri(),
             None,
@@ -6391,9 +6547,89 @@ mod tests {
         assert!(restored.accept_notified_uri("about:blank"));
 
         let restored_to_blank = super::BrowserLoadState::new(Some("https://restored.example/old"));
-        restored_to_blank.record_explicit_navigation("about:blank");
+        restored_to_blank.record_explicit_navigation("about:blank", Some("about:blank"));
         assert_eq!(restored_to_blank.take_first_map_uri(), None);
         assert!(restored_to_blank.accept_notified_uri("about:blank"));
+    }
+
+    #[test]
+    fn browser_load_state_post_map_same_uri_does_not_wedge_restoring() {
+        let state = super::BrowserLoadState::new(Some("https://example.com"));
+        let _ = state.take_first_map_uri();
+        assert!(state.accept_notified_uri("https://example.com"));
+
+        // Navigating an already-mapped non-blank page to the same URL does not
+        // emit notify::uri; restoring must stay false so a later about:blank works.
+        state.record_explicit_navigation("https://example.com", Some("https://example.com"));
+        assert!(state.accept_notified_uri("about:blank"));
+    }
+
+    #[test]
+    fn browser_load_state_failed_load_clears_restoring() {
+        let state = super::BrowserLoadState::new(Some("https://unreachable.invalid"));
+        assert!(!state.accept_notified_uri("about:blank"));
+        state.clear_restoring();
+        assert!(state.accept_notified_uri("about:blank"));
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn pane_summaries_for_widgets_preserves_caller_leaf_order() {
+        use super::{create_pane, pane_summaries_for_widgets, retire_pane, PaneCallbacks};
+        use crate::app_config::AppConfig;
+        use gtk4 as gtk;
+        use gtk4::prelude::Cast;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        if gtk::init().is_err() {
+            return;
+        }
+        let shortcuts = Rc::new(default_shortcuts());
+        let make_callbacks = || {
+            let shortcuts = shortcuts.clone();
+            let config = Rc::new(RefCell::new(AppConfig::default()));
+            Rc::new(PaneCallbacks {
+                workspace_id: "swap-order-test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(|| {}),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(move || config.clone()),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+
+        let first: gtk::Widget =
+            create_pane(make_callbacks(), shortcuts.clone(), None, None, true).upcast();
+        let second: gtk::Widget =
+            create_pane(make_callbacks(), shortcuts, None, None, true).upcast();
+        let initial = pane_summaries_for_widgets(&[first.clone(), second.clone()]);
+        assert_eq!(initial.len(), 2);
+        assert!(initial[0].pane_id < initial[1].pane_id);
+
+        let swapped = pane_summaries_for_widgets(&[second.clone(), first.clone()]);
+        assert_eq!(
+            swapped.iter().map(|p| p.pane_id).collect::<Vec<_>>(),
+            vec![initial[1].pane_id, initial[0].pane_id]
+        );
+
+        retire_pane(&first);
+        retire_pane(&second);
     }
 
     #[cfg(feature = "webkit")]
@@ -6474,6 +6710,116 @@ mod tests {
             Some(target_url)
         );
         drop(tab_state);
+        window.close();
+    }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn browser_back_and_forward_report_destination_uri_immediately() {
+        use super::{
+            add_browser_tab_to_pane_with_uri, browser_target_for_surface, create_pane,
+            find_pane_internals, glib, navigate_browser_surface, PaneCallbacks, TabKind,
+        };
+        use crate::app_config::AppConfig;
+        use gtk4 as gtk;
+        use gtk4::prelude::*;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+        }
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let state_changes = Rc::new(Cell::new(0usize));
+        let state_changes_cb = state_changes.clone();
+        let callbacks = Rc::new(PaneCallbacks {
+            workspace_id: "test".to_string(),
+            autostart_command: Rc::default(),
+            suppress_next_autostart: Cell::new(false),
+            initial_command: RefCell::new(None),
+            on_split: Box::new(|_, _| {}),
+            on_close_pane: Box::new(|_| {}),
+            on_bell: Box::new(|_, _, _| {}),
+            on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+            on_open_browser_here: Box::new(|_| {}),
+            on_open_url_in_browser: Box::new(|_, _| {}),
+            on_open_keybinds: Box::new(|_| {}),
+            current_shortcuts: Box::new({
+                let shortcuts = shortcuts.clone();
+                move || shortcuts.clone()
+            }),
+            on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+            on_pwd_changed: Box::new(|_| {}),
+            on_empty: Box::new(|_, _| {}),
+            on_state_changed: Box::new(move || {
+                state_changes_cb.set(state_changes_cb.get() + 1);
+            }),
+            on_unread_changed: Box::new(|| {}),
+            is_pane_visible: Box::new(|_| true),
+            on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+            current_config: Box::new(move || config.clone()),
+            workspace_for_pane: Box::new(|_| None),
+        });
+
+        let first_url = "data:text/plain,first";
+        let second_url = "data:text/plain,second";
+        let pane = create_pane(callbacks, shortcuts, None, None, true);
+        add_browser_tab_to_pane_with_uri(pane.upcast_ref(), Some(first_url));
+
+        let window = gtk::Window::builder().child(&pane).build();
+        window.present();
+
+        let internals = find_pane_internals(pane.upcast_ref()).unwrap();
+        let webview = {
+            let tab_state = internals.tab_state.borrow();
+            let TabKind::Browser { state } = &tab_state.tabs[0].kind else {
+                panic!("expected browser tab");
+            };
+            state.handles.webview.clone()
+        };
+
+        let wait_until = |pred: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !pred() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                context.iteration(true);
+            }
+        };
+
+        wait_until(&|| {
+            webkit6::prelude::WebViewExt::uri(&webview).as_deref() == Some(first_url)
+                && !webkit6::prelude::WebViewExt::is_loading(&webview)
+        });
+
+        assert!(navigate_browser_surface(pane.upcast_ref(), None, second_url).is_some());
+        wait_until(&|| {
+            webkit6::prelude::WebViewExt::uri(&webview).as_deref() == Some(second_url)
+                && webkit6::prelude::WebViewExt::can_go_back(&webview)
+                && !webkit6::prelude::WebViewExt::is_loading(&webview)
+        });
+
+        let (_, _, target) = browser_target_for_surface(pane.upcast_ref(), None).unwrap();
+        let before = state_changes.get();
+        assert!(target.go_back());
+        // Must report destination URL immediately before async WebProcess IPC finishes.
+        assert_eq!(target.current_uri().as_deref(), Some(first_url));
+        assert!(state_changes.get() > before);
+
+        wait_until(&|| {
+            webkit6::prelude::WebViewExt::uri(&webview).as_deref() == Some(first_url)
+                && webkit6::prelude::WebViewExt::can_go_forward(&webview)
+                && !webkit6::prelude::WebViewExt::is_loading(&webview)
+        });
+
+        let before = state_changes.get();
+        assert!(target.go_forward());
+        assert_eq!(target.current_uri().as_deref(), Some(second_url));
+        assert!(state_changes.get() > before);
+
         window.close();
     }
 }

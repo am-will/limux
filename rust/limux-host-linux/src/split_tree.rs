@@ -37,7 +37,7 @@ impl SplitNode {
         matches!(self, SplitNode::Leaf { .. })
     }
 
-    fn collect_panes(&self, panes: &mut Vec<gtk::Widget>) {
+    pub(crate) fn collect_panes(&self, panes: &mut Vec<gtk::Widget>) {
         match self {
             SplitNode::Leaf { pane_widget } => panes.push(pane_widget.clone()),
             SplitNode::Split { left, right, .. } => {
@@ -128,7 +128,7 @@ impl SplitNode {
         }
     }
 
-    fn swap_panes(&mut self, first: &gtk::Widget, second: &gtk::Widget) -> bool {
+    pub(crate) fn swap_panes(&mut self, first: &gtk::Widget, second: &gtk::Widget) -> bool {
         if !self.contains_pane(first) || !self.contains_pane(second) {
             return false;
         }
@@ -216,12 +216,39 @@ enum SplitChildSide {
     End,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PaneResizeOutcome {
+    pub(crate) changed: bool,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+}
+
 fn apply_pane_resize_delta(current_ratio: f64, side: SplitChildSide, raw_delta: f64) -> f64 {
     let signed_delta = match side {
         SplitChildSide::Start => raw_delta,
         SplitChildSide::End => -raw_delta,
     };
     layout_state::clamp_split_ratio(current_ratio + signed_delta)
+}
+
+fn expected_resized_child_extent(
+    extent: i32,
+    max_position: i32,
+    handle_size: i32,
+    clamped_position: i32,
+    side: SplitChildSide,
+) -> i32 {
+    match side {
+        SplitChildSide::Start => clamped_position.max(0),
+        SplitChildSide::End => {
+            let allocatable = if max_position > 0 {
+                max_position
+            } else {
+                (extent - handle_size.max(0)).max(0)
+            };
+            (allocatable - clamped_position).max(0)
+        }
+    }
 }
 
 /// Manages the workspace's split layout following Ghostty's atomic rebuild
@@ -475,16 +502,22 @@ impl SplitTreeContainer {
         target: &gtk::Widget,
         axis: gtk::Orientation,
         signed_units: f64,
-    ) -> bool {
+    ) -> Option<PaneResizeOutcome> {
         if !self.contains(target) {
-            return false;
+            return None;
         }
+        let mut width = target.width();
+        let mut height = target.height();
         let Some((ratio_cell, side)) = self
             .tree
             .borrow()
             .nearest_split_ratio_for_pane(target, axis)
         else {
-            return true;
+            return Some(PaneResizeOutcome {
+                changed: false,
+                width,
+                height,
+            });
         };
 
         let mut ancestor = target.parent();
@@ -499,17 +532,15 @@ impl SplitTreeContainer {
             ancestor = widget.parent();
         }
 
-        let raw_delta = if let Some(ref paned) = matched_paned {
-            let extent = if axis == gtk::Orientation::Horizontal {
+        let paned_extent = matched_paned.as_ref().map_or(0, |paned| {
+            if axis == gtk::Orientation::Horizontal {
                 paned.width()
             } else {
                 paned.height()
-            };
-            if extent > 0 {
-                (signed_units * 10.0) / f64::from(extent)
-            } else {
-                signed_units * 0.02
             }
+        });
+        let raw_delta = if paned_extent > 0 {
+            (signed_units * 10.0) / f64::from(paned_extent)
         } else {
             signed_units * 0.02
         };
@@ -519,10 +550,29 @@ impl SplitTreeContainer {
 
         if let Some(paned) = matched_paned {
             let applying = Rc::new(Cell::new(false));
-            crate::window::apply_ratio_value(&paned, axis, updated, &applying);
+            let applied = crate::window::apply_ratio_value(&paned, axis, updated, &applying);
             update_split_ratio_state(&paned, updated);
+            if applied && paned_extent > 0 {
+                let handle_size = paned.measure(axis, -1).0;
+                let resized_extent = expected_resized_child_extent(
+                    paned_extent,
+                    paned.max_position(),
+                    handle_size,
+                    paned.position(),
+                    side,
+                );
+                if axis == gtk::Orientation::Horizontal {
+                    width = resized_extent;
+                } else {
+                    height = resized_extent;
+                }
+            }
         }
-        true
+        Some(PaneResizeOutcome {
+            changed: true,
+            width,
+            height,
+        })
     }
 
     /// Run `f` once the widget tree matches the model: at once, or after the
@@ -1189,6 +1239,23 @@ mod tests {
         // Negative delta (left/up) shrinks a Start child and shrinks an End child.
         assert!((apply_pane_resize_delta(0.5, SplitChildSide::Start, -0.1) - 0.4).abs() < 1e-9);
         assert!((apply_pane_resize_delta(0.5, SplitChildSide::End, -0.1) - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn expected_resized_child_extent_computes_post_resize_frame_before_reallocation() {
+        assert_eq!(
+            expected_resized_child_extent(800, 799, 1, 450, SplitChildSide::Start),
+            450
+        );
+        assert_eq!(
+            expected_resized_child_extent(800, 799, 1, 350, SplitChildSide::End),
+            449
+        );
+        // Falls back to extent - handle_size when max_position is not yet populated.
+        assert_eq!(
+            expected_resized_child_extent(800, 0, 4, 300, SplitChildSide::End),
+            496
+        );
     }
 
     #[test]

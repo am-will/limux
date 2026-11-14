@@ -3587,34 +3587,85 @@ fn is_gui_hook_event_name(name: &str) -> bool {
     )
 }
 
-fn parse_set_hook_positional(args: &[String]) -> Result<(String, String)> {
-    let mut positional = Vec::new();
+fn parse_set_hook_options(args: &[String]) -> (bool, Option<String>) {
+    let mut list_mode = false;
+    let mut unset = None;
     let mut idx = 0;
     while idx < args.len() {
         let arg = &args[idx];
         if arg == "--" {
-            positional.extend(args[idx + 1..].iter().cloned());
             break;
         }
-        if arg == "--unset" {
-            idx += 2;
-            continue;
-        }
-        if arg == "--list" || arg.starts_with('-') {
+        if arg == "--list" {
+            list_mode = true;
             idx += 1;
             continue;
         }
-        positional.push(arg.clone());
-        idx += 1;
+        if arg == "--unset" {
+            unset = args.get(idx + 1).cloned();
+            idx += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--unset=") {
+            unset = Some(val.to_string());
+            idx += 1;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--workspace" | "--surface" | "--pane" | "--tab" | "-t"
+        ) {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
     }
-    let Some((name, rest)) = positional.split_first() else {
+    (list_mode, unset)
+}
+
+fn parse_set_hook_positional(args: &[String]) -> Result<(String, String)> {
+    let mut idx = 0;
+    let mut name: Option<String> = None;
+    let mut options_ended = false;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if !options_ended {
+            if arg == "--" {
+                options_ended = true;
+                idx += 1;
+                continue;
+            }
+            if matches!(
+                arg.as_str(),
+                "--workspace" | "--unset" | "--surface" | "--pane" | "--tab" | "-t"
+            ) {
+                idx += 2;
+                continue;
+            }
+            if arg == "--list" || arg.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+        }
+        name = Some(arg.clone());
+        idx += 1;
+        break;
+    }
+    let Some(name) = name else {
         bail!("set-hook requires <name> <command>");
     };
-    let body = rest.join(" ");
+    if !options_ended && args.get(idx).map(String::as_str) == Some("--") {
+        idx += 1;
+    }
+    let body = args.get(idx..).unwrap_or_default().join(" ");
     if name.trim().is_empty() || body.trim().is_empty() {
         bail!("set-hook requires <name> <command>");
     }
-    Ok((name.clone(), body))
+    Ok((name, body))
 }
 
 async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) -> Result<Value> {
@@ -3756,8 +3807,7 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
                 .await
         }
         "set-hook" => {
-            let list_mode = parse_flag(args, "--list");
-            let unset = parse_opt(args, "--unset");
+            let (list_mode, unset) = parse_set_hook_options(args);
             if list_mode {
                 let gui_entries = client
                     .call("gui_hook.list", json!({}))
@@ -5276,7 +5326,93 @@ mod new_pane_tests {
                 "echo ready".to_string()
             )
         );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "after-workspace-create",
+                "bash",
+                "-lc",
+                "echo ready",
+            ]))
+            .unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "bash -lc echo ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "after-workspace-create",
+                "notify-send",
+                "-u",
+                "critical",
+                "Done",
+            ]))
+            .unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "notify-send -u critical Done".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "--workspace",
+                "ws1",
+                "on-workspace-create",
+                "echo",
+                "-n",
+                "ready",
+            ]))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "--workspace=ws1",
+                "-g",
+                "on-workspace-create",
+                "echo",
+                "-n",
+                "ready",
+            ]))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(
+                &["on-workspace-create", "--", "echo", "-n", "ready",]
+            ))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&[
+                "on-workspace-create",
+                "cmd",
+                "--list",
+                "--unset",
+                "x"
+            ])),
+            (false, None)
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&["--workspace", "ws1", "--list"])),
+            (true, None)
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&["--unset", "on-workspace-create"])),
+            (false, Some("on-workspace-create".to_string()))
+        );
         assert!(parse_set_hook_positional(&args(&["only-name"])).is_err());
+        assert!(parse_set_hook_positional(&args(&["on-workspace-create", "--"])).is_err());
         assert!(is_gui_hook_event_name("on-workspace-create"));
         assert!(!is_gui_hook_event_name("pane-focus-in"));
     }

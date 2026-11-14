@@ -157,6 +157,14 @@ impl AppState {
             .iter()
             .find(|workspace| widget.is_ancestor(&workspace.root))
     }
+
+    fn workspace_for_pane_widget(&self, widget: &gtk::Widget) -> Option<&Workspace> {
+        self.workspace_for_widget(widget).or_else(|| {
+            self.workspaces
+                .iter()
+                .find(|workspace| workspace.split_container.contains(widget))
+        })
+    }
 }
 
 fn workspace_ref(id: &str) -> String {
@@ -477,25 +485,55 @@ fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>,
     (Some(surface.pane_id), Some(surface.surface_id))
 }
 
+fn visible_workspace_pane_widgets(workspace: &Workspace) -> Vec<gtk::Widget> {
+    workspace
+        .split_container
+        .panes()
+        .into_iter()
+        .filter(|widget| widget.is_ancestor(&workspace.root))
+        .collect()
+}
+
+fn workspace_pane_summaries(workspace: &Workspace) -> Vec<pane::PaneSummary> {
+    let visible_panes = visible_workspace_pane_widgets(workspace);
+    let summaries = pane::pane_summaries_for_widgets(&visible_panes);
+    if summaries.is_empty() {
+        pane::pane_summaries_for_root(&workspace.root)
+    } else {
+        summaries
+    }
+}
+
+fn workspace_surface_summaries(workspace: &Workspace) -> Vec<pane::SurfaceSummary> {
+    let visible_panes = visible_workspace_pane_widgets(workspace);
+    let summaries = pane::surface_summaries_for_widgets(&visible_panes);
+    if summaries.is_empty() {
+        pane::surface_summaries_for_root(&workspace.root)
+    } else {
+        summaries
+    }
+}
+
 fn control_pane_target(
     state: &State,
     index: usize,
     pane_hint: Option<&str>,
 ) -> Option<(gtk::Widget, u32)> {
-    let (workspace_id, root) = {
+    let (workspace_id, fallback_pane_id) = {
         let app_state = state.borrow();
         let workspace = &app_state.workspaces[index];
-        (workspace.id.clone(), workspace.root.clone())
+        (
+            workspace.id.clone(),
+            workspace_pane_summaries(workspace)
+                .first()
+                .map(|pane| pane.pane_id),
+        )
     };
     let pane_id = match pane_hint {
         Some(hint) => parse_pane_handle(hint)?,
         None => focused_ids_for_workspace(state, &workspace_id)
             .0
-            .or_else(|| {
-                pane::pane_summaries_for_root(&root)
-                    .first()
-                    .map(|pane| pane.pane_id)
-            })?,
+            .or(fallback_pane_id)?,
     };
     Some((
         pane::pane_widget_for_workspace(&workspace_id, pane_id)?,
@@ -521,21 +559,78 @@ fn control_surface_target(
     Some((widget, pane_id, tab_id))
 }
 
-fn note_workspace_pane_focus(app_state: &mut AppState, workspace_id: &str, pane_id: u32) {
-    if let Some(previous) = app_state
-        .current_pane_by_workspace
-        .insert(workspace_id.to_string(), pane_id)
-    {
+fn record_pane_focus_history(
+    current_pane_by_workspace: &mut HashMap<String, u32>,
+    last_pane_by_workspace: &mut HashMap<String, u32>,
+    workspace_id: &str,
+    pane_id: u32,
+    seeded_previous: Option<u32>,
+) {
+    if let Some(seed) = seeded_previous {
+        current_pane_by_workspace
+            .entry(workspace_id.to_string())
+            .or_insert(seed);
+    }
+    if let Some(previous) = current_pane_by_workspace.insert(workspace_id.to_string(), pane_id) {
         if previous != pane_id {
-            app_state
-                .last_pane_by_workspace
-                .insert(workspace_id.to_string(), previous);
+            last_pane_by_workspace.insert(workspace_id.to_string(), previous);
         }
     }
 }
 
+fn resolve_last_pane_target(
+    current_pane_by_workspace: &HashMap<String, u32>,
+    last_pane_by_workspace: &HashMap<String, u32>,
+    workspace_id: &str,
+    fallback_focused: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    let current_focused = current_pane_by_workspace
+        .get(workspace_id)
+        .copied()
+        .or(fallback_focused);
+    let target_pane = last_pane_by_workspace
+        .get(workspace_id)
+        .copied()
+        .filter(|id| Some(*id) != current_focused);
+    (current_focused, target_pane)
+}
+
+fn note_workspace_pane_focus_with_seed(
+    app_state: &mut AppState,
+    workspace_id: &str,
+    pane_id: u32,
+    seeded_previous: Option<u32>,
+) {
+    record_pane_focus_history(
+        &mut app_state.current_pane_by_workspace,
+        &mut app_state.last_pane_by_workspace,
+        workspace_id,
+        pane_id,
+        seeded_previous,
+    );
+}
+
+fn note_workspace_pane_focus(app_state: &mut AppState, workspace_id: &str, pane_id: u32) {
+    note_workspace_pane_focus_with_seed(app_state, workspace_id, pane_id, None);
+}
+
 fn focus_control_surface(state: &State, index: usize, pane: &gtk::Widget, tab_id: &str) -> bool {
     select_workspace_by_index(state, index);
+    let existing_focused = {
+        let (workspace_id, fallback_pane_id) = {
+            let app_state = state.borrow();
+            let workspace = &app_state.workspaces[index];
+            (
+                workspace.id.clone(),
+                workspace_pane_summaries(workspace)
+                    .first()
+                    .map(|summary| summary.pane_id),
+            )
+        };
+        focused_ids_for_workspace(state, &workspace_id)
+            .0
+            .or(fallback_pane_id)
+    };
     let activated = pane::activate_tab_in_pane(pane, tab_id);
     if activated {
         let (container, workspace_id) = {
@@ -546,7 +641,12 @@ fn focus_control_surface(state: &State, index: usize, pane: &gtk::Widget, tab_id
             )
         };
         if let Some(summary) = pane::active_surface_summary(pane) {
-            note_workspace_pane_focus(&mut state.borrow_mut(), &workspace_id, summary.pane_id);
+            note_workspace_pane_focus_with_seed(
+                &mut state.borrow_mut(),
+                &workspace_id,
+                summary.pane_id,
+                existing_focused,
+            );
         }
         container.reveal_pane(pane);
         request_session_save(state);
@@ -774,17 +874,16 @@ pub(crate) fn resolve_pane_create_target(
                 PaneCreateTargetError::InvalidSurfaceId(surface_id.unwrap_or_default().to_string())
             }
         })?;
-    let (workspace_id, workspace_root, target_workspace_is_active) = {
+    let (workspace_id, workspace_root, pane_summaries, target_workspace_is_active) = {
         let app_state = state.borrow();
         let workspace = &app_state.workspaces[workspace_index];
         (
             workspace.id.clone(),
             workspace.root.clone(),
+            workspace_pane_summaries(workspace),
             workspace_index == app_state.active_idx,
         )
     };
-
-    let pane_summaries = pane::pane_summaries_for_root(&workspace_root);
     let pane_ids = pane_summaries
         .iter()
         .map(|summary| summary.pane_id)
@@ -815,9 +914,11 @@ pub(crate) fn resolve_pane_create_target(
     })
 }
 
-fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value {
-    let (focused_pane_id, _) = focused_ids_for_workspace(state, &workspace.id);
-    let panes = pane::pane_summaries_for_root(&workspace.root)
+fn pane_list_payload_from_summaries(
+    pane_summaries: Vec<pane::PaneSummary>,
+    focused_pane_id: Option<u32>,
+) -> serde_json::Value {
+    let panes = pane_summaries
         .into_iter()
         .enumerate()
         .map(|(index, pane)| {
@@ -854,13 +955,18 @@ fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value 
     serde_json::json!({ "panes": panes })
 }
 
+fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value {
+    let (focused_pane_id, _) = focused_ids_for_workspace(state, &workspace.id);
+    pane_list_payload_from_summaries(workspace_pane_summaries(workspace), focused_pane_id)
+}
+
 fn surface_list_payload(
     state: &State,
     workspace: &Workspace,
     pane_filter: Option<u32>,
 ) -> serde_json::Value {
     let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
-    let surfaces = pane::surface_summaries_for_root(&workspace.root)
+    let surfaces = workspace_surface_summaries(workspace)
         .into_iter()
         .filter(|surface| pane_filter.is_none_or(|pane_id| surface.pane_id == pane_id))
         .enumerate()
@@ -1412,6 +1518,7 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
         })
         .unwrap_or(loaded.state.active_workspace_index);
     restore_active_workspace(state, active_index);
+    state.borrow_mut().last_workspace_id = None;
     apply_sidebar_state_immediately(state, &loaded.state.sidebar);
 
     let mut restored = snapshot_session_state(state);
@@ -5999,6 +6106,21 @@ fn dispatch_control_command(command: ControlCommand) {
     });
 }
 
+fn after_containers_rebuilt(
+    source: Option<Rc<SplitTreeContainer>>,
+    dest: Rc<SplitTreeContainer>,
+    f: impl FnOnce() + 'static,
+) {
+    match source {
+        Some(source) if !Rc::ptr_eq(&source, &dest) => {
+            source.after_pending_rebuild(move || {
+                dest.after_pending_rebuild(f);
+            });
+        }
+        _ => dest.after_pending_rebuild(f),
+    }
+}
+
 fn break_tabs_into_new_workspace(
     state: &State,
     source_pane: &gtk::Widget,
@@ -7182,11 +7304,29 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 }
             };
 
+            let source_ws = {
+                let app_state = state.borrow();
+                app_state
+                    .workspace_for_pane_widget(&source_pane)
+                    .map(|ws| (ws.id.clone(), ws.split_container.clone()))
+            };
             match break_tabs_into_new_workspace(state, &source_pane, &tabs_to_move) {
-                Ok((split_container, payload)) => {
-                    split_container.after_pending_rebuild(move || {
-                        let _ = reply.send(Ok(payload));
+                Ok((dest_split_container, payload)) => {
+                    let source_split_container = source_ws.and_then(|(id, container)| {
+                        state
+                            .borrow()
+                            .workspaces
+                            .iter()
+                            .any(|ws| ws.id == id)
+                            .then_some(container)
                     });
+                    after_containers_rebuilt(
+                        source_split_container,
+                        dest_split_container,
+                        move || {
+                            let _ = reply.send(Ok(payload));
+                        },
+                    );
                 }
                 Err(error) => {
                     let _ = reply.send(Err(error));
@@ -7226,7 +7366,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let container = {
                     let app_state = state.borrow();
                     app_state
-                        .workspace_for_widget(&widget)
+                        .workspace_for_pane_widget(&widget)
                         .map(|ws| ws.split_container.clone())
                 };
                 let Some(container) = container else {
@@ -7292,16 +7432,30 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let _ = reply.send(Err(BridgeError::not_found("source pane has no surfaces")));
                 return;
             }
+            let source_ws = {
+                let app_state = state.borrow();
+                app_state
+                    .workspace_for_pane_widget(&source_pane_widget)
+                    .map(|ws| (ws.id.clone(), ws.split_container.clone()))
+            };
             let _ =
                 pane::move_tabs_preserving_active(&source_pane_widget, &tab_ids, &dest_pane_widget);
             request_session_save(state);
 
+            let source_split_container = source_ws.and_then(|(id, container)| {
+                state
+                    .borrow()
+                    .workspaces
+                    .iter()
+                    .any(|ws| ws.id == id)
+                    .then_some(container)
+            });
             let response = serde_json::json!({
                 "pane_id": dest_pane_id,
                 "pane_ref": pane_ref(dest_pane_id),
                 "ok": true,
             });
-            dest_split_container.after_pending_rebuild(move || {
+            after_containers_rebuilt(source_split_container, dest_split_container, move || {
                 let _ = reply.send(Ok(response));
             });
         }
@@ -7311,15 +7465,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
             let ws_id = state.borrow().workspaces[index].id.clone();
-            let current_focused = focused_ids_for_workspace(state, &ws_id).0.or_else(|| {
-                state
-                    .borrow()
-                    .current_pane_by_workspace
-                    .get(&ws_id)
-                    .copied()
-            });
-            let last_pane = state.borrow().last_pane_by_workspace.get(&ws_id).copied();
-            let Some(pane_id) = last_pane.filter(|id| Some(*id) != current_focused) else {
+            let fallback_focused = focused_ids_for_workspace(state, &ws_id).0;
+            let (current_focused, target_pane_id) = {
+                let app_state = state.borrow();
+                resolve_last_pane_target(
+                    &app_state.current_pane_by_workspace,
+                    &app_state.last_pane_by_workspace,
+                    &ws_id,
+                    fallback_focused,
+                )
+            };
+            let Some(pane_id) = target_pane_id else {
                 let _ = reply.send(Err(BridgeError::not_found("last pane not found")));
                 return;
             };
@@ -7331,13 +7487,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let _ = reply.send(Err(BridgeError::not_found("last pane not found")));
                 return;
             };
-            if let Some(current) = current_focused {
-                state
-                    .borrow_mut()
-                    .current_pane_by_workspace
-                    .entry(ws_id.clone())
-                    .or_insert(current);
-            }
+            note_workspace_pane_focus_with_seed(
+                &mut state.borrow_mut(),
+                &ws_id,
+                pane_id,
+                current_focused,
+            );
             focus_control_surface(state, index, &pane_widget, &tab_id);
             let _ = reply.send(Ok(serde_json::json!({
                 "pane_id": pane_id,
@@ -7389,17 +7544,24 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     (gtk::Orientation::Vertical, amount as f64, "down")
                 }
             };
-            if split_container.resize_pane(&pane_widget, axis, signed_amount) {
-                request_session_save(state);
-            }
+            let (frame_width, frame_height) =
+                match split_container.resize_pane(&pane_widget, axis, signed_amount) {
+                    Some(outcome) => {
+                        if outcome.changed {
+                            request_session_save(state);
+                        }
+                        (outcome.width, outcome.height)
+                    }
+                    None => (pane_widget.width(), pane_widget.height()),
+                };
             let _ = reply.send(Ok(serde_json::json!({
                 "pane_id": parsed_pane_id,
                 "pane_ref": pane_ref(parsed_pane_id),
                 "direction": dir_label,
                 "amount": amount,
                 "frame": {
-                    "width": pane_widget.width(),
-                    "height": pane_widget.height(),
+                    "width": frame_width,
+                    "height": frame_height,
                 },
                 "ok": true,
             })));
@@ -7583,6 +7745,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 }
                 crate::control_bridge::BrowserControlAction::Back => {
                     let _ = browser_target.go_back();
+                    request_session_save(state);
                     let current_url = browser_target
                         .current_uri()
                         .unwrap_or_else(|| "about:blank".to_string());
@@ -7594,6 +7757,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 }
                 crate::control_bridge::BrowserControlAction::Forward => {
                     let _ = browser_target.go_forward();
+                    request_session_save(state);
                     let current_url = browser_target
                         .current_uri()
                         .unwrap_or_else(|| "about:blank".to_string());
@@ -8737,12 +8901,12 @@ fn split_pane(
         pane::active_surface_summary(pane_widget),
         pane::active_surface_summary(&new_pane_widget),
     ) {
-        let mut app_state = state.borrow_mut();
-        app_state
-            .current_pane_by_workspace
-            .entry(ws_id.to_string())
-            .or_insert(source_summary.pane_id);
-        note_workspace_pane_focus(&mut app_state, ws_id, new_summary.pane_id);
+        note_workspace_pane_focus_with_seed(
+            &mut state.borrow_mut(),
+            ws_id,
+            new_summary.pane_id,
+            Some(source_summary.pane_id),
+        );
     }
 
     if options.persist {
@@ -10876,6 +11040,143 @@ mod tests {
         );
         assert_eq!(super::tail_lines("alpha\nbeta\ngamma", 2), "beta\ngamma");
         assert_eq!(super::tail_lines("alpha\nbeta", 10), "alpha\nbeta");
+    }
+
+    #[test]
+    fn pane_list_payload_from_summaries_preserves_swapped_leaf_order_and_indices() {
+        use crate::pane;
+
+        let payload = super::pane_list_payload_from_summaries(
+            vec![
+                pane::PaneSummary {
+                    pane_id: 2,
+                    surface_count: 1,
+                    active_surface_id: Some("2:tab-b".to_string()),
+                },
+                pane::PaneSummary {
+                    pane_id: 1,
+                    surface_count: 2,
+                    active_surface_id: Some("1:tab-a".to_string()),
+                },
+            ],
+            Some(2),
+        );
+        let panes = payload["panes"].as_array().expect("panes array");
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0]["pane_id"], "2");
+        assert_eq!(panes[0]["pane_ref"], "pane:2");
+        assert_eq!(panes[0]["index"], 0);
+        assert_eq!(panes[0]["focused"], true);
+        assert_eq!(panes[1]["pane_id"], "1");
+        assert_eq!(panes[1]["pane_ref"], "pane:1");
+        assert_eq!(panes[1]["index"], 1);
+        assert_eq!(panes[1]["focused"], false);
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn swapped_split_node_panes_report_swapped_order_and_indices() {
+        use crate::app_config::AppConfig;
+        use crate::pane;
+        use crate::shortcut_config::default_shortcuts;
+        use crate::split_tree::SplitNode;
+        use gtk4::prelude::Cast;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        if gtk4::init().is_err() {
+            return;
+        }
+        let shortcuts = Rc::new(default_shortcuts());
+        let make_callbacks = || {
+            let shortcuts = shortcuts.clone();
+            let config = Rc::new(RefCell::new(AppConfig::default()));
+            Rc::new(pane::PaneCallbacks {
+                workspace_id: "window-swap-test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(|| {}),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(move || config.clone()),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+
+        let first: gtk4::Widget =
+            pane::create_pane(make_callbacks(), shortcuts.clone(), None, None, true).upcast();
+        let second: gtk4::Widget =
+            pane::create_pane(make_callbacks(), shortcuts, None, None, true).upcast();
+        let first_id = pane::pane_summary_for_widget(&first).unwrap().pane_id;
+        let second_id = pane::pane_summary_for_widget(&second).unwrap().pane_id;
+
+        let mut tree = SplitNode::Split {
+            orientation: gtk4::Orientation::Horizontal,
+            ratio: Rc::new(RefCell::new(0.5)),
+            left: Box::new(SplitNode::Leaf {
+                pane_widget: first.clone(),
+            }),
+            right: Box::new(SplitNode::Leaf {
+                pane_widget: second.clone(),
+            }),
+        };
+        assert!(tree.swap_panes(&first, &second));
+
+        let mut leaf_widgets = Vec::new();
+        tree.collect_panes(&mut leaf_widgets);
+        let summaries = pane::pane_summaries_for_widgets(&leaf_widgets);
+        let payload = super::pane_list_payload_from_summaries(summaries, Some(second_id));
+        let panes = payload["panes"].as_array().unwrap();
+        assert_eq!(panes[0]["pane_id"], second_id.to_string());
+        assert_eq!(panes[0]["index"], 0);
+        assert_eq!(panes[1]["pane_id"], first_id.to_string());
+        assert_eq!(panes[1]["index"], 1);
+
+        pane::retire_pane(&first);
+        pane::retire_pane(&second);
+    }
+
+    #[test]
+    fn workspace_pane_focus_history_seeds_initial_focus_and_toggles_last_pane() {
+        use std::collections::HashMap;
+
+        let mut current = HashMap::new();
+        let mut last = HashMap::new();
+
+        // Initial unseeded focus(pane 2) with seeded pane 1 (e.g. freshly restored session).
+        super::record_pane_focus_history(&mut current, &mut last, "ws-1", 2, Some(1));
+        assert_eq!(current.get("ws-1"), Some(&2));
+        assert_eq!(last.get("ws-1"), Some(&1));
+
+        // Immediate last_pane before deferred GTK focus moves off pane 1 must still
+        // see current == 2 from synchronous tracking and switch back to pane 1.
+        let (cur, target) = super::resolve_last_pane_target(&current, &last, "ws-1", Some(1));
+        assert_eq!(cur, Some(2));
+        assert_eq!(target, Some(1));
+        super::record_pane_focus_history(&mut current, &mut last, "ws-1", 1, cur);
+        assert_eq!(current.get("ws-1"), Some(&1));
+        assert_eq!(last.get("ws-1"), Some(&2));
+
+        // Second last_pane switches back to pane 2.
+        let (cur2, target2) = super::resolve_last_pane_target(&current, &last, "ws-1", Some(1));
+        assert_eq!(cur2, Some(1));
+        assert_eq!(target2, Some(2));
+        super::record_pane_focus_history(&mut current, &mut last, "ws-1", 2, cur2);
+        assert_eq!(current.get("ws-1"), Some(&2));
+        assert_eq!(last.get("ws-1"), Some(&1));
     }
 }
 
