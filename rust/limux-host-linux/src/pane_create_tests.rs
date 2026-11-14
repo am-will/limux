@@ -52,6 +52,7 @@ fn pane_create_replies_once_the_new_pane_can_be_targeted() {
                 direction: BridgePaneCreateDirection::Right,
                 pane_type: PaneCreateType::Terminal,
                 command: None,
+                url: None,
             },
             reply,
         },

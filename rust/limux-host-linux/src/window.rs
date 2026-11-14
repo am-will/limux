@@ -114,6 +114,9 @@ pub(crate) struct AppState {
     group_headers: HashMap<String, sidebar_groups::GroupHeader>,
     last_focused_surface: Option<FocusRestoreTarget>,
     pending_focus_restore: Option<FocusRestoreTarget>,
+    last_workspace_id: Option<String>,
+    current_pane_by_workspace: HashMap<String, u32>,
+    last_pane_by_workspace: HashMap<String, u32>,
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
@@ -197,13 +200,42 @@ fn pane_create_response_payload(
     })
 }
 
-fn send_pane_create_response_after_command(
-    pane_widget: gtk::Widget,
-    surface_id: String,
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    if max_lines == 0 || text.is_empty() {
+        return String::new();
+    }
+    let has_trailing_newline = text.ends_with('\n');
+    let trimmed = text.strip_suffix('\n').unwrap_or(text);
+    let mut kept: Vec<&str> = trimmed.split('\n').rev().take(max_lines).collect();
+    kept.reverse();
+    let mut out = kept.join("\n");
+    if has_trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
+fn send_response_after_terminal_command(
+    method: &'static str,
+    root_or_pane: gtk::Widget,
+    surface_id: Option<String>,
     command: String,
     response: serde_json::Value,
     reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
 ) {
+    if let Some((_, handle)) =
+        pane::terminal_handle_for_surface(&root_or_pane, surface_id.as_deref()).or_else(|| {
+            surface_id
+                .is_none()
+                .then(|| pane::terminal_handle_for_root(&root_or_pane))
+                .flatten()
+        })
+    {
+        if !handle.health().realized {
+            handle.realize_in_background();
+        }
+    }
+
     let mut attempts = 0;
     let mut command_sent = false;
     let mut reply = Some(reply);
@@ -214,8 +246,18 @@ fn send_pane_create_response_after_command(
             attempts += 1;
 
             if let Some((_, handle)) =
-                pane::terminal_handle_for_surface(&pane_widget, Some(&surface_id))
+                pane::terminal_handle_for_surface(&root_or_pane, surface_id.as_deref()).or_else(
+                    || {
+                        surface_id
+                            .is_none()
+                            .then(|| pane::terminal_handle_for_root(&root_or_pane))
+                            .flatten()
+                    },
+                )
             {
+                if !handle.health().realized {
+                    handle.realize_in_background();
+                }
                 if !command_sent {
                     command_sent = handle.send_text(&command);
                 }
@@ -229,8 +271,9 @@ fn send_pane_create_response_after_command(
 
             if attempts >= PANE_CREATE_COMMAND_READY_ATTEMPTS {
                 if let Some(reply) = reply.take() {
+                    let label = surface_id.as_deref().unwrap_or("initial");
                     let _ = reply.send(Err(BridgeError::internal(format!(
-                        "pane.create command target surface {surface_id} never became writable"
+                        "{method} command target surface {label} never became writable"
                     ))));
                 }
                 glib::ControlFlow::Break
@@ -478,15 +521,85 @@ fn control_surface_target(
     Some((widget, pane_id, tab_id))
 }
 
+fn note_workspace_pane_focus(app_state: &mut AppState, workspace_id: &str, pane_id: u32) {
+    if let Some(previous) = app_state
+        .current_pane_by_workspace
+        .insert(workspace_id.to_string(), pane_id)
+    {
+        if previous != pane_id {
+            app_state
+                .last_pane_by_workspace
+                .insert(workspace_id.to_string(), previous);
+        }
+    }
+}
+
 fn focus_control_surface(state: &State, index: usize, pane: &gtk::Widget, tab_id: &str) -> bool {
     select_workspace_by_index(state, index);
     let activated = pane::activate_tab_in_pane(pane, tab_id);
     if activated {
-        let container = state.borrow().workspaces[index].split_container.clone();
+        let (container, workspace_id) = {
+            let app_state = state.borrow();
+            (
+                app_state.workspaces[index].split_container.clone(),
+                app_state.workspaces[index].id.clone(),
+            )
+        };
+        if let Some(summary) = pane::active_surface_summary(pane) {
+            note_workspace_pane_focus(&mut state.borrow_mut(), &workspace_id, summary.pane_id);
+        }
         container.reveal_pane(pane);
         request_session_save(state);
     }
     activated
+}
+
+fn control_browser_target(
+    state: &State,
+    workspace_index: usize,
+    surface: Option<(u32, String)>,
+) -> Option<(
+    serde_json::Value,
+    gtk::Widget,
+    Option<String>,
+    String,
+    pane::BrowserShortcutTarget,
+)> {
+    let app_state = state.borrow();
+    let workspace = &app_state.workspaces[workspace_index];
+    let resolved_surface = surface.or_else(|| {
+        let pane_id = focused_ids_for_workspace(state, &workspace.id).0?;
+        let pane_widget = pane::pane_widget_for_workspace(&workspace.id, pane_id)?;
+        let active_tab = pane::active_tab_in_pane(&pane_widget)?;
+        pane::browser_target_for_surface(&pane_widget, Some(&active_tab))
+            .map(|_| (pane_id, active_tab))
+    });
+    let (pane_widget, tab_hint, (surface_id, title, target)) = match resolved_surface {
+        Some((pane_id, tab_id)) => {
+            let pane_widget = pane::pane_widget_for_workspace(&workspace.id, pane_id)?;
+            let found = pane::browser_target_for_surface(&pane_widget, Some(&tab_id))?;
+            (pane_widget, Some(tab_id), found)
+        }
+        None => {
+            let found = pane::browser_target_for_root(&workspace.root)?;
+            let (raw_pane, raw_tab) = found.0.split_once(':')?;
+            let pane_id = raw_pane.parse::<u32>().ok()?;
+            let pane_widget = pane::pane_widget_for_workspace(&workspace.id, pane_id)?;
+            (pane_widget, Some(raw_tab.to_string()), found)
+        }
+    };
+    Some((
+        serde_json::json!({
+            "workspace_id": workspace.id.as_str(),
+            "workspace_ref": workspace_ref(&workspace.id),
+            "surface_id": surface_id.as_str(),
+            "surface_ref": surface_ref(&surface_id),
+        }),
+        pane_widget,
+        tab_hint,
+        title,
+        target,
+    ))
 }
 
 /// Resolve all terminal control operations through the same workspace-local target.
@@ -2280,6 +2393,9 @@ pub fn build_window(app: &adw::Application) {
         group_headers: HashMap::new(),
         last_focused_surface: None,
         pending_focus_restore: None,
+        last_workspace_id: None,
+        current_pane_by_workspace: HashMap::new(),
+        last_pane_by_workspace: HashMap::new(),
         shortcuts,
         stack: stack.clone(),
         indicator_box: indicator_box.clone(),
@@ -5313,6 +5429,14 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         app_state
             .sidebar
             .push_workspace(new_workspace_id.clone(), false);
+        if let Some(prev_id) = app_state
+            .workspaces
+            .get(app_state.active_idx)
+            .map(|ws| ws.id.clone())
+            .filter(|id| id != &new_workspace_id)
+        {
+            app_state.last_workspace_id = Some(prev_id);
+        }
         app_state.active_idx = app_state.workspaces.len() - 1;
         sync_indicator_active_state(&app_state);
         app_state.stack.set_visible_child_name(&stack_name);
@@ -5875,6 +5999,183 @@ fn dispatch_control_command(command: ControlCommand) {
     });
 }
 
+fn break_tabs_into_new_workspace(
+    state: &State,
+    source_pane: &gtk::Widget,
+    tabs_to_move: &[String],
+) -> Result<(Rc<SplitTreeContainer>, serde_json::Value), BridgeError> {
+    let Some(first_tab_id) = tabs_to_move.first() else {
+        return Err(BridgeError::not_found("surface not found"));
+    };
+    let active_seed_tab = pane::active_tab_in_pane(source_pane);
+    let seed_tab_id =
+        pane::preserved_active_tab_for_batch_move(active_seed_tab.as_deref(), tabs_to_move)
+            .unwrap_or(first_tab_id.as_str());
+    let Some(title) = pane::tab_title(source_pane, seed_tab_id) else {
+        return Err(BridgeError::not_found("surface not found"));
+    };
+    let tab_cwd = pane::tab_working_directory(source_pane, seed_tab_id);
+    let (seed, previous_active_workspace_id, shortcuts) = {
+        let app_state = state.borrow();
+        let source = app_state
+            .workspace_for_widget(source_pane)
+            .map(|workspace| WorkspaceSeedSource {
+                workspace_cwd: workspace.cwd.borrow().clone(),
+                workspace_folder_path: workspace.folder_path.clone(),
+            })
+            .unwrap_or(WorkspaceSeedSource {
+                workspace_cwd: None,
+                workspace_folder_path: None,
+            });
+        (
+            tab_drag_workspace_seed(source, &title, tab_cwd),
+            app_state
+                .active_workspace()
+                .map(|workspace| workspace.id.clone()),
+            app_state.shortcuts.clone(),
+        )
+    };
+
+    let new_workspace_id = uuid::Uuid::new_v4().to_string();
+    let autostart_command = Rc::new(RefCell::new(None));
+    let stack_name = format!("ws-{new_workspace_id}");
+    let dest_pane = create_pane_for_workspace(
+        state,
+        &shortcuts,
+        &new_workspace_id,
+        seed.cwd.as_deref(),
+        autostart_command.clone(),
+        PaneCreationOptions {
+            initial_state: None,
+            skip_default_tab: true,
+            suppress_initial_autostart: true,
+            initial_command: None,
+        },
+    );
+    let split_container = SplitTreeContainer::new(state, dest_pane.clone().upcast());
+    let root = split_container.widget().clone();
+
+    let show_workspace_path = state
+        .borrow()
+        .config
+        .borrow()
+        .appearance
+        .show_workspace_path;
+    let (row, name_label, favorite_button, notify_dot, notify_label, path_label, close_button) =
+        build_sidebar_row(&seed.name, seed.folder_path.as_deref(), show_workspace_path);
+    {
+        let state = state.clone();
+        let ws_id = new_workspace_id.clone();
+        close_button.connect_clicked(move |_| {
+            close_workspace_from_gui(&state, &ws_id);
+        });
+    }
+    let (indicator_button, indicator_unread_dot) = build_workspace_indicator(&seed.name);
+    {
+        let state = state.clone();
+        let ws_id = new_workspace_id.clone();
+        indicator_button.connect_clicked(move |_| {
+            let (idx, row, sidebar_list) = {
+                let s = state.borrow();
+                let Some(idx) = s.workspaces.iter().position(|w| w.id == ws_id) else {
+                    return;
+                };
+                (
+                    idx,
+                    s.workspaces[idx].sidebar_row.clone(),
+                    s.sidebar_list.clone(),
+                )
+            };
+            switch_workspace(&state, idx);
+            sidebar_list.select_row(Some(&row));
+        });
+    }
+    let row_clone = row.clone();
+    {
+        let mut app_state = state.borrow_mut();
+        app_state.stack.add_named(&root, Some(&stack_name));
+        app_state.sidebar_list.append(&row);
+        app_state.indicator_box.append(&indicator_button);
+        install_workspace_row_interactions(state, &new_workspace_id, &row, &favorite_button);
+
+        if let Some(prev_id) = app_state
+            .workspaces
+            .get(app_state.active_idx)
+            .map(|ws| ws.id.clone())
+            .filter(|id| id != &new_workspace_id)
+        {
+            app_state.last_workspace_id = Some(prev_id);
+        }
+        app_state.workspaces.push(Workspace {
+            id: new_workspace_id.clone(),
+            name: seed.name.clone(),
+            root: root.clone().upcast(),
+            split_container: split_container.clone(),
+            sidebar_row: row,
+            name_label,
+            favorite_button,
+            notify_dot,
+            notify_label,
+            unread: false,
+            manual_unread: false,
+            color: None,
+            cwd: Rc::new(RefCell::new(seed.cwd.clone())),
+            folder_path: seed.folder_path.clone(),
+            autostart_command,
+            path_label,
+            indicator_button,
+            indicator_unread_dot,
+        });
+        app_state
+            .sidebar
+            .push_workspace(new_workspace_id.clone(), false);
+        app_state.active_idx = app_state.workspaces.len() - 1;
+        sync_indicator_active_state(&app_state);
+        app_state.stack.set_visible_child_name(&stack_name);
+    }
+
+    {
+        let sidebar_list = state.borrow().sidebar_list.clone();
+        sidebar_list.select_row(Some(&row_clone));
+    }
+    sidebar_groups::sync_row_visibility(state);
+
+    let dest_widget: gtk::Widget = dest_pane.upcast();
+    let moved_any = pane::move_tabs_preserving_active(source_pane, tabs_to_move, &dest_widget);
+    if !moved_any {
+        close_workspace_by_id_internal(
+            state,
+            &new_workspace_id,
+            false,
+            previous_active_workspace_id.as_deref(),
+        );
+        return Err(BridgeError::conflict(
+            "failed to move surface to new workspace",
+        ));
+    }
+
+    apply_top_bar_mode(state);
+    request_session_save(state);
+
+    let Some(summary) = pane::active_surface_summary(&dest_widget) else {
+        return Err(BridgeError::internal(
+            "pane.break did not produce a surface",
+        ));
+    };
+    note_workspace_pane_focus(&mut state.borrow_mut(), &new_workspace_id, summary.pane_id);
+
+    let payload = serde_json::json!({
+        "workspace_id": new_workspace_id,
+        "workspace_ref": workspace_ref(&new_workspace_id),
+        "pane_id": summary.pane_id,
+        "pane_ref": pane_ref(summary.pane_id),
+        "surface_id": summary.surface_id,
+        "surface_ref": surface_ref(&summary.surface_id),
+        "ok": true,
+    });
+    Ok((split_container, payload))
+}
+
 fn handle_control_command(state: &State, command: ControlCommand) {
     match command {
         ControlCommand::Identify { caller, reply } => {
@@ -5985,13 +6286,6 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let _ = reply.send(Ok(result));
         }
         ControlCommand::CreatePane { request, reply } => {
-            if !matches!(request.pane_type, PaneCreateType::Terminal) {
-                let _ = reply.send(Err(BridgeError::invalid_params(
-                    "pane.create live GTK bridge supports type=terminal only",
-                )));
-                return;
-            }
-
             let source_pane_id = request
                 .source_pane_id
                 .as_deref()
@@ -6031,18 +6325,25 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
+            let initial_state = match request.pane_type {
+                PaneCreateType::Terminal => None,
+                PaneCreateType::Browser => Some(PaneState::browser_only(request.url.as_deref())),
+            };
+            let suppress_initial_autostart =
+                matches!(request.pane_type, PaneCreateType::Browser) || request.command.is_some();
+
             let new_pane = split_pane(
                 state,
                 &resolved.workspace_id,
                 &resolved.pane_widget,
                 resolved.placement.orientation,
                 SplitPaneOptions {
-                    initial_state: None,
+                    initial_state,
                     skip_default_tab: false,
                     inherit_active_directory: false,
                     new_pane_first: resolved.placement.new_pane_first,
                     persist: true,
-                    suppress_initial_autostart: request.command.is_some(),
+                    suppress_initial_autostart,
                 },
             );
             let Some(new_pane) = new_pane else {
@@ -6054,7 +6355,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let Some(surface) = pane::active_surface_summary(&new_pane) else {
                 let _ = reply.send(Err(BridgeError::internal(
-                    "pane.create did not produce a terminal surface",
+                    "pane.create did not produce a surface",
                 )));
                 return;
             };
@@ -6064,9 +6365,16 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 pane_create_response_payload(&resolved.workspace_id, &workspace_name, surface);
 
             if let Some(command) = request.command {
-                send_pane_create_response_after_command(
-                    new_pane, surface_id, command, response, reply,
-                );
+                split_container.after_pending_rebuild(move || {
+                    send_response_after_terminal_command(
+                        "pane.create",
+                        new_pane,
+                        Some(surface_id),
+                        command,
+                        response,
+                        reply,
+                    );
+                });
                 return;
             }
 
@@ -6134,42 +6442,35 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             create_workspace_with_folder(state, &title, folder_path);
 
-            let result = {
+            let (result, workspace_root) = {
                 let app_state = state.borrow();
-                workspace_payload(&app_state, app_state.active_idx)
+                let root = app_state
+                    .workspaces
+                    .get(app_state.active_idx)
+                    .map(|workspace| workspace.root.clone());
+                (workspace_payload(&app_state, app_state.active_idx), root)
             };
 
-            if let (Some(command), Some(workspace_id)) = (
-                command,
-                result
-                    .as_ref()
-                    .and_then(|payload| payload["workspace_id"].as_str())
-                    .map(ToOwned::to_owned),
-            ) {
-                let state = state.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
-                    let target = {
-                        let app_state = state.borrow();
-                        app_state
-                            .workspaces
-                            .iter()
-                            .find(|workspace| workspace.id == workspace_id)
-                            .and_then(|workspace| {
-                                pane::terminal_handle_for_surface(&workspace.root, None)
-                            })
-                    };
-                    if let Some((_surface_id, handle)) = target {
-                        handle.send_text(&command);
-                        handle.send_text("\n");
-                    }
-                });
+            let Some(payload) = result else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
+                    "workspace.create did not produce a workspace",
+                )));
+                return;
+            };
+
+            if let (Some(command), Some(root)) = (command, workspace_root) {
+                send_response_after_terminal_command(
+                    "workspace.create",
+                    root,
+                    None,
+                    command,
+                    payload,
+                    reply,
+                );
+                return;
             }
 
-            let _ = reply.send(result.ok_or_else(|| {
-                crate::control_bridge::BridgeError::internal(
-                    "workspace.create did not produce a workspace",
-                )
-            }));
+            let _ = reply.send(Ok(payload));
         }
         ControlCommand::SelectWorkspace { target, reply } => {
             let resolved = {
@@ -6329,6 +6630,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         ControlCommand::ReadSurfaceText {
             target,
             surface_hint,
+            scrollback,
+            lines,
             reply,
         } => {
             let (index, surface) =
@@ -6349,11 +6652,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let Some(text) = handle.read_viewport_text() else {
+            let Some(raw_text) = handle.read_text(scrollback) else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
                     "surface.read_text failed",
                 )));
                 return;
+            };
+            let text = match lines {
+                Some(limit) => tail_lines(&raw_text, limit),
+                None => raw_text,
             };
             if let Some(map) = payload.as_object_mut() {
                 map.insert("text".to_string(), serde_json::Value::String(text));
@@ -6685,6 +6992,630 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             });
             let _ = reply.send(Ok(payload));
         }
+        ControlCommand::RelativeWorkspace { delta, reply } => {
+            let selected = {
+                let app_state = state.borrow();
+                let len = app_state.workspaces.len();
+                if len == 0 {
+                    None
+                } else {
+                    let index = if len == 1 {
+                        0
+                    } else {
+                        ((app_state.active_idx as i32 + delta).rem_euclid(len as i32)) as usize
+                    };
+                    Some((
+                        index,
+                        app_state.workspaces[index].sidebar_row.clone(),
+                        app_state.sidebar_list.clone(),
+                    ))
+                }
+            };
+            let Some((index, row, sidebar_list)) = selected else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+            switch_workspace(state, index);
+            sidebar_list.select_row(Some(&row));
+            let result = {
+                let app_state = state.borrow();
+                workspace_payload(&app_state, index)
+            };
+            let _ = reply.send(result.ok_or_else(|| BridgeError::not_found("workspace not found")));
+        }
+        ControlCommand::LastWorkspace { reply } => {
+            let selected = {
+                let app_state = state.borrow();
+                let last_id = app_state.last_workspace_id.as_deref();
+                last_id.and_then(|last_id| {
+                    let index = app_state
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == last_id)?;
+                    (index != app_state.active_idx).then(|| {
+                        (
+                            index,
+                            app_state.workspaces[index].sidebar_row.clone(),
+                            app_state.sidebar_list.clone(),
+                        )
+                    })
+                })
+            };
+            let Some((index, row, sidebar_list)) = selected else {
+                let _ = reply.send(Err(BridgeError::not_found("last workspace not found")));
+                return;
+            };
+            switch_workspace(state, index);
+            sidebar_list.select_row(Some(&row));
+            let result = {
+                let app_state = state.borrow();
+                workspace_payload(&app_state, index)
+            };
+            let _ = reply
+                .send(result.ok_or_else(|| BridgeError::not_found("last workspace not found")));
+        }
+        ControlCommand::SwapPanes {
+            target,
+            first_pane_id,
+            second_pane_id,
+            reply,
+        } => {
+            let Some(first_id) = parse_pane_handle(&first_pane_id) else {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.swap requires a valid first_pane_id",
+                )));
+                return;
+            };
+            let Some(second_id) = parse_pane_handle(&second_pane_id) else {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.swap requires a valid second_pane_id",
+                )));
+                return;
+            };
+
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target).map(|index| {
+                    (
+                        app_state.workspaces[index].id.clone(),
+                        app_state.workspaces[index].split_container.clone(),
+                    )
+                })
+            };
+            let Some((ws_id, split_container)) = resolved else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let Some(first_widget) = pane::pane_widget_for_workspace(&ws_id, first_id) else {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            };
+            let Some(second_widget) = pane::pane_widget_for_workspace(&ws_id, second_id) else {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            };
+
+            if first_id != second_id && !split_container.swap(&first_widget, &second_widget) {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            }
+            request_session_save(state);
+
+            let state_for_reply = state.clone();
+            split_container.after_pending_rebuild(move || {
+                let payload = {
+                    let app_state = state_for_reply.borrow();
+                    app_state
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == ws_id)
+                        .map(|workspace| pane_list_payload(&state_for_reply, workspace))
+                };
+                let _ = reply
+                    .send(payload.ok_or_else(|| BridgeError::not_found("workspace not found")));
+            });
+        }
+        ControlCommand::BreakPane {
+            target,
+            pane_hint,
+            surface_hint,
+            reply,
+        } => {
+            let (source_pane, tabs_to_move) = if surface_hint.is_some() {
+                let (index, surface) =
+                    match control_request_target(state, &target, surface_hint.as_deref(), false) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let _ = reply.send(Err(error.bridge_error("surface not found")));
+                            return;
+                        }
+                    };
+                let Some((pane_widget, _, tab_id)) = control_surface_target(state, index, surface)
+                else {
+                    let _ = reply.send(Err(BridgeError::not_found("surface not found")));
+                    return;
+                };
+                let is_single_pane = state.borrow().workspaces[index]
+                    .split_container
+                    .is_single_pane();
+                if is_single_pane && pane::tab_count_in_pane(&pane_widget) <= 1 {
+                    let _ = reply.send(Err(BridgeError::conflict(
+                        "cannot break the only surface in a workspace",
+                    )));
+                    return;
+                }
+                (pane_widget, vec![tab_id])
+            } else {
+                let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+                    let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                    return;
+                };
+                let Some((pane_widget, _)) =
+                    control_pane_target(state, index, pane_hint.as_deref())
+                else {
+                    let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                    return;
+                };
+                let is_single_pane = state.borrow().workspaces[index]
+                    .split_container
+                    .is_single_pane();
+                if is_single_pane {
+                    if pane::tab_count_in_pane(&pane_widget) <= 1 {
+                        let _ = reply.send(Err(BridgeError::conflict(
+                            "cannot break the only surface in a workspace",
+                        )));
+                        return;
+                    }
+                    let Some(active_tab) = pane::active_tab_in_pane(&pane_widget) else {
+                        let _ = reply.send(Err(BridgeError::not_found("surface not found")));
+                        return;
+                    };
+                    (pane_widget, vec![active_tab])
+                } else {
+                    let tab_ids = pane::tab_ids_in_pane(&pane_widget);
+                    if tab_ids.is_empty() {
+                        let _ = reply.send(Err(BridgeError::not_found("surface not found")));
+                        return;
+                    }
+                    (pane_widget, tab_ids)
+                }
+            };
+
+            match break_tabs_into_new_workspace(state, &source_pane, &tabs_to_move) {
+                Ok((split_container, payload)) => {
+                    split_container.after_pending_rebuild(move || {
+                        let _ = reply.send(Ok(payload));
+                    });
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+        }
+        ControlCommand::JoinPane {
+            target,
+            source_pane_id,
+            source_surface_id,
+            target_pane_id,
+            reply,
+        } => {
+            let Some(dest_pane_id) = parse_pane_handle(&target_pane_id) else {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.join requires a valid target_pane_id",
+                )));
+                return;
+            };
+            let Some(preferred_index) = workspace_index_for_target(&state.borrow(), &target) else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+            let preferred_ws_id = state.borrow().workspaces[preferred_index].id.clone();
+            let (dest_pane_widget, dest_split_container) = if let Some(widget) =
+                pane::pane_widget_for_workspace(&preferred_ws_id, dest_pane_id)
+            {
+                let container = state.borrow().workspaces[preferred_index]
+                    .split_container
+                    .clone();
+                (widget, container)
+            } else if matches!(target, WorkspaceTarget::Active) {
+                let Some(widget) = pane::find_pane_widget_by_id(dest_pane_id) else {
+                    let _ = reply.send(Err(BridgeError::not_found("target pane not found")));
+                    return;
+                };
+                let container = {
+                    let app_state = state.borrow();
+                    app_state
+                        .workspace_for_widget(&widget)
+                        .map(|ws| ws.split_container.clone())
+                };
+                let Some(container) = container else {
+                    let _ = reply.send(Err(BridgeError::not_found("target pane not found")));
+                    return;
+                };
+                (widget, container)
+            } else {
+                let _ = reply.send(Err(BridgeError::not_found("target pane not found")));
+                return;
+            };
+
+            let (source_pane_widget, src_pane_id) =
+                if let Some(raw_pane) = source_pane_id.as_deref() {
+                    let Some(parsed) = parse_pane_handle(raw_pane) else {
+                        let _ = reply.send(Err(BridgeError::invalid_params(
+                            "pane.join requires a valid source pane_id",
+                        )));
+                        return;
+                    };
+                    let found =
+                        pane::pane_widget_for_workspace(&preferred_ws_id, parsed).or_else(|| {
+                            matches!(target, WorkspaceTarget::Active)
+                                .then(|| pane::find_pane_widget_by_id(parsed))
+                                .flatten()
+                        });
+                    let Some(widget) = found else {
+                        let _ = reply.send(Err(BridgeError::not_found("source pane not found")));
+                        return;
+                    };
+                    (widget, parsed)
+                } else if let Some(surface_hint) = source_surface_id.as_deref() {
+                    let (index, surface) =
+                        match control_request_target(state, &target, Some(surface_hint), false) {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                let _ = reply.send(Err(error.bridge_error("surface not found")));
+                                return;
+                            }
+                        };
+                    let Some((widget, pane_id, _)) = control_surface_target(state, index, surface)
+                    else {
+                        let _ = reply.send(Err(BridgeError::not_found("surface not found")));
+                        return;
+                    };
+                    (widget, pane_id)
+                } else {
+                    let Some((widget, pane_id)) = control_pane_target(state, preferred_index, None)
+                    else {
+                        let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                        return;
+                    };
+                    (widget, pane_id)
+                };
+
+            if src_pane_id == dest_pane_id {
+                let _ = reply.send(Err(BridgeError::conflict("cannot join pane into itself")));
+                return;
+            }
+
+            let tab_ids = pane::tab_ids_in_pane(&source_pane_widget);
+            if tab_ids.is_empty() {
+                let _ = reply.send(Err(BridgeError::not_found("source pane has no surfaces")));
+                return;
+            }
+            let _ =
+                pane::move_tabs_preserving_active(&source_pane_widget, &tab_ids, &dest_pane_widget);
+            request_session_save(state);
+
+            let response = serde_json::json!({
+                "pane_id": dest_pane_id,
+                "pane_ref": pane_ref(dest_pane_id),
+                "ok": true,
+            });
+            dest_split_container.after_pending_rebuild(move || {
+                let _ = reply.send(Ok(response));
+            });
+        }
+        ControlCommand::LastPane { target, reply } => {
+            let Some(index) = workspace_index_for_target(&state.borrow(), &target) else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+            let ws_id = state.borrow().workspaces[index].id.clone();
+            let current_focused = focused_ids_for_workspace(state, &ws_id).0.or_else(|| {
+                state
+                    .borrow()
+                    .current_pane_by_workspace
+                    .get(&ws_id)
+                    .copied()
+            });
+            let last_pane = state.borrow().last_pane_by_workspace.get(&ws_id).copied();
+            let Some(pane_id) = last_pane.filter(|id| Some(*id) != current_focused) else {
+                let _ = reply.send(Err(BridgeError::not_found("last pane not found")));
+                return;
+            };
+            let Some(pane_widget) = pane::pane_widget_for_workspace(&ws_id, pane_id) else {
+                let _ = reply.send(Err(BridgeError::not_found("last pane not found")));
+                return;
+            };
+            let Some(tab_id) = pane::active_tab_in_pane(&pane_widget) else {
+                let _ = reply.send(Err(BridgeError::not_found("last pane not found")));
+                return;
+            };
+            if let Some(current) = current_focused {
+                state
+                    .borrow_mut()
+                    .current_pane_by_workspace
+                    .entry(ws_id.clone())
+                    .or_insert(current);
+            }
+            focus_control_surface(state, index, &pane_widget, &tab_id);
+            let _ = reply.send(Ok(serde_json::json!({
+                "pane_id": pane_id,
+                "pane_ref": pane_ref(pane_id),
+                "ok": true,
+            })));
+        }
+        ControlCommand::ResizePane {
+            target,
+            pane_id,
+            direction,
+            amount,
+            reply,
+        } => {
+            let Some(parsed_pane_id) = parse_pane_handle(&pane_id) else {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.resize requires a valid pane_id",
+                )));
+                return;
+            };
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target).map(|index| {
+                    (
+                        app_state.workspaces[index].id.clone(),
+                        app_state.workspaces[index].split_container.clone(),
+                    )
+                })
+            };
+            let Some((ws_id, split_container)) = resolved else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+            let Some(pane_widget) = pane::pane_widget_for_workspace(&ws_id, parsed_pane_id) else {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            };
+            let (axis, signed_amount, dir_label) = match direction {
+                BridgePaneCreateDirection::Left => {
+                    (gtk::Orientation::Horizontal, -(amount as f64), "left")
+                }
+                BridgePaneCreateDirection::Right => {
+                    (gtk::Orientation::Horizontal, amount as f64, "right")
+                }
+                BridgePaneCreateDirection::Up => {
+                    (gtk::Orientation::Vertical, -(amount as f64), "up")
+                }
+                BridgePaneCreateDirection::Down => {
+                    (gtk::Orientation::Vertical, amount as f64, "down")
+                }
+            };
+            if split_container.resize_pane(&pane_widget, axis, signed_amount) {
+                request_session_save(state);
+            }
+            let _ = reply.send(Ok(serde_json::json!({
+                "pane_id": parsed_pane_id,
+                "pane_ref": pane_ref(parsed_pane_id),
+                "direction": dir_label,
+                "amount": amount,
+                "frame": {
+                    "width": pane_widget.width(),
+                    "height": pane_widget.height(),
+                },
+                "ok": true,
+            })));
+        }
+        ControlCommand::ClearSurfaceHistory {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let (index, surface) =
+                match control_request_target(state, &target, surface_hint.as_deref(), true) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = reply.send(Err(error.bridge_error("terminal surface not found")));
+                        return;
+                    }
+                };
+            let Some((mut payload, handle)) = control_terminal_target(state, index, surface) else {
+                let _ = reply.send(Err(BridgeError::not_found("terminal surface not found")));
+                return;
+            };
+            let _ = handle.perform_binding_action("clear_screen");
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::BrowserOpenSplit {
+            target,
+            surface_hint,
+            url,
+            reply,
+        } => {
+            let resolved = match resolve_pane_create_target(
+                state,
+                &target,
+                surface_hint.as_deref(),
+                None,
+                PaneCreateDirection::Right,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = reply.send(Err(pane_create_target_error(error)));
+                    return;
+                }
+            };
+            let split_container = {
+                let app_state = state.borrow();
+                app_state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == resolved.workspace_id)
+                    .map(|workspace| workspace.split_container.clone())
+            };
+            let Some(split_container) = split_container else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let effective_url = url.unwrap_or_else(|| {
+                let tab_hint = surface_hint
+                    .as_deref()
+                    .and_then(|hint| hint.split_once(':').map(|(_, tab)| tab.to_string()))
+                    .or_else(|| pane::active_tab_in_pane(&resolved.pane_widget));
+                pane::browser_target_for_surface(&resolved.pane_widget, tab_hint.as_deref())
+                    .and_then(|(_, _, browser)| browser.current_uri())
+                    .filter(|uri| !uri.is_empty())
+                    .unwrap_or_else(|| "about:blank".to_string())
+            });
+
+            let (created_split, dest_pane) = if let Some(right_pane) =
+                pane_in_direction(state, &resolved.pane_widget, Direction::Right)
+            {
+                pane::add_browser_tab_to_pane_with_uri(&right_pane, Some(&effective_url));
+                request_session_save(state);
+                (false, right_pane)
+            } else {
+                let Some(new_pane) = split_pane(
+                    state,
+                    &resolved.workspace_id,
+                    &resolved.pane_widget,
+                    gtk::Orientation::Horizontal,
+                    SplitPaneOptions {
+                        initial_state: Some(PaneState::browser_only(Some(&effective_url))),
+                        skip_default_tab: false,
+                        inherit_active_directory: false,
+                        new_pane_first: false,
+                        persist: true,
+                        suppress_initial_autostart: true,
+                    },
+                ) else {
+                    let _ = reply.send(Err(BridgeError::invalid_params(
+                        "not enough room to split pane",
+                    )));
+                    return;
+                };
+                (true, new_pane)
+            };
+
+            let Some(surface) = pane::active_surface_summary(&dest_pane) else {
+                let _ = reply.send(Err(BridgeError::internal(
+                    "browser.open_split did not produce a surface",
+                )));
+                return;
+            };
+            let response = serde_json::json!({
+                "workspace_id": resolved.workspace_id,
+                "workspace_ref": workspace_ref(&resolved.workspace_id),
+                "surface_id": surface.surface_id,
+                "surface_ref": surface_ref(&surface.surface_id),
+                "pane_id": surface.pane_id,
+                "pane_ref": pane_ref(surface.pane_id),
+                "target_pane_id": surface.pane_id,
+                "created_split": created_split,
+                "browser": {
+                    "open": true,
+                    "url": effective_url,
+                    "title": surface.title,
+                },
+                "ok": true,
+            });
+            split_container.after_pending_rebuild(move || {
+                let _ = reply.send(Ok(response));
+            });
+        }
+        ControlCommand::BrowserAction {
+            target,
+            surface_hint,
+            action,
+            reply,
+        } => {
+            let (index, surface) =
+                match control_request_target(state, &target, surface_hint.as_deref(), false) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = reply.send(Err(error.bridge_error("browser surface not found")));
+                        return;
+                    }
+                };
+            let Some((mut payload, pane_widget, tab_hint, title, browser_target)) =
+                control_browser_target(state, index, surface)
+            else {
+                let _ = reply.send(Err(BridgeError::not_found("browser surface not found")));
+                return;
+            };
+
+            match action {
+                crate::control_bridge::BrowserControlAction::Navigate { url } => {
+                    let Some((_, updated_title)) =
+                        pane::navigate_browser_surface(&pane_widget, tab_hint.as_deref(), &url)
+                    else {
+                        let _ =
+                            reply.send(Err(BridgeError::not_found("browser surface not found")));
+                        return;
+                    };
+                    request_session_save(state);
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert(
+                            "browser".to_string(),
+                            serde_json::json!({
+                                "open": true,
+                                "url": url,
+                                "title": updated_title,
+                            }),
+                        );
+                        map.insert("url".to_string(), serde_json::Value::String(url));
+                        map.insert("ok".to_string(), serde_json::Value::Bool(true));
+                    }
+                    let _ = reply.send(Ok(payload));
+                }
+                crate::control_bridge::BrowserControlAction::GetUrl => {
+                    let current_url = browser_target
+                        .current_uri()
+                        .unwrap_or_else(|| "about:blank".to_string());
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("url".to_string(), serde_json::Value::String(current_url));
+                        map.insert("title".to_string(), serde_json::Value::String(title));
+                        map.insert("ok".to_string(), serde_json::Value::Bool(true));
+                    }
+                    let _ = reply.send(Ok(payload));
+                }
+                crate::control_bridge::BrowserControlAction::Back => {
+                    let _ = browser_target.go_back();
+                    let current_url = browser_target
+                        .current_uri()
+                        .unwrap_or_else(|| "about:blank".to_string());
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("url".to_string(), serde_json::Value::String(current_url));
+                        map.insert("ok".to_string(), serde_json::Value::Bool(true));
+                    }
+                    let _ = reply.send(Ok(payload));
+                }
+                crate::control_bridge::BrowserControlAction::Forward => {
+                    let _ = browser_target.go_forward();
+                    let current_url = browser_target
+                        .current_uri()
+                        .unwrap_or_else(|| "about:blank".to_string());
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("url".to_string(), serde_json::Value::String(current_url));
+                        map.insert("ok".to_string(), serde_json::Value::Bool(true));
+                    }
+                    let _ = reply.send(Ok(payload));
+                }
+                crate::control_bridge::BrowserControlAction::Reload => {
+                    let _ = browser_target.reload();
+                    let current_url = browser_target
+                        .current_uri()
+                        .unwrap_or_else(|| "about:blank".to_string());
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("url".to_string(), serde_json::Value::String(current_url));
+                        map.insert("ok".to_string(), serde_json::Value::Bool(true));
+                    }
+                    let _ = reply.send(Ok(payload));
+                }
+            }
+        }
     }
 }
 
@@ -6873,6 +7804,14 @@ fn add_workspace_with_initial_command(
 
     {
         let mut s = state.borrow_mut();
+        if let Some(prev_id) = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|existing| existing.id.clone())
+            .filter(|prev| prev != &ws.id)
+        {
+            s.last_workspace_id = Some(prev_id);
+        }
         s.sidebar.push_workspace(ws.id.clone(), workspace.favorite);
         s.workspaces.push(ws);
         s.active_idx = s.workspaces.len() - 1;
@@ -7133,6 +8072,11 @@ fn close_workspace_by_id_internal(
 
     let ws = s.workspaces.remove(idx);
     s.sidebar.remove_workspace(id);
+    if s.last_workspace_id.as_deref() == Some(id) {
+        s.last_workspace_id = None;
+    }
+    s.current_pane_by_workspace.remove(id);
+    s.last_pane_by_workspace.remove(id);
     let sidebar_list = s.sidebar_list.clone();
     let indicator_box = s.indicator_box.clone();
 
@@ -7299,6 +8243,14 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
 
     let (stack, stack_name, focus_root, workspace_id) = {
         let mut s = state.borrow_mut();
+        if let Some(prev_id) = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|workspace| workspace.id.clone())
+            .filter(|prev| prev != &s.workspaces[idx].id)
+        {
+            s.last_workspace_id = Some(prev_id);
+        }
         s.active_idx = idx;
         sync_indicator_active_state(&s);
         let stack = s.stack.clone();
@@ -7508,6 +8460,7 @@ fn record_last_focused_surface_from_window(state: &State, window: &gtk::Window) 
                 focus_restore_target_for_pane(&workspace_id, &split_container, &widget)
             {
                 if let Ok(mut app_state) = state.try_borrow_mut() {
+                    note_workspace_pane_focus(&mut app_state, &workspace_id, target.pane_id);
                     app_state.last_focused_surface = Some(target);
                 }
                 return;
@@ -7779,10 +8732,23 @@ fn split_pane(
         return None;
     }
 
+    let new_pane_widget: gtk::Widget = new_pane.upcast();
+    if let (Some(source_summary), Some(new_summary)) = (
+        pane::active_surface_summary(pane_widget),
+        pane::active_surface_summary(&new_pane_widget),
+    ) {
+        let mut app_state = state.borrow_mut();
+        app_state
+            .current_pane_by_workspace
+            .entry(ws_id.to_string())
+            .or_insert(source_summary.pane_id);
+        note_workspace_pane_focus(&mut app_state, ws_id, new_summary.pane_id);
+    }
+
     if options.persist {
         request_session_save(state);
     }
-    Some(new_pane.upcast())
+    Some(new_pane_widget)
 }
 
 fn open_url_in_browser_tab(state: &State, ws_id: &str, pane_widget: &gtk::Widget, url: &str) {
@@ -9898,6 +10864,18 @@ mod tests {
             left_pane.clone().upcast::<gtk4::Widget>(),
             "find_leaf_pane should descend through a Paned to its leaf"
         );
+    }
+
+    #[test]
+    fn tail_lines_preserves_trailing_newline_and_slices_tail() {
+        assert_eq!(super::tail_lines("", 5), "");
+        assert_eq!(super::tail_lines("alpha\nbeta\ngamma\n", 0), "");
+        assert_eq!(
+            super::tail_lines("alpha\nbeta\ngamma\n", 2),
+            "beta\ngamma\n"
+        );
+        assert_eq!(super::tail_lines("alpha\nbeta\ngamma", 2), "beta\ngamma");
+        assert_eq!(super::tail_lines("alpha\nbeta", 10), "alpha\nbeta");
     }
 }
 
