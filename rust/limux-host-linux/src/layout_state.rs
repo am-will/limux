@@ -1,10 +1,11 @@
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::workspace_color::WorkspaceColor;
 
@@ -141,56 +142,9 @@ pub struct TabState {
     pub content: TabContentState,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RestorableAgentKind {
-    Claude,
-    Codex,
-    OpenCode,
-    Gemini,
-}
-
-impl RestorableAgentKind {
-    pub fn resume_command(
-        self,
-        session_id: &str,
-        launch_command: Option<&AgentLaunchCommandState>,
-        cwd: Option<&str>,
-    ) -> Option<String> {
-        build_resume_command(self, session_id, launch_command, cwd)
-    }
-
-    fn fallback_executable(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Gemini => "gemini",
-        }
-    }
-
-    fn store_name(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Gemini => "gemini",
-        }
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
-pub struct AgentLaunchCommandState {
-    pub executable: String,
-    #[serde(default)]
-    pub arguments: Vec<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub environment: BTreeMap<String, String>,
-    #[serde(default)]
-    pub captured_at: Option<f64>,
-}
+pub use limux_control::agent_sessions::{
+    AgentKind as RestorableAgentKind, AgentLaunchCommand as AgentLaunchCommandState,
+};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct RestorableAgentState {
@@ -209,7 +163,8 @@ impl RestorableAgentState {
         if !self.restore_on_startup {
             return None;
         }
-        self.kind.resume_command(
+        build_resume_command(
+            self.kind,
             &self.session_id,
             self.launch_command.as_ref(),
             self.cwd.as_deref(),
@@ -573,18 +528,15 @@ pub struct RestorableAgentIndex {
 
 impl RestorableAgentIndex {
     pub fn load() -> Self {
-        Self::load_from_dir(&agent_hook_state_dir())
+        let index = Self::load_from_dir(&agent_hook_state_dir());
+        sync_cached_ended_agent_bindings(&index);
+        index
     }
 
     pub fn load_from_dir(dir: &Path) -> Self {
         let mut index = Self::default();
-        for (kind, file_name) in [
-            (RestorableAgentKind::Claude, "claude-hook-sessions.json"),
-            (RestorableAgentKind::Codex, "codex-hook-sessions.json"),
-            (RestorableAgentKind::OpenCode, "opencode-hook-sessions.json"),
-            (RestorableAgentKind::Gemini, "gemini-hook-sessions.json"),
-        ] {
-            let path = dir.join(file_name);
+        for kind in RestorableAgentKind::ALL {
+            let path = dir.join(kind.hook_session_file_name());
             let Ok(raw) = fs::read_to_string(&path) else {
                 continue;
             };
@@ -711,6 +663,46 @@ fn surface_tab_id(surface_id: &str) -> &str {
     surface_id.rsplit(':').next().unwrap_or(surface_id)
 }
 
+type EndedAgentBindingKey = (RestorableAgentKind, String, String);
+
+fn cached_ended_agent_bindings() -> &'static Mutex<HashSet<EndedAgentBindingKey>> {
+    static ENDED: OnceLock<Mutex<HashSet<EndedAgentBindingKey>>> = OnceLock::new();
+    ENDED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn sync_cached_ended_agent_bindings(index: &RestorableAgentIndex) {
+    let Ok(mut guard) = cached_ended_agent_bindings().lock() else {
+        return;
+    };
+    for (kind, ended) in &index.ended_sessions {
+        let session_id = ended.session_id.trim();
+        let tab_id = surface_tab_id(ended.surface_id.trim());
+        if !session_id.is_empty() && !tab_id.is_empty() {
+            guard.insert((*kind, session_id.to_string(), tab_id.to_string()));
+        }
+    }
+    for ((_, surface_id), (active, _)) in &index.by_surface {
+        let session_id = active.session_id.trim();
+        let tab_id = surface_tab_id(surface_id.trim());
+        guard.remove(&(active.kind, session_id.to_string(), tab_id.to_string()));
+    }
+}
+
+pub(crate) fn is_cached_ended_agent_binding(
+    kind: RestorableAgentKind,
+    session_id: &str,
+    tab_id: &str,
+) -> bool {
+    let Ok(guard) = cached_ended_agent_bindings().lock() else {
+        return false;
+    };
+    guard.contains(&(
+        kind,
+        session_id.trim().to_string(),
+        tab_id.trim().to_string(),
+    ))
+}
+
 pub(crate) fn attach_restorable_agents_to_session(
     session: &mut AppSessionState,
     index: &RestorableAgentIndex,
@@ -760,7 +752,9 @@ pub fn attach_restorable_agents_to_layout(
 }
 
 fn agent_hook_state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("LIMUX_AGENT_HOOK_STATE_DIR") {
+    if let Some(dir) =
+        std::env::var_os("LIMUX_AGENT_HOOK_STATE_DIR").filter(|value| !value.is_empty())
+    {
         return PathBuf::from(dir);
     }
     if let Some(dir) = dirs::state_dir() {
@@ -859,54 +853,8 @@ fn build_resume_command(
     cwd: Option<&str>,
 ) -> Option<String> {
     let session_id = normalized_str(session_id)?;
-    let fallback = kind.fallback_executable().to_string();
-    let args = launch
-        .map(|launch| launch.arguments.clone())
-        .filter(|args| !args.is_empty())
-        .unwrap_or_else(|| vec![fallback.clone()]);
-    let sanitized = sanitize_launch_arguments(kind, &args);
-    let executable = launch
-        .and_then(|launch| normalized_str(&launch.executable))
-        .or_else(|| sanitized.first().cloned())
-        .unwrap_or(fallback);
-    let preserved_tail = sanitized
-        .get(1..)
-        .map(|tail| tail.to_vec())
-        .unwrap_or_default();
-
-    let mut parts = vec![executable];
-    match kind {
-        RestorableAgentKind::Codex => {
-            parts.push("resume".to_string());
-            parts.extend(preserved_tail);
-            parts.push(session_id.clone());
-        }
-        RestorableAgentKind::OpenCode => {
-            parts.push("--session".to_string());
-            parts.push(session_id.clone());
-            parts.extend(preserved_tail);
-        }
-        RestorableAgentKind::Claude | RestorableAgentKind::Gemini => {
-            parts.push("--resume".to_string());
-            parts.push(session_id.clone());
-            parts.extend(preserved_tail);
-        }
-    }
-
-    let command = parts
-        .iter()
-        .map(|part| shell_single_quote(part))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let cwd = cwd.and_then(normalized_str).or_else(|| {
-        launch
-            .and_then(|launch| launch.cwd.as_deref())
-            .and_then(normalized_str)
-    });
-    let run_command = match cwd {
-        Some(cwd) => format!("cd {} && {command}", shell_single_quote(&cwd)),
-        None => command,
-    };
+    let run_command =
+        limux_control::agent_sessions::build_resume_command(kind, &session_id, launch, cwd)?;
     Some(wrap_restored_agent_command(kind, &session_id, &run_command))
 }
 
@@ -921,8 +869,8 @@ fn wrap_restored_agent_command(
     );
     let cleanup = format!(
         "printf %s {} | {} --json hooks {} cleanup >/dev/null 2>&1 || true",
-        shell_single_quote(&payload),
-        shell_single_quote(&limux_cli_executable()),
+        limux_control::agent_sessions::shell_single_quote(&payload),
+        limux_control::agent_sessions::shell_single_quote(&limux_cli_executable()),
         kind.store_name()
     );
     format!("{run_command}; limux_agent_status=$?; {cleanup}; exec \"${{SHELL:-/bin/sh}}\" -l")
@@ -949,6 +897,13 @@ fn limux_cli_candidates(exe: &Path) -> Vec<PathBuf> {
     if let Some(dir) = exe.parent() {
         candidates.push(dir.join("limux-cli"));
 
+        #[cfg(test)]
+        if let Some(test_cli) = cargo_test_profile_limux_cli(exe) {
+            if !candidates.contains(&test_cli) {
+                candidates.push(test_cli);
+            }
+        }
+
         if let Some(libexec_dir) = dir.parent() {
             if let Some(prefix) = libexec_dir.parent() {
                 candidates.push(prefix.join("bin/limux"));
@@ -960,118 +915,40 @@ fn limux_cli_candidates(exe: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-fn sanitize_launch_arguments(kind: RestorableAgentKind, arguments: &[String]) -> Vec<String> {
-    if arguments.is_empty() {
-        return vec![kind.fallback_executable().to_string()];
+#[cfg(test)]
+fn cargo_test_profile_limux_cli(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    if dir.file_name().is_some_and(|name| name == "deps") {
+        return Some(dir.parent()?.join("limux-cli"));
     }
-    let mut result = Vec::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        let arg = &arguments[index];
-        if index == 0 {
-            result.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        if is_resume_selector(kind, arg) || option_takes_secret_value(arg) {
-            index += 1;
-            if index < arguments.len() && !arguments[index].starts_with('-') {
-                index += 1;
+    if dir.file_name().is_some_and(|name| name == "out") {
+        for ancestor in dir.ancestors().skip(1).take(4) {
+            if ancestor.file_name().is_some_and(|name| name == "build") {
+                return Some(ancestor.parent()?.join("limux-cli"));
             }
-            continue;
-        }
-        if option_is_secret_assignment(arg) {
-            index += 1;
-            continue;
-        }
-        if option_takes_safe_value(arg) {
-            result.push(arg.clone());
-            if index + 1 < arguments.len() {
-                result.push(arguments[index + 1].clone());
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if option_is_safe_flag_or_assignment(arg) {
-            result.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        break;
-    }
-    result
-}
-
-fn is_resume_selector(kind: RestorableAgentKind, arg: &str) -> bool {
-    match kind {
-        RestorableAgentKind::Codex => {
-            arg == "resume" || arg == "--resume" || arg.starts_with("--resume=")
-        }
-        RestorableAgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
-        RestorableAgentKind::Claude | RestorableAgentKind::Gemini => {
-            arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
         }
     }
+    None
 }
 
-fn option_takes_secret_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--api-key" | "--apikey" | "--token" | "--auth-token" | "--password"
-    )
+#[cfg(test)]
+pub(crate) fn test_limux_cli_path_from_exe(exe: &Path) -> PathBuf {
+    cargo_test_profile_limux_cli(exe).unwrap_or_else(|| {
+        exe.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("limux-cli")
+    })
 }
 
-fn option_is_secret_assignment(arg: &str) -> bool {
-    let lower = arg.to_ascii_lowercase();
-    lower.starts_with("--api-key=")
-        || lower.starts_with("--apikey=")
-        || lower.starts_with("--token=")
-        || lower.starts_with("--auth-token=")
-        || lower.starts_with("--password=")
-}
-
-fn option_takes_safe_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--model"
-            | "-m"
-            | "--config"
-            | "-c"
-            | "--profile"
-            | "--sandbox"
-            | "--approval-policy"
-            | "--cwd"
-            | "--cd"
-            | "--working-directory"
-    )
-}
-
-fn option_is_safe_flag_or_assignment(arg: &str) -> bool {
-    if matches!(
-        arg,
-        "--dangerously-bypass-approvals-and-sandbox" | "--dangerously-skip-permissions"
-    ) {
-        return true;
-    }
-    let Some((name, _)) = arg.split_once('=') else {
-        return false;
-    };
-    option_takes_safe_value(name)
+#[cfg(test)]
+pub(crate) fn test_limux_cli_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current test executable");
+    test_limux_cli_path_from_exe(&exe)
 }
 
 fn normalized_str(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -1143,6 +1020,35 @@ mod tests {
         let candidates = limux_cli_candidates(dev);
         assert!(candidates.contains(&PathBuf::from("/repo/target/debug/limux-cli")));
         assert!(candidates.contains(&PathBuf::from("limux")));
+    }
+
+    #[test]
+    fn test_limux_cli_path_handles_deps_and_cargo_build_dir_layouts() {
+        let deps_bin = Path::new("/repo/target/release/deps/limux-89e919ff7179bb04");
+        assert_eq!(
+            test_limux_cli_path_from_exe(deps_bin),
+            PathBuf::from("/repo/target/release/limux-cli")
+        );
+        assert!(limux_cli_candidates(deps_bin)
+            .contains(&PathBuf::from("/repo/target/release/limux-cli")));
+
+        let cargo_1_100_bin = Path::new(
+            "/repo/target/release/build/limux-host-linux/7d6eb6e61a9954d1/out/limux-89e919ff7179bb04",
+        );
+        assert_eq!(
+            test_limux_cli_path_from_exe(cargo_1_100_bin),
+            PathBuf::from("/repo/target/release/limux-cli")
+        );
+        assert!(limux_cli_candidates(cargo_1_100_bin)
+            .contains(&PathBuf::from("/repo/target/release/limux-cli")));
+
+        let hashed_build_bin = Path::new(
+            "/repo/target/debug/build/limux-host-linux-7d6eb6e61a9954d1/out/limux-89e919ff7179bb04",
+        );
+        assert_eq!(
+            test_limux_cli_path_from_exe(hashed_build_bin),
+            PathBuf::from("/repo/target/debug/limux-cli")
+        );
     }
 
     #[test]
@@ -2090,5 +1996,135 @@ mod tests {
             DEFAULT_SPLIT_RATIO
         );
         assert_eq!(snapshot_split_ratio(0, 0, None), DEFAULT_SPLIT_RATIO);
+    }
+
+    #[test]
+    fn restorable_agent_resume_preserves_config_dir_flags_and_allowed_environment() {
+        let mut environment = BTreeMap::new();
+        environment.insert(
+            "GEMINI_CONFIG_DIR".to_string(),
+            "/tmp/gemini-work".to_string(),
+        );
+        let agent = RestorableAgentState {
+            kind: RestorableAgentKind::Gemini,
+            session_id: "gem-sess-1".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            launch_command: Some(AgentLaunchCommandState {
+                executable: "gemini".to_string(),
+                arguments: vec![
+                    "gemini".to_string(),
+                    "--config-dir".to_string(),
+                    "/tmp/gemini-work".to_string(),
+                    "--yolo".to_string(),
+                    "--model".to_string(),
+                    "gemini-2.5-pro".to_string(),
+                ],
+                cwd: Some("/tmp/project".to_string()),
+                environment,
+                captured_at: Some(15.0),
+            }),
+            restore_on_startup: true,
+        };
+
+        let command = agent.resume_command().expect("resume command");
+        assert!(command.contains(
+            "cd '/tmp/project' && 'env' 'GEMINI_CONFIG_DIR=/tmp/gemini-work' 'gemini' '--resume' 'gem-sess-1' '--config-dir' '/tmp/gemini-work' '--yolo' '--model' 'gemini-2.5-pro'"
+        ));
+        assert!(command.contains("hooks gemini cleanup"));
+    }
+
+    #[test]
+    fn hook_index_loads_agy_sessions_and_resumes_conversation() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("agy-hook-sessions.json"),
+            r#"{
+                "version": 1,
+                "sessions": {
+                    "conv-99": {
+                        "session_id": "conv-99",
+                        "workspace_id": "ws-1",
+                        "surface_id": "7:tab-agy",
+                        "cwd": "/tmp/agy-repo",
+                        "pid": 100,
+                        "launch_command": {
+                            "executable": "agy",
+                            "arguments": ["agy", "--model", "gemini-2.5-pro"],
+                            "cwd": "/tmp/agy-repo",
+                            "environment": {"AGY_CONFIG_DIR": "/tmp/agy-cfg"},
+                            "captured_at": 10.0
+                        },
+                        "updated_at": 10.0
+                    }
+                }
+            }"#,
+        )
+        .expect("write agy hook state");
+
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        let agent = index
+            .agent_for_surface("ws-1", Some(7), "tab-agy")
+            .expect("agy restorable state");
+        assert_eq!(agent.kind, RestorableAgentKind::Agy);
+        let command = agent.resume_command().expect("agy resume command");
+        assert!(command.contains(
+            "cd '/tmp/agy-repo' && 'env' 'AGY_CONFIG_DIR=/tmp/agy-cfg' 'agy' '--conversation' 'conv-99' '--model' 'gemini-2.5-pro'"
+        ));
+        assert!(command.contains("hooks agy cleanup"));
+    }
+
+    #[test]
+    fn cached_ended_agent_bindings_track_cleanup_and_clear_on_resume() {
+        let dir = tempdir().expect("tempdir");
+        let tab_id = new_tab_id();
+        let surface_id = format!("4:{tab_id}");
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {},
+                "ended_sessions": [{
+                    "session_id": "sess-cache-1",
+                    "workspace_id": "ws-1",
+                    "surface_id": surface_id,
+                    "updated_at": 10.0
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write ended codex state");
+
+        let ended_index = RestorableAgentIndex::load_from_dir(dir.path());
+        sync_cached_ended_agent_bindings(&ended_index);
+        assert!(is_cached_ended_agent_binding(
+            RestorableAgentKind::Codex,
+            "sess-cache-1",
+            &tab_id
+        ));
+
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {
+                    "sess-cache-1": {
+                        "session_id": "sess-cache-1",
+                        "workspace_id": "ws-1",
+                        "surface_id": surface_id,
+                        "updated_at": 20.0
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write resumed codex state");
+
+        let resumed_index = RestorableAgentIndex::load_from_dir(dir.path());
+        sync_cached_ended_agent_bindings(&resumed_index);
+        assert!(!is_cached_ended_agent_binding(
+            RestorableAgentKind::Codex,
+            "sess-cache-1",
+            &tab_id
+        ));
     }
 }

@@ -1,3 +1,4 @@
+pub mod agent_sessions;
 pub mod auth;
 pub mod ffi;
 pub mod flatpak;
