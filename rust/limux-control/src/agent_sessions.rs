@@ -6,8 +6,7 @@ pub const ALLOWED_AGENT_ENV_VARS: &[&str] = &[
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
     "OPENCODE_CONFIG_DIR",
-    "GEMINI_CONFIG_DIR",
-    "AGY_CONFIG_DIR",
+    "GEMINI_CLI_HOME",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
@@ -233,9 +232,12 @@ pub fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -> Vec<S
             continue;
         }
         if option_takes_safe_value(kind, arg) {
-            result.push(arg.clone());
-            if index + 1 < arguments.len() {
-                result.push(arguments[index + 1].clone());
+            if let Some(next) = arguments
+                .get(index + 1)
+                .filter(|next| !next.starts_with('-') && !next.trim().is_empty())
+            {
+                result.push(arg.clone());
+                result.push(next.clone());
                 index += 2;
             } else {
                 index += 1;
@@ -402,7 +404,7 @@ fn is_script_source_path(path_lower: &str) -> bool {
 fn resume_selector_takes_value(kind: AgentKind, arg: &str) -> bool {
     match kind {
         AgentKind::Codex => arg == "resume" || arg == "--resume",
-        AgentKind::OpenCode => arg == "--session",
+        AgentKind::OpenCode => arg == "--session" || arg == "-s",
         AgentKind::Claude | AgentKind::Gemini => arg == "--resume" || arg == "-r",
         AgentKind::Agy => arg == "--conversation",
     }
@@ -447,15 +449,18 @@ fn option_takes_safe_value(kind: AgentKind, arg: &str) -> bool {
     if arg == "-c" {
         return kind == AgentKind::Codex;
     }
+    if matches!(arg, "--sandbox" | "-s") {
+        return kind == AgentKind::Codex;
+    }
     matches!(
         arg,
         "--model"
             | "-m"
             | "--config"
             | "--profile"
-            | "--sandbox"
             | "--approval-policy"
             | "--ask-for-approval"
+            | "--approval-mode"
             | "--cwd"
             | "--cd"
             | "--working-directory"
@@ -471,6 +476,12 @@ fn option_takes_safe_value(kind: AgentKind, arg: &str) -> bool {
 }
 
 fn option_is_safe_flag_or_assignment(kind: AgentKind, arg: &str) -> bool {
+    if arg == "--sandbox" && matches!(kind, AgentKind::Agy | AgentKind::Gemini) {
+        return true;
+    }
+    if arg == "-s" && kind == AgentKind::Gemini {
+        return true;
+    }
     if matches!(
         arg,
         "--dangerously-bypass-approvals-and-sandbox"
@@ -484,10 +495,13 @@ fn option_is_safe_flag_or_assignment(kind: AgentKind, arg: &str) -> bool {
         return true;
     }
 
-    let Some((name, _)) = arg.split_once('=') else {
+    let Some((name, value)) = arg.split_once('=') else {
         return false;
     };
-    option_takes_safe_value(kind, name)
+    if name == "--sandbox" && matches!(kind, AgentKind::Agy | AgentKind::Gemini) {
+        return matches!(value.trim(), "true" | "false");
+    }
+    option_takes_safe_value(kind, name) && !value.trim().is_empty()
 }
 
 #[cfg(test)]
@@ -624,5 +638,121 @@ mod tests {
                 "--dangerously-skip-permissions",
             ]))
         );
+    }
+
+    #[test]
+    fn sanitizer_treats_sandbox_as_boolean_for_agy_and_gemini_and_value_for_codex() {
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Agy,
+                &vec_str(&[
+                    "agy",
+                    "--sandbox",
+                    "--model",
+                    "gemini-2.5-pro",
+                    "secret prompt"
+                ]),
+            ),
+            vec_str(&["agy", "--sandbox", "--model", "gemini-2.5-pro"])
+        );
+
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Gemini,
+                &vec_str(&[
+                    "gemini",
+                    "--sandbox",
+                    "-m",
+                    "gemini-2.5-pro",
+                    "secret prompt"
+                ]),
+            ),
+            vec_str(&["gemini", "--sandbox", "-m", "gemini-2.5-pro"])
+        );
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Gemini,
+                &vec_str(&["gemini", "-s", "secret prompt"]),
+            ),
+            vec_str(&["gemini", "-s"])
+        );
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Gemini,
+                &vec_str(&["gemini", "--sandbox=true", "secret prompt"]),
+            ),
+            vec_str(&["gemini", "--sandbox=true"])
+        );
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Gemini,
+                &vec_str(&["gemini", "--sandbox=false", "secret prompt"]),
+            ),
+            vec_str(&["gemini", "--sandbox=false"])
+        );
+
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Codex,
+                &vec_str(&["codex", "--sandbox", "workspace-write", "secret prompt"]),
+            ),
+            vec_str(&["codex", "--sandbox", "workspace-write"])
+        );
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Codex,
+                &vec_str(&[
+                    "codex",
+                    "--sandbox=workspace-write",
+                    "-s",
+                    "read-only",
+                    "secret prompt"
+                ]),
+            ),
+            vec_str(&["codex", "--sandbox=workspace-write", "-s", "read-only"])
+        );
+    }
+
+    #[test]
+    fn sanitizer_drops_dangling_value_flags_without_swallowing_following_flags() {
+        assert_eq!(
+            sanitize_launch_arguments(AgentKind::Agy, &vec_str(&["agy", "--model", "--sandbox"])),
+            vec_str(&["agy", "--sandbox"])
+        );
+        assert_eq!(
+            sanitize_launch_arguments(AgentKind::Agy, &vec_str(&["agy", "--model"])),
+            vec_str(&["agy"])
+        );
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Codex,
+                &vec_str(&["codex", "--sandbox", "--full-auto"]),
+            ),
+            vec_str(&["codex", "--full-auto"])
+        );
+        assert_eq!(
+            sanitize_launch_arguments(AgentKind::Codex, &vec_str(&["codex", "--sandbox"])),
+            vec_str(&["codex"])
+        );
+    }
+
+    #[test]
+    fn environment_allowlist_honors_gemini_cli_home_and_drops_nonexistent_config_vars() {
+        let filtered = filter_allowed_environment([
+            ("GEMINI_CLI_HOME", "/tmp/gemini-home"),
+            ("GEMINI_CONFIG_DIR", "/tmp/ignored-gemini"),
+            ("AGY_CONFIG_DIR", "/tmp/ignored-agy"),
+            ("CLAUDE_CONFIG_DIR", "/tmp/claude"),
+        ]);
+        assert_eq!(
+            filtered.get("GEMINI_CLI_HOME").map(String::as_str),
+            Some("/tmp/gemini-home")
+        );
+        assert_eq!(
+            filtered.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/tmp/claude")
+        );
+        assert!(!filtered.contains_key("GEMINI_CONFIG_DIR"));
+        assert!(!filtered.contains_key("AGY_CONFIG_DIR"));
     }
 }

@@ -355,7 +355,10 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let home = tempfile::tempdir().unwrap();
-        let helper = b"#!/bin/sh\nif [ \"$1\" = --help ]; then echo 'hooks setup [agent] [--osc]'; else test \"$1 $2 $3 $4\" = 'hooks setup agy --osc' || exit 19; mkdir -p \"$GEMINI_CONFIG_DIR/config\"; echo installed > \"$GEMINI_CONFIG_DIR/config/hooks.json\"; fi\n";
+        let existing = home.path().join(".gemini/config/hooks.json");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, "before agy").unwrap();
+        let helper = b"#!/bin/sh\nif [ \"$1\" = --help ]; then echo 'hooks setup [agent] [--osc]'; else test \"$1 $2 $3 $4\" = 'hooks setup agy --osc' || exit 19; mkdir -p \"$HOME/.gemini/config\"; echo installed > \"$HOME/.gemini/config/hooks.json\"; fi\n";
         let mut checksum = glib::Checksum::new(glib::ChecksumType::Sha256).unwrap();
         checksum.update(helper);
         let hash = checksum.string().unwrap();
@@ -372,8 +375,7 @@ mod tests {
                     &helper.len().to_string(),
                 ])
                 .env("HOME", home_dir)
-                .env("AGY_CONFIG_DIR", "")
-                .env("GEMINI_CONFIG_DIR", "")
+                .env("GEMINI_CLI_HOME", "/tmp/ignored-for-agy")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -393,12 +395,127 @@ mod tests {
             std::fs::read_to_string(home.path().join(".gemini/config/hooks.json")).unwrap(),
             "installed\n"
         );
+        let backups: Vec<_> = std::fs::read_dir(home.path().join(".local/share/limux/ssh-helpers"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("backup-agy.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].join("config.json")).unwrap(),
+            "before agy"
+        );
 
         let home2 = tempfile::tempdir().unwrap();
         let target_dir = home2.path().join("redirected");
         std::fs::create_dir(&target_dir).unwrap();
         std::os::unix::fs::symlink(&target_dir, home2.path().join(".gemini")).unwrap();
         assert!(!run_agy(home2.path()).status.success());
+
+        let home3 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home3.path().join(".gemini")).unwrap();
+        let target_cfg = home3.path().join("redirected-cfg");
+        std::fs::create_dir(&target_cfg).unwrap();
+        std::os::unix::fs::symlink(&target_cfg, home3.path().join(".gemini/config")).unwrap();
+        assert!(!run_agy(home3.path()).status.success());
+    }
+
+    #[test]
+    fn installer_supports_gemini_cli_home_and_rejects_symlinks() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let helper = b"#!/bin/sh\nif [ \"$1\" = --help ]; then echo 'hooks setup [agent] [--osc]'; else test \"$1 $2 $3 $4\" = 'hooks setup gemini --osc' || exit 19; base=${GEMINI_CLI_HOME:-$HOME}; mkdir -p \"$base/.gemini\"; echo installed > \"$base/.gemini/settings.json\"; fi\n";
+        let mut checksum = glib::Checksum::new(glib::ChecksumType::Sha256).unwrap();
+        checksum.update(helper);
+        let hash = checksum.string().unwrap();
+
+        let run_gemini = |home_dir: &std::path::Path, gemini_cli_home: Option<&std::path::Path>| {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args([
+                "-c",
+                INSTALL_SCRIPT,
+                "installer",
+                &hash,
+                std::env::consts::ARCH,
+                "gemini",
+                &helper.len().to_string(),
+            ])
+            .env("HOME", home_dir);
+            match gemini_cli_home {
+                Some(path) => {
+                    cmd.env("GEMINI_CLI_HOME", path);
+                }
+                None => {
+                    cmd.env("GEMINI_CLI_HOME", "");
+                }
+            }
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let _ = child.stdin.take().unwrap().write_all(helper);
+            child.wait_with_output().unwrap()
+        };
+
+        // Default to $HOME/.gemini/settings.json when GEMINI_CLI_HOME is empty.
+        let home_default = tempfile::tempdir().unwrap();
+        let default_res = run_gemini(home_default.path(), None);
+        assert!(
+            default_res.status.success(),
+            "{}",
+            String::from_utf8_lossy(&default_res.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(home_default.path().join(".gemini/settings.json")).unwrap(),
+            "installed\n"
+        );
+
+        // Honor explicit GEMINI_CLI_HOME and back up $GEMINI_CLI_HOME/.gemini/settings.json.
+        let home_custom = tempfile::tempdir().unwrap();
+        let custom_cli_home = home_custom.path().join("custom-gemini-home");
+        std::fs::create_dir_all(custom_cli_home.join(".gemini")).unwrap();
+        std::fs::write(custom_cli_home.join(".gemini/settings.json"), "prior").unwrap();
+        let custom_res = run_gemini(home_custom.path(), Some(&custom_cli_home));
+        assert!(
+            custom_res.status.success(),
+            "{}",
+            String::from_utf8_lossy(&custom_res.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(custom_cli_home.join(".gemini/settings.json")).unwrap(),
+            "installed\n"
+        );
+        let backups: Vec<_> =
+            std::fs::read_dir(home_custom.path().join(".local/share/limux/ssh-helpers"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("backup-gemini.")
+                })
+                .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].join("config.json")).unwrap(),
+            "prior"
+        );
+
+        // Reject symlinked GEMINI_CLI_HOME.
+        let symlink_home = home_custom.path().join("symlink-gemini-home");
+        std::os::unix::fs::symlink(&custom_cli_home, &symlink_home).unwrap();
+        assert!(!run_gemini(home_custom.path(), Some(&symlink_home))
+            .status
+            .success());
     }
     #[test]
     #[ignore = "requires built limux-cli; runs in maintained GUI harness"]

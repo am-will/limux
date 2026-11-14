@@ -437,8 +437,10 @@ pub(crate) fn launch_record_from_context(
         .ok()
         .and_then(|value| normalized(&value))
         .or_else(|| sanitized.first().cloned())?;
-    let mut environment = proc_env.cloned().unwrap_or_default();
-    environment.extend(filter_allowed_environment(std::env::vars()));
+    let mut environment = filter_allowed_environment(std::env::vars());
+    if let Some(proc_env) = proc_env {
+        environment.extend(filter_allowed_environment(proc_env));
+    }
 
     Some(AgentLaunchCommandRecord {
         executable,
@@ -767,6 +769,7 @@ mod tests {
     fn launch_record_captures_ancestor_proc_args_cwd_and_env() {
         let proc_args = vec![
             "/usr/local/bin/agy".to_string(),
+            "--sandbox".to_string(),
             "--model".to_string(),
             "gemini-2.5-pro".to_string(),
             "--effort".to_string(),
@@ -776,7 +779,15 @@ mod tests {
             "initial prompt".to_string(),
         ];
         let mut proc_env = BTreeMap::new();
+        proc_env.insert(
+            "GEMINI_CLI_HOME".to_string(),
+            "/tmp/gemini-home".to_string(),
+        );
         proc_env.insert("AGY_CONFIG_DIR".to_string(), "/tmp/agy-cfg".to_string());
+        proc_env.insert(
+            "GEMINI_CONFIG_DIR".to_string(),
+            "/tmp/gemini-cfg".to_string(),
+        );
 
         let record = launch_record_from_context(
             AgentKind::Agy,
@@ -792,6 +803,7 @@ mod tests {
             record.arguments,
             vec![
                 "/usr/local/bin/agy",
+                "--sandbox",
                 "--model",
                 "gemini-2.5-pro",
                 "--effort",
@@ -800,9 +812,14 @@ mod tests {
         );
         assert_eq!(record.cwd.as_deref(), Some("/tmp/proc-cwd"));
         assert_eq!(
-            record.environment.get("AGY_CONFIG_DIR").map(String::as_str),
-            Some("/tmp/agy-cfg")
+            record
+                .environment
+                .get("GEMINI_CLI_HOME")
+                .map(String::as_str),
+            Some("/tmp/gemini-home")
         );
+        assert!(!record.environment.contains_key("AGY_CONFIG_DIR"));
+        assert!(!record.environment.contains_key("GEMINI_CONFIG_DIR"));
     }
 
     fn await_marker(path: &Path) {

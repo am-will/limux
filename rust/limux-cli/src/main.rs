@@ -2140,33 +2140,24 @@ fn claude_settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-fn gemini_config_dir_from(gemini_env: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
-    gemini_env
-        .or_else(|| home.map(|home| home.join(".gemini")))
-        .unwrap_or_else(|| PathBuf::from(".gemini"))
+fn gemini_settings_path_from(gemini_cli_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    gemini_cli_home
+        .or(home)
+        .map(|base| base.join(".gemini/settings.json"))
+        .unwrap_or_else(|| PathBuf::from(".gemini/settings.json"))
 }
 
 fn gemini_settings_path() -> PathBuf {
-    gemini_config_dir_from(non_empty_env_path("GEMINI_CONFIG_DIR"), dirs::home_dir())
-        .join("settings.json")
+    gemini_settings_path_from(non_empty_env_path("GEMINI_CLI_HOME"), dirs::home_dir())
 }
 
-fn agy_hooks_path_from(
-    agy_env: Option<PathBuf>,
-    gemini_env: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> PathBuf {
-    agy_env
-        .unwrap_or_else(|| gemini_config_dir_from(gemini_env, home).join("config"))
-        .join("hooks.json")
+fn agy_hooks_path_from(home: Option<PathBuf>) -> PathBuf {
+    home.map(|home| home.join(".gemini/config/hooks.json"))
+        .unwrap_or_else(|| PathBuf::from(".gemini/config/hooks.json"))
 }
 
 fn agy_hooks_path() -> PathBuf {
-    agy_hooks_path_from(
-        non_empty_env_path("AGY_CONFIG_DIR"),
-        non_empty_env_path("GEMINI_CONFIG_DIR"),
-        dirs::home_dir(),
-    )
+    agy_hooks_path_from(dirs::home_dir())
 }
 
 fn opencode_config_dir() -> PathBuf {
@@ -4928,30 +4919,29 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn gemini_and_agy_config_paths_honor_env_overrides() {
+    fn gemini_and_agy_config_paths_resolve_canonical_locations() {
         assert_eq!(
-            gemini_config_dir_from(
-                Some(PathBuf::from("/custom/gemini")),
-                Some(PathBuf::from("/home/u"))
-            )
-            .join("settings.json"),
-            PathBuf::from("/custom/gemini/settings.json")
-        );
-        assert_eq!(
-            agy_hooks_path_from(
-                Some(PathBuf::from("/custom/agy")),
-                Some(PathBuf::from("/custom/gemini")),
+            gemini_settings_path_from(
+                Some(PathBuf::from("/custom/gemini-home")),
                 Some(PathBuf::from("/home/u")),
             ),
-            PathBuf::from("/custom/agy/hooks.json")
+            PathBuf::from("/custom/gemini-home/.gemini/settings.json")
         );
         assert_eq!(
-            agy_hooks_path_from(
-                None,
-                Some(PathBuf::from("/custom/gemini")),
-                Some(PathBuf::from("/home/u")),
-            ),
-            PathBuf::from("/custom/gemini/config/hooks.json")
+            gemini_settings_path_from(None, Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.gemini/settings.json")
+        );
+        assert_eq!(
+            gemini_settings_path_from(None, None),
+            PathBuf::from(".gemini/settings.json")
+        );
+        assert_eq!(
+            agy_hooks_path_from(Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.gemini/config/hooks.json")
+        );
+        assert_eq!(
+            agy_hooks_path_from(None),
+            PathBuf::from(".gemini/config/hooks.json")
         );
     }
 

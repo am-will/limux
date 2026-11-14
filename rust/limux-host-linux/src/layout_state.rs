@@ -278,6 +278,10 @@ impl TabState {
 }
 
 pub fn persistence_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LIMUX_SESSION_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(dir);
+    }
+
     if let Some(data_dir) = dirs::data_dir() {
         return data_dir.join(PERSISTENCE_DIR_NAME);
     }
@@ -674,6 +678,7 @@ pub(crate) fn sync_cached_ended_agent_bindings(index: &RestorableAgentIndex) {
     let Ok(mut guard) = cached_ended_agent_bindings().lock() else {
         return;
     };
+    guard.clear();
     for (kind, ended) in &index.ended_sessions {
         let session_id = ended.session_id.trim();
         let tab_id = surface_tab_id(ended.surface_id.trim());
@@ -960,6 +965,7 @@ mod tests {
     use tempfile::tempdir;
 
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static ENDED_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -987,8 +993,28 @@ mod tests {
     }
 
     #[test]
+    fn persistence_dir_honors_limux_session_dir_and_ignores_empty_override() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", Some("/tmp/limux-xdg-data"));
+        let _home = EnvGuard::set("HOME", Some("/tmp/limux-home"));
+        let _session_dir = EnvGuard::set("LIMUX_SESSION_DIR", Some("/tmp/custom-limux-session"));
+
+        assert_eq!(
+            persistence_dir(),
+            PathBuf::from("/tmp/custom-limux-session")
+        );
+
+        let _empty_session_dir = EnvGuard::set("LIMUX_SESSION_DIR", Some(""));
+        assert_eq!(
+            persistence_dir(),
+            PathBuf::from("/tmp/limux-xdg-data").join(PERSISTENCE_DIR_NAME)
+        );
+    }
+
+    #[test]
     fn persistence_dir_uses_xdg_data_home_directly() {
         let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _session_dir = EnvGuard::set("LIMUX_SESSION_DIR", None);
         let _xdg = EnvGuard::set("XDG_DATA_HOME", Some("/tmp/limux-xdg-data"));
         let _home = EnvGuard::set("HOME", Some("/tmp/limux-home"));
 
@@ -1001,6 +1027,7 @@ mod tests {
     #[test]
     fn persistence_dir_falls_back_to_home_local_share_when_data_dir_missing() {
         let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _session_dir = EnvGuard::set("LIMUX_SESSION_DIR", None);
         let _xdg = EnvGuard::set("XDG_DATA_HOME", None);
         let _home = EnvGuard::set("HOME", Some("/tmp/limux-home"));
 
@@ -2002,8 +2029,12 @@ mod tests {
     fn restorable_agent_resume_preserves_config_dir_flags_and_allowed_environment() {
         let mut environment = BTreeMap::new();
         environment.insert(
+            "GEMINI_CLI_HOME".to_string(),
+            "/tmp/gemini-home".to_string(),
+        );
+        environment.insert(
             "GEMINI_CONFIG_DIR".to_string(),
-            "/tmp/gemini-work".to_string(),
+            "/tmp/ignored-gemini-cfg".to_string(),
         );
         let agent = RestorableAgentState {
             kind: RestorableAgentKind::Gemini,
@@ -2013,6 +2044,7 @@ mod tests {
                 executable: "gemini".to_string(),
                 arguments: vec![
                     "gemini".to_string(),
+                    "--sandbox".to_string(),
                     "--config-dir".to_string(),
                     "/tmp/gemini-work".to_string(),
                     "--yolo".to_string(),
@@ -2028,8 +2060,9 @@ mod tests {
 
         let command = agent.resume_command().expect("resume command");
         assert!(command.contains(
-            "cd '/tmp/project' && 'env' 'GEMINI_CONFIG_DIR=/tmp/gemini-work' 'gemini' '--resume' 'gem-sess-1' '--config-dir' '/tmp/gemini-work' '--yolo' '--model' 'gemini-2.5-pro'"
+            "cd '/tmp/project' && 'env' 'GEMINI_CLI_HOME=/tmp/gemini-home' 'gemini' '--resume' 'gem-sess-1' '--sandbox' '--config-dir' '/tmp/gemini-work' '--yolo' '--model' 'gemini-2.5-pro'"
         ));
+        assert!(!command.contains("GEMINI_CONFIG_DIR"));
         assert!(command.contains("hooks gemini cleanup"));
     }
 
@@ -2049,7 +2082,7 @@ mod tests {
                         "pid": 100,
                         "launch_command": {
                             "executable": "agy",
-                            "arguments": ["agy", "--model", "gemini-2.5-pro"],
+                            "arguments": ["agy", "--sandbox", "--model", "gemini-2.5-pro"],
                             "cwd": "/tmp/agy-repo",
                             "environment": {"AGY_CONFIG_DIR": "/tmp/agy-cfg"},
                             "captured_at": 10.0
@@ -2068,13 +2101,15 @@ mod tests {
         assert_eq!(agent.kind, RestorableAgentKind::Agy);
         let command = agent.resume_command().expect("agy resume command");
         assert!(command.contains(
-            "cd '/tmp/agy-repo' && 'env' 'AGY_CONFIG_DIR=/tmp/agy-cfg' 'agy' '--conversation' 'conv-99' '--model' 'gemini-2.5-pro'"
+            "cd '/tmp/agy-repo' && 'agy' '--conversation' 'conv-99' '--sandbox' '--model' 'gemini-2.5-pro'"
         ));
+        assert!(!command.contains("AGY_CONFIG_DIR"));
         assert!(command.contains("hooks agy cleanup"));
     }
 
     #[test]
     fn cached_ended_agent_bindings_track_cleanup_and_clear_on_resume() {
+        let _lock = ENDED_CACHE_TEST_LOCK.lock().expect("ended cache test lock");
         let dir = tempdir().expect("tempdir");
         let tab_id = new_tab_id();
         let surface_id = format!("4:{tab_id}");
@@ -2124,6 +2159,46 @@ mod tests {
         assert!(!is_cached_ended_agent_binding(
             RestorableAgentKind::Codex,
             "sess-cache-1",
+            &tab_id
+        ));
+    }
+
+    #[test]
+    fn sync_cached_ended_agent_bindings_clears_entries_removed_after_pruning_or_dir_switch() {
+        let _lock = ENDED_CACHE_TEST_LOCK.lock().expect("ended cache test lock");
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let tab_id = new_tab_id();
+        let surface_id = format!("4:{tab_id}");
+        fs::write(
+            dir_a.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {},
+                "ended_sessions": [{
+                    "session_id": "sess-pruned-1",
+                    "workspace_id": "ws-1",
+                    "surface_id": surface_id,
+                    "updated_at": 10.0
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write ended codex state in dir_a");
+
+        let index_a = RestorableAgentIndex::load_from_dir(dir_a.path());
+        sync_cached_ended_agent_bindings(&index_a);
+        assert!(is_cached_ended_agent_binding(
+            RestorableAgentKind::Codex,
+            "sess-pruned-1",
+            &tab_id
+        ));
+
+        let index_b = RestorableAgentIndex::load_from_dir(dir_b.path());
+        sync_cached_ended_agent_bindings(&index_b);
+        assert!(!is_cached_ended_agent_binding(
+            RestorableAgentKind::Codex,
+            "sess-pruned-1",
             &tab_id
         ));
     }
