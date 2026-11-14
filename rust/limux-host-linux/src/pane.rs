@@ -2175,6 +2175,20 @@ fn autostart_script_extension(
     }
 }
 
+fn is_usable_autostart_runtime_dir(
+    dir: &Path,
+    flatpak_id: Option<&std::ffi::OsStr>,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+) -> bool {
+    if !flatpak_id.is_some_and(|id| id == crate::APP_ID) {
+        return true;
+    }
+    xdg_runtime_dir
+        .filter(|xdg| !xdg.is_empty())
+        .map(Path::new)
+        .is_some_and(|xdg| xdg.is_absolute() && dir.starts_with(xdg.join("limux")))
+}
+
 fn create_workspace_autostart_script(
     command: &str,
     shell_kind: crate::ghostty_config::AutostartShellKind,
@@ -2188,6 +2202,17 @@ fn create_workspace_autostart_script(
             return None;
         }
     };
+    if !is_usable_autostart_runtime_dir(
+        &dir,
+        std::env::var_os("FLATPAK_ID").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    ) {
+        eprintln!(
+            "limux: refusing fallback autostart directory {} inside Flatpak because XDG_RUNTIME_DIR/limux is required for the host shell",
+            dir.display()
+        );
+        return None;
+    }
 
     let ext = autostart_script_extension(shell_kind);
     let pid = std::process::id();
@@ -4868,8 +4893,6 @@ fn create_browser_widget(
 ) -> (gtk::Widget, String, BrowserHandles) {
     use webkit6::prelude::*;
 
-    // Use a NetworkSession to avoid sandbox issues
-    let network_session = webkit6::NetworkSession::default();
     let web_context = webkit6::WebContext::default();
     let user_content_manager = webkit6::UserContentManager::new();
     let dom_editable = Rc::new(Cell::new(false));
@@ -5074,7 +5097,6 @@ fn create_browser_widget(
     }
 
     // Suppress unused variable warnings
-    let _ = network_session;
     let _ = web_context;
 
     (vbox.upcast(), "Browser".to_string(), browser_handles)
@@ -5144,12 +5166,13 @@ fn create_browser_widget(
 mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolve_surface_hint, resolved_link_destination, select_terminal_commands,
-        select_terminal_tab, surface_hint_match, workspace_autostart_initial_input,
-        workspace_autostart_script, ContentDropZone, HintResolution, SurfaceHintMatch,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        effective_drop_target_dimensions, is_localhost_input, is_usable_autostart_runtime_dir,
+        next_active_after_tab_removal, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, resolve_surface_hint,
+        resolved_link_destination, select_terminal_commands, select_terminal_tab,
+        surface_hint_match, workspace_autostart_initial_input, workspace_autostart_script,
+        ContentDropZone, HintResolution, SurfaceHintMatch, TabDragPayload,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -5264,6 +5287,43 @@ mod tests {
                 "^rm -f -- \"/run/user/1000/limux dir/workspace-autostart-42-2.nu\"\nprint ready\n"
             )
         );
+    }
+
+    #[test]
+    fn flatpak_autostart_refuses_tmp_fallback_outside_xdg_runtime_dir() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        assert!(is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            None,
+            None,
+        ));
+        assert!(is_usable_autostart_runtime_dir(
+            Path::new("/run/user/1000/limux"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            None,
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/run/user/1000/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("relative/limux"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("relative")),
+        ));
     }
 
     #[test]

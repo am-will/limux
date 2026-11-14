@@ -3785,24 +3785,41 @@ fn ensure_private_core_dir(candidate: &std::path::Path, expected_uid: u32) -> st
     }
 }
 
-fn core_private_runtime_dir() -> std::io::Result<std::path::PathBuf> {
+fn current_core_euid() -> u32 {
     #[cfg(unix)]
-    let euid =
-        std::fs::metadata("/proc/self").map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))?;
+    {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() }
+    }
     #[cfg(not(unix))]
-    let euid = 0_u32;
+    {
+        0
+    }
+}
 
-    let candidate = std::env::var_os("XDG_RUNTIME_DIR")
+fn select_core_runtime_dir(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    temp_dir: &std::path::Path,
+    euid: u32,
+) -> std::path::PathBuf {
+    xdg_runtime_dir
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
         .filter(|dir| {
+            if !dir.is_absolute() {
+                return false;
+            }
             #[cfg(unix)]
             {
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
                 std::fs::symlink_metadata(dir)
                     .map(|meta| {
-                        meta.file_type().is_dir()
-                            && !meta.file_type().is_symlink()
-                            && std::os::unix::fs::MetadataExt::uid(&meta) == euid
+                        !meta.file_type().is_symlink()
+                            && meta.file_type().is_dir()
+                            && meta.uid() == euid
+                            && (meta.permissions().mode() & 0o077) == 0
                     })
                     .unwrap_or(false)
             }
@@ -3812,8 +3829,16 @@ fn core_private_runtime_dir() -> std::io::Result<std::path::PathBuf> {
             }
         })
         .map(|dir| dir.join("limux"))
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("limux-{euid}")));
+        .unwrap_or_else(|| temp_dir.join(format!("limux-{euid}")))
+}
 
+fn core_private_runtime_dir() -> std::io::Result<std::path::PathBuf> {
+    let euid = current_core_euid();
+    let candidate = select_core_runtime_dir(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        &std::env::temp_dir(),
+        euid,
+    );
     ensure_private_core_dir(&candidate, euid)?;
     Ok(candidate)
 }
@@ -3823,8 +3848,31 @@ fn debug_log_path() -> std::io::Result<std::path::PathBuf> {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             let explicit = std::path::PathBuf::from(trimmed);
-            if let Some(parent) = explicit.parent() {
-                if !parent.as_os_str().is_empty() {
+            if let Some(parent) = explicit
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                let euid = current_core_euid();
+                let runtime_candidate = select_core_runtime_dir(
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    &std::env::temp_dir(),
+                    euid,
+                );
+                if parent == runtime_candidate.as_path() {
+                    ensure_private_core_dir(parent, euid)?;
+                } else {
+                    #[cfg(unix)]
+                    if let Ok(meta) = std::fs::symlink_metadata(parent) {
+                        if meta.file_type().is_symlink() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "refusing symlink debug log directory {}",
+                                    parent.display()
+                                ),
+                            ));
+                        }
+                    }
                     std::fs::create_dir_all(parent)?;
                 }
             }
@@ -3834,24 +3882,74 @@ fn debug_log_path() -> std::io::Result<std::path::PathBuf> {
     Ok(core_private_runtime_dir()?.join("limux-debug.log"))
 }
 
+fn open_core_debug_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let euid = current_core_euid();
+        let open_existing_verified = |meta: std::fs::Metadata| -> std::io::Result<std::fs::File> {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing symlink or non-regular debug log",
+                ));
+            }
+            if meta.uid() != euid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing foreign-owned debug log",
+                ));
+            }
+            let file = std::fs::OpenOptions::new().append(true).open(path)?;
+            let opened = file.metadata()?;
+            if !opened.file_type().is_file()
+                || opened.uid() != euid
+                || opened.dev() != meta.dev()
+                || opened.ino() != meta.ino()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing swapped or non-regular debug log",
+                ));
+            }
+            Ok(file)
+        };
+
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => open_existing_verified(meta),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::OpenOptions::new()
+                    .append(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                {
+                    Ok(file) => Ok(file),
+                    Err(open_err) if open_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let meta = std::fs::symlink_metadata(path)?;
+                        open_existing_verified(meta)
+                    }
+                    Err(open_err) => Err(open_err),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
+}
+
 fn append_debug_log(event: &str) {
     let Ok(path) = debug_log_path() else {
         return;
     };
-    #[cfg(unix)]
-    if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            return;
-        }
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    if let Ok(mut file) = options.open(path) {
+    if let Ok(mut file) = open_core_debug_log(&path) {
         let _ = std::io::Write::write_all(&mut file, event.as_bytes());
         let _ = std::io::Write::write_all(&mut file, b"\n");
     }
@@ -3859,18 +3957,45 @@ fn append_debug_log(event: &str) {
 
 #[cfg(all(test, unix))]
 mod runtime_dir_tests {
-    use super::ensure_private_core_dir;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use super::{
+        core_private_runtime_dir, current_core_euid, ensure_private_core_dir, open_core_debug_log,
+        select_core_runtime_dir,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Mutex;
 
-    fn current_euid() -> u32 {
-        std::fs::metadata("/proc/self").unwrap().uid()
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+            let old = std::env::var_os(key);
+            match value {
+                Some(val) => unsafe { std::env::set_var(key, val) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(val) => unsafe { std::env::set_var(self.key, val) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 
     #[test]
     fn ensure_private_core_dir_creates_and_tightens_owned_directory() {
         let temp = tempfile::tempdir().unwrap();
         let candidate = temp.path().join("limux-private");
-        let euid = current_euid();
+        let euid = current_core_euid();
 
         ensure_private_core_dir(&candidate, euid).unwrap();
         let mode = std::fs::symlink_metadata(&candidate)
@@ -3893,7 +4018,7 @@ mod runtime_dir_tests {
     #[test]
     fn ensure_private_core_dir_rejects_symlinks_files_and_foreign_owners() {
         let temp = tempfile::tempdir().unwrap();
-        let euid = current_euid();
+        let euid = current_core_euid();
 
         let real_dir = temp.path().join("real");
         std::fs::create_dir(&real_dir).unwrap();
@@ -3907,6 +4032,77 @@ mod runtime_dir_tests {
 
         let wrong_owner_err = ensure_private_core_dir(&real_dir, euid.wrapping_add(1)).unwrap_err();
         assert_eq!(wrong_owner_err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn core_private_runtime_dir_rejects_unsafe_xdg_runtime_dir_and_falls_back() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp_root = tempfile::tempdir().unwrap();
+        let _tmpdir = EnvGuard::set("TMPDIR", Some(tmp_root.path().as_os_str()));
+        let euid = current_core_euid();
+        let expected_fallback = tmp_root.path().join(format!("limux-{euid}"));
+
+        let valid_xdg = temp.path().join("valid-xdg");
+        std::fs::create_dir(&valid_xdg).unwrap();
+        std::fs::set_permissions(&valid_xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            select_core_runtime_dir(Some(valid_xdg.as_os_str()), tmp_root.path(), euid),
+            valid_xdg.join("limux")
+        );
+
+        let missing_xdg = temp.path().join("missing-xdg");
+        let symlink_xdg = temp.path().join("symlink-xdg");
+        std::os::unix::fs::symlink(&valid_xdg, &symlink_xdg).unwrap();
+        let mode_755 = temp.path().join("mode-755");
+        std::fs::create_dir(&mode_755).unwrap();
+        std::fs::set_permissions(&mode_755, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode_777 = temp.path().join("mode-777");
+        std::fs::create_dir(&mode_777).unwrap();
+        std::fs::set_permissions(&mode_777, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        for invalid in [
+            missing_xdg.as_os_str(),
+            std::ffi::OsStr::new("relative/xdg-runtime"),
+            symlink_xdg.as_os_str(),
+            mode_755.as_os_str(),
+            mode_777.as_os_str(),
+        ] {
+            let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(invalid));
+            let resolved = core_private_runtime_dir().expect("fallback runtime dir");
+            assert_eq!(resolved, expected_fallback, "case: {invalid:?}");
+            let mode = std::fs::symlink_metadata(&resolved)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn open_core_debug_log_rejects_symlinks_and_enforces_0600() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("limux-debug.log");
+
+        let mut file = open_core_debug_log(&log_path).expect("create log file");
+        std::io::Write::write_all(&mut file, b"hello\n").unwrap();
+        let mode = std::fs::symlink_metadata(&log_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let dangling_target = temp.path().join("victim-new");
+        let dangling_link = temp.path().join("dangling.log");
+        std::os::unix::fs::symlink(&dangling_target, &dangling_link).unwrap();
+        assert!(open_core_debug_log(&dangling_link).is_err());
+        assert!(!dangling_target.exists());
+
+        let existing_link = temp.path().join("existing.log");
+        std::os::unix::fs::symlink(&log_path, &existing_link).unwrap();
+        assert!(open_core_debug_log(&existing_link).is_err());
     }
 }
 

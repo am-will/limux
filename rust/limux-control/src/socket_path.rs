@@ -40,39 +40,53 @@ pub fn current_euid() -> u32 {
 pub fn default_runtime_dir() -> PathBuf {
     if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
         let candidate = PathBuf::from(&runtime_dir);
-        let usable = match fs::symlink_metadata(&candidate) {
-            Ok(meta) => {
-                !meta.file_type().is_symlink()
-                    && meta.file_type().is_dir()
-                    && meta.uid() == current_euid()
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
-        if usable {
+        if is_usable_xdg_runtime_dir(&candidate, current_euid()) {
             return candidate.join(RUNTIME_SUBDIR);
         }
     }
     env::temp_dir().join(format!("limux-{}", current_euid()))
 }
 
+fn is_usable_xdg_runtime_dir(candidate: &Path, expected_uid: u32) -> bool {
+    if !candidate.is_absolute() {
+        return false;
+    }
+    match fs::symlink_metadata(candidate) {
+        Ok(meta) => {
+            !meta.file_type().is_symlink()
+                && meta.file_type().is_dir()
+                && meta.uid() == expected_uid
+                && (meta.permissions().mode() & 0o077) == 0
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    ensure_private_dir_for_uid(path, current_euid())
+}
+
+pub fn ensure_private_dir_for_uid(path: &Path, expected_uid: u32) -> io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_and_chmod_private_dir(path, &metadata)?,
+        Ok(metadata) => validate_and_chmod_private_dir(path, &metadata, expected_uid)?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(PRIVATE_DIR_MODE)
                 .create(path)?;
             let metadata = fs::symlink_metadata(path)?;
-            validate_and_chmod_private_dir(path, &metadata)?;
+            validate_and_chmod_private_dir(path, &metadata, expected_uid)?;
         }
         Err(err) => return Err(err),
     }
     Ok(())
 }
 
-fn validate_and_chmod_private_dir(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+fn validate_and_chmod_private_dir(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+) -> io::Result<()> {
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -82,7 +96,6 @@ fn validate_and_chmod_private_dir(path: &Path, metadata: &fs::Metadata) -> io::R
             ),
         ));
     }
-    let expected_uid = current_euid();
     if metadata.uid() != expected_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -95,6 +108,20 @@ fn validate_and_chmod_private_dir(path: &Path, metadata: &fs::Metadata) -> io::R
     }
     if (metadata.permissions().mode() & 0o777) != PRIVATE_DIR_MODE {
         fs::set_permissions(path, PermissionsExt::from_mode(PRIVATE_DIR_MODE))?;
+        let refreshed = fs::symlink_metadata(path)?;
+        if refreshed.file_type().is_symlink()
+            || !refreshed.file_type().is_dir()
+            || refreshed.uid() != expected_uid
+            || (refreshed.permissions().mode() & 0o777) != PRIVATE_DIR_MODE
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime directory {} permissions are not private (0700)",
+                    path.display()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -311,6 +338,8 @@ mod tests {
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
         let xdg = TempDir::new().expect("xdg runtime dir temp path");
+        std::fs::set_permissions(xdg.path(), PermissionsExt::from_mode(0o700))
+            .expect("chmod xdg 0700");
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(xdg.path().to_str().expect("utf8")));
 
         let resolved = resolve_socket_path(None, SocketMode::Runtime);
@@ -318,6 +347,56 @@ mod tests {
             resolved,
             xdg.path().join(RUNTIME_SUBDIR).join(RUNTIME_SOCKET_NAME)
         );
+    }
+
+    #[test]
+    fn default_runtime_dir_rejects_nonexistent_relative_symlink_and_non_private_xdg() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
+        let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+
+        let expected_fallback = env::temp_dir().join(format!("limux-{}", current_euid()));
+        let temp = TempDir::new().expect("tempdir");
+
+        let missing = temp.path().join("missing-xdg");
+        {
+            let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(missing.to_str().expect("utf8")));
+            assert_eq!(default_runtime_dir(), expected_fallback);
+        }
+
+        {
+            let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some("relative/xdg-runtime"));
+            assert_eq!(default_runtime_dir(), expected_fallback);
+        }
+
+        let private_target = temp.path().join("private-target");
+        std::fs::create_dir(&private_target).expect("create private target");
+        std::fs::set_permissions(&private_target, PermissionsExt::from_mode(0o700))
+            .expect("chmod 0700");
+        let symlink_xdg = temp.path().join("symlink-xdg");
+        std::os::unix::fs::symlink(&private_target, &symlink_xdg).expect("symlink xdg");
+        {
+            let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(symlink_xdg.to_str().expect("utf8")));
+            assert_eq!(default_runtime_dir(), expected_fallback);
+        }
+
+        for mode in [0o755, 0o777] {
+            let shared_xdg = temp.path().join(format!("shared-{mode:o}"));
+            std::fs::create_dir(&shared_xdg).expect("create shared xdg");
+            std::fs::set_permissions(&shared_xdg, PermissionsExt::from_mode(mode))
+                .expect("chmod shared xdg");
+            let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(shared_xdg.to_str().expect("utf8")));
+            assert_eq!(
+                default_runtime_dir(),
+                expected_fallback,
+                "mode {mode:o} must fall back"
+            );
+        }
+
+        assert!(!is_usable_xdg_runtime_dir(
+            &private_target,
+            current_euid().wrapping_add(1)
+        ));
     }
 
     #[test]
@@ -339,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_private_dir_rejects_symlinks_and_enforces_0700() {
+    fn ensure_private_dir_rejects_symlinks_wrong_owner_and_enforces_0700() {
         let temp = TempDir::new().expect("tempdir");
         let real_dir = temp.path().join("real");
         std::fs::create_dir(&real_dir).expect("create real dir");
@@ -353,6 +432,10 @@ mod tests {
         std::os::unix::fs::symlink(&real_dir, &link_path).expect("symlink");
         let err = ensure_private_dir(&link_path).expect_err("symlink must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let owner_err = ensure_private_dir_for_uid(&real_dir, current_euid().wrapping_add(1))
+            .expect_err("foreign owner must be rejected");
+        assert_eq!(owner_err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -361,6 +444,8 @@ mod tests {
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
         let xdg = TempDir::new().expect("xdg runtime dir temp path");
+        std::fs::set_permissions(xdg.path(), PermissionsExt::from_mode(0o700))
+            .expect("chmod xdg 0700");
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(xdg.path().to_str().expect("utf8")));
 
         let path = resolve_socket_path(None, SocketMode::Runtime);

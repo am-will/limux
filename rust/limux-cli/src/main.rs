@@ -3107,6 +3107,49 @@ async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
     Ok(payload)
 }
 
+fn ensure_placeholder_screenshot_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("refusing symlinked screenshot target {}", path.display());
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create screenshot directory {}", parent.display())
+                })?;
+            }
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(_) => Ok(()),
+                Err(open_err) if open_err.kind() == ErrorKind::AlreadyExists => {
+                    let meta = fs::symlink_metadata(path).with_context(|| {
+                        format!("failed to inspect screenshot {}", path.display())
+                    })?;
+                    if meta.file_type().is_symlink() {
+                        bail!("refusing symlinked screenshot target {}", path.display());
+                    }
+                    Ok(())
+                }
+                Err(open_err) => Err(open_err)
+                    .with_context(|| format!("failed to create screenshot {}", path.display())),
+            }
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to inspect screenshot {}", path.display()))
+        }
+    }
+}
+
 async fn run_browser(
     client: &mut Client,
     args: &[String],
@@ -3303,22 +3346,7 @@ async fn run_browser(
             if let Some(out_path) = out {
                 path = out_path;
             }
-            if !Path::new(&path).exists() {
-                use std::os::unix::fs::OpenOptionsExt as _;
-
-                if let Some(parent) = Path::new(&path).parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("failed to create screenshot directory {}", parent.display())
-                    })?;
-                }
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .with_context(|| format!("failed to create screenshot {}", path))?;
-            }
+            ensure_placeholder_screenshot_file(Path::new(&path))?;
             let url = format!("file://{}", path);
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("path".to_string(), Value::String(path.clone()));
@@ -5321,13 +5349,47 @@ mod new_pane_tests {
         );
     }
 
+    static CLI_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TestEnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvGuard {
+        fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+            let old = std::env::var_os(key);
+            match value {
+                Some(val) => unsafe { std::env::set_var(key, val) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(val) => unsafe { std::env::set_var(self.key, val) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[test]
     fn cli_runtime_paths_avoid_shared_tmp_and_enforce_private_modes() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        let _lock = CLI_ENV_TEST_LOCK.lock().expect("cli env test lock");
+        let temp_xdg = tempfile::tempdir().expect("temp xdg runtime dir");
+        std::fs::set_permissions(temp_xdg.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod xdg 0700");
+        let _xdg = TestEnvGuard::set("XDG_RUNTIME_DIR", Some(temp_xdg.path().as_os_str()));
+        let expected_runtime_dir = temp_xdg.path().join("limux");
+
         let signal_path = super::wait_signal_path("agent/ready").expect("wait_signal_path");
         assert!(
-            signal_path.starts_with(limux_control::socket_path::default_runtime_dir()),
+            signal_path.starts_with(&expected_runtime_dir),
             "unexpected signal path: {}",
             signal_path.display()
         );
@@ -5343,14 +5405,14 @@ mod new_pane_tests {
             & 0o777;
         assert_eq!(signal_parent_mode, 0o700);
 
-        let fake_socket = limux_control::socket_path::default_runtime_dir().join("test-cli.sock");
+        let fake_socket = expected_runtime_dir.join("test-cli.sock");
         super::with_locked_json_map(&fake_socket, "hooks-test", |map, path| {
             map.insert("pane-focus-in".to_string(), "echo ok".to_string());
             super::write_json_map(path, map)
         })
         .expect("with_locked_json_map");
         let state_path = super::cli_state_path(&fake_socket, "hooks-test");
-        assert!(state_path.starts_with(limux_control::socket_path::default_runtime_dir()));
+        assert!(state_path.starts_with(&expected_runtime_dir));
         let state_mode = std::fs::symlink_metadata(&state_path)
             .expect("state file metadata")
             .permissions()
@@ -5363,6 +5425,97 @@ mod new_pane_tests {
             .mode()
             & 0o777;
         assert_eq!(state_dir_mode, 0o700);
-        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_refuses_dangling_and_existing_symlink_out_targets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let dangling_target = temp.path().join("victim-new.png");
+        let dangling_link = temp.path().join("dangling-out.png");
+        std::os::unix::fs::symlink(&dangling_target, &dangling_link).expect("dangling symlink");
+
+        let err = super::ensure_placeholder_screenshot_file(&dangling_link)
+            .expect_err("dangling symlink must be refused");
+        assert!(err
+            .to_string()
+            .contains("refusing symlinked screenshot target"));
+        assert!(!dangling_target.exists());
+
+        let existing_target = temp.path().join("victim-existing.png");
+        std::fs::write(&existing_target, b"original-bytes").expect("write existing");
+        let existing_link = temp.path().join("existing-out.png");
+        std::os::unix::fs::symlink(&existing_target, &existing_link).expect("existing symlink");
+
+        let err = super::ensure_placeholder_screenshot_file(&existing_link)
+            .expect_err("existing symlink must be refused");
+        assert!(err
+            .to_string()
+            .contains("refusing symlinked screenshot target"));
+        assert_eq!(std::fs::read(&existing_target).unwrap(), b"original-bytes");
+
+        let socket_path = temp.path().join("mock-browser.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind mock socket");
+        let server_shot = temp.path().join("server-missing.png");
+        let server_shot_str = server_shot.to_string_lossy().into_owned();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            let mut buf = BufReader::new(reader);
+            buf.read_line(&mut line).await.expect("read request");
+            let req: serde_json::Value = serde_json::from_str(&line).expect("parse request");
+            let resp = json!({
+                "id": req["id"],
+                "ok": true,
+                "result": {
+                    "ok": true,
+                    "format": "png",
+                    "path": server_shot_str,
+                }
+            });
+            let mut encoded = serde_json::to_string(&resp).unwrap();
+            encoded.push('\n');
+            writer
+                .write_all(encoded.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let mut client = super::Client {
+            socket: socket_path,
+            seq: 1,
+        };
+        let cli_args = vec![
+            "--surface".to_string(),
+            "surface:1".to_string(),
+            "screenshot".to_string(),
+            "--out".to_string(),
+            dangling_link.to_string_lossy().into_owned(),
+        ];
+        let cli_err = match super::run_browser(&mut client, &cli_args, false).await {
+            Ok(_) => panic!("browser screenshot --out dangling symlink must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            cli_err
+                .to_string()
+                .contains("refusing symlinked screenshot target"),
+            "unexpected error: {cli_err}"
+        );
+        assert!(!dangling_target.exists());
+        server.await.expect("mock server task");
+
+        let created_shot = temp.path().join("nested/shot.png");
+        super::ensure_placeholder_screenshot_file(&created_shot).expect("create placeholder");
+        let mode = std::fs::symlink_metadata(&created_shot)
+            .expect("created metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
