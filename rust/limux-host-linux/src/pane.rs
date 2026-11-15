@@ -6363,4 +6363,45 @@ mod tests {
             "the moved tab still reports to the pane it left"
         );
     }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    fn prepare_private_webkit_dir_creates_0700_dir_and_rejects_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let created =
+            super::prepare_private_webkit_dir(Some(temp.path().to_path_buf()), "webkit-data")
+                .expect("private webkit dir");
+        let created_path = std::path::Path::new(&created);
+        assert_eq!(created_path, temp.path().join("limux").join("webkit-data"));
+        let mode = std::fs::symlink_metadata(created_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let symlink_leaf = temp.path().join("limux").join("webkit-cache");
+        std::os::unix::fs::symlink(&outside, &symlink_leaf).expect("symlink");
+        assert!(
+            super::prepare_private_webkit_dir(Some(temp.path().to_path_buf()), "webkit-cache",)
+                .is_none(),
+            "symlinked webkit cache leaf must be rejected"
+        );
+    }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    fn configure_browser_settings_disables_popups_file_access_and_clipboard() {
+        let settings = webkit6::Settings::new();
+        super::configure_browser_settings(&settings);
+        assert!(settings.enables_developer_extras());
+        assert!(!settings.is_javascript_can_open_windows_automatically());
+        assert!(!settings.allows_file_access_from_file_urls());
+        assert!(!settings.allows_universal_access_from_file_urls());
+        assert!(!settings.is_javascript_can_access_clipboard());
+    }
 }
