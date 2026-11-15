@@ -4704,7 +4704,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
     Ok(out)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let opts = parse_global_args()?;
     if should_launch_host(&opts) {
