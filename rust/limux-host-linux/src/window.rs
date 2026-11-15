@@ -7622,10 +7622,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             let effective_url = url.unwrap_or_else(|| {
-                let tab_hint = surface_hint
-                    .as_deref()
-                    .and_then(|hint| hint.split_once(':').map(|(_, tab)| tab.to_string()))
-                    .or_else(|| pane::active_tab_in_pane(&resolved.pane_widget));
+                let tab_hint =
+                    surface_hint.or_else(|| pane::active_tab_in_pane(&resolved.pane_widget));
                 pane::browser_target_for_surface(&resolved.pane_widget, tab_hint.as_deref())
                     .and_then(|(_, _, browser)| browser.current_uri())
                     .filter(|uri| !uri.is_empty())

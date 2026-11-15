@@ -1073,6 +1073,26 @@ PARITY_URL="$("$LIMUX_CLI" browser --surface "$PARITY_BROWSER_SURFACE" get-url)"
 [ "$PARITY_URL" = "data:text/plain,parity-two" ] \
   || { echo "FAIL: browser get-url returned '$PARITY_URL' instead of 'data:text/plain,parity-two'"; exit 1; }
 
+PARITY_BROWSER_PANE="${PARITY_BROWSER_SURFACE%%:*}"
+PARITY_BROWSER_TAB="${PARITY_BROWSER_SURFACE#*:}"
+"$LIMUX_CLI" --json --id-format both new-surface --workspace "$PARITY_WORKSPACE" \
+  --pane "$PARITY_BROWSER_PANE" --type browser --url "data:text/plain,other-tab" \
+  >"$LOG_DIR/stage6f-browser-other.json"
+for _ in $(seq 1 60); do
+  PARITY_URL="$("$LIMUX_CLI" browser --surface "$PARITY_BROWSER_SURFACE" get-url)"
+  [ "$PARITY_URL" = "data:text/plain,parity-two" ] && break
+  sleep 0.1
+done
+[ "$PARITY_URL" = "data:text/plain,parity-two" ] \
+  || { echo "FAIL: inactive browser source did not retain its URL"; exit 1; }
+"$LIMUX_CLI" --id-format both --request "$(jq -nc \
+  --arg ws "$PARITY_WORKSPACE" --arg surface "$PARITY_BROWSER_TAB" \
+  '{method:"browser.open_split",params:{workspace_id:$ws,surface_id:$surface}}')" \
+  >"$LOG_DIR/stage6f-browser-inherited.json"
+jq -e '.browser.url == "data:text/plain,parity-two"' \
+  "$LOG_DIR/stage6f-browser-inherited.json" >/dev/null \
+  || { echo "FAIL: browser split did not inherit the explicitly selected tab URL"; exit 1; }
+
 "$LIMUX_CLI" close-workspace --workspace "$PARITY_WORKSPACE" >"$LOG_DIR/stage6f-close-ws.txt"
 "$LIMUX_CLI" select-workspace --workspace "$WORKSPACE_ID" >"$LOG_DIR/stage6f-restore-ws.txt"
 echo "stage 6f: OK (tmux window/pane/history and browser bridge parity verified)"
