@@ -173,10 +173,13 @@ fn pane_create_replies_once_the_new_pane_can_be_targeted() {
             std::time::Instant::now() < deadline,
             "initial pane never showed"
         );
-        context.iteration(true);
+        if !context.iteration(false) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     };
 
     let (reply, rx) = std::sync::mpsc::channel();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     handle_control_command(
         &state,
         ControlCommand::CreatePane {
@@ -201,7 +204,9 @@ fn pane_create_replies_once_the_new_pane_can_be_targeted() {
             std::time::Instant::now() < deadline,
             "pane.create never replied"
         );
-        context.iteration(true);
+        if !context.iteration(false) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     };
     let pane_id: u32 = response["pane_id"].as_str().unwrap().parse().unwrap();
     assert!(
