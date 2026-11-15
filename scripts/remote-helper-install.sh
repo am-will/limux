@@ -12,10 +12,24 @@ case "$arch" in x86_64|aarch64) ;; *) exit 2;; esac
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = "$arch" ] || {
     echo 'Helper architecture does not match this Linux host' >&2; exit 1;
 }
+extra_dir=""
 case "$agent" in
     codex) config_dir=${CODEX_HOME:-"$HOME/.codex"}; config="$config_dir/hooks.json"; export CODEX_HOME="$config_dir";;
     claude) config_dir=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}; config="$config_dir/settings.json"; export CLAUDE_CONFIG_DIR="$config_dir";;
-    gemini) config_dir="$HOME/.gemini"; config="$config_dir/settings.json";;
+    gemini)
+        gemini_home=${GEMINI_CLI_HOME:-"$HOME"}
+        extra_dir="$gemini_home"
+        config_dir="$gemini_home/.gemini"
+        config="$config_dir/settings.json"
+        if [ -n "${GEMINI_CLI_HOME:-}" ]; then
+            export GEMINI_CLI_HOME="$gemini_home"
+        fi
+        ;;
+    agy)
+        extra_dir="$HOME/.gemini"
+        config_dir="$extra_dir/config"
+        config="$config_dir/hooks.json"
+        ;;
     *) exit 2;;
 esac
 case "$config_dir" in /*) ;; *) echo 'Agent config directory must be absolute' >&2; exit 1;; esac
@@ -28,7 +42,7 @@ for dir in "$HOME/.local" "$HOME/.local/share" "$HOME/.local/share/limux" "$HOME
     }
 done
 base="$HOME/.local/share/limux/ssh-helpers"
-[ ! -L "$base/.install.lock" ] && [ ! -L "$config_dir" ] && [ ! -L "$config" ] || {
+[ ! -L "$base/.install.lock" ] && { [ -z "$extra_dir" ] || { [ ! -L "$extra_dir" ] && [ ! -L "${extra_dir%/}" ]; }; } && [ ! -L "$config_dir" ] && [ ! -L "${config_dir%/}" ] && [ ! -L "$config" ] || {
     echo 'Refusing symlinked install lock or agent configuration' >&2; exit 1;
 }
 exec 9>>"$base/.install.lock"

@@ -59,6 +59,28 @@ pub fn authorize_peer<S: AsRawFd>(stream: &S, mode: SocketControlMode) -> io::Re
     }
 }
 
+pub fn verify_server_peer<S: AsRawFd>(stream: &S, mode: SocketControlMode) -> io::Result<PeerInfo> {
+    let peer = peer_info(stream)?;
+    let allow_untrusted = std::env::var("LIMUX_ALLOW_UNTRUSTED_SERVER")
+        .ok()
+        .is_some_and(|val| matches!(val.trim(), "1" | "true" | "yes"));
+    if matches!(mode, SocketControlMode::AllowAll) || allow_untrusted {
+        return Ok(peer);
+    }
+    let expected_uid = current_uid();
+    if peer.uid == expected_uid || peer.uid == 0 {
+        Ok(peer)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "untrusted control server uid={} pid={} (expected uid={expected_uid})",
+                peer.uid, peer.pid
+            ),
+        ))
+    }
+}
+
 pub fn is_authorized(peer: &PeerInfo, mode: SocketControlMode) -> bool {
     match mode {
         SocketControlMode::AllowAll => true,
@@ -102,7 +124,7 @@ fn peer_info<S: AsRawFd>(stream: &S) -> io::Result<PeerInfo> {
 }
 
 fn current_uid() -> u32 {
-    unsafe { libc::getuid() }
+    unsafe { libc::geteuid() }
 }
 
 fn is_descendant(pid: u32) -> bool {
@@ -227,8 +249,11 @@ mod tests {
         let (server, _) = listener.accept().expect("accept client");
 
         let peer = authorize_peer(&server, SocketControlMode::LocalUser).expect("authorize");
+        let server_peer =
+            verify_server_peer(&client, SocketControlMode::LocalUser).expect("verify server peer");
 
         assert_eq!(peer.uid, current_uid());
+        assert_eq!(server_peer.uid, current_uid());
         assert_eq!(peer.gid, unsafe { libc::getgid() });
 
         drop(client);

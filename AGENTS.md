@@ -77,8 +77,9 @@ When fixing user-visible CLI behavior, verify the production GTK bridge path,
 not only the standalone dispatcher. The live bridge supports system
 capabilities/identify, window activation, workspace and workspace-group
 management, pane/surface focus and lifecycle, terminal send/key/read/health,
-tab actions, GUI lifecycle hooks (`gui_hook.*`), notifications, and terminal
-pane-create commands. Canonical RPC method specs (`CORE_COMMAND_NAMES`,
+tab actions, GUI lifecycle hooks (`gui_hook.*`), notifications, terminal and
+browser pane creation, browser navigation/history, and tmux-compatible
+workspace and pane commands. Canonical RPC method specs (`CORE_COMMAND_NAMES`,
 `GTK_BRIDGE_COMMAND_NAMES`, socket `wire_aliases`, and `cli_subcommands`) live in
 `rust/limux-protocol/src/methods.rs`; check `docs/cmux-parity-plan.md` before
 changing agent or browser automation.

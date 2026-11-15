@@ -254,7 +254,7 @@ pub const HOST_ONLY_COMMAND_NAMES: [&str; 12] = [
     "gui_hook.clear",
 ];
 
-pub const GTK_BRIDGE_COMMAND_NAMES: [&str; 35] = [
+pub const GTK_BRIDGE_COMMAND_NAMES: [&str; 50] = [
     "system.ping",
     "system.identify",
     "system.capabilities",
@@ -263,6 +263,9 @@ pub const GTK_BRIDGE_COMMAND_NAMES: [&str; 35] = [
     "workspace.current",
     "workspace.create",
     "workspace.select",
+    "workspace.next",
+    "workspace.previous",
+    "workspace.last",
     "workspace.rename",
     "workspace.close",
     "workspace.set_color",
@@ -277,6 +280,11 @@ pub const GTK_BRIDGE_COMMAND_NAMES: [&str; 35] = [
     "pane.surfaces",
     "pane.create",
     "pane.focus",
+    "pane.swap",
+    "pane.break",
+    "pane.join",
+    "pane.last",
+    "pane.resize",
     "surface.list",
     "surface.create",
     "surface.focus",
@@ -285,11 +293,18 @@ pub const GTK_BRIDGE_COMMAND_NAMES: [&str; 35] = [
     "surface.read_text",
     "surface.send_text",
     "surface.send_key",
+    "surface.clear_history",
     "notification.create",
     "tab.action",
     "gui_hook.list",
     "gui_hook.set",
     "gui_hook.clear",
+    "browser.open_split",
+    "browser.navigate",
+    "browser.url.get",
+    "browser.back",
+    "browser.forward",
+    "browser.reload",
 ];
 
 pub const ALL_METHOD_SPECS: [MethodSpec; 178] = [
@@ -333,19 +348,22 @@ pub const ALL_METHOD_SPECS: [MethodSpec; 178] = [
         &["workspace.activate", "activate-workspace"],
         &["select-workspace"],
     ),
-    core_only_spec(
+    shared_spec(
         "workspace.next",
         MethodCategory::Workspace,
         &["next-window"],
+        &["next-window"],
     ),
-    core_only_spec(
+    shared_spec(
         "workspace.previous",
         MethodCategory::Workspace,
         &["previous-window"],
+        &["previous-window"],
     ),
-    core_only_spec(
+    shared_spec(
         "workspace.last",
         MethodCategory::Workspace,
+        &["last-window"],
         &["last-window"],
     ),
     shared_spec(
@@ -430,11 +448,36 @@ pub const ALL_METHOD_SPECS: [MethodSpec; 178] = [
         &["focus-pane"],
         &["focus-pane"],
     ),
-    core_only_spec("pane.swap", MethodCategory::Pane, &[]),
-    core_only_spec("pane.break", MethodCategory::Pane, &["break-pane"]),
-    core_only_spec("pane.join", MethodCategory::Pane, &["join-pane"]),
-    core_only_spec("pane.last", MethodCategory::Pane, &["last-pane"]),
-    core_only_spec("pane.resize", MethodCategory::Pane, &["resize-pane"]),
+    shared_spec(
+        "pane.swap",
+        MethodCategory::Pane,
+        &["swap-pane"],
+        &["swap-pane"],
+    ),
+    shared_spec(
+        "pane.break",
+        MethodCategory::Pane,
+        &["break-pane"],
+        &["break-pane"],
+    ),
+    shared_spec(
+        "pane.join",
+        MethodCategory::Pane,
+        &["join-pane"],
+        &["join-pane"],
+    ),
+    shared_spec(
+        "pane.last",
+        MethodCategory::Pane,
+        &["last-pane"],
+        &["last-pane"],
+    ),
+    shared_spec(
+        "pane.resize",
+        MethodCategory::Pane,
+        &["resize-pane"],
+        &["resize-pane"],
+    ),
     shared_spec(
         "surface.list",
         MethodCategory::Surface,
@@ -490,9 +533,10 @@ pub const ALL_METHOD_SPECS: [MethodSpec; 178] = [
         &["send-key"],
     ),
     core_only_spec("surface.trigger_flash", MethodCategory::Surface, &[]),
-    core_only_spec(
+    shared_spec(
         "surface.clear_history",
         MethodCategory::Surface,
+        &["clear-history"],
         &["clear-history"],
     ),
     core_only_spec("surface.action", MethodCategory::Surface, &[]),
@@ -518,17 +562,19 @@ pub const ALL_METHOD_SPECS: [MethodSpec; 178] = [
     gtk_bridge_only_spec("gui_hook.list", MethodCategory::GuiHook, &[], &[]),
     gtk_bridge_only_spec("gui_hook.set", MethodCategory::GuiHook, &[], &[]),
     gtk_bridge_only_spec("gui_hook.clear", MethodCategory::GuiHook, &[], &[]),
-    core_only_spec(
+    shared_spec(
         "browser.open_split",
         MethodCategory::Browser,
+        &[],
         &["open-browser"],
     ),
-    core_only_spec(
+    shared_spec(
         "browser.navigate",
         MethodCategory::Browser,
+        &[],
         &["navigate-browser"],
     ),
-    core_only_spec("browser.url.get", MethodCategory::Browser, &[]),
+    shared_spec("browser.url.get", MethodCategory::Browser, &[], &[]),
     core_only_spec("browser.eval", MethodCategory::Browser, &[]),
     core_only_spec("browser.wait", MethodCategory::Browser, &[]),
     core_only_spec("browser.click", MethodCategory::Browser, &[]),
@@ -540,15 +586,22 @@ pub const ALL_METHOD_SPECS: [MethodSpec; 178] = [
     core_only_spec("browser.focus_webview", MethodCategory::Browser, &[]),
     core_only_spec("browser.is_webview_focused", MethodCategory::Browser, &[]),
     core_only_spec("browser.screenshot", MethodCategory::Browser, &[]),
-    core_only_spec("browser.back", MethodCategory::Browser, &["browser-back"]),
-    core_only_spec(
+    shared_spec(
+        "browser.back",
+        MethodCategory::Browser,
+        &[],
+        &["browser-back"],
+    ),
+    shared_spec(
         "browser.forward",
         MethodCategory::Browser,
+        &[],
         &["browser-forward"],
     ),
-    core_only_spec(
+    shared_spec(
         "browser.reload",
         MethodCategory::Browser,
+        &[],
         &["browser-reload"],
     ),
     core_only_spec("browser.focus", MethodCategory::Browser, &[]),
@@ -823,7 +876,10 @@ mod tests {
             Some("workspace.select")
         );
 
-        assert_eq!(canonical_wire_method_name("next-window"), None);
+        assert_eq!(
+            canonical_wire_method_name("next-window"),
+            Some("workspace.next")
+        );
         assert_eq!(
             resolve_cli_subcommand_spec("next-window").map(|spec| spec.name),
             Some("workspace.next")
@@ -892,7 +948,6 @@ mod tests {
             "next-workspace",
             "previous-workspace",
             "last-workspace",
-            "swap-pane",
             "new-split",
             "browser.open-split",
         ] {

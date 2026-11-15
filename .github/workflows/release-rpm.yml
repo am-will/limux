@@ -77,9 +77,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            apparmor \
+            apparmor-utils \
             appstream \
             binutils \
             build-essential \
+            bubblewrap \
             cpio \
             dbus-x11 \
             desktop-file-utils \
@@ -98,6 +101,7 @@ jobs:
             pkg-config \
             python3-gi \
             rpm \
+            xdg-dbus-proxy \
             weston
 
       - name: Install current blueprint-compiler
@@ -124,7 +128,8 @@ jobs:
       - name: Smoke exact RPM artifact
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/smoke-release-artifacts.sh "$VERSION" rpm
+          UV_PYTHON: /usr/bin/python3
+        run: ./scripts/ci-webkit-sandbox.sh -- ./scripts/smoke-release-artifacts.sh "$VERSION" rpm
 
       - name: Resolve RPM path
         id: rpm

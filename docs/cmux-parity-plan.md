@@ -13,10 +13,11 @@ Limux has **two control servers**:
    the live GTK command set defined in
    `limux_protocol::methods::GTK_BRIDGE_COMMAND_NAMES` to the GTK main loop,
    including `system.{ping,identify,capabilities}`, `window.activate`,
-   `workspace.{current,list,create,select,rename,close,set_color,set_group}`,
+   `workspace.{current,list,create,select,next,previous,last,rename,close,set_color,set_group}`,
    `workspace.group_{list,create,rename,set_color,set_collapsed,delete}`,
-   `pane.{list,surfaces,create,focus}`,
-   `surface.{list,create,close,focus,send_text,send_key,read_text,health}`,
+   `pane.{list,surfaces,create,focus,swap,break,join,last,resize}`,
+   `surface.{list,create,close,focus,send_text,send_key,read_text,health,clear_history}`,
+   `browser.{open_split,navigate,url.get,back,forward,reload}`,
    `tab.action`, `gui_hook.{list,set,clear}`, and `notification.create`.
    Canonical method metadata, socket `wire_aliases`, and `cli_subcommands` are
    cataloged in `rust/limux-protocol/src/methods.rs`.
@@ -44,7 +45,7 @@ variants that interrogate the live state. The cleanest path:
   notification.create) remain as `ControlCommand` variants.
 
 The terminal introspection path is now bridged directly against live GTK state.
-Remaining proxy work is for deferred browser surface commands and broader
+Remaining proxy work is for browser DOM automation commands and broader
 dispatcher parity.
 
 **Shipped so far (in 6b8eb1a and follow-up bridge work):**
@@ -59,15 +60,18 @@ dispatcher parity.
 - `surface.send_key` now routes to the exact terminal surface when provided,
   so agents can send deterministic key-level control such as Ctrl-C.
 - `surface.health` and `surface.read_text` now route on the live GTK bridge,
-  so agents can inspect peer terminal health and visible screen text.
-- `pane.create` now routes through the GTK bridge for terminal panes. From
+  so agents can inspect peer terminal health, visible screen text, and scrollback.
+- `pane.create` now routes through the GTK bridge for terminal and browser panes. From
   inside an agent terminal, `limux new-pane --direction right --command claude`
   uses `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, and `LIMUX_PANE_ID` to split
   the caller's pane, create a new terminal, and launch the command there.
+- Workspace navigation, pane swap/break/join/resize, and history clearing run
+  against live GTK state. Browser split, navigation, URL queries, and history
+  commands use the embedded WebKit tab.
 
 **Still open (priority order):**
 
-- Browser command bridge parity.
+- Browser DOM evaluation, interaction, and screenshot bridge parity.
 
 ### Phase 3 — `limux notify` + GUI toast/sidebar integration ✅
 `ControlCommand::CreateNotification` wired through the bridge into

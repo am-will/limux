@@ -2643,6 +2643,15 @@ impl CommandError {
             data: None,
         }
     }
+
+    fn internal(message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self {
+            code: -32603,
+            message: format!("internal_error: {message}"),
+            data: None,
+        }
+    }
 }
 
 fn encode_handle_id(id: u64) -> String {
@@ -3549,28 +3558,353 @@ fn estimate_changed_pixels(previous: &str, current: &str) -> u64 {
     ((diff as u64).saturating_mul(64)).max(24)
 }
 
-fn debug_log_path() -> std::path::PathBuf {
+fn ensure_private_core_dir(candidate: &std::path::Path, expected_uid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+        match std::fs::symlink_metadata(candidate) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(candidate)?;
+            }
+            Err(err) => return Err(err),
+        }
+
+        let meta = std::fs::symlink_metadata(candidate)?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "runtime directory {} is not a real directory",
+                    candidate.display()
+                ),
+            ));
+        }
+        if meta.uid() != expected_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime directory {} is not owned by uid {expected_uid}",
+                    candidate.display()
+                ),
+            ));
+        }
+        if (meta.permissions().mode() & 0o777) != 0o700 {
+            std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o700))?;
+            let refreshed = std::fs::symlink_metadata(candidate)?;
+            if refreshed.file_type().is_symlink()
+                || !refreshed.file_type().is_dir()
+                || refreshed.uid() != expected_uid
+                || (refreshed.permissions().mode() & 0o777) != 0o700
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "runtime directory {} permissions are not private (0700)",
+                        candidate.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expected_uid;
+        std::fs::create_dir_all(candidate)
+    }
+}
+
+fn current_core_euid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn select_core_runtime_dir(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    temp_dir: &std::path::Path,
+    euid: u32,
+) -> std::path::PathBuf {
+    xdg_runtime_dir
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|dir| {
+            if !dir.is_absolute() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                std::fs::symlink_metadata(dir)
+                    .map(|meta| {
+                        !meta.file_type().is_symlink()
+                            && meta.file_type().is_dir()
+                            && meta.uid() == euid
+                            && (meta.permissions().mode() & 0o077) == 0
+                    })
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                dir.is_dir()
+            }
+        })
+        .map(|dir| dir.join("limux"))
+        .unwrap_or_else(|| temp_dir.join(format!("limux-{euid}")))
+}
+
+fn core_private_runtime_dir() -> std::io::Result<std::path::PathBuf> {
+    let euid = current_core_euid();
+    let candidate = select_core_runtime_dir(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        &std::env::temp_dir(),
+        euid,
+    );
+    ensure_private_core_dir(&candidate, euid)?;
+    Ok(candidate)
+}
+
+fn debug_log_path() -> std::io::Result<std::path::PathBuf> {
     if let Ok(path) = std::env::var("LIMUX_DEBUG_LOG") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
-            return std::path::PathBuf::from(trimmed);
+            let explicit = std::path::PathBuf::from(trimmed);
+            if let Some(parent) = explicit
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                let euid = current_core_euid();
+                let runtime_candidate = select_core_runtime_dir(
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    &std::env::temp_dir(),
+                    euid,
+                );
+                if parent == runtime_candidate.as_path() {
+                    ensure_private_core_dir(parent, euid)?;
+                } else {
+                    #[cfg(unix)]
+                    if let Ok(meta) = std::fs::symlink_metadata(parent) {
+                        if meta.file_type().is_symlink() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "refusing symlink debug log directory {}",
+                                    parent.display()
+                                ),
+                            ));
+                        }
+                    }
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            return Ok(explicit);
         }
     }
-    std::path::PathBuf::from("/tmp/limux-debug.log")
+    Ok(core_private_runtime_dir()?.join("limux-debug.log"))
+}
+
+fn open_core_debug_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let euid = current_core_euid();
+        let open_existing_verified = |meta: std::fs::Metadata| -> std::io::Result<std::fs::File> {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing symlink or non-regular debug log",
+                ));
+            }
+            if meta.uid() != euid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing foreign-owned debug log",
+                ));
+            }
+            let file = std::fs::OpenOptions::new().append(true).open(path)?;
+            let opened = file.metadata()?;
+            if !opened.file_type().is_file()
+                || opened.uid() != euid
+                || opened.dev() != meta.dev()
+                || opened.ino() != meta.ino()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing swapped or non-regular debug log",
+                ));
+            }
+            Ok(file)
+        };
+
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => open_existing_verified(meta),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::OpenOptions::new()
+                    .append(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                {
+                    Ok(file) => Ok(file),
+                    Err(open_err) if open_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let meta = std::fs::symlink_metadata(path)?;
+                        open_existing_verified(meta)
+                    }
+                    Err(open_err) => Err(open_err),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
 }
 
 fn append_debug_log(event: &str) {
-    let path = debug_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    let Ok(path) = debug_log_path() else {
+        return;
+    };
+    if let Ok(mut file) = open_core_debug_log(&path) {
         let _ = std::io::Write::write_all(&mut file, event.as_bytes());
         let _ = std::io::Write::write_all(&mut file, b"\n");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_dir_tests {
+    use super::{
+        current_core_euid, ensure_private_core_dir, open_core_debug_log, select_core_runtime_dir,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn ensure_private_core_dir_creates_and_tightens_owned_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("limux-private");
+        let euid = current_core_euid();
+
+        ensure_private_core_dir(&candidate, euid).unwrap();
+        let mode = std::fs::symlink_metadata(&candidate)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_core_dir(&candidate, euid).unwrap();
+        let tightened = std::fs::symlink_metadata(&candidate)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(tightened, 0o700);
+    }
+
+    #[test]
+    fn ensure_private_core_dir_rejects_symlinks_files_and_foreign_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let euid = current_core_euid();
+
+        let real_dir = temp.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let symlink_dir = temp.path().join("symlink");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+        assert!(ensure_private_core_dir(&symlink_dir, euid).is_err());
+
+        let regular_file = temp.path().join("file");
+        std::fs::write(&regular_file, b"not a dir").unwrap();
+        assert!(ensure_private_core_dir(&regular_file, euid).is_err());
+
+        let wrong_owner_err = ensure_private_core_dir(&real_dir, euid.wrapping_add(1)).unwrap_err();
+        assert_eq!(wrong_owner_err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn select_core_runtime_dir_rejects_unsafe_xdg_runtime_dir_and_falls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let tmp_root = tempfile::tempdir().unwrap();
+        let euid = current_core_euid();
+        let expected_fallback = tmp_root.path().join(format!("limux-{euid}"));
+
+        let valid_xdg = temp.path().join("valid-xdg");
+        std::fs::create_dir(&valid_xdg).unwrap();
+        std::fs::set_permissions(&valid_xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            select_core_runtime_dir(Some(valid_xdg.as_os_str()), tmp_root.path(), euid),
+            valid_xdg.join("limux")
+        );
+
+        let missing_xdg = temp.path().join("missing-xdg");
+        let symlink_xdg = temp.path().join("symlink-xdg");
+        std::os::unix::fs::symlink(&valid_xdg, &symlink_xdg).unwrap();
+        let mode_755 = temp.path().join("mode-755");
+        std::fs::create_dir(&mode_755).unwrap();
+        std::fs::set_permissions(&mode_755, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode_777 = temp.path().join("mode-777");
+        std::fs::create_dir(&mode_777).unwrap();
+        std::fs::set_permissions(&mode_777, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        for invalid in [
+            missing_xdg.as_os_str(),
+            std::ffi::OsStr::new("relative/xdg-runtime"),
+            symlink_xdg.as_os_str(),
+            mode_755.as_os_str(),
+            mode_777.as_os_str(),
+        ] {
+            let resolved = select_core_runtime_dir(Some(invalid), tmp_root.path(), euid);
+            assert_eq!(resolved, expected_fallback, "case: {invalid:?}");
+            ensure_private_core_dir(&resolved, euid).expect("fallback runtime dir");
+            let mode = std::fs::symlink_metadata(&resolved)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn open_core_debug_log_rejects_symlinks_and_enforces_0600() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("limux-debug.log");
+
+        let mut file = open_core_debug_log(&log_path).expect("create log file");
+        std::io::Write::write_all(&mut file, b"hello\n").unwrap();
+        let mode = std::fs::symlink_metadata(&log_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let dangling_target = temp.path().join("victim-new");
+        let dangling_link = temp.path().join("dangling.log");
+        std::os::unix::fs::symlink(&dangling_target, &dangling_link).unwrap();
+        assert!(open_core_debug_log(&dangling_link).is_err());
+        assert!(!dangling_target.exists());
+
+        let existing_link = temp.path().join("existing.log");
+        std::os::unix::fs::symlink(&log_path, &existing_link).unwrap();
+        assert!(open_core_debug_log(&existing_link).is_err());
     }
 }
 
@@ -5389,16 +5723,45 @@ fn handle_command(
             let params = params_object(params)?;
             let workspace_id = optional_u64_param_any(params, &["workspace_id"])?;
             let surface_hint = optional_u64_param_any(params, &["surface_id", "id"])?;
+            let _scrollback = optional_bool_param(params, "scrollback")?.unwrap_or(false);
+            let lines = match optional_u64_param(params, "lines")? {
+                Some(0) => {
+                    return Err(CommandError::invalid_params("lines must be greater than 0"));
+                }
+                Some(limit) => Some(limit as usize),
+                None => None,
+            };
             let (workspace_id, surface_id) =
                 resolve_surface_target(state, workspace_id, surface_hint)?;
             let surface = update_surface_metadata(state, workspace_id, surface_id, |_| {})
                 .ok_or_else(|| CommandError::not_found("surface not found"))?;
+            let text = match lines {
+                Some(limit) => {
+                    let has_trailing_newline = surface.text.ends_with('\n');
+                    let trimmed = surface
+                        .text
+                        .strip_suffix('\n')
+                        .unwrap_or(surface.text.as_str());
+                    if trimmed.is_empty() {
+                        String::new()
+                    } else {
+                        let mut kept: Vec<&str> = trimmed.split('\n').rev().take(limit).collect();
+                        kept.reverse();
+                        let mut out = kept.join("\n");
+                        if has_trailing_newline {
+                            out.push('\n');
+                        }
+                        out
+                    }
+                }
+                None => surface.text,
+            };
             Ok(json!({
                 "workspace_id": encode_handle_id(workspace_id),
                 "workspace_ref": workspace_ref(workspace_id),
                 "surface_id": encode_handle_id(surface.id),
                 "surface_ref": surface_ref(surface.id),
-                "text": surface.text
+                "text": text
             }))
         }
         "surface.send_text" => {
@@ -5866,14 +6229,21 @@ fn handle_command(
         "browser.is_webview_focused" => Ok(
             json!({ "focused": state.browser.focused, "is_webview_focused": state.browser.focused }),
         ),
-        "browser.screenshot" => Ok(json!({
-            "ok": true,
-            "format": "png",
-            "bytes": 256,
-            "path": "/tmp/limux-browser-shot.png",
-            "url": "file:///tmp/limux-browser-shot.png",
-            "png_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        })),
+        "browser.screenshot" => {
+            let runtime_dir = core_private_runtime_dir().map_err(|err| {
+                CommandError::internal(format!("failed to prepare runtime directory: {err}"))
+            })?;
+            let shot_path = runtime_dir.join("limux-browser-shot.png");
+            let shot_str = shot_path.to_string_lossy().into_owned();
+            Ok(json!({
+                "ok": true,
+                "format": "png",
+                "bytes": 256,
+                "path": shot_str,
+                "url": format!("file://{}", shot_path.display()),
+                "png_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }))
+        }
         "browser.back" => {
             if state.browser.history_index > 0 {
                 state.browser.history_index -= 1;
@@ -6977,5 +7347,29 @@ mod tests {
                 .unwrap_or_else(|| panic!("host-only method {method} should fail in core"));
             assert_eq!(error.code, -32601, "{method}");
         }
+    }
+
+    #[tokio::test]
+    async fn surface_read_text_slices_trailing_lines_and_validates_params() {
+        let dispatcher = Dispatcher::default();
+        let _ = dispatcher
+            .dispatch(request(
+                "surface.send_text",
+                json!({ "text": "one\ntwo\nthree\nfour\n" }),
+            ))
+            .await;
+
+        let tail = dispatcher
+            .dispatch(request(
+                "surface.read_text",
+                json!({ "scrollback": true, "lines": 2 }),
+            ))
+            .await;
+        assert_eq!(tail.result.expect("tail read")["text"], "three\nfour\n");
+
+        let zero_lines = dispatcher
+            .dispatch(request("surface.read_text", json!({ "lines": 0 })))
+            .await;
+        assert_eq!(zero_lines.error.expect("zero lines error").code, -32602);
     }
 }

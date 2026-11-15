@@ -78,9 +78,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            apparmor \
+            apparmor-utils \
             appstream \
             binutils \
             build-essential \
+            bubblewrap \
             dbus-x11 \
             desktop-file-utils \
             fuse3 \
@@ -97,6 +100,7 @@ jobs:
             ninja-build \
             python3-gi \
             pkg-config \
+            xdg-dbus-proxy \
             weston
 
       - name: Install current blueprint-compiler
@@ -149,7 +153,33 @@ jobs:
       - name: Smoke exact Linux artifacts
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/smoke-release-artifacts.sh "$VERSION" linux
+          UV_PYTHON: /usr/bin/python3
+        run: ./scripts/ci-webkit-sandbox.sh -- ./scripts/smoke-release-artifacts.sh "$VERSION" linux
+
+      - name: Verify installed Debian package AppArmor allowance
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          UV_PYTHON: /usr/bin/python3
+        run: |
+          set -euo pipefail
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          sudo dpkg -i "dist/limux_${VERSION}_amd64.deb"
+          sudo aa-status
+          uv run scripts/smoke-packaged-runtime.py /usr /usr/bin/limux --library-dir /usr/lib/limux \
+            --expected-apparmor-profile limux
+
+      - name: Verify denied sandbox access preserves terminals
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          UV_PYTHON: /usr/bin/python3
+        run: |
+          set -euo pipefail
+          negative_root="$(mktemp -d "$RUNNER_TEMP/limux-denied-deb.XXXXXX")"
+          trap 'rm -rf "$negative_root"' EXIT
+          dpkg-deb -x "dist/limux_${VERSION}_amd64.deb" "$negative_root"
+          ./scripts/ci-webkit-sandbox.sh --deny-userns -- \
+            uv run scripts/smoke-packaged-runtime.py "$negative_root/usr" "$negative_root/usr/bin/limux" \
+              --library-dir "$negative_root/usr/lib/limux" --expect-browser-unavailable
 
       - name: Upload packages as artifact
         uses: actions/upload-artifact@v7

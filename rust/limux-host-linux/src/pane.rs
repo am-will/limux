@@ -130,10 +130,14 @@ pub enum PaneEmptyReason {
 const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
 const TAB_RENAME_ENTRY_CSS_CLASS: &str = "limux-tab-rename-entry";
 const TAB_RENAME_ENTRY_CSS_CLASSES: [&str; 2] = [HOST_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASS];
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_URL_ENTRY_CSS_CLASS: &str = "limux-browser-url-entry";
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_URL_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASS];
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_SEARCH_ENTRY_CSS_CLASS: &str = "limux-browser-search-entry";
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_SEARCH_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASS];
 #[cfg(feature = "webkit")]
@@ -303,8 +307,9 @@ struct TerminalTabState {
     generation: Rc<()>,
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
-    /// Preserve restored bindings even when no external hook record remains.
-    agent: Option<Box<RestorableAgentState>>,
+    /// Preserve restored bindings even when no external hook record remains,
+    /// until cleanup invalidates the binding.
+    agent: Rc<RefCell<Option<RestorableAgentState>>>,
 }
 
 #[derive(Clone)]
@@ -354,6 +359,7 @@ struct BrowserTabState {
 pub struct BrowserShortcutTarget {
     uri: Rc<RefCell<Option<String>>>,
     handles: BrowserHandles,
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
 }
 
 #[derive(Clone)]
@@ -1170,6 +1176,154 @@ pub fn terminal_handle_for_surface(
         composite_surface_id(internals.pane_id, tab_id),
         state.handle.clone(),
     ))
+}
+
+pub fn browser_target_for_surface(
+    pane_widget: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<(String, String, BrowserShortcutTarget)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    let browser_tab_ids = tab_state.tabs.iter().filter_map(|entry| {
+        matches!(entry.kind, TabKind::Browser { .. }).then_some(entry.id.as_str())
+    });
+    let tab_id = select_terminal_tab(
+        internals.pane_id,
+        browser_tab_ids,
+        tab_state.active_tab.as_deref(),
+        surface_hint,
+    )?;
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+    let TabKind::Browser { state } = &entry.kind else {
+        return None;
+    };
+    Some((
+        composite_surface_id(internals.pane_id, tab_id),
+        entry.title_label.label().to_string(),
+        BrowserShortcutTarget {
+            uri: state.uri.clone(),
+            handles: state.handles.clone(),
+            callbacks: state.callbacks.clone(),
+        },
+    ))
+}
+
+pub fn browser_target_for_root(
+    root: &gtk::Widget,
+) -> Option<(String, String, BrowserShortcutTarget)> {
+    pane_internals_for_root(root)
+        .into_iter()
+        .find_map(|internals| {
+            let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+            browser_target_for_surface(&pane_widget, None)
+        })
+}
+
+pub fn navigate_browser_surface(
+    pane_widget: &gtk::Widget,
+    surface_hint: Option<&str>,
+    url: &str,
+) -> Option<(String, String)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let (surface_id, title, handles, uri_cell, callbacks) = {
+        let tab_state = internals.tab_state.borrow();
+        let browser_tab_ids = tab_state.tabs.iter().filter_map(|entry| {
+            matches!(entry.kind, TabKind::Browser { .. }).then_some(entry.id.as_str())
+        });
+        let tab_id = select_terminal_tab(
+            internals.pane_id,
+            browser_tab_ids,
+            tab_state.active_tab.as_deref(),
+            surface_hint,
+        )?;
+        let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+        let TabKind::Browser { state } = &entry.kind else {
+            return None;
+        };
+        let callbacks = state.callbacks.borrow().clone();
+        (
+            composite_surface_id(internals.pane_id, tab_id),
+            entry.title_label.label().to_string(),
+            state.handles.clone(),
+            state.uri.clone(),
+            callbacks,
+        )
+    };
+
+    *uri_cell.borrow_mut() = Some(url.to_string());
+    handles.navigate(url);
+
+    (callbacks.on_state_changed)();
+    Some((surface_id, title))
+}
+
+pub fn tab_ids_in_pane(pane_widget: &gtk::Widget) -> Vec<String> {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return Vec::new();
+    };
+    let tab_state = internals.tab_state.borrow();
+    tab_state
+        .tabs
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect()
+}
+
+pub(crate) fn preserved_active_tab_for_batch_move<'a>(
+    source_active_tab: Option<&'a str>,
+    tabs_to_move: &[String],
+) -> Option<&'a str> {
+    source_active_tab.filter(|active| tabs_to_move.iter().any(|tab_id| tab_id == active))
+}
+
+pub fn move_tabs_preserving_active(
+    source_pane: &gtk::Widget,
+    tabs_to_move: &[String],
+    dest_pane: &gtk::Widget,
+) -> bool {
+    let source_active = active_tab_in_pane(source_pane);
+    let preserved_active =
+        preserved_active_tab_for_batch_move(source_active.as_deref(), tabs_to_move)
+            .map(str::to_owned);
+    let mut moved_any = false;
+    for tab_id in tabs_to_move {
+        if move_tab_to_pane(source_pane, tab_id, dest_pane) {
+            moved_any = true;
+        }
+    }
+    if moved_any {
+        if let Some(active_tab_id) = preserved_active.as_deref() {
+            let _ = activate_tab_in_pane(dest_pane, active_tab_id);
+        }
+    }
+    moved_any
+}
+
+#[cfg(test)]
+mod batch_move_tests {
+    use super::preserved_active_tab_for_batch_move;
+
+    #[test]
+    fn batch_move_preserves_source_active_tab_when_included_in_moved_set() {
+        let tabs = vec![
+            "tab-a".to_string(),
+            "tab-b".to_string(),
+            "tab-c".to_string(),
+        ];
+        assert_eq!(
+            preserved_active_tab_for_batch_move(Some("tab-a"), &tabs),
+            Some("tab-a")
+        );
+        assert_eq!(
+            preserved_active_tab_for_batch_move(Some("tab-b"), &tabs),
+            Some("tab-b")
+        );
+        assert_eq!(
+            preserved_active_tab_for_batch_move(Some("tab-other"), &tabs),
+            None
+        );
+        assert_eq!(preserved_active_tab_for_batch_move(None, &tabs), None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2043,12 +2197,12 @@ fn add_terminal_tab_inner(
     );
     let mut initial_input = None;
     if let Some(command) = workspace_autostart_command.as_deref() {
-        if terminal::terminal_command_accepts_shell_input() {
+        if let Some(shell_kind) = terminal::terminal_autostart_shell_kind() {
             eprintln!(
                 "limux: running workspace autostart workspace={} surface={}:{}",
                 internals.callbacks.workspace_id, internals.pane_id, tab_id
             );
-            initial_input = prepare_workspace_autostart(command);
+            initial_input = prepare_workspace_autostart(command, shell_kind);
         } else {
             eprintln!(
                 "limux: skipping workspace autostart for non-shell terminal command workspace={} surface={}:{}",
@@ -2097,10 +2251,9 @@ fn add_terminal_tab_inner(
                     generation: Rc::new(()),
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
-                    agent: options
-                        .as_ref()
-                        .and_then(|value| value.agent.clone())
-                        .map(Box::new),
+                    agent: Rc::new(RefCell::new(
+                        options.as_ref().and_then(|value| value.agent.clone()),
+                    )),
                 },
             },
         });
@@ -2157,42 +2310,81 @@ fn select_terminal_commands(
     (None, autostart_command)
 }
 
-fn prepare_workspace_autostart(command: &str) -> Option<String> {
+fn prepare_workspace_autostart(
+    command: &str,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<String> {
     if command.contains('\0') {
         eprintln!("limux: workspace autostart contains a NUL byte; refusing to run it");
         return None;
     }
 
-    let script_path = create_workspace_autostart_script(command)?;
-    workspace_autostart_initial_input(&script_path)
+    let script_path = create_workspace_autostart_script(command, shell_kind)?;
+    workspace_autostart_initial_input(&script_path, shell_kind)
 }
 
-fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    if runtime_dir.is_empty() {
-        eprintln!("limux: XDG_RUNTIME_DIR is unset; workspace autostart was not started");
+fn autostart_script_extension(
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> &'static str {
+    match shell_kind {
+        crate::ghostty_config::AutostartShellKind::Posix => "sh",
+        crate::ghostty_config::AutostartShellKind::Fish => "fish",
+        crate::ghostty_config::AutostartShellKind::Nushell => "nu",
+    }
+}
+
+fn is_usable_autostart_runtime_dir(
+    dir: &Path,
+    flatpak_id: Option<&std::ffi::OsStr>,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+) -> bool {
+    if !flatpak_id.is_some_and(|id| id == crate::APP_ID) {
+        return true;
+    }
+    xdg_runtime_dir
+        .filter(|xdg| !xdg.is_empty())
+        .map(Path::new)
+        .is_some_and(|xdg| xdg.is_absolute() && dir.starts_with(xdg.join("limux")))
+}
+
+fn create_workspace_autostart_script(
+    command: &str,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<PathBuf> {
+    static NEXT_AUTOSTART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let dir = match limux_control::socket_path::ensure_private_runtime_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("limux: failed to prepare private autostart runtime directory: {error}");
+            return None;
+        }
+    };
+    if !is_usable_autostart_runtime_dir(
+        &dir,
+        std::env::var_os("FLATPAK_ID").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    ) {
+        eprintln!(
+            "limux: refusing fallback autostart directory {} inside Flatpak because XDG_RUNTIME_DIR/limux is required for the host shell",
+            dir.display()
+        );
         return None;
     }
 
-    let dir = PathBuf::from(runtime_dir).join("limux");
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!("limux: failed to create autostart runtime directory: {error}");
-        return None;
-    }
-
-    for suffix in 0..100_u8 {
-        let path = dir.join(format!(
-            "workspace-autostart-{}-{suffix}.sh",
-            std::process::id()
-        ));
-        let Some(script) = workspace_autostart_script(command, &path) else {
+    let ext = autostart_script_extension(shell_kind);
+    let pid = std::process::id();
+    for _ in 0..1024_u16 {
+        let seq = NEXT_AUTOSTART_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("workspace-autostart-{pid}-{seq}.{ext}"));
+        let Some(script) = workspace_autostart_script(command, &path, shell_kind) else {
             eprintln!("limux: workspace autostart path is not valid UTF-8");
             return None;
         };
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o700)
+            .mode(0o600)
             .open(&path);
         match file {
             Ok(mut file) => {
@@ -2215,30 +2407,90 @@ fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
     None
 }
 
-fn workspace_autostart_script(command: &str, script_path: &Path) -> Option<String> {
+fn workspace_autostart_script(
+    command: &str,
+    script_path: &Path,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<String> {
     let script_path = script_path.to_str()?;
-    Some(format!(
-        "#!/bin/sh\nrm -f -- {}\n{command}\n",
-        shell_quote(script_path)
-    ))
+    Some(match shell_kind {
+        crate::ghostty_config::AutostartShellKind::Posix => format!(
+            "#!/bin/sh\nrm -f -- {}\n{command}\n",
+            shell_quote(script_path)
+        ),
+        crate::ghostty_config::AutostartShellKind::Fish => format!(
+            "#!/usr/bin/env fish\ncommand rm -f -- {}\n{command}\n",
+            fish_quote(script_path)
+        ),
+        crate::ghostty_config::AutostartShellKind::Nushell => {
+            format!("^rm -f -- {}\n{command}\n", nushell_quote(script_path))
+        }
+    })
 }
 
-fn workspace_autostart_initial_input(script_path: &Path) -> Option<String> {
+fn workspace_autostart_initial_input(
+    script_path: &Path,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<String> {
     let script_path = script_path.to_str()?;
     // Only the private script path enters terminal input. The configured
     // autostart text stays out of shell history and scrollback, while Ghostty's
     // configured interactive shell remains untouched.
-    Some(format!(". {}\n", shell_quote(script_path)))
+    Some(match shell_kind {
+        crate::ghostty_config::AutostartShellKind::Posix => {
+            format!(". {}\n", shell_quote(script_path))
+        }
+        crate::ghostty_config::AutostartShellKind::Fish => {
+            format!("source {}\n", fish_quote(script_path))
+        }
+        crate::ghostty_config::AutostartShellKind::Nushell => {
+            format!("source {}\n", nushell_quote(script_path))
+        }
+    })
+}
+
+fn is_safe_shell_bareword(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
 }
 
 fn shell_quote(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
-    {
+    if is_safe_shell_bareword(value) {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn fish_quote(value: &str) -> String {
+    if is_safe_shell_bareword(value) {
+        value.to_string()
+    } else {
+        let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("'{escaped}'")
+    }
+}
+
+fn nushell_quote(value: &str) -> String {
+    if is_safe_shell_bareword(value) {
+        value.to_string()
+    } else {
+        let mut escaped = String::with_capacity(value.len() + 2);
+        escaped.push('"');
+        for ch in value.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped.push('"');
+        escaped
     }
 }
 
@@ -2519,11 +2771,22 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
         .iter()
         .map(|entry| {
             let content = match &entry.kind {
-                TabKind::Terminal { state } => TabContentState::Terminal {
-                    cwd: state.cwd.borrow().clone(),
-                    agent: state.agent.as_deref().cloned(),
-                    ssh: state.ssh.clone().map(Box::new),
-                },
+                TabKind::Terminal { state } => {
+                    if state.agent.borrow().as_ref().is_some_and(|agent| {
+                        crate::layout_state::is_cached_ended_agent_binding(
+                            agent.kind,
+                            &agent.session_id,
+                            &entry.id,
+                        )
+                    }) {
+                        *state.agent.borrow_mut() = None;
+                    }
+                    TabContentState::Terminal {
+                        cwd: state.cwd.borrow().clone(),
+                        agent: state.agent.borrow().clone(),
+                        ssh: state.ssh.clone().map(Box::new),
+                    }
+                }
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
                 },
@@ -2782,28 +3045,42 @@ pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
         })
 }
 
+fn pane_summary_from_internals(internals: &PaneInternals) -> PaneSummary {
+    let pane_id = internals.pane_id;
+    let tab_state = internals.tab_state.borrow();
+    let active_surface_id = tab_state
+        .active_tab
+        .as_deref()
+        .map(|tab_id| composite_surface_id(pane_id, tab_id))
+        .or_else(|| {
+            tab_state
+                .tabs
+                .first()
+                .map(|entry| composite_surface_id(pane_id, &entry.id))
+        });
+    PaneSummary {
+        pane_id,
+        surface_count: tab_state.tabs.len(),
+        active_surface_id,
+    }
+}
+
+pub fn pane_summary_for_widget(pane_widget: &gtk::Widget) -> Option<PaneSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    Some(pane_summary_from_internals(&internals))
+}
+
+pub fn pane_summaries_for_widgets(pane_widgets: &[gtk::Widget]) -> Vec<PaneSummary> {
+    pane_widgets
+        .iter()
+        .filter_map(pane_summary_for_widget)
+        .collect()
+}
+
 pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
     pane_internals_for_root(root)
         .into_iter()
-        .map(|internals| {
-            let pane_id = internals.pane_id;
-            let tab_state = internals.tab_state.borrow();
-            let active_surface_id = tab_state
-                .active_tab
-                .as_deref()
-                .map(|tab_id| composite_surface_id(pane_id, tab_id))
-                .or_else(|| {
-                    tab_state
-                        .tabs
-                        .first()
-                        .map(|entry| composite_surface_id(pane_id, &entry.id))
-                });
-            PaneSummary {
-                pane_id,
-                surface_count: tab_state.tabs.len(),
-                active_surface_id,
-            }
-        })
+        .map(|internals| pane_summary_from_internals(&internals))
         .collect()
 }
 
@@ -2822,14 +3099,14 @@ pub(crate) fn pane_widget_for_workspace(workspace_id: &str, pane_id: u32) -> Opt
         .then(|| internals.pane_outer.clone().upcast())
 }
 
-pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
-    let mut surfaces = Vec::new();
-
-    for internals in pane_internals_for_root(root) {
-        let pane_id = internals.pane_id;
-        let tab_state = internals.tab_state.borrow();
-        let active_tab = tab_state.active_tab.as_deref();
-        for entry in &tab_state.tabs {
+fn surface_summaries_from_internals(internals: &PaneInternals) -> Vec<SurfaceSummary> {
+    let pane_id = internals.pane_id;
+    let tab_state = internals.tab_state.borrow();
+    let active_tab = tab_state.active_tab.as_deref();
+    let mut surfaces = tab_state
+        .tabs
+        .iter()
+        .map(|entry| {
             let selected = active_tab
                 .map(|current| current == entry.id)
                 .unwrap_or_else(|| {
@@ -2847,7 +3124,7 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
                 }
                 TabKind::Keybinds => ("keybinds".to_string(), None, None),
             };
-            surfaces.push(SurfaceSummary {
+            SurfaceSummary {
                 pane_id,
                 tab_id: entry.id.clone(),
                 surface_id: composite_surface_id(pane_id, &entry.id),
@@ -2856,16 +3133,33 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
                 selected,
                 cwd,
                 uri,
-            });
-        }
-    }
-
+            }
+        })
+        .collect::<Vec<_>>();
     surfaces.sort_by(|left, right| {
-        left.pane_id
-            .cmp(&right.pane_id)
-            .then_with(|| right.selected.cmp(&left.selected))
+        right
+            .selected
+            .cmp(&left.selected)
             .then_with(|| left.surface_id.cmp(&right.surface_id))
     });
+    surfaces
+}
+
+pub fn surface_summaries_for_widgets(pane_widgets: &[gtk::Widget]) -> Vec<SurfaceSummary> {
+    let mut surfaces = Vec::new();
+    for widget in pane_widgets {
+        if let Some(internals) = find_pane_internals(widget) {
+            surfaces.extend(surface_summaries_from_internals(&internals));
+        }
+    }
+    surfaces
+}
+
+pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
+    let mut surfaces = Vec::new();
+    for internals in pane_internals_for_root(root) {
+        surfaces.extend(surface_summaries_from_internals(&internals));
+    }
     surfaces
 }
 
@@ -2943,6 +3237,7 @@ pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarg
             }) => FocusedShortcutTarget::Browser(BrowserShortcutTarget {
                 uri: state.uri.clone(),
                 handles: state.handles.clone(),
+                callbacks: state.callbacks.clone(),
             }),
             Some(TabEntry {
                 kind: TabKind::Keybinds,
@@ -3154,15 +3449,118 @@ fn remove_tab(
 // Browser widget
 // ---------------------------------------------------------------------------
 
+#[cfg(any(feature = "webkit", test))]
+const DEFAULT_BROWSER_URI: &str = "about:blank";
+
+#[cfg(any(feature = "webkit", test))]
+fn is_non_blank_browser_uri(uri: Option<&str>) -> bool {
+    uri.is_some_and(|value| !value.is_empty() && value != "about:blank")
+}
+
+#[cfg(any(feature = "webkit", test))]
+#[derive(Clone, Debug)]
+struct BrowserLoadState {
+    pending_first_map_uri: Rc<RefCell<Option<String>>>,
+    restoring: Rc<Cell<bool>>,
+}
+
+#[cfg(any(feature = "webkit", test))]
+impl BrowserLoadState {
+    fn new(initial_uri: Option<&str>) -> Self {
+        let first_map_uri = initial_uri.unwrap_or(DEFAULT_BROWSER_URI).to_string();
+        Self {
+            pending_first_map_uri: Rc::new(RefCell::new(Some(first_map_uri))),
+            restoring: Rc::new(Cell::new(is_non_blank_browser_uri(initial_uri))),
+        }
+    }
+
+    fn record_explicit_navigation(&self, url: &str, current_webview_uri: Option<&str>) {
+        *self.pending_first_map_uri.borrow_mut() = None;
+        self.restoring.set(
+            is_non_blank_browser_uri(Some(url)) && !is_non_blank_browser_uri(current_webview_uri),
+        );
+    }
+
+    fn clear_restoring(&self) {
+        self.restoring.set(false);
+    }
+
+    fn take_first_map_uri(&self) -> Option<String> {
+        self.pending_first_map_uri.borrow_mut().take()
+    }
+
+    fn accept_notified_uri(&self, uri: &str) -> bool {
+        if self.restoring.get() && !is_non_blank_browser_uri(Some(uri)) {
+            return false;
+        }
+        self.restoring.set(false);
+        true
+    }
+}
+
+#[cfg(feature = "webkit")]
+fn step_webview_history(
+    webview: &webkit6::WebView,
+    url_entry: Option<&gtk::Entry>,
+    load_state: &BrowserLoadState,
+    saved_uri: &RefCell<Option<String>>,
+    callbacks: &RefCell<Rc<PaneCallbacks>>,
+    forward: bool,
+) {
+    let can_step = if forward {
+        webview.can_go_forward()
+    } else {
+        webview.can_go_back()
+    };
+    if !can_step {
+        return;
+    }
+    let target_item = webview.back_forward_list().and_then(|list| {
+        if forward {
+            list.forward_item()
+        } else {
+            list.back_item()
+        }
+    });
+    let target_uri = target_item.map(|item| {
+        item.uri()
+            .filter(|uri| !uri.is_empty())
+            .map(|uri| uri.to_string())
+            .unwrap_or_else(|| "about:blank".to_string())
+    });
+    load_state.clear_restoring();
+    if let Some(uri) = target_uri {
+        if let Some(entry) = url_entry {
+            entry.set_text(&uri);
+        }
+        *saved_uri.borrow_mut() = Some(uri);
+        let callbacks = callbacks.borrow().clone();
+        (callbacks.on_state_changed)();
+    }
+    if forward {
+        webview.go_forward();
+    } else {
+        webview.go_back();
+    }
+}
+
 #[cfg(feature = "webkit")]
 #[derive(Clone)]
-struct BrowserHandles {
+struct LiveBrowserHandles {
     webview: webkit6::WebView,
     url_entry: gtk::Entry,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     find_controller: webkit6::FindController,
     dom_editable: Rc<Cell<bool>>,
+    load_state: BrowserLoadState,
+}
+
+#[cfg(feature = "webkit")]
+#[derive(Clone)]
+enum BrowserHandles {
+    Ready(Rc<LiveBrowserHandles>),
+    Unavailable(gtk::Widget),
 }
 
 #[cfg(not(feature = "webkit"))]
@@ -3179,11 +3577,11 @@ impl BrowserShortcutTarget {
     }
 
     pub fn go_back(&self) -> bool {
-        self.handles.go_back()
+        self.handles.go_back(&self.uri, &self.callbacks)
     }
 
     pub fn go_forward(&self) -> bool {
-        self.handles.go_forward()
+        self.handles.go_forward(&self.uri, &self.callbacks)
     }
 
     pub fn reload(&self) -> bool {
@@ -3228,12 +3626,20 @@ impl BrowserShortcutTarget {
 }
 
 #[cfg(feature = "webkit")]
-impl BrowserHandles {
+impl LiveBrowserHandles {
     fn prepare_for_removal(&self) {
         self.find_controller.search_finish();
         self.search_bar.set_search_mode(false);
         self.dom_editable.set(false);
         self.webview.stop_loading();
+    }
+
+    fn navigate(&self, url: &str) {
+        let current_uri = self.webview.uri();
+        self.load_state
+            .record_explicit_navigation(url, current_uri.as_deref());
+        self.url_entry.set_text(url);
+        self.webview.load_uri(url);
     }
 
     fn is_find_active(&self) -> bool {
@@ -3260,13 +3666,35 @@ impl BrowserHandles {
         true
     }
 
-    fn go_back(&self) -> bool {
-        self.webview.go_back();
+    fn go_back(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        step_webview_history(
+            &self.webview,
+            Some(&self.url_entry),
+            &self.load_state,
+            saved_uri,
+            callbacks,
+            false,
+        );
         true
     }
 
-    fn go_forward(&self) -> bool {
-        self.webview.go_forward();
+    fn go_forward(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        step_webview_history(
+            &self.webview,
+            Some(&self.url_entry),
+            &self.load_state,
+            saved_uri,
+            callbacks,
+            true,
+        );
         true
     }
 
@@ -3370,6 +3798,127 @@ impl BrowserHandles {
 }
 
 #[cfg(feature = "webkit")]
+impl BrowserHandles {
+    fn prepare_for_removal(&self) {
+        if let Self::Ready(handles) = self {
+            handles.prepare_for_removal();
+        }
+    }
+
+    fn navigate(&self, url: &str) {
+        if let Self::Ready(handles) = self {
+            handles.navigate(url);
+        }
+    }
+
+    fn focus_content(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.focus_content(),
+            Self::Unavailable(widget) => widget.grab_focus(),
+        }
+    }
+
+    fn is_find_active(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.is_find_active(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn is_page_editable(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.is_page_editable(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn focus_location(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.focus_location(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn go_back(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        match self {
+            Self::Ready(handles) => handles.go_back(saved_uri, callbacks),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn go_forward(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        match self {
+            Self::Ready(handles) => handles.go_forward(saved_uri, callbacks),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn reload(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.reload(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn show_inspector(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.show_inspector(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn show_console(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.show_console(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn show_find(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.show_find(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn find_next(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.find_next(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn find_previous(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.find_previous(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn hide_find(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.hide_find(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn use_selection_for_find(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.use_selection_for_find(),
+            Self::Unavailable(_) => false,
+        }
+    }
+}
+
+#[cfg(feature = "webkit")]
 fn search_for_browser_text(find_controller: &webkit6::FindController, query: &str) {
     if query.is_empty() {
         find_controller.search_finish();
@@ -3385,6 +3934,8 @@ fn search_for_browser_text(find_controller: &webkit6::FindController, query: &st
 #[cfg(not(feature = "webkit"))]
 impl BrowserHandles {
     fn prepare_for_removal(&self) {}
+
+    fn navigate(&self, _url: &str) {}
 
     fn is_find_active(&self) -> bool {
         false
@@ -3402,11 +3953,19 @@ impl BrowserHandles {
         false
     }
 
-    fn go_back(&self) -> bool {
+    fn go_back(
+        &self,
+        _saved_uri: &RefCell<Option<String>>,
+        _callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
         false
     }
 
-    fn go_forward(&self) -> bool {
+    fn go_forward(
+        &self,
+        _saved_uri: &RefCell<Option<String>>,
+        _callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
         false
     }
 
@@ -3497,9 +4056,43 @@ fn is_kde_wayland_session() -> bool {
 }
 
 #[cfg(feature = "webkit")]
+fn prepare_private_webkit_dir(base: Option<PathBuf>, leaf: &str) -> Option<String> {
+    let root = base?.join("limux");
+    std::fs::create_dir_all(&root).ok()?;
+    let dir = root.join(leaf);
+    limux_control::socket_path::ensure_private_dir(&dir).ok()?;
+    dir.to_str().map(str::to_string)
+}
+
+#[cfg(feature = "webkit")]
+fn shared_browser_network_session() -> webkit6::NetworkSession {
+    thread_local! {
+        static SESSION: std::cell::OnceCell<webkit6::NetworkSession> =
+            const { std::cell::OnceCell::new() };
+    }
+    SESSION.with(|cell| {
+        cell.get_or_init(|| {
+            let data_dir = prepare_private_webkit_dir(dirs::data_local_dir(), "webkit-data");
+            let cache_dir = prepare_private_webkit_dir(dirs::cache_dir(), "webkit-cache");
+            let session = match (data_dir.as_deref(), cache_dir.as_deref()) {
+                (Some(data), Some(cache)) => webkit6::NetworkSession::new(Some(data), Some(cache)),
+                _ => webkit6::NetworkSession::new_ephemeral(),
+            };
+            session.set_tls_errors_policy(webkit6::TLSErrorsPolicy::Fail);
+            session.set_itp_enabled(true);
+            session
+        })
+        .clone()
+    })
+}
+
+#[cfg(feature = "webkit")]
 fn configure_browser_settings(settings: &webkit6::Settings) {
     settings.set_enable_developer_extras(true);
-    settings.set_javascript_can_open_windows_automatically(true);
+    settings.set_javascript_can_open_windows_automatically(false);
+    settings.set_allow_file_access_from_file_urls(false);
+    settings.set_allow_universal_access_from_file_urls(false);
+    settings.set_javascript_can_access_clipboard(false);
 
     if is_kde_wayland_session() {
         settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
@@ -3569,9 +4162,9 @@ fn create_browser_widget(
 ) -> (gtk::Widget, String, BrowserHandles) {
     use webkit6::prelude::*;
 
-    // Use a NetworkSession to avoid sandbox issues
-    let network_session = webkit6::NetworkSession::default();
-    let web_context = webkit6::WebContext::default();
+    if let Some(error) = crate::browser_sandbox::unavailable_reason() {
+        return unavailable_browser_widget(error);
+    }
     let user_content_manager = webkit6::UserContentManager::new();
     let dom_editable = Rc::new(Cell::new(false));
     let _ = user_content_manager
@@ -3597,7 +4190,9 @@ fn create_browser_widget(
         );
     }
 
+    let browser_network_session = shared_browser_network_session();
     let webview = webkit6::WebView::builder()
+        .network_session(&browser_network_session)
         .user_content_manager(&user_content_manager)
         .hexpand(true)
         .vexpand(true)
@@ -3630,19 +4225,44 @@ fn create_browser_widget(
     nav_bar.append(&reload_btn);
     nav_bar.append(&url_entry);
 
+    let load_state = BrowserLoadState::new(initial_uri);
     {
         let webview = webview.downgrade();
+        let url_entry = url_entry.downgrade();
+        let saved_uri = saved_uri.clone();
+        let callbacks = callbacks.clone();
+        let load_state = load_state.clone();
         back_btn.connect_clicked(move |_| {
             if let Some(webview) = webview.upgrade() {
-                webview.go_back();
+                let entry = url_entry.upgrade();
+                step_webview_history(
+                    &webview,
+                    entry.as_ref(),
+                    &load_state,
+                    &saved_uri,
+                    &callbacks,
+                    false,
+                );
             }
         });
     }
     {
         let webview = webview.downgrade();
+        let url_entry = url_entry.downgrade();
+        let saved_uri = saved_uri.clone();
+        let callbacks = callbacks.clone();
+        let load_state = load_state.clone();
         fwd_btn.connect_clicked(move |_| {
             if let Some(webview) = webview.upgrade() {
-                webview.go_forward();
+                let entry = url_entry.upgrade();
+                step_webview_history(
+                    &webview,
+                    entry.as_ref(),
+                    &load_state,
+                    &saved_uri,
+                    &callbacks,
+                    true,
+                );
             }
         });
     }
@@ -3656,29 +4276,43 @@ fn create_browser_widget(
     }
     {
         let webview = webview.downgrade();
+        let saved_uri = saved_uri.clone();
+        let callbacks = callbacks.clone();
+        let load_state = load_state.clone();
         url_entry.connect_activate(move |entry| {
             if let Some(webview) = webview.upgrade() {
                 let url = normalize_browser_entry_input(&entry.text());
+                let current_uri = webview.uri();
+                load_state.record_explicit_navigation(&url, current_uri.as_deref());
+                entry.set_text(&url);
+                *saved_uri.borrow_mut() = Some(url.clone());
+                let callbacks = callbacks.borrow().clone();
+                (callbacks.on_state_changed)();
                 webview.load_uri(&url);
             }
+        });
+    }
+    {
+        let load_state = load_state.clone();
+        webview.connect_load_failed(move |_, _, _, _| {
+            load_state.clear_restoring();
+            false
         });
     }
     {
         let entry = url_entry.downgrade();
         let saved_uri = saved_uri.clone();
         let callbacks = callbacks.clone();
-        let restoring = Rc::new(std::cell::Cell::new(initial_uri.is_some()));
-        let restoring_flag = restoring.clone();
+        let load_state = load_state.clone();
         webview.connect_uri_notify(move |wv| {
             if let Some(uri) = wv.uri() {
                 let uri_str: String = uri.into();
+                if !load_state.accept_notified_uri(&uri_str) {
+                    return;
+                }
                 if let Some(entry) = entry.upgrade() {
                     entry.set_text(&uri_str);
                 }
-                if restoring_flag.get() && (uri_str.is_empty() || uri_str == "about:blank") {
-                    return;
-                }
-                restoring_flag.set(false);
                 *saved_uri.borrow_mut() = Some(uri_str);
                 let callbacks = callbacks.borrow().clone();
                 (callbacks.on_state_changed)();
@@ -3734,14 +4368,15 @@ fn create_browser_widget(
     vbox.set_overflow(gtk::Overflow::Hidden);
     vbox.add_css_class("limux-browser");
 
-    let browser_handles = BrowserHandles {
+    let browser_handles = BrowserHandles::Ready(Rc::new(LiveBrowserHandles {
         webview: webview.clone(),
         url_entry: url_entry.clone(),
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         find_controller: find_controller.clone(),
         dom_editable,
-    };
+        load_state: load_state.clone(),
+    }));
 
     {
         let find_controller = find_controller.downgrade();
@@ -3752,33 +4387,63 @@ fn create_browser_widget(
         });
     }
 
-    // Load default URL only on the first map. The WebView preserves its
-    // page and history across reparenting (splits), so we must not reload.
+    // Load default URL only on the first map unless explicit navigation already
+    // chose a target. The WebView preserves its page and history across
+    // reparenting (splits), so subsequent maps must not reload.
     {
         let webview = webview.downgrade();
-        let loaded = std::cell::Cell::new(false);
-        let initial_uri = initial_uri.map(|value| value.to_string());
         vbox.connect_map(move |_| {
-            if !loaded.get() {
-                loaded.set(true);
+            if let Some(uri) = load_state.take_first_map_uri() {
                 if let Some(webview) = webview.upgrade() {
-                    if let Some(uri) = &initial_uri {
-                        webview.load_uri(uri);
-                    } else {
-                        webview.load_uri("https://google.com");
-                    }
+                    webview.load_uri(&uri);
                 }
             }
         });
     }
 
-    // Suppress unused variable warnings
-    let _ = network_session;
-    let _ = web_context;
-
     (vbox.upcast(), "Browser".to_string(), browser_handles)
 }
 
+#[cfg(feature = "webkit")]
+fn unavailable_browser_widget(error: &str) -> (gtk::Widget, String, BrowserHandles) {
+    let placeholder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .hexpand(true)
+        .vexpand(true)
+        .focusable(true)
+        .build();
+    let title = gtk::Label::new(Some("Browser unavailable"));
+    title.add_css_class("title-3");
+    let guidance = gtk::Label::builder()
+        .label("WebKit could not start its sandbox. Check this installation's user-namespace policy and sandbox helpers, then restart Limux.")
+        .wrap(true)
+        .max_width_chars(75)
+        .build();
+    let explanation = gtk::Label::builder()
+        .label(error)
+        .wrap(true)
+        .selectable(true)
+        .max_width_chars(75)
+        .build();
+    let details = gtk::Expander::new(Some("Technical details"));
+    details.set_child(Some(&explanation));
+    let saved = gtk::Label::new(Some(
+        "Your browser tab is saved. Terminals remain available.",
+    ));
+    placeholder.append(&title);
+    placeholder.append(&guidance);
+    placeholder.append(&saved);
+    placeholder.append(&details);
+    let widget = placeholder.upcast::<gtk::Widget>();
+    (
+        widget.clone(),
+        "Browser".to_string(),
+        BrowserHandles::Unavailable(widget),
+    )
+}
+
+#[cfg(any(feature = "webkit", test))]
 fn normalize_browser_entry_input(input: &str) -> String {
     if input.starts_with("http://") || input.starts_with("https://") {
         return input.to_string();
@@ -3796,6 +4461,7 @@ fn normalize_browser_entry_input(input: &str) -> String {
     }
 }
 
+#[cfg(any(feature = "webkit", test))]
 fn is_localhost_input(input: &str) -> bool {
     input == "localhost"
         || input
@@ -3843,12 +4509,13 @@ fn create_browser_widget(
 mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolve_surface_hint, resolved_link_destination, select_terminal_commands,
-        select_terminal_tab, surface_hint_match, workspace_autostart_initial_input,
-        workspace_autostart_script, ContentDropZone, HintResolution, SurfaceHintMatch,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        effective_drop_target_dimensions, is_localhost_input, is_usable_autostart_runtime_dir,
+        next_active_after_tab_removal, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, resolve_surface_hint,
+        resolved_link_destination, select_terminal_commands, select_terminal_tab,
+        surface_hint_match, workspace_autostart_initial_input, workspace_autostart_script,
+        ContentDropZone, HintResolution, SurfaceHintMatch, TabDragPayload,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -3922,23 +4589,84 @@ mod tests {
 
     #[test]
     fn workspace_autostart_uses_hidden_initial_input() {
+        use crate::ghostty_config::AutostartShellKind;
+
+        let posix_path = std::path::Path::new("/run/user/1000/limux/workspace-autostart-42-0.sh");
         assert_eq!(
-            workspace_autostart_initial_input(std::path::Path::new(
-                "/run/user/1000/limux/workspace-autostart-42-0.sh"
-            ))
-            .as_deref(),
+            workspace_autostart_initial_input(posix_path, AutostartShellKind::Posix).as_deref(),
             Some(". /run/user/1000/limux/workspace-autostart-42-0.sh\n")
         );
         assert_eq!(
-            workspace_autostart_script(
-                "echo ready",
-                std::path::Path::new("/run/user/1000/limux/workspace-autostart-42-0.sh")
-            )
-            .as_deref(),
+            workspace_autostart_script("echo ready", posix_path, AutostartShellKind::Posix)
+                .as_deref(),
             Some(
                 "#!/bin/sh\nrm -f -- /run/user/1000/limux/workspace-autostart-42-0.sh\necho ready\n"
             )
         );
+
+        let fish_path =
+            std::path::Path::new("/run/user/1000/limux dir/workspace-autostart-42-1.fish");
+        assert_eq!(
+            workspace_autostart_initial_input(fish_path, AutostartShellKind::Fish).as_deref(),
+            Some("source '/run/user/1000/limux dir/workspace-autostart-42-1.fish'\n")
+        );
+        assert_eq!(
+            workspace_autostart_script("echo ready", fish_path, AutostartShellKind::Fish)
+                .as_deref(),
+            Some(
+                "#!/usr/bin/env fish\ncommand rm -f -- '/run/user/1000/limux dir/workspace-autostart-42-1.fish'\necho ready\n"
+            )
+        );
+
+        let nu_path = std::path::Path::new("/run/user/1000/limux dir/workspace-autostart-42-2.nu");
+        assert_eq!(
+            workspace_autostart_initial_input(nu_path, AutostartShellKind::Nushell).as_deref(),
+            Some("source \"/run/user/1000/limux dir/workspace-autostart-42-2.nu\"\n")
+        );
+        assert_eq!(
+            workspace_autostart_script("print ready", nu_path, AutostartShellKind::Nushell)
+                .as_deref(),
+            Some(
+                "^rm -f -- \"/run/user/1000/limux dir/workspace-autostart-42-2.nu\"\nprint ready\n"
+            )
+        );
+    }
+
+    #[test]
+    fn flatpak_autostart_refuses_tmp_fallback_outside_xdg_runtime_dir() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        assert!(is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            None,
+            None,
+        ));
+        assert!(is_usable_autostart_runtime_dir(
+            Path::new("/run/user/1000/limux"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            None,
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/run/user/1000/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("relative/limux"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("relative")),
+        ));
     }
 
     #[test]
@@ -4977,5 +5705,356 @@ mod tests {
             Rc::ptr_eq(&state.callbacks.borrow(), &target_state.callbacks),
             "the moved tab still reports to the pane it left"
         );
+    }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    fn prepare_private_webkit_dir_creates_0700_dir_and_rejects_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let created =
+            super::prepare_private_webkit_dir(Some(temp.path().to_path_buf()), "webkit-data")
+                .expect("private webkit dir");
+        let created_path = std::path::Path::new(&created);
+        assert_eq!(created_path, temp.path().join("limux").join("webkit-data"));
+        let mode = std::fs::symlink_metadata(created_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let symlink_leaf = temp.path().join("limux").join("webkit-cache");
+        std::os::unix::fs::symlink(&outside, &symlink_leaf).expect("symlink");
+        assert!(
+            super::prepare_private_webkit_dir(Some(temp.path().to_path_buf()), "webkit-cache",)
+                .is_none(),
+            "symlinked webkit cache leaf must be rejected"
+        );
+    }
+
+    #[test]
+    fn browser_load_state_cancels_first_map_after_explicit_navigation() {
+        let default_state = super::BrowserLoadState::new(None);
+        assert_eq!(
+            default_state.take_first_map_uri().as_deref(),
+            Some("about:blank")
+        );
+        assert_eq!(default_state.take_first_map_uri(), None);
+
+        let restored = super::BrowserLoadState::new(Some("https://restored.example/docs"));
+        assert!(!restored.accept_notified_uri(""));
+        assert!(!restored.accept_notified_uri("about:blank"));
+        restored.record_explicit_navigation("https://explicit.example/page", None);
+        assert_eq!(
+            restored.take_first_map_uri(),
+            None,
+            "first map must not overwrite an explicit pre-map navigation"
+        );
+        assert!(
+            !restored.accept_notified_uri("about:blank"),
+            "transient blank notifications must not clobber explicit pre-map target"
+        );
+        assert!(restored.accept_notified_uri("https://explicit.example/page"));
+        assert!(restored.accept_notified_uri("about:blank"));
+
+        let restored_to_blank = super::BrowserLoadState::new(Some("https://restored.example/old"));
+        restored_to_blank.record_explicit_navigation("about:blank", Some("about:blank"));
+        assert_eq!(restored_to_blank.take_first_map_uri(), None);
+        assert!(restored_to_blank.accept_notified_uri("about:blank"));
+    }
+
+    #[test]
+    fn browser_load_state_post_map_same_uri_does_not_wedge_restoring() {
+        let state = super::BrowserLoadState::new(Some("https://example.com"));
+        let _ = state.take_first_map_uri();
+        assert!(state.accept_notified_uri("https://example.com"));
+
+        // Navigating an already-mapped non-blank page to the same URL does not
+        // emit notify::uri; restoring must stay false so a later about:blank works.
+        state.record_explicit_navigation("https://example.com", Some("https://example.com"));
+        assert!(state.accept_notified_uri("about:blank"));
+    }
+
+    #[test]
+    fn browser_load_state_failed_load_clears_restoring() {
+        let state = super::BrowserLoadState::new(Some("https://unreachable.invalid"));
+        assert!(!state.accept_notified_uri("about:blank"));
+        state.clear_restoring();
+        assert!(state.accept_notified_uri("about:blank"));
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn pane_summaries_for_widgets_preserves_caller_leaf_order() {
+        use super::{create_pane, pane_summaries_for_widgets, retire_pane, PaneCallbacks};
+        use crate::app_config::AppConfig;
+        use gtk4 as gtk;
+        use gtk4::prelude::Cast;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        if gtk::init().is_err() {
+            return;
+        }
+        let shortcuts = Rc::new(default_shortcuts());
+        let make_callbacks = || {
+            let shortcuts = shortcuts.clone();
+            let config = Rc::new(RefCell::new(AppConfig::default()));
+            Rc::new(PaneCallbacks {
+                workspace_id: "swap-order-test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(|| {}),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(move || config.clone()),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+
+        let first: gtk::Widget =
+            create_pane(make_callbacks(), shortcuts.clone(), None, None, true).upcast();
+        let second: gtk::Widget =
+            create_pane(make_callbacks(), shortcuts, None, None, true).upcast();
+        let initial = pane_summaries_for_widgets(&[first.clone(), second.clone()]);
+        assert_eq!(initial.len(), 2);
+        assert!(initial[0].pane_id < initial[1].pane_id);
+
+        let swapped = pane_summaries_for_widgets(&[second.clone(), first.clone()]);
+        assert_eq!(
+            swapped.iter().map(|p| p.pane_id).collect::<Vec<_>>(),
+            vec![initial[1].pane_id, initial[0].pane_id]
+        );
+
+        retire_pane(&first);
+        retire_pane(&second);
+    }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn configure_browser_settings_disables_popups_file_access_and_clipboard() {
+        gtk4::init().expect("GTK display required");
+        let settings = webkit6::Settings::new();
+        super::configure_browser_settings(&settings);
+        assert!(settings.enables_developer_extras());
+        assert!(!settings.is_javascript_can_open_windows_automatically());
+        assert!(!settings.allows_file_access_from_file_urls());
+        assert!(!settings.allows_universal_access_from_file_urls());
+        assert!(!settings.is_javascript_can_access_clipboard());
+    }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn pre_map_browser_navigation_survives_first_map() {
+        use super::{
+            add_browser_tab_to_pane_with_uri, create_pane, find_pane_internals, glib,
+            navigate_browser_surface, PaneCallbacks, TabKind,
+        };
+        use crate::app_config::AppConfig;
+        use gtk4 as gtk;
+        use gtk4::prelude::*;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+        }
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let callbacks = Rc::new(PaneCallbacks {
+            workspace_id: "test".to_string(),
+            autostart_command: Rc::default(),
+            suppress_next_autostart: Cell::new(false),
+            initial_command: RefCell::new(None),
+            on_split: Box::new(|_, _| {}),
+            on_close_pane: Box::new(|_| {}),
+            on_bell: Box::new(|_, _, _| {}),
+            on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+            on_open_browser_here: Box::new(|_| {}),
+            on_open_url_in_browser: Box::new(|_, _| {}),
+            on_open_keybinds: Box::new(|_| {}),
+            current_shortcuts: Box::new({
+                let shortcuts = shortcuts.clone();
+                move || shortcuts.clone()
+            }),
+            on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+            on_pwd_changed: Box::new(|_| {}),
+            on_empty: Box::new(|_, _| {}),
+            on_state_changed: Box::new(|| {}),
+            on_unread_changed: Box::new(|| {}),
+            is_pane_visible: Box::new(|_| true),
+            on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+            current_config: Box::new(move || config.clone()),
+            workspace_for_pane: Box::new(|_| None),
+        });
+
+        let pane = create_pane(callbacks, shortcuts, None, None, true);
+        add_browser_tab_to_pane_with_uri(pane.upcast_ref(), Some("https://restored.invalid/old"));
+
+        let target_url = "data:text/plain,explicit-pre-map";
+        assert!(navigate_browser_surface(pane.upcast_ref(), None, target_url).is_some());
+
+        let window = gtk::Window::builder().child(&pane).build();
+        window.present();
+
+        let internals = find_pane_internals(pane.upcast_ref()).unwrap();
+        let content = internals.tab_state.borrow().tabs[0].content.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !content.is_mapped() {
+            assert!(std::time::Instant::now() < deadline, "browser never mapped");
+            context.iteration(true);
+        }
+        while context.iteration(false) {}
+
+        let tab_state = internals.tab_state.borrow();
+        let TabKind::Browser { state } = &tab_state.tabs[0].kind else {
+            panic!("expected browser tab");
+        };
+        let super::BrowserHandles::Ready(handles) = &state.handles else {
+            panic!("expected available browser");
+        };
+        assert_eq!(handles.load_state.take_first_map_uri(), None);
+        assert_eq!(state.uri.borrow().as_deref(), Some(target_url));
+        assert_eq!(handles.url_entry.text().as_str(), target_url);
+        assert_eq!(
+            webkit6::prelude::WebViewExt::uri(&handles.webview).as_deref(),
+            Some(target_url)
+        );
+        drop(tab_state);
+        window.close();
+    }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn browser_back_and_forward_report_destination_uri_immediately() {
+        use super::{
+            add_browser_tab_to_pane_with_uri, browser_target_for_surface, create_pane,
+            find_pane_internals, glib, navigate_browser_surface, PaneCallbacks, TabKind,
+        };
+        use crate::app_config::AppConfig;
+        use gtk4 as gtk;
+        use gtk4::prelude::*;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+        }
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let state_changes = Rc::new(Cell::new(0usize));
+        let state_changes_cb = state_changes.clone();
+        let callbacks = Rc::new(PaneCallbacks {
+            workspace_id: "test".to_string(),
+            autostart_command: Rc::default(),
+            suppress_next_autostart: Cell::new(false),
+            initial_command: RefCell::new(None),
+            on_split: Box::new(|_, _| {}),
+            on_close_pane: Box::new(|_| {}),
+            on_bell: Box::new(|_, _, _| {}),
+            on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+            on_open_browser_here: Box::new(|_| {}),
+            on_open_url_in_browser: Box::new(|_, _| {}),
+            on_open_keybinds: Box::new(|_| {}),
+            current_shortcuts: Box::new({
+                let shortcuts = shortcuts.clone();
+                move || shortcuts.clone()
+            }),
+            on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+            on_pwd_changed: Box::new(|_| {}),
+            on_empty: Box::new(|_, _| {}),
+            on_state_changed: Box::new(move || {
+                state_changes_cb.set(state_changes_cb.get() + 1);
+            }),
+            on_unread_changed: Box::new(|| {}),
+            is_pane_visible: Box::new(|_| true),
+            on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+            current_config: Box::new(move || config.clone()),
+            workspace_for_pane: Box::new(|_| None),
+        });
+
+        let first_url = "data:text/plain,first";
+        let second_url = "data:text/plain,second";
+        let pane = create_pane(callbacks, shortcuts, None, None, true);
+        add_browser_tab_to_pane_with_uri(pane.upcast_ref(), Some(first_url));
+
+        let window = gtk::Window::builder().child(&pane).build();
+        window.present();
+
+        let internals = find_pane_internals(pane.upcast_ref()).unwrap();
+        let webview = {
+            let tab_state = internals.tab_state.borrow();
+            let TabKind::Browser { state } = &tab_state.tabs[0].kind else {
+                panic!("expected browser tab");
+            };
+            let super::BrowserHandles::Ready(handles) = &state.handles else {
+                panic!("expected available browser");
+            };
+            handles.webview.clone()
+        };
+
+        let wait_until = |pred: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !pred() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                context.iteration(true);
+            }
+        };
+
+        wait_until(&|| {
+            webkit6::prelude::WebViewExt::uri(&webview).as_deref() == Some(first_url)
+                && !webkit6::prelude::WebViewExt::is_loading(&webview)
+        });
+
+        assert!(navigate_browser_surface(pane.upcast_ref(), None, second_url).is_some());
+        wait_until(&|| {
+            webkit6::prelude::WebViewExt::uri(&webview).as_deref() == Some(second_url)
+                && webkit6::prelude::WebViewExt::can_go_back(&webview)
+                && !webkit6::prelude::WebViewExt::is_loading(&webview)
+        });
+
+        let (_, _, target) = browser_target_for_surface(pane.upcast_ref(), None).unwrap();
+        let before = state_changes.get();
+        assert!(target.go_back());
+        // Must report destination URL immediately before async WebProcess IPC finishes.
+        assert_eq!(target.current_uri().as_deref(), Some(first_url));
+        assert!(state_changes.get() > before);
+
+        wait_until(&|| {
+            webkit6::prelude::WebViewExt::uri(&webview).as_deref() == Some(first_url)
+                && webkit6::prelude::WebViewExt::can_go_forward(&webview)
+                && !webkit6::prelude::WebViewExt::is_loading(&webview)
+        });
+
+        let before = state_changes.get();
+        assert!(target.go_forward());
+        assert_eq!(target.current_uri().as_deref(), Some(second_url));
+        assert!(state_changes.get() > before);
+
+        window.close();
     }
 }

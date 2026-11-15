@@ -318,6 +318,7 @@ pub(super) fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
         })
         .unwrap_or(loaded.state.active_workspace_index);
     restore_active_workspace(state, active_index);
+    state.borrow_mut().last_workspace_id = None;
     apply_sidebar_state_immediately(state, &loaded.state.sidebar);
 
     let mut restored = snapshot_session_state(state);
