@@ -790,6 +790,7 @@ dependencies = [
  "gdk4-wayland",
  "gtk4",
  "libadwaita",
+ "libc",
  "limux-control",
  "limux-ghostty-sys",
  "limux-protocol",

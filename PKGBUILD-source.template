@@ -57,6 +57,8 @@ package() {
     cp -a ghostty/zig-out/share/ghostty/. "$pkgdir/usr/share/limux/ghostty/"
     install -Dm644 ghostty/zig-out/share/terminfo/x/xterm-ghostty \
         "$pkgdir/usr/share/limux/terminfo/x/xterm-ghostty"
+    install -Dm755 scripts/install-apparmor-profile.sh \
+        "$pkgdir/usr/share/limux/install-apparmor-profile.sh"
 
     install -Dm644 rust/limux-host-linux/dev.limux.linux.desktop \
         "$pkgdir/usr/share/applications/dev.limux.linux.desktop"

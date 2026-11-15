@@ -306,7 +306,7 @@ else
     fail "application runtime closure" "libwebkitgtk-6.0.so.4 would be excluded"
 fi
 
-# ----- T8: WebKitGTK process path is made relative to AppRun cwd -----
+# ----- T8: WebKitGTK process paths use an absolute runtime placeholder -----
 
 echo "T8: AppImage relocates WebKitGTK process path"
 
@@ -325,10 +325,45 @@ patch_appimage_webkit_paths "$WEBKIT_APPDIR"
 
 if grep -aFq "$WEBKITGTK_PROCESS_DIR" "$WEBKIT_LIBRARY"; then
     fail "WebKitGTK path relocation" "compiled-in process path remains"
-elif ! grep -aFq "usr/lib/webkitgtk-6.0" "$WEBKIT_LIBRARY"; then
-    fail "WebKitGTK path relocation" "relative process path is missing"
+elif ! grep -aFq "/proc/limux-wk-XXXXX" "$WEBKIT_LIBRARY"; then
+    fail "WebKitGTK path relocation" "absolute runtime placeholder is missing"
 else
     pass "rewrites compiled-in process and injected-bundle paths"
+fi
+
+echo 'T9: AppImage materializes absolute sandbox helper paths'
+mkdir -p "$WEBKIT_APPDIR/usr/lib/webkitgtk-6.0/injected-bundle"
+printf '#!/bin/sh\nprintf "helper executable OK\\n"\n' > "$WEBKIT_APPDIR/usr/lib/webkitgtk-6.0/WebKitWebProcess"
+chmod 755 "$WEBKIT_APPDIR/usr/lib/webkitgtk-6.0/WebKitWebProcess"
+if (
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/../appimage-webkit-runtime.sh"
+    trap cleanup_appimage_webkit_runtime EXIT
+    export XDG_CACHE_HOME="$HEREDOC_TMP/cache" LD_LIBRARY_PATH=''
+    prepare_appimage_webkit_runtime "$WEBKIT_APPDIR"
+    [ "$("$LIMUX_WEBKIT_RUNTIME_DIR/WebKitWebProcess")" = 'helper executable OK' ]
+    [ "$(stat -c %s "$WEBKIT_LIBRARY")" = "$(stat -c %s "$LIMUX_WEBKIT_LIBRARY_DIR/libwebkitgtk-6.0.so.4")" ]
+    grep -aFq "$LIMUX_WEBKIT_RUNTIME_DIR" "$LIMUX_WEBKIT_LIBRARY_DIR/libwebkitgtk-6.0.so.4"
+    ! grep -aFq '/proc/limux-wk-XXXXX' "$LIMUX_WEBKIT_LIBRARY_DIR/libwebkitgtk-6.0.so.4"
+    runtime="$LIMUX_WEBKIT_RUNTIME_DIR"
+    library="$LIMUX_WEBKIT_LIBRARY_DIR"
+    cleanup_appimage_webkit_runtime
+    [ ! -e "$runtime" ] && [ ! -e "$library" ]
+); then
+    pass 'absolute paths preserve library size, execute helpers, and clean private runtime'
+else
+    fail 'absolute WebKit runtime' 'runtime preparation, helper execution, or cleanup failed'
+fi
+
+if (
+    source "$SCRIPT_DIR/../appimage-webkit-runtime.sh"
+    trap cleanup_appimage_webkit_runtime EXIT
+    export XDG_CACHE_HOME=/dev/null LD_LIBRARY_PATH=''
+    ! prepare_appimage_webkit_runtime "$WEBKIT_APPDIR" 2>/dev/null
+); then
+    pass 'unavailable executable cache fails explicitly'
+else
+    fail 'unavailable WebKit cache' 'runtime preparation reported success'
 fi
 
 # ----- Summary -----

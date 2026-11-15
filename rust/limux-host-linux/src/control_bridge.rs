@@ -27,6 +27,9 @@ const METHODS: &[&str] = &[
     "workspace.list",
     "workspace.create",
     "workspace.select",
+    "workspace.next",
+    "workspace.previous",
+    "workspace.last",
     "workspace.rename",
     "workspace.set_color",
     "workspace.set_group",
@@ -40,16 +43,28 @@ const METHODS: &[&str] = &[
     "pane.list",
     "pane.surfaces",
     "pane.create",
+    "pane.swap",
+    "pane.break",
+    "pane.join",
+    "pane.last",
+    "pane.resize",
     "surface.list",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
     "surface.send_key",
+    "surface.clear_history",
     "surface.create",
     "surface.close",
     "surface.focus",
     "pane.focus",
     "tab.action",
+    "browser.open_split",
+    "browser.navigate",
+    "browser.url.get",
+    "browser.back",
+    "browser.forward",
+    "browser.reload",
     "notification.create",
     "gui_hook.list",
     "gui_hook.set",
@@ -132,6 +147,15 @@ pub enum PaneCreateType {
     Browser,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserControlAction {
+    Navigate { url: String },
+    GetUrl,
+    Back,
+    Forward,
+    Reload,
+}
+
 /// Parser-level contract for the live-GTK `pane.create` route.
 ///
 /// Request fields accepted by the bridge:
@@ -147,11 +171,10 @@ pub enum PaneCreateType {
 /// - `command` is a terminal-only host extension: the host injects it into the
 ///   newly-created surface after creation. The standalone core dispatcher may
 ///   accept the field for compatibility but does not launch a process.
+/// - `url` is an optional browser-only initial URI.
 ///
-/// This delivery only implements live-GTK terminal panes. Browser pane support
-/// remains a follow-up, so `type=browser` and `url` fail at parse time before
-/// any GTK work is scheduled. Responses must keep the existing core/CLI field
-/// names: `pane_id`, `pane_ref`, `surface_id`, and `surface_ref`.
+/// Responses keep the existing core/CLI field names: `pane_id`, `pane_ref`,
+/// `surface_id`, and `surface_ref`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatePaneRequest {
     pub target: WorkspaceTarget,
@@ -160,6 +183,7 @@ pub struct CreatePaneRequest {
     pub direction: PaneCreateDirection,
     pub pane_type: PaneCreateType,
     pub command: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -191,6 +215,36 @@ pub enum ControlCommand {
         request: CreatePaneRequest,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SwapPanes {
+        target: WorkspaceTarget,
+        first_pane_id: String,
+        second_pane_id: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    BreakPane {
+        target: WorkspaceTarget,
+        pane_hint: Option<String>,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    JoinPane {
+        target: WorkspaceTarget,
+        source_pane_id: Option<String>,
+        source_surface_id: Option<String>,
+        target_pane_id: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    LastPane {
+        target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ResizePane {
+        target: WorkspaceTarget,
+        pane_id: String,
+        direction: PaneCreateDirection,
+        amount: u64,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ListSurfaces {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
@@ -203,6 +257,13 @@ pub enum ControlCommand {
     ReadSurfaceText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
+        scrollback: bool,
+        lines: Option<usize>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ClearSurfaceHistory {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
     CreateWorkspace {
@@ -213,6 +274,13 @@ pub enum ControlCommand {
     },
     SelectWorkspace {
         target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    RelativeWorkspace {
+        delta: i32,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    LastWorkspace {
         reply: mpsc::Sender<BridgeResult>,
     },
     RenameWorkspace {
@@ -283,6 +351,18 @@ pub enum ControlCommand {
         title: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    BrowserOpenSplit {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        url: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    BrowserAction {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        action: BrowserControlAction,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     /// Post a desktop-style notification into the sidebar + toast overlay.
     /// `target` chooses the workspace; `surface_hint` identifies the tab when available.
     CreateNotification {
@@ -305,11 +385,19 @@ impl ControlCommand {
             | Self::ListPanes { reply, .. }
             | Self::ListPaneSurfaces { reply, .. }
             | Self::CreatePane { reply, .. }
+            | Self::SwapPanes { reply, .. }
+            | Self::BreakPane { reply, .. }
+            | Self::JoinPane { reply, .. }
+            | Self::LastPane { reply, .. }
+            | Self::ResizePane { reply, .. }
             | Self::ListSurfaces { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
+            | Self::ClearSurfaceHistory { reply, .. }
             | Self::CreateWorkspace { reply, .. }
             | Self::SelectWorkspace { reply, .. }
+            | Self::RelativeWorkspace { reply, .. }
+            | Self::LastWorkspace { reply }
             | Self::RenameWorkspace { reply, .. }
             | Self::SetWorkspaceColor { reply, .. }
             | Self::CloseWorkspace { reply, .. }
@@ -322,6 +410,8 @@ impl ControlCommand {
             | Self::FocusSurface { reply, .. }
             | Self::FocusPane { reply, .. }
             | Self::TabAction { reply, .. }
+            | Self::BrowserOpenSplit { reply, .. }
+            | Self::BrowserAction { reply, .. }
             | Self::CreateNotification { reply, .. } => {
                 let _ = reply.send(result);
             }
@@ -536,6 +626,38 @@ fn optional_tab_handle(params: &Map<String, Value>) -> Result<Option<String>, Br
     Ok(selected)
 }
 
+fn validate_browser_url(raw: &str) -> Result<String, BridgeError> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err(BridgeError::invalid_params(
+            "url must be a non-empty string",
+        ));
+    }
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(BridgeError::invalid_params(
+            "url must be an absolute URI without control characters",
+        ));
+    }
+    let uri = glib::Uri::parse(url, glib::UriFlags::NONE)
+        .map_err(|_| BridgeError::invalid_params("url must be an absolute URI"))?;
+    if matches!(uri.scheme().as_str(), "http" | "https")
+        && uri.host().is_none_or(|host| host.is_empty())
+    {
+        return Err(BridgeError::invalid_params("url must be an absolute URI"));
+    }
+    Ok(url.to_string())
+}
+
+fn optional_browser_url(params: &Map<String, Value>) -> Result<Option<String>, BridgeError> {
+    match params.get("url") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => validate_browser_url(raw).map(Some),
+        Some(_) => Err(BridgeError::invalid_params(
+            "url must be a non-empty string",
+        )),
+    }
+}
+
 fn parse_surface_kind(params: &Map<String, Value>) -> Result<(bool, Option<String>), BridgeError> {
     let mut browser = None;
     for key in ["type", "kind"] {
@@ -556,35 +678,16 @@ fn parse_surface_kind(params: &Map<String, Value>) -> Result<(bool, Option<Strin
         }
         browser = Some(parsed);
     }
-    let url = params
-        .get("url")
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::trim)
-                .filter(|url| !url.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| BridgeError::invalid_params("url must be a non-empty string"))
-        })
-        .transpose()?;
+    if matches!(params.get("url"), Some(Value::Null)) {
+        return Err(BridgeError::invalid_params(
+            "url must be a non-empty string",
+        ));
+    }
+    let url = optional_browser_url(params)?;
     if browser == Some(false) && url.is_some() {
         return Err(BridgeError::invalid_params(
             "url requires a browser surface",
         ));
-    }
-    if let Some(url) = &url {
-        if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
-            return Err(BridgeError::invalid_params(
-                "url must be an absolute URI without control characters",
-            ));
-        }
-        let uri = glib::Uri::parse(url, glib::UriFlags::NONE)
-            .map_err(|_| BridgeError::invalid_params("url must be an absolute URI"))?;
-        if matches!(uri.scheme().as_str(), "http" | "https")
-            && uri.host().is_none_or(|host| host.is_empty())
-        {
-            return Err(BridgeError::invalid_params("url must be an absolute URI"));
-        }
     }
     Ok((browser.unwrap_or(url.is_some()), url))
 }
@@ -830,23 +933,29 @@ fn parse_gui_hook_request(
     Ok(GuiHookRequest::Set { event, update })
 }
 
+fn parse_direction_param(
+    params: &Map<String, Value>,
+    method: &str,
+) -> Result<PaneCreateDirection, BridgeError> {
+    match optional_string(params, &["direction"])
+        .unwrap_or_else(|| "right".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "left" => Ok(PaneCreateDirection::Left),
+        "right" => Ok(PaneCreateDirection::Right),
+        "up" => Ok(PaneCreateDirection::Up),
+        "down" => Ok(PaneCreateDirection::Down),
+        _ => Err(BridgeError::invalid_params(format!(
+            "{method} direction must be one of left|right|up|down"
+        ))),
+    }
+}
+
 fn parse_create_pane_request(
     params: &Map<String, Value>,
 ) -> Result<CreatePaneRequest, BridgeError> {
-    let direction = match optional_string(params, &["direction"])
-        .unwrap_or_else(|| "right".to_string())
-        .as_str()
-    {
-        "left" => PaneCreateDirection::Left,
-        "right" => PaneCreateDirection::Right,
-        "up" => PaneCreateDirection::Up,
-        "down" => PaneCreateDirection::Down,
-        _ => {
-            return Err(BridgeError::invalid_params(
-                "pane.create direction must be one of left|right|up|down",
-            ));
-        }
-    };
+    let direction = parse_direction_param(params, "pane.create")?;
 
     let pane_type = match optional_string(params, &["type"])
         .unwrap_or_else(|| "terminal".to_string())
@@ -861,14 +970,16 @@ fn parse_create_pane_request(
         }
     };
 
-    if matches!(pane_type, PaneCreateType::Browser) {
-        return Err(BridgeError::invalid_params(
-            "pane.create live GTK bridge supports type=terminal only",
-        ));
-    }
-    if optional_string(params, &["url"]).is_some() {
+    let command = optional_string(params, &["command"]);
+    let url = optional_browser_url(params)?;
+    if matches!(pane_type, PaneCreateType::Terminal) && url.is_some() {
         return Err(BridgeError::invalid_params(
             "pane.create url is only supported for browser panes",
+        ));
+    }
+    if matches!(pane_type, PaneCreateType::Browser) && command.is_some() {
+        return Err(BridgeError::invalid_params(
+            "pane.create command is only supported for terminal panes",
         ));
     }
 
@@ -878,8 +989,36 @@ fn parse_create_pane_request(
         source_surface_id: optional_ref_handle(params, &["surface_id"], "surface:")?,
         direction,
         pane_type,
-        command: optional_string(params, &["command"]),
+        command,
+        url,
     })
+}
+
+fn parse_read_text_options(
+    params: &Map<String, Value>,
+) -> Result<(bool, Option<usize>), BridgeError> {
+    let scrollback = match params.get("scrollback") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(BridgeError::invalid_params("scrollback must be a boolean")),
+    };
+    let lines = match params.get("lines") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(number)) => {
+            let count = number
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| BridgeError::invalid_params("lines must be a positive integer"))?;
+            Some(count)
+        }
+        Some(_) => {
+            return Err(BridgeError::invalid_params(
+                "lines must be a positive integer",
+            ))
+        }
+    };
+    Ok((scrollback, lines))
 }
 
 fn parse_required_workspace_target(
@@ -986,6 +1125,167 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CreatePane { request, reply }, rx)
         }
+        "pane.swap" | "swap-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let first_pane_id =
+                match optional_ref_handle(params, &["first_pane_id", "pane_id"], "pane:") {
+                    Ok(Some(handle)) if !handle.trim().is_empty() => handle,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("pane.swap requires pane_id/first_pane_id"),
+                        )
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let second_pane_id =
+                match optional_ref_handle(params, &["second_pane_id", "target_pane_id"], "pane:") {
+                    Ok(Some(handle)) if !handle.trim().is_empty() => handle,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(
+                                "pane.swap requires target_pane_id/second_pane_id",
+                            ),
+                        )
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SwapPanes {
+                    target,
+                    first_pane_id,
+                    second_pane_id,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.break" | "break-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_hint = match optional_ref_handle(params, &["pane_id", "id"], "pane:") {
+                Ok(pane_hint) => pane_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_surface_handle(params, &["surface_id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::BreakPane {
+                    target,
+                    pane_hint,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.join" | "join-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let target_pane_id = match optional_ref_handle(params, &["target_pane_id"], "pane:") {
+                Ok(Some(handle)) if !handle.trim().is_empty() => handle,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("pane.join requires target_pane_id"),
+                    )
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let source_pane_id =
+                match optional_ref_handle(params, &["source_pane_id", "pane_id"], "pane:") {
+                    Ok(source_pane_id) => source_pane_id,
+                    Err(error) => return error_response(id, error),
+                };
+            let source_surface_id = match optional_surface_handle(params, &["surface_id"]) {
+                Ok(source_surface_id) => source_surface_id,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::JoinPane {
+                    target,
+                    source_pane_id,
+                    source_surface_id,
+                    target_pane_id,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.last" | "last-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::LastPane { target, reply }, rx)
+        }
+        "pane.resize" | "resize-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_id = match optional_ref_handle(params, &["pane_id", "id"], "pane:") {
+                Ok(Some(handle)) if !handle.trim().is_empty() => handle,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("pane.resize requires pane_id"),
+                    )
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let direction = match parse_direction_param(params, "pane.resize") {
+                Ok(direction) => direction,
+                Err(error) => return error_response(id, error),
+            };
+            let amount = match params.get("amount") {
+                None | Some(Value::Null) => 1,
+                Some(Value::Number(number)) => match number.as_u64().filter(|v| *v > 0) {
+                    Some(amount) => amount,
+                    None => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(
+                                "pane.resize amount must be a positive integer",
+                            ),
+                        )
+                    }
+                },
+                Some(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params(
+                            "pane.resize amount must be a positive integer",
+                        ),
+                    )
+                }
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ResizePane {
+                    target,
+                    pane_id,
+                    direction,
+                    amount,
+                    reply,
+                },
+                rx,
+            )
+        }
         "surface.list" | "list-panels" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -1023,9 +1323,34 @@ fn handle_method(
                 Ok(surface_hint) => surface_hint,
                 Err(error) => return error_response(id, error),
             };
+            let (scrollback, lines) = match parse_read_text_options(params) {
+                Ok(options) => options,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::ReadSurfaceText {
+                    target,
+                    surface_hint,
+                    scrollback,
+                    lines,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.clear_history" | "clear-history" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_surface_handle(params, &["surface_id", "id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ClearSurfaceHistory {
                     target,
                     surface_hint,
                     reply,
@@ -1052,6 +1377,18 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::SelectWorkspace { target, reply }, rx)
+        }
+        "workspace.next" | "next-window" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::RelativeWorkspace { delta: 1, reply }, rx)
+        }
+        "workspace.previous" | "previous-window" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::RelativeWorkspace { delta: -1, reply }, rx)
+        }
+        "workspace.last" | "last-window" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::LastWorkspace { reply }, rx)
         }
         "workspace.rename" | "rename-workspace" => {
             let Some(title) = optional_string(params, &["title", "name"]) else {
@@ -1313,6 +1650,68 @@ fn handle_method(
                     target,
                     surface_hint,
                     key,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "browser.open_split" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_surface_handle(params, &["surface_id", "id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let url = match optional_browser_url(params) {
+                Ok(url) => url,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::BrowserOpenSplit {
+                    target,
+                    surface_hint,
+                    url,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "browser.navigate" | "browser.url.get" | "browser.back" | "browser.forward"
+        | "browser.reload" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_surface_handle(params, &["surface_id", "id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let action = match method {
+                "browser.navigate" => match optional_browser_url(params) {
+                    Ok(Some(url)) => BrowserControlAction::Navigate { url },
+                    Ok(None) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.navigate requires url"),
+                        )
+                    }
+                    Err(error) => return error_response(id, error),
+                },
+                "browser.url.get" => BrowserControlAction::GetUrl,
+                "browser.back" => BrowserControlAction::Back,
+                "browser.forward" => BrowserControlAction::Forward,
+                "browser.reload" => BrowserControlAction::Reload,
+                _ => unreachable!(),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::BrowserAction {
+                    target,
+                    surface_hint,
+                    action,
                     reply,
                 },
                 rx,
@@ -2187,15 +2586,33 @@ mod tests {
     }
 
     #[test]
-    fn pane_create_contract_rejects_deferred_browser_fields() {
-        let browser = json!({ "type": "browser" });
-        let error = parse_create_pane_request(browser.as_object().expect("object params"))
-            .expect_err("browser panes are deferred");
+    fn pane_create_contract_validates_browser_and_terminal_fields() {
+        let browser = json!({ "type": "browser", "url": "https://example.com" });
+        let request = parse_create_pane_request(browser.as_object().expect("object params"))
+            .expect("browser pane with valid url should parse");
+        assert_eq!(request.pane_type, PaneCreateType::Browser);
+        assert_eq!(request.url.as_deref(), Some("https://example.com"));
+
+        let browser_default = json!({ "type": "browser" });
+        let request =
+            parse_create_pane_request(browser_default.as_object().expect("object params"))
+                .expect("browser pane without url should parse");
+        assert_eq!(request.pane_type, PaneCreateType::Browser);
+        assert_eq!(request.url, None);
+
+        let url_on_terminal = json!({ "url": "https://example.com" });
+        let error = parse_create_pane_request(url_on_terminal.as_object().expect("object params"))
+            .expect_err("url is browser-only");
         assert_eq!(error.code, INVALID_PARAMS_CODE);
 
-        let url = json!({ "url": "https://example.com" });
-        let error = parse_create_pane_request(url.as_object().expect("object params"))
-            .expect_err("url is browser-only");
+        let cmd_on_browser = json!({ "type": "browser", "command": "echo hi" });
+        let error = parse_create_pane_request(cmd_on_browser.as_object().expect("object params"))
+            .expect_err("command is terminal-only");
+        assert_eq!(error.code, INVALID_PARAMS_CODE);
+
+        let bad_url = json!({ "type": "browser", "url": "not a url" });
+        let error = parse_create_pane_request(bad_url.as_object().expect("object params"))
+            .expect_err("invalid browser url should fail");
         assert_eq!(error.code, INVALID_PARAMS_CODE);
     }
 
@@ -2339,15 +2756,19 @@ mod tests {
     #[test]
     fn read_text_route_accepts_capture_alias_and_surface_refs() {
         let response = dispatch_request(
-            r#"{"id":1,"method":"capture-pane","params":{"surface_id":"surface:9:tab"}}"#,
+            r#"{"id":1,"method":"capture-pane","params":{"surface_id":"surface:9:tab","scrollback":true,"lines":25}}"#,
             &|command| match command {
                 ControlCommand::ReadSurfaceText {
                     target,
                     surface_hint,
+                    scrollback,
+                    lines,
                     reply,
                 } => {
                     assert_eq!(target, WorkspaceTarget::Active);
                     assert_eq!(surface_hint, Some("9:tab".to_string()));
+                    assert!(scrollback);
+                    assert_eq!(lines, Some(25));
                     let _ = reply.send(Ok(json!({ "text": "ready" })));
                 }
                 other => panic!("unexpected command: {other:?}"),
@@ -2356,6 +2777,22 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert_eq!(response.result.expect("result")["text"], "ready");
+
+        for invalid in [
+            json!({ "scrollback": "yes" }),
+            json!({ "lines": 0 }),
+            json!({ "lines": -1 }),
+            json!({ "lines": "10" }),
+        ] {
+            let response = dispatch_request(
+                &json!({ "id": 1, "method": "surface.read_text", "params": invalid }).to_string(),
+                &|command| panic!("invalid read_text options dispatched: {command:?}"),
+            );
+            assert_eq!(
+                response.error.map(|error| error.code),
+                Some(INVALID_PARAMS_CODE)
+            );
+        }
     }
 
     #[test]
@@ -2489,6 +2926,105 @@ mod tests {
                 group_request_error(method, params.clone()),
                 INVALID_PARAMS_CODE,
                 "{method} {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_and_browser_methods_are_advertised_and_validated() {
+        for method in [
+            "workspace.next",
+            "workspace.previous",
+            "workspace.last",
+            "pane.swap",
+            "pane.break",
+            "pane.join",
+            "pane.last",
+            "pane.resize",
+            "surface.clear_history",
+            "browser.open_split",
+            "browser.navigate",
+            "browser.url.get",
+            "browser.back",
+            "browser.forward",
+            "browser.reload",
+        ] {
+            assert!(METHODS.contains(&method), "{method}");
+        }
+
+        let swap = dispatch_request(
+            r#"{"id":1,"method":"pane.swap","params":{"pane_id":"pane:1","target_pane_id":"pane:2"}}"#,
+            &|command| match command {
+                ControlCommand::SwapPanes {
+                    first_pane_id,
+                    second_pane_id,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(first_pane_id, "1");
+                    assert_eq!(second_pane_id, "2");
+                    reply.send(Ok(json!({ "ok": true }))).unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(swap.error, None);
+
+        let resize = dispatch_request(
+            r#"{"id":2,"method":"pane.resize","params":{"pane_id":"pane:3","direction":"down","amount":4}}"#,
+            &|command| match command {
+                ControlCommand::ResizePane {
+                    pane_id,
+                    direction,
+                    amount,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(pane_id, "3");
+                    assert_eq!(direction, PaneCreateDirection::Down);
+                    assert_eq!(amount, 4);
+                    reply.send(Ok(json!({ "ok": true }))).unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(resize.error, None);
+
+        let nav = dispatch_request(
+            r#"{"id":3,"method":"browser.navigate","params":{"surface_id":"surface:4:tab","url":"https://example.com/docs"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction {
+                    surface_hint,
+                    action: BrowserControlAction::Navigate { url },
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint.as_deref(), Some("4:tab"));
+                    assert_eq!(url, "https://example.com/docs");
+                    reply.send(Ok(json!({ "ok": true }))).unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(nav.error, None);
+
+        for (method, params) in [
+            ("pane.swap", json!({ "pane_id": "1" })),
+            ("pane.join", json!({ "pane_id": "1" })),
+            ("pane.resize", json!({ "direction": "right" })),
+            ("pane.resize", json!({ "pane_id": "1", "amount": 0 })),
+            ("browser.navigate", json!({})),
+            ("browser.navigate", json!({ "url": "https://" })),
+            ("browser.open_split", json!({ "url": "bad url" })),
+        ] {
+            let response = dispatch_request(
+                &json!({ "method": method, "params": params }).to_string(),
+                &|command| panic!("invalid params reached GTK: {command:?}"),
+            );
+            assert_eq!(
+                response.error.map(|error| error.code),
+                Some(INVALID_PARAMS_CODE),
+                "{method}"
             );
         }
     }

@@ -101,6 +101,14 @@ SH
 chmod 755 "$PACKAGE_DIR/limux" "$PACKAGE_DIR/libexec/limux/limux-host"
 printf 'synthetic Ghostty library\n' > "$PACKAGE_DIR/lib/libghostty-internal.so"
 printf 'Ghostty resource sentinel\n' > "$PACKAGE_DIR/share/limux/ghostty/installer-layout-test"
+cat > "$PACKAGE_DIR/share/limux/install-apparmor-profile.sh" <<'SH'
+#!/bin/sh
+if [ "$1" = --render ]; then
+    exec "$LIMUX_TEST_PROFILE_RENDERER" "$@"
+fi
+printf 'apparmor %s\n' "$*" >> "$LIMUX_TEST_SIDE_EFFECT_LOG"
+SH
+chmod 755 "$PACKAGE_DIR/share/limux/install-apparmor-profile.sh"
 printf '<svg/>' > "$PACKAGE_DIR/share/icons/hicolor/scalable/actions/limux-globe-symbolic.svg"
 cat > "$PACKAGE_DIR/share/applications/dev.limux.linux.desktop" <<'EOF'
 [Desktop Entry]
@@ -174,6 +182,7 @@ export LIMUX_TEST_REAL_INSTALL="$REAL_INSTALL_PATH"
 export PATH="$FAKE_BIN:$PATH"
 export LIMUX_TEST_SUDO_LOG="$SUDO_LOG"
 export LIMUX_TEST_SIDE_EFFECT_LOG="$SIDE_EFFECT_LOG"
+export LIMUX_TEST_PROFILE_RENDERER="$ROOT_DIR/scripts/install-apparmor-profile.sh"
 
 cat > "$ROOT_GUARD_BIN/sudo" <<'SH'
 #!/bin/sh
@@ -204,7 +213,7 @@ grep -Fq "Install prefix cannot contain '%' because this installer does not supp
 [ ! -s "$SIDE_EFFECT_LOG" ] || fail "rejected percent prefix caused side effects"
 rm -f "$SUDO_LOG" "$SIDE_EFFECT_LOG"
 
-"$PACKAGE_DIR/install.sh" --prefix="$PREFIX"
+"$PACKAGE_DIR/install.sh" --prefix="$PREFIX" | tee "$TMP_DIR/user-install.log"
 
 [ -x "$PREFIX/bin/limux" ] || fail "user-prefix install did not create the CLI"
 [ -x "$PREFIX/libexec/limux/limux-host" ] || fail "user-prefix install did not create the host"
@@ -235,7 +244,12 @@ for sentinel in \
     [ -e "$sentinel" ] || fail "user-prefix install removed global sentinel: $sentinel"
 done
 [ ! -e "$SUDO_LOG" ] || fail "writable user-prefix install invoked sudo"
-[ ! -s "$SIDE_EFFECT_LOG" ] || fail "user-prefix install ran a global cache command: $(cat "$SIDE_EFFECT_LOG")"
+[ ! -s "$SIDE_EFFECT_LOG" ] || fail "user-prefix install ran a global cache or AppArmor command: $(cat "$SIDE_EFFECT_LOG")"
+grep -Fq 'this path needs an administrator-written AppArmor profile' "$TMP_DIR/user-install.log" || \
+    fail "unsupported profile path omitted explicit manual administrator guidance"
+if grep -Fq ' --install ' "$TMP_DIR/user-install.log"; then
+    fail "unsupported profile path printed an unusable automatic administrator command"
+fi
 
 rm -f "$SUDO_LOG" "$SIDE_EFFECT_LOG"
 "$PACKAGE_DIR/install.sh" --prefix="$PREFIX" --uninstall
@@ -298,7 +312,11 @@ fi
 
 LEGACY_USER_PREFIX="$TMP_DIR/legacy-user-prefix"
 printf '%s\n' "$LEGACY_USER_PREFIX/lib/limux" > "$SYSTEM_ROOT/etc/ld.so.conf.d/limux.conf"
-"$PACKAGE_DIR/install.sh" --prefix="$LEGACY_USER_PREFIX"
+"$PACKAGE_DIR/install.sh" --prefix="$LEGACY_USER_PREFIX" | tee "$TMP_DIR/legacy-user-install.log"
+grep -Fq 'an administrator can install its allowance' "$TMP_DIR/legacy-user-install.log" || \
+    fail "supported user-prefix install omitted its administrator allowance command"
+grep -Fq "sudo $LEGACY_USER_PREFIX/share/limux/install-apparmor-profile.sh --install $LEGACY_USER_PREFIX/libexec/limux/limux-host" \
+    "$TMP_DIR/legacy-user-install.log" || fail "supported profile path printed an incorrect administrator command"
 
 [ -x "$LEGACY_USER_PREFIX/bin/limux" ] || fail "legacy user-prefix install did not create the CLI"
 [ "$(cat "$SYSTEM_ROOT/etc/ld.so.conf.d/limux.conf")" = "$LEGACY_USER_PREFIX/lib/limux" ] || \
@@ -330,6 +348,8 @@ LIMUX_TEST_SIDE_EFFECT_LOG="$SIDE_EFFECT_LOG" \
 
 [ -x "$SYSTEM_PREFIX/bin/limux" ] || fail "system-prefix install did not create the CLI"
 [ -s "$SUDO_LOG" ] || fail "system-prefix install did not request root"
+grep -Fq "apparmor --install $SYSTEM_PREFIX/libexec/limux/limux-host" "$SIDE_EFFECT_LOG" || \
+    fail "system-prefix install did not configure its exact host AppArmor allowance"
 [ "$(cat "$SYSTEM_ROOT/etc/ld.so.conf.d/limux.conf")" = "$SYSTEM_ROOT/usr/local/lib/limux" ] || \
     fail "system-prefix install changed another prefix's loader config"
 for sentinel in \
@@ -359,6 +379,8 @@ LIMUX_TEST_SIDE_EFFECT_LOG="$SIDE_EFFECT_LOG" \
 [ "$(cat "$SYSTEM_ROOT/etc/ld.so.conf.d/limux.conf")" = "$SYSTEM_ROOT/usr/local/lib/limux" ] || \
     fail "system-prefix uninstall removed another prefix's loader config"
 [ -s "$SUDO_LOG" ] || fail "system-prefix uninstall did not request root"
+grep -Fq "apparmor --remove $SYSTEM_PREFIX/libexec/limux/limux-host" "$SIDE_EFFECT_LOG" || \
+    fail "system-prefix uninstall did not remove its exact host AppArmor allowance"
 if grep -q '^ldconfig ' "$SIDE_EFFECT_LOG" 2>/dev/null; then
     fail "system-prefix uninstall ran ldconfig for another prefix's config"
 fi

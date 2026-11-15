@@ -52,8 +52,9 @@ def wait_for(check, processes, description):
                 raise RuntimeError(
                     f"{description}: child exited with {process.returncode}"
                 )
-        if check():
-            return
+        result = check()
+        if result:
+            return result
         time.sleep(0.2)
     raise RuntimeError(f"timed out waiting for {description}")
 
@@ -64,6 +65,289 @@ def child_pids(pid):
         with contextlib.suppress(FileNotFoundError, ProcessLookupError):
             children.update(int(value) for value in path.read_text().split())
     return children
+
+
+def descendants(root_pid):
+    pending = [root_pid]
+    seen = {root_pid}
+    while pending:
+        pid = pending.pop()
+        try:
+            children = child_pids(pid)
+        except PermissionError as error:
+            raise RuntimeError(
+                f"cannot enumerate child processes below PID {pid}; "
+                f"WebKit sandbox verification is blocked by /proc permissions: {error}"
+            ) from error
+        for child in children - seen:
+            seen.add(child)
+            pending.append(child)
+    return seen - {root_pid}
+
+
+def verify_webkit_sandbox(host_pid):
+    limux_hosts = []
+    web_processes = []
+    for pid in descendants(host_pid):
+        try:
+            executable = Path(os.readlink(f"/proc/{pid}/exe")).name
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            try:
+                comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except PermissionError as error:
+                raise RuntimeError(
+                    f"cannot identify child PID {pid}; WebKit sandbox verification "
+                    f"is blocked by /proc permissions: {error}"
+                ) from error
+            if "WebKitWeb" in comm:
+                web_processes.append(pid)
+            continue
+        if Path(executable).name in {"limux", "limux-host"}:
+            limux_hosts.append(pid)
+        elif "WebKitWebProcess" in executable:
+            web_processes.append(pid)
+    if not limux_hosts:
+        raise RuntimeError(
+            f"could not locate the Limux host below launcher PID {host_pid}; "
+            "its namespace could not be used as the WebKit sandbox baseline"
+        )
+    if not web_processes:
+        raise RuntimeError(
+            "could not locate the WebKitWebProcess below the packaged host; "
+            "its sandbox state could not be verified"
+        )
+
+    host_user_namespace = os.stat(f"/proc/{limux_hosts[0]}/ns/user").st_ino
+    inspected = False
+    for pid in web_processes:
+        try:
+            status = Path(f"/proc/{pid}/status").read_text()
+            user_namespace = os.stat(f"/proc/{pid}/ns/user").st_ino
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as error:
+            raise RuntimeError(
+                f"cannot inspect WebKitWebProcess {pid} sandbox state through /proc: {error}"
+            ) from error
+        inspected = True
+        fields = {
+            line.split(":", 1)[0]: line.split(":", 1)[1].strip()
+            for line in status.splitlines()
+            if ":" in line
+        }
+        sandbox = {
+            "NoNewPrivs": fields.get("NoNewPrivs"),
+            "Seccomp": fields.get("Seccomp"),
+            "CapEff": fields.get("CapEff"),
+            "separate_user_namespace": user_namespace != host_user_namespace,
+        }
+        if (
+            sandbox["NoNewPrivs"] != "1"
+            or sandbox["Seccomp"] != "2"
+            or sandbox["CapEff"] != "0000000000000000"
+            or not sandbox["separate_user_namespace"]
+        ):
+            raise RuntimeError(
+                f"WebKitWebProcess {pid} did not enter the default sandbox: {sandbox}"
+            )
+        print(f"WebKitWebProcess {pid} sandbox: {sandbox}", flush=True)
+    if not inspected:
+        raise RuntimeError("WebKitWebProcess exited before sandbox inspection")
+
+
+def assert_no_browser_sandbox_processes(host_pid):
+    limux_hosts = []
+    for pid in descendants(host_pid):
+        try:
+            name = Path(os.readlink(f"/proc/{pid}/exe")).name
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as error:
+            raise RuntimeError(
+                f"cannot check for leftover WebKit processes below PID {pid}: {error}"
+            ) from error
+        if name in {"limux", "limux-host"}:
+            limux_hosts.append(pid)
+        if "WebKit" in name or name in {"bwrap", "xdg-dbus-proxy"}:
+            raise RuntimeError(
+                f"browser sandbox helper {name} (PID {pid}) remains after rejection"
+            )
+    if len(limux_hosts) > 1:
+        raise RuntimeError(
+            "a disposable Limux sandbox-probe process remains after rejection: "
+            f"{limux_hosts}"
+        )
+
+
+def compile_userns_denial_launcher(output):
+    compiler = shutil.which("cc")
+    if compiler is None:
+        raise RuntimeError("--deny-userns requires a C compiler (cc)")
+    fixture = Path(__file__).resolve().parent / "tests/deny-userns-launcher.c"
+    result = subprocess.run(
+        [compiler, "-O2", "-Wall", "-Wextra", "-Werror", str(fixture), "-o", str(output)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            "could not build the child-local user-namespace denial launcher: "
+            f"{result.stderr.strip()}"
+        )
+    baseline = subprocess.run(
+        ["unshare", "-Ur", "true"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    if baseline.returncode:
+        raise RuntimeError(
+            "--deny-userns requires unprivileged user namespaces to work before "
+            "the child-local filter is installed: "
+            f"{baseline.stderr.strip() or baseline.stdout.strip()}"
+        )
+    probe = subprocess.run(
+        [str(output), "unshare", "-Ur", "true"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    if probe.returncode == 0 or "operation not permitted" not in probe.stderr.lower():
+        raise RuntimeError(
+            "test launcher did not deny unshare(CLONE_NEWUSER) with EPERM: "
+            f"exit={probe.returncode}, stderr={probe.stderr.strip()}"
+        )
+    print(
+        "Child-local seccomp fixture changed unshare(CLONE_NEWUSER) from allowed to EPERM.",
+        flush=True,
+    )
+
+
+def assert_apparmor_profile(host_pid, expected_profile):
+    candidates = {host_pid, *descendants(host_pid)}
+    for pid in candidates:
+        try:
+            executable = os.readlink(f"/proc/{pid}/exe")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if Path(executable.removesuffix(" (deleted)")).name not in {
+            "limux",
+            "limux-host",
+        }:
+            continue
+        try:
+            profile = Path(f"/proc/{pid}/attr/current").read_text().strip()
+        except (FileNotFoundError, ProcessLookupError, PermissionError) as error:
+            raise RuntimeError(
+                f"cannot read AppArmor profile for Limux host PID {pid}: {error}"
+            ) from error
+        if not profile.startswith(expected_profile) or (
+            len(profile) > len(expected_profile)
+            and not profile[len(expected_profile)].isspace()
+        ):
+            raise RuntimeError(
+                f"Limux host PID {pid} has AppArmor label {profile!r}, "
+                f"expected {expected_profile!r}"
+            )
+        print(f"Limux host PID {pid} AppArmor label: {profile}", flush=True)
+        return
+    raise RuntimeError(
+        f"could not locate limux-host below launcher PID {host_pid} "
+        "to verify its AppArmor profile"
+    )
+
+
+def find_browser_tabs(value):
+    if isinstance(value, dict):
+        if value.get("tab_kind") == "browser":
+            yield value
+        for child in value.values():
+            yield from find_browser_tabs(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from find_browser_tabs(child)
+
+
+def saved_browser_state(session_path):
+    try:
+        session = json.loads(session_path.read_text())
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"cannot read saved browser session: {error}") from error
+    return sorted(
+        (
+            tab.get("id"),
+            tab.get("custom_name"),
+            tab.get("pinned"),
+            tab.get("uri"),
+        )
+        for tab in find_browser_tabs(session)
+    )
+
+
+def stop_process_tree(process, timeout=5):
+    with contextlib.ExitStack() as stack:
+        owned = {}
+        root_fd = os.pidfd_open(process.pid)
+        stack.callback(os.close, root_fd)
+        owned[process.pid] = os.dup(root_fd)
+
+        def capture_and_signal(sig):
+            if process.poll() is not None:
+                return
+            with contextlib.ExitStack() as snapshot:
+                for pid, fd in capture_processes(process.pid, snapshot):
+                    if pid in owned and not select.select([owned[pid]], [], [], 0)[0]:
+                        continue
+                    if pid in owned:
+                        os.close(owned.pop(pid))
+                    owned[pid] = os.dup(fd)
+                    with contextlib.suppress(ProcessLookupError):
+                        signal.pidfd_send_signal(owned[pid], sig)
+
+        def reap():
+            process.poll()
+            for pid, fd in owned.items():
+                if pid != process.pid:
+                    with contextlib.suppress(ChildProcessError):
+                        os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+
+        def exited():
+            return len(select.select(list(owned.values()), [], [], 0)[0]) == len(owned)
+
+        def signal_owned(sig):
+            for fd in owned.values():
+                with contextlib.suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(fd, sig)
+
+        stack.callback(lambda: [os.close(fd) for fd in owned.values()])
+        capture_and_signal(signal.SIGTERM)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            capture_and_signal(signal.SIGTERM)
+            reap()
+            if exited():
+                return
+            time.sleep(0.05)
+        signal_owned(signal.SIGKILL)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"host process {process.pid} survived forced shutdown") from error
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            reap()
+            if exited():
+                return
+            time.sleep(0.05)
+        raise RuntimeError("host child processes survived forced shutdown")
 
 
 @contextlib.contextmanager
@@ -291,6 +575,8 @@ def run(args, root):
                 "DISPLAY",
                 "WAYLAND_DISPLAY",
                 "DBUS_SESSION_BUS_ADDRESS",
+                "DBUS_STARTER_ADDRESS",
+                "DBUS_STARTER_BUS_TYPE",
                 "LD_LIBRARY_PATH",
                 "LD_PRELOAD",
                 "GDK_PIXBUF_MODULE_FILE",
@@ -304,6 +590,9 @@ def run(args, root):
                 "HTTP_PROXY",
                 "HTTPS_PROXY",
                 "ALL_PROXY",
+                "GNOME_KEYRING_CONTROL",
+                "GPG_AGENT_INFO",
+                "SSH_AUTH_SOCK",
             }:
                 env.pop(key)
         for kind in ("DATA", "STATE", "CONFIG", "CACHE", "RUNTIME"):
@@ -312,8 +601,25 @@ def run(args, root):
             env[f"XDG_{kind}_HOME" if kind != "RUNTIME" else "XDG_RUNTIME_DIR"] = str(
                 path
             )
+        private_home = root / "home"
+        private_home.mkdir(mode=0o700)
+        dbus_config = root / "dbus.conf"
+        dbus_config.write_text(
+            """<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"""
+        )
         env.update(
             {
+                "HOME": str(private_home),
                 "LIMUX_SOCKET": str(root / "control.sock"),
                 "LIMUX_SOCKET_PATH": str(root / "control.sock"),
                 "LIMUX_SOCKET_MODE": "runtime",
@@ -323,6 +629,9 @@ def run(args, root):
                 "GALLIUM_DRIVER": "llvmpipe",
                 "LP_NUM_THREADS": "1",
                 "XDG_DATA_DIRS": "/usr/local/share:/usr/share",
+                "GTK_USE_PORTAL": "0",
+                "GIO_USE_VFS": "local",
+                "GTK_A11Y": "none",
             }
         )
         config = root / "config/ghostty"
@@ -356,7 +665,13 @@ def run(args, root):
                             "pane_id": 2,
                             "active_tab_id": "browser",
                             "tabs": [
-                                {"id": "browser", "tab_kind": "browser", "uri": url}
+                                {
+                                    "id": "browser",
+                                    "tab_kind": "browser",
+                                    "uri": url,
+                                    "custom_name": "Saved sandbox browser",
+                                    "pinned": True,
+                                }
                             ],
                         },
                     },
@@ -397,9 +712,9 @@ def run(args, root):
             "Weston",
         )
         host_env = env.copy()
-        print(
-            "Browser smoke uses the packaged host's default sandbox policy.", flush=True
-        )
+        if args.explicit_disable_sandbox:
+            host_env["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"] = "1"
+        print("Browser smoke verifies the packaged host's WebKit policy.", flush=True)
         if args.appimage:
             command = [str(prefix / "AppRun")]
         else:
@@ -407,7 +722,15 @@ def run(args, root):
             host_env["GHOSTTY_RESOURCES_DIR"] = str(prefix / "share/limux/ghostty")
             host_env["TERMINFO"] = str(prefix / "share/limux/terminfo")
             command = [str(prefix / "libexec/limux/limux-host")]
-        start(["dbus-run-session", "--", *command], "host", host_env)
+        host_command = [
+            "dbus-run-session",
+            f"--config-file={dbus_config}",
+            "--",
+            *command,
+        ]
+        if args.deny_userns:
+            host_command = [str(root / "deny-userns-launcher"), *host_command]
+        host_process = start(host_command, "host", host_env)
 
         def control(*command):
             result = subprocess.run(
@@ -450,6 +773,8 @@ def run(args, root):
             return False
 
         wait_for(healthy, processes, "packaged terminal health")
+        if args.expected_apparmor_profile:
+            assert_apparmor_profile(host_process.pid, args.expected_apparmor_profile)
         target = ["--workspace", "package-smoke", "--surface", surface]
         proof = root / "terminal-proof"
         # The full marker is never typed, so readback cannot pass on command echo.
@@ -472,16 +797,188 @@ def run(args, root):
         wait_for(
             terminal_output, processes, "packaged terminal command and screen readback"
         )
-        wait_for(
-            loaded.is_set,
-            processes,
-            "packaged browser page load and JavaScript callback",
-        )
-        if not healthy():
-            raise RuntimeError("terminal became unhealthy after browser load")
-        print(
-            "Packaged runtime smoke: OK (terminal health, executed input/readback, browser load/JavaScript)"
-        )
+        if args.expect_browser_unavailable:
+            def unavailable():
+                try:
+                    health = json.loads(
+                        control("--json", "surface-health", "--workspace", "package-smoke")
+                    )
+                except (RuntimeError, subprocess.TimeoutExpired, ValueError):
+                    return False
+                (root / "health.json").write_text(json.dumps(health, indent=2))
+                browser = next(
+                    (
+                        row
+                        for row in health.get("surfaces", [])
+                        if row.get("type") == "browser"
+                    ),
+                    None,
+                )
+                error = browser.get("error", "") if browser else ""
+                return (
+                    browser
+                    if browser
+                    and browser.get("healthy") is False
+                    and browser.get("realized") is False
+                    and browser.get("sandboxed") is False
+                    and error
+                    else False
+                )
+
+            browser_health = wait_for(
+                unavailable,
+                processes,
+                "restored browser to report sandbox unavailable",
+            )
+            diagnostic = browser_health.get("error", "").lower()
+            if not any(
+                word in diagnostic for word in ("sandbox", "namespace", "bubblewrap", "bwrap")
+            ):
+                raise RuntimeError(
+                    "browser sandbox failure was not reported clearly: "
+                    f"{browser_health.get('error')}"
+                )
+            if loaded.is_set():
+                raise RuntimeError("browser rendered while user namespaces were denied")
+            assert_no_browser_sandbox_processes(host_process.pid)
+
+            session_path = root / "data/limux/session.json"
+            expected_browser_state = [
+                ("browser", "Saved sandbox browser", True, url)
+            ]
+            if saved_browser_state(session_path) != expected_browser_state:
+                raise RuntimeError(
+                    "browser state was not preserved after sandbox denial: "
+                    f"{saved_browser_state(session_path)}"
+                )
+
+            rejected_create = subprocess.run(
+                [
+                    str(cli),
+                    "--json",
+                    "new-surface",
+                    "--workspace",
+                    "package-smoke",
+                    "--type",
+                    "browser",
+                    "--url",
+                    url,
+                ],
+                env=env,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            create_error = f"{rejected_create.stderr}\n{rejected_create.stdout}".lower()
+            if rejected_create.returncode == 0 or not any(
+                word in create_error for word in ("sandbox", "namespace", "bubblewrap", "bwrap")
+            ):
+                raise RuntimeError(
+                    "new browser creation did not fail with the sandbox diagnostic: "
+                    f"{create_error.strip()}"
+                )
+            if saved_browser_state(session_path) != expected_browser_state:
+                raise RuntimeError("rejected browser creation mutated saved session state")
+            if not healthy():
+                raise RuntimeError("terminal became unhealthy after browser sandbox denial")
+
+            control(
+                "send",
+                *target,
+                f"printf '%s%s\\n' 'denied-' '{token}'; printf ok > {shlex.quote(str(proof))}",
+            )
+            control("send-key", *target, "Enter")
+            wait_for(
+                lambda: proof.exists()
+                and proof.read_text() == "ok"
+                and f"denied-{token}" in control("read-screen", *target),
+                processes,
+                "terminal remains executable after browser sandbox denial",
+            )
+
+            old_host_process = host_process
+            stop_process_tree(old_host_process)
+            processes.remove(old_host_process)
+            if saved_browser_state(session_path) != expected_browser_state:
+                raise RuntimeError("browser URI, name, or pin changed during shutdown")
+            host_process = start(host_command, "host-restarted", host_env)
+            wait_for(healthy, processes, "terminal health after denied-browser restart")
+            browser_health = wait_for(
+                unavailable,
+                processes,
+                "restored browser to remain unavailable after restart",
+            )
+            if saved_browser_state(session_path) != expected_browser_state:
+                raise RuntimeError("browser URI, name, or pin did not survive restart")
+            assert_no_browser_sandbox_processes(host_process.pid)
+            print(
+                "Packaged denied-sandbox smoke: OK (browser unavailable, terminal usable, "
+                "saved browser state retained across restart)",
+                flush=True,
+            )
+        elif args.explicit_disable_sandbox:
+            wait_for(
+                loaded.is_set,
+                processes,
+                "browser page load and JavaScript callback with explicit bypass",
+            )
+            health = json.loads(
+                control("--json", "surface-health", "--workspace", "package-smoke")
+            )
+            browser = next(
+                (row for row in health.get("surfaces", []) if row.get("type") == "browser"),
+                None,
+            )
+            if (
+                not browser
+                or browser.get("healthy") is not True
+                or browser.get("realized") is not True
+                or browser.get("sandboxed") is not False
+            ):
+                raise RuntimeError(
+                    "explicit sandbox bypass was not reported as an unsandboxed browser: "
+                    f"{browser}"
+                )
+            if not healthy():
+                raise RuntimeError("terminal became unhealthy after explicit sandbox bypass")
+            print(
+                "Packaged explicit-bypass smoke: OK "
+                "(browser works and health reports sandboxed=false)",
+                flush=True,
+            )
+        else:
+            wait_for(
+                loaded.is_set,
+                processes,
+                "packaged browser page load and JavaScript callback",
+            )
+            verify_webkit_sandbox(host_process.pid)
+            health = json.loads(
+                control("--json", "surface-health", "--workspace", "package-smoke")
+            )
+            browser = next(
+                (row for row in health.get("surfaces", []) if row.get("type") == "browser"),
+                None,
+            )
+            if (
+                not browser
+                or browser.get("healthy") is not True
+                or browser.get("realized") is not True
+                or browser.get("sandboxed") is not True
+            ):
+                raise RuntimeError(
+                    "sandboxed browser health did not report a healthy isolated surface: "
+                    f"{browser}"
+                )
+            if not healthy():
+                raise RuntimeError("terminal became unhealthy after browser load")
+            print(
+                "Packaged runtime smoke: OK (terminal health, executed input/readback, "
+                "browser load/JavaScript and WebKit sandbox)",
+                flush=True,
+            )
     finally:
         failure = sys.exception()
         cleanup_errors = []
@@ -517,18 +1014,101 @@ def main():
     parser.add_argument(
         "--appimage", action="store_true", help="launch the extracted AppRun unchanged"
     )
+    parser.add_argument(
+        "--deny-userns",
+        action="store_true",
+        help="deny user namespaces in the packaged host process tree with seccomp",
+    )
+    parser.add_argument(
+        "--expect-browser-unavailable",
+        action="store_true",
+        help="expect the runtime policy to deny user namespaces and test graceful browser failure",
+    )
+    parser.add_argument(
+        "--explicit-disable-sandbox",
+        action="store_true",
+        help="check an explicit WebKit sandbox bypass is reported as unsandboxed",
+    )
+    parser.add_argument(
+        "--expected-apparmor-profile",
+        help="require the limux-host process to have this AppArmor profile label",
+    )
     args = parser.parse_args()
+    if args.deny_userns and not args.explicit_disable_sandbox:
+        args.expect_browser_unavailable = True
+    if args.expect_browser_unavailable and args.explicit_disable_sandbox:
+        parser.error(
+            "--expect-browser-unavailable cannot be combined with --explicit-disable-sandbox"
+        )
     if not args.appimage and args.library_dir is None:
         parser.error("--library-dir is required outside AppImage mode")
     try:
         require_pidfd_support()
     except RuntimeError as error:
         parser.error(str(error))
-    for tool in ("weston", "dbus-run-session", "fusermount3"):
+    for tool in (
+        "weston",
+        "dbus-run-session",
+        "fusermount3",
+        "bwrap",
+        "xdg-dbus-proxy",
+    ):
         if shutil.which(tool) is None:
             parser.error(f"missing runtime dependency: {tool}")
+    if args.deny_userns and shutil.which("unshare") is None:
+        parser.error("--deny-userns requires unshare from util-linux")
     root = Path(tempfile.mkdtemp(prefix="limux-package-runtime-"))
     try:
+        if args.deny_userns:
+            compile_userns_denial_launcher(root / "deny-userns-launcher")
+        if args.expect_browser_unavailable or args.deny_userns:
+            probe = [
+                "bwrap",
+                "--unshare-user",
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+                "/bin/true",
+            ]
+            if args.deny_userns:
+                probe.insert(0, str(root / "deny-userns-launcher"))
+            result = subprocess.run(
+                probe,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            (root / "userns-denial-probe.log").write_text(
+                f"exit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+            if result.returncode == 0:
+                parser.error(
+                    "the negative test is not running under a user-namespace denial policy"
+                )
+            denial_text = f"{result.stdout}\n{result.stderr}".lower()
+            if not any(
+                reason in denial_text
+                for reason in ("permission denied", "operation not permitted", "namespace")
+            ):
+                parser.error(
+                    "bubblewrap failed for a reason other than user-namespace denial: "
+                    f"{denial_text.strip()}"
+                )
+            print(
+                "Runtime user-namespace denial confirmed: "
+                f"{result.stderr.strip() or result.stdout.strip() or f'exit {result.returncode}'}",
+                flush=True,
+            )
         with child_subreaper():
             run(args, root)
         remove_runtime_directory(root)

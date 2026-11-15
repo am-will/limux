@@ -231,7 +231,7 @@ Common commands:
   focus-surface [--workspace <id|ref>] [--surface <id|ref>]
   focus-pane [--workspace <id|ref>] [--pane <id|ref>]
   new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]
-      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.
+      Supports terminal and browser panes on both the live GTK host and standalone server.
   rename-workspace [--workspace <id|ref>] <title>
   set-workspace-color [--workspace <id|ref>] <red|orange|amber|green|teal|blue|purple|pink|none>
   list-groups
@@ -265,8 +265,8 @@ Common commands:
 Agent integrations:
   notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
   hooks setup [agent] [--osc] | hooks uninstall [agent] | hooks <agent> <event>
-  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]
-  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]
+  claude-hook | opencode-hook | gemini-hook | agy-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]
+  agent-team [--agents codex,claude[,opencode,gemini,agy]] [--cwd <path>] [--no-launch] [--dry-run]
       Splits the active workspace into one pane per agent (caller's pane stays
       as the orchestrator on the left, peers stack down the right), launches
       each CLI in its pane, and writes AGENTS.md describing the <agent-msg>
@@ -329,15 +329,25 @@ fn resolve_host_binary() -> Result<PathBuf> {
 
 fn launch_host() -> Result<()> {
     let host = resolve_host_binary()?;
-    let err = Command::new(&host)
-        .spawn()
-        .with_context(|| format!("failed to launch {}", host.display()))?
-        .wait()
-        .with_context(|| format!("failed to wait for {}", host.display()))?;
-    if err.success() {
-        Ok(())
-    } else {
-        bail!("{} exited with {}", host.display(), err)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let error = Command::new(&host).exec();
+        Err(error).with_context(|| format!("failed to launch {}", host.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = Command::new(&host)
+            .spawn()
+            .with_context(|| format!("failed to launch {}", host.display()))?
+            .wait()
+            .with_context(|| format!("failed to wait for {}", host.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("{} exited with {}", host.display(), status)
+        }
     }
 }
 
@@ -674,55 +684,21 @@ async fn call_in_workspace_scope(
 
 async fn browser_call(
     client: &mut Client,
-    surface: Option<String>,
+    workspace: Option<&str>,
+    surface: Option<&str>,
     method: &str,
     mut params: Map<String, Value>,
 ) -> Result<Value> {
     if let Some(surface) = surface {
-        params.insert("surface_id".to_string(), Value::String(surface));
+        params.insert("surface_id".to_string(), Value::String(surface.to_string()));
     }
-    client.call(method, Value::Object(params)).await
-}
-
-async fn selected_surface_for_pane(
-    client: &mut Client,
-    workspace: Option<String>,
-    pane_id: &str,
-) -> Result<String> {
-    let payload = call_in_workspace_scope(
+    call_in_workspace_scope(
         client,
-        workspace,
-        "pane.surfaces",
-        json!({ "pane_id": pane_id }),
+        workspace.map(str::to_string),
+        method,
+        Value::Object(params),
     )
-    .await?;
-    let rows = payload
-        .get("surfaces")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("pane.surfaces returned no surfaces"))?;
-
-    for row in rows {
-        let focused = row.get("focused").and_then(Value::as_bool).unwrap_or(false)
-            || row
-                .get("selected")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        if focused {
-            let handle = handle_from_payload(row, "surface_id", "surface_ref");
-            if !handle.is_empty() {
-                return Ok(handle);
-            }
-        }
-    }
-
-    let first = rows
-        .first()
-        .ok_or_else(|| anyhow!("pane has no surfaces"))?;
-    let handle = handle_from_payload(first, "surface_id", "surface_ref");
-    if handle.is_empty() {
-        bail!("pane.surfaces returned an empty surface handle");
-    }
-    Ok(handle)
+    .await
 }
 
 fn window_activation_params(activation_token: Option<&str>, startup_id: Option<&str>) -> Value {
@@ -1076,8 +1052,15 @@ fn hook_str<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
 fn parse_hook_event(args: &[String], payload: &Value) -> String {
     parse_opt(args, "--event")
         .or_else(|| trailing_title(args))
-        .or_else(|| hook_str(payload, &["hook_event_name", "event"]).map(str::to_owned))
+        .or_else(|| {
+            hook_str(payload, &["hook_event_name", "hookEventName", "event"]).map(str::to_owned)
+        })
         .unwrap_or_else(|| "event".to_string())
+}
+
+fn agy_stop_suppresses_notification(payload: &Value) -> bool {
+    payload.get("fullyIdle").and_then(Value::as_bool) == Some(false)
+        || hook_str(payload, &["terminationReason"]) == Some("USER_CANCELED")
 }
 
 /// Run an agent hook: read JSON from stdin, synthesize a notification.
@@ -1124,12 +1107,18 @@ async fn run_agent_hook(
                 .unwrap_or("waiting for input")
                 .to_owned(),
         )),
-        "Stop" | "stop" | "finished" => Some((
-            format!("{agent_label} finished"),
-            hook_str(&payload, &["message", "reason"])
-                .unwrap_or("task complete")
-                .to_owned(),
-        )),
+        "Stop" | "stop" | "finished" => {
+            if agent == agent_hooks::AgentKind::Agy && agy_stop_suppresses_notification(&payload) {
+                None
+            } else {
+                Some((
+                    format!("{agent_label} finished"),
+                    hook_str(&payload, &["message", "reason"])
+                        .unwrap_or("task complete")
+                        .to_owned(),
+                ))
+            }
+        }
         "SessionStart" | "session-start" | "SessionEnd" | "session-end" | "UserPromptSubmit"
         | "prompt-submit" | "PreToolUse" | "PostToolUse" | "SubagentStop" | "subagent-stop"
         | "Cleanup" | "cleanup" | "restore-exit" => None,
@@ -1142,12 +1131,15 @@ async fn run_agent_hook(
     };
 
     if let Some((title, body)) = notification_title_body {
-        let subtitle = hook_str(&payload, &["session_id"])
-            .map(|s| {
-                // Show only a short prefix of the session id to keep sidebar tidy.
-                s.chars().take(8).collect::<String>()
-            })
-            .unwrap_or_default();
+        let subtitle = hook_str(
+            &payload,
+            &["session_id", "conversationId", "sessionId", "sessionID"],
+        )
+        .map(|s| {
+            // Show only a short prefix of the session id to keep sidebar tidy.
+            s.chars().take(8).collect::<String>()
+        })
+        .unwrap_or_default();
 
         let (workspace, surface) = notification_scope(args, env_opt);
 
@@ -1170,11 +1162,28 @@ async fn run_agent_hook(
         }
     }
 
-    Ok(agent_hook_output(&event, &payload))
+    Ok(agent_hook_output(agent, &event, &payload))
 }
 
-fn agent_hook_output(event: &str, payload: &Value) -> Value {
+fn agent_hook_output(agent: agent_hooks::AgentKind, event: &str, payload: &Value) -> Value {
     let canonical_event = canonical_hook_event_name(event);
+    if agent == agent_hooks::AgentKind::Agy {
+        return match canonical_event {
+            Some("Stop") => json!({ "decision": "allow" }),
+            Some("SessionStart") => match hook_additional_context(payload) {
+                Some(context) => json!({
+                    "injectSteps": [{
+                        "systemMessage": {
+                            "systemMessage": context
+                        }
+                    }]
+                }),
+                None => json!({}),
+            },
+            _ => json!({}),
+        };
+    }
+
     let mut output = Map::new();
     output.insert("continue".to_string(), Value::Bool(true));
     output.insert("suppressOutput".to_string(), Value::Bool(false));
@@ -1236,7 +1245,7 @@ fn persist_agent_hook_session(
     payload: &Value,
     event: &str,
 ) -> Result<()> {
-    let Some(session_id) = hook_session_id(payload) else {
+    let Some(session_id) = hook_session_id(agent, payload) else {
         write_agent_hook_debug(
             agent,
             event,
@@ -1307,16 +1316,28 @@ fn persist_agent_hook_session(
         return Ok(());
     };
 
+    let ancestor_pid = agent_ancestor_pid(agent);
+    let proc_args = ancestor_pid.and_then(proc_cmdline_args);
+    let proc_cwd = ancestor_pid.and_then(proc_cwd_path);
+    let proc_env = ancestor_pid.and_then(proc_allowed_environment);
+
     let result = store.update(&session_id, |existing| {
         let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
             .map(str::to_string)
+            .or_else(|| proc_cwd.clone())
             .or_else(|| existing.and_then(|record| record.cwd.clone()));
         let pid = hook_str(payload, &["pid"])
             .and_then(|value| value.parse::<u32>().ok())
-            .or_else(|| agent_ancestor_pid(agent))
+            .or(ancestor_pid)
             .or_else(|| existing.and_then(|record| record.pid));
-        let launch_command = agent_hooks::launch_record_from_env(agent, cwd.as_deref())
-            .or_else(|| existing.and_then(|record| record.launch_command.clone()));
+        let launch_command = agent_hooks::launch_record_from_context(
+            agent,
+            cwd.as_deref(),
+            proc_args.as_deref(),
+            proc_cwd.as_deref(),
+            proc_env.as_ref(),
+        )
+        .or_else(|| existing.and_then(|record| record.launch_command.clone()));
 
         agent_hooks::AgentHookSessionRecord {
             session_id: session_id.clone(),
@@ -1356,13 +1377,27 @@ fn agent_hook_cleanup_scope(
     (workspace, surface)
 }
 
-fn hook_session_id(payload: &Value) -> Option<String> {
-    hook_str(payload, &["session_id", "sessionId", "sessionID"])
-        .map(str::to_string)
-        .or_else(|| limux_env_value("CLAUDE_CODE_SESSION_ID"))
-        .or_else(|| limux_env_value("CLAUDE_SESSION_ID"))
-        .or_else(|| hook_session_id_from_transcript(payload))
-        .filter(|value| !value.trim().is_empty())
+fn hook_session_id(agent: agent_hooks::AgentKind, payload: &Value) -> Option<String> {
+    hook_session_id_with_env(agent, payload, limux_env_value)
+}
+
+fn hook_session_id_with_env(
+    agent: agent_hooks::AgentKind,
+    payload: &Value,
+    env_value: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    hook_str(
+        payload,
+        &["session_id", "sessionId", "sessionID", "conversationId"],
+    )
+    .map(str::to_string)
+    .or_else(|| {
+        (agent == agent_hooks::AgentKind::Claude)
+            .then(|| env_value("CLAUDE_CODE_SESSION_ID").or_else(|| env_value("CLAUDE_SESSION_ID")))
+            .flatten()
+    })
+    .or_else(|| hook_session_id_from_transcript(payload))
+    .filter(|value| !value.trim().is_empty())
 }
 
 fn hook_session_id_from_transcript(payload: &Value) -> Option<String> {
@@ -1370,11 +1405,22 @@ fn hook_session_id_from_transcript(payload: &Value) -> Option<String> {
         payload,
         &["transcript_path", "transcriptPath", "transcript"],
     )?;
-    Path::new(transcript)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
+    let path = Path::new(transcript);
+    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+    if matches!(stem, "transcript" | "transcript_full") {
+        let components: Vec<&str> = path
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect();
+        if let Some(idx) = components.iter().rposition(|part| *part == "brain") {
+            return components
+                .get(idx + 1)
+                .map(|value| (*value).to_string())
+                .filter(|value| !value.trim().is_empty() && !value.starts_with('.'));
+        }
+        return None;
+    }
+    Some(stem.to_string()).filter(|value| !value.trim().is_empty())
 }
 
 fn payload_keys(payload: &Value) -> Vec<String> {
@@ -1384,15 +1430,36 @@ fn payload_keys(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn agent_hook_debug_enabled() -> bool {
+    env::var_os("LIMUX_HOOK_DEBUG")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 fn write_agent_hook_debug(
     agent: agent_hooks::AgentKind,
     event: &str,
     outcome: &str,
     details: &Value,
 ) {
+    if !agent_hook_debug_enabled() {
+        return;
+    }
     let Some(dir) = agent_hook_debug_dir() else {
         return;
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .is_err()
+        {
+            return;
+        }
+    }
+    #[cfg(not(unix))]
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -1411,7 +1478,7 @@ fn write_agent_hook_debug(
 }
 
 fn agent_hook_debug_dir() -> Option<PathBuf> {
-    if let Some(dir) = env::var_os("LIMUX_AGENT_HOOK_STATE_DIR") {
+    if let Some(dir) = env::var_os("LIMUX_AGENT_HOOK_STATE_DIR").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     dirs::state_dir()
@@ -1421,9 +1488,14 @@ fn agent_hook_debug_dir() -> Option<PathBuf> {
 
 fn append_debug_line(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     file.write_all(bytes)
@@ -1439,14 +1511,13 @@ fn limux_env_value(name: &str) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn agent_ancestor_pid(agent: agent_hooks::AgentKind) -> Option<u32> {
-    let needle = agent.store_name();
     let mut pid = std::process::id();
     for _ in 0..8 {
         let parent = proc_parent_pid(pid)?;
         if parent <= 1 || parent == pid {
             return None;
         }
-        if proc_identity_contains(parent, needle) {
+        if proc_matches_pid(parent, agent) {
             return Some(parent);
         }
         pid = parent;
@@ -1460,23 +1531,58 @@ fn agent_ancestor_pid(_agent: agent_hooks::AgentKind) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn proc_identity_contains(pid: u32, needle: &str) -> bool {
-    let needle = needle.to_ascii_lowercase();
-    proc_cmdline(pid)
-        .or_else(|| fs::read_to_string(format!("/proc/{pid}/comm")).ok())
-        .map(|value| value.to_ascii_lowercase().contains(&needle))
-        .unwrap_or(false)
+fn proc_matches_pid(pid: u32, agent: agent_hooks::AgentKind) -> bool {
+    let args = proc_cmdline_args(pid).unwrap_or_default();
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+    limux_control::agent_sessions::proc_matches_agent(&args, comm.as_deref(), agent)
 }
 
 #[cfg(target_os = "linux")]
-fn proc_cmdline(pid: u32) -> Option<String> {
+fn proc_cmdline_args(pid: u32) -> Option<Vec<String>> {
     let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let parts = raw
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
-        .filter_map(|part| std::str::from_utf8(part).ok())
+        .filter_map(|part| std::str::from_utf8(part).ok().map(str::to_string))
         .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join(" "))
+    (!parts.is_empty()).then_some(parts)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cmdline_args(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_cwd_path(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cwd_path(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_allowed_environment(pid: u32) -> Option<BTreeMap<String, String>> {
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(allowed_environment_from_environ(&environ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_allowed_environment(_pid: u32) -> Option<BTreeMap<String, String>> {
+    None
+}
+
+fn allowed_environment_from_environ(environ: &[u8]) -> BTreeMap<String, String> {
+    let pairs = environ
+        .split(|byte| *byte == 0)
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .filter_map(|entry| entry.split_once('='));
+    agent_hooks::filter_allowed_environment(pairs)
 }
 
 #[cfg(target_os = "linux")]
@@ -1648,6 +1754,7 @@ fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
         agent_hooks::AgentKind::Codex,
         agent_hooks::AgentKind::Claude,
         agent_hooks::AgentKind::Gemini,
+        agent_hooks::AgentKind::Agy,
     ]
 }
 
@@ -1676,7 +1783,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind, osc: bool) -> Result<()> {
             ],
         ),
         agent_hooks::AgentKind::OpenCode if osc => {
-            bail!("OSC hook setup supports Codex, Claude, and Gemini")
+            bail!("OSC hook setup supports Codex, Claude, Gemini, and Antigravity")
         }
         agent_hooks::AgentKind::OpenCode => install_opencode_plugin(),
         agent_hooks::AgentKind::Gemini => install_json_hooks(
@@ -1690,6 +1797,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind, osc: bool) -> Result<()> {
                 ("SessionEnd", "session-end"),
             ],
         ),
+        agent_hooks::AgentKind::Agy => install_agy_hooks(&agy_hooks_path(), osc),
     }
 }
 
@@ -1706,7 +1814,77 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             opencode_config_unregister_plugin()
         }
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
+        agent_hooks::AgentKind::Agy => uninstall_agy_hooks(&agy_hooks_path()),
     }
+}
+
+fn install_agy_hooks(path: &Path, osc: bool) -> Result<()> {
+    let mut root = read_json_object(path)?;
+    let marker = hook_marker(agent_hooks::AgentKind::Agy);
+    prune_agy_limux_entries(&mut root, marker);
+    root.insert(
+        "limux".to_string(),
+        json!({
+            "SessionStart": [{
+                "type": "command",
+                "command": hook_command_with_fallback(
+                    agent_hooks::AgentKind::Agy,
+                    "session-start",
+                    osc,
+                    "{}",
+                )?,
+                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
+            }],
+            "Stop": [{
+                "type": "command",
+                "command": hook_command_with_fallback(
+                    agent_hooks::AgentKind::Agy,
+                    "stop",
+                    osc,
+                    "{\"decision\":\"allow\"}",
+                )?,
+                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
+            }]
+        }),
+    );
+    write_json_object(path, &root)
+}
+
+fn uninstall_agy_hooks(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root = read_json_object(path)?;
+    let marker = hook_marker(agent_hooks::AgentKind::Agy);
+    prune_agy_limux_entries(&mut root, marker);
+    write_json_object(path, &root)
+}
+
+fn prune_agy_limux_entries(root: &mut Map<String, Value>, marker: &str) {
+    for group in root.values_mut() {
+        if let Some(events) = group.as_object_mut() {
+            for handlers in events.values_mut() {
+                if let Some(entries) = handlers.as_array_mut() {
+                    entries.retain(|entry| !json_value_contains(entry, marker));
+                }
+            }
+            events.retain(|_, handlers| {
+                handlers
+                    .as_array()
+                    .map(|entries| !entries.is_empty())
+                    .unwrap_or(true)
+            });
+        }
+    }
+    root.retain(|name, group| {
+        if name == "limux" && json_value_contains(group, marker) {
+            return false;
+        }
+        group
+            .as_object()
+            .map(|events| !events.is_empty())
+            .unwrap_or(true)
+    });
 }
 
 fn install_json_hooks(
@@ -1762,7 +1940,7 @@ fn install_json_hooks(
 
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
-        agent_hooks::AgentKind::Claude => 5,
+        agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Agy => 5,
         agent_hooks::AgentKind::Codex | agent_hooks::AgentKind::Gemini => 5000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
@@ -1831,6 +2009,20 @@ fn opencode_config_unregister_plugin() -> Result<()> {
 }
 
 fn hook_command(agent: agent_hooks::AgentKind, event: &str, osc: bool) -> Result<String> {
+    hook_command_with_fallback(
+        agent,
+        event,
+        osc,
+        "{\"continue\":true,\"suppressOutput\":false}",
+    )
+}
+
+fn hook_command_with_fallback(
+    agent: agent_hooks::AgentKind,
+    event: &str,
+    osc: bool,
+    fallback_json: &str,
+) -> Result<String> {
     let disable_var = format!(
         "LIMUX_{}_HOOKS_DISABLED",
         agent.store_name().to_ascii_uppercase()
@@ -1842,9 +2034,10 @@ fn hook_command(agent: agent_hooks::AgentKind, event: &str, osc: bool) -> Result
         limux_command
     };
     Ok(format!(
-        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo '{{\"continue\":true,\"suppressOutput\":false}}'",
+        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo {}",
         agent.store_name(),
-        event
+        event,
+        shell_single_quote(fallback_json)
     ))
 }
 
@@ -1888,6 +2081,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Codex => "hooks codex",
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
+        agent_hooks::AgentKind::Agy => "hooks agy",
     }
 }
 
@@ -1930,31 +2124,48 @@ fn json_value_contains(value: &Value, needle: &str) -> bool {
     }
 }
 
-fn codex_hooks_path() -> PathBuf {
-    env::var_os("CODEX_HOME")
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn codex_hooks_path() -> PathBuf {
+    non_empty_env_path("CODEX_HOME")
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .unwrap_or_else(|| PathBuf::from(".codex"))
         .join("hooks.json")
 }
 
 fn claude_settings_path() -> PathBuf {
-    env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
+    non_empty_env_path("CLAUDE_CONFIG_DIR")
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
         .unwrap_or_else(|| PathBuf::from(".claude"))
         .join("settings.json")
 }
 
+fn gemini_settings_path_from(gemini_cli_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    gemini_cli_home
+        .or(home)
+        .map(|base| base.join(".gemini/settings.json"))
+        .unwrap_or_else(|| PathBuf::from(".gemini/settings.json"))
+}
+
 fn gemini_settings_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".gemini/settings.json")
+    gemini_settings_path_from(non_empty_env_path("GEMINI_CLI_HOME"), dirs::home_dir())
+}
+
+fn agy_hooks_path_from(home: Option<PathBuf>) -> PathBuf {
+    home.map(|home| home.join(".gemini/config/hooks.json"))
+        .unwrap_or_else(|| PathBuf::from(".gemini/config/hooks.json"))
+}
+
+fn agy_hooks_path() -> PathBuf {
+    agy_hooks_path_from(dirs::home_dir())
 }
 
 fn opencode_config_dir() -> PathBuf {
-    env::var_os("OPENCODE_CONFIG_DIR")
-        .map(PathBuf::from)
+    non_empty_env_path("OPENCODE_CONFIG_DIR")
         .or_else(|| dirs::home_dir().map(|home| home.join(".config/opencode")))
         .unwrap_or_else(|| PathBuf::from(".config/opencode"))
 }
@@ -2160,6 +2371,7 @@ fn agent_launch_command(agent: &str) -> Option<(&'static str, String)> {
         "claude" | "claude-code" => Some(("claude", "claude".to_string())),
         "opencode" => Some(("opencode", "opencode".to_string())),
         "gemini" | "gemini-cli" => Some(("gemini", "gemini".to_string())),
+        "agy" | "antigravity" | "antigravity-cli" => Some(("agy", "agy".to_string())),
         _ => None,
     }
 }
@@ -2519,8 +2731,8 @@ fn build_agents_md(
     out.push_str(
         "`new-pane` reads `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, and\n\
          `LIMUX_PANE_ID`, so it splits your current pane even if GTK focus has\n\
-         moved elsewhere. Live GTK self-spawn currently supports terminal\n\
-         panes only; browser pane creation is deferred.\n\n",
+         moved elsewhere. Live GTK self-spawn supports both terminal and browser\n\
+         panes (`--type browser --url <url>`).\n\n",
     );
 
     out.push_str("## Policies (edit these freely)\n\n");
@@ -2758,26 +2970,34 @@ async fn run_new_pane(client: &mut Client, args: &[String]) -> Result<Value> {
     call_in_workspace_scope(client, workspace, "pane.create", params).await
 }
 
-async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> {
-    if let Some(lines) = parse_opt(args, "--lines") {
-        if lines.parse::<u64>().unwrap_or(0) == 0 {
-            bail!("--lines must be greater than 0");
-        }
+fn build_read_screen_params(args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    if let Some(raw_lines) = parse_opt(args, "--lines") {
+        let lines = raw_lines
+            .parse::<u64>()
+            .ok()
+            .filter(|&lines| lines > 0)
+            .ok_or_else(|| anyhow!("--lines must be greater than 0"))?;
+        params.insert("lines".to_string(), Value::Number(lines.into()));
+    } else if parse_flag(args, "--lines") {
+        bail!("--lines must be greater than 0");
     }
 
-    let workspace = parse_opt(args, "--workspace");
-    let surface = parse_terminal_surface(args)?;
-    let mut params = Map::new();
-    if let Some(workspace) = workspace {
+    if parse_flag(args, "--scrollback") {
+        params.insert("scrollback".to_string(), Value::Bool(true));
+    }
+    if let Some(workspace) = parse_opt(args, "--workspace") {
         params.insert("workspace_id".to_string(), Value::String(workspace));
     }
-    if let Some(surface) = surface {
+    if let Some(surface) = parse_terminal_surface(args)? {
         params.insert("surface_id".to_string(), Value::String(surface));
     }
+    Ok(Value::Object(params))
+}
 
-    client
-        .call("surface.read_text", Value::Object(params))
-        .await
+async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> {
+    let params = build_read_screen_params(args)?;
+    client.call("surface.read_text", params).await
 }
 
 /// Build the `workspace.set_color` params; the host validates the colour name.
@@ -3150,25 +3370,91 @@ fn ensure_placeholder_screenshot_file(path: &Path) -> Result<()> {
     }
 }
 
-async fn run_browser(
-    client: &mut Client,
-    args: &[String],
-    json_output: bool,
-) -> Result<CommandOutput> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserInvocation {
+    browser_args: Vec<String>,
+    local_json: bool,
+    workspace: Option<String>,
+    surface: Option<String>,
+    subcommand: String,
+    rest: Vec<String>,
+}
+
+fn is_browser_subcommand(token: &str) -> bool {
+    matches!(
+        token,
+        "open"
+            | "open-split"
+            | "new"
+            | "identify"
+            | "url"
+            | "get-url"
+            | "goto"
+            | "navigate"
+            | "back"
+            | "forward"
+            | "reload"
+            | "wait"
+            | "snapshot"
+            | "screenshot"
+            | "find"
+            | "frame"
+            | "click"
+            | "dblclick"
+            | "hover"
+            | "focus"
+            | "focus-webview"
+            | "is-webview-focused"
+            | "check"
+            | "uncheck"
+            | "scroll-into-view"
+            | "type"
+            | "fill"
+            | "press"
+            | "keydown"
+            | "keyup"
+            | "select"
+            | "scroll"
+            | "eval"
+            | "get"
+            | "is"
+            | "cookies"
+            | "storage"
+            | "tab"
+            | "addscript"
+            | "addinitscript"
+            | "addstyle"
+            | "console"
+            | "errors"
+            | "highlight"
+            | "state"
+            | "viewport"
+            | "dialog"
+            | "download"
+            | "input-mouse"
+            | "input-keyboard"
+            | "input-touch"
+    )
+}
+
+fn parse_browser_invocation(args: &[String], json_output: bool) -> Result<BrowserInvocation> {
     let mut browser_args = args.to_vec();
     let mut local_json = json_output;
 
-    loop {
-        if browser_args.last().map(|s| s.as_str()) == Some("--json") {
-            local_json = true;
-            browser_args.pop();
-            continue;
-        }
-        break;
+    while browser_args.last().map(|s| s.as_str()) == Some("--json") {
+        local_json = true;
+        browser_args.pop();
     }
 
     let workspace = parse_opt(&browser_args, "--workspace");
-    let mut surface = parse_opt(&browser_args, "--surface");
+    if let Some(ref ws) = workspace {
+        if ws.trim().is_empty() {
+            bail!("--workspace requires a non-empty target");
+        }
+    } else if parse_flag(&browser_args, "--workspace") {
+        bail!("--workspace requires a non-empty target");
+    }
+    let mut surface = parse_terminal_surface(&browser_args)?;
 
     let mut positional: Vec<String> = Vec::new();
     let mut skip = false;
@@ -3179,7 +3465,8 @@ async fn run_browser(
         }
         match arg.as_str() {
             "--workspace" | "--surface" | "--id-format" | "--timeout-ms" | "--load-state"
-            | "--out" => {
+            | "--out" | "--selector" | "--text" | "--attr" | "--property" | "--name"
+            | "--value" => {
                 if idx + 1 < browser_args.len() {
                     skip = true;
                 }
@@ -3195,22 +3482,42 @@ async fn run_browser(
 
     let mut pos_idx = 0usize;
     let first = positional[0].clone();
-    let verbs_without_surface = ["open", "open-split", "new", "identify"];
-
-    if !verbs_without_surface.contains(&first.as_str()) {
-        if !first.contains(':') && !first.contains('-') {
-            // probably still subcommand
-        } else {
-            surface = Some(first);
-            pos_idx = 1;
-        }
+    if surface.is_none()
+        && !is_browser_subcommand(&first)
+        && (first.contains(':') || first.contains('-'))
+    {
+        surface = Some(first);
+        pos_idx = 1;
     }
 
     if pos_idx >= positional.len() {
         bail!("browser requires a subcommand");
     }
-    let sub = positional[pos_idx].clone();
-    let rest = positional[(pos_idx + 1)..].to_vec();
+
+    Ok(BrowserInvocation {
+        browser_args,
+        local_json,
+        workspace,
+        surface,
+        subcommand: positional[pos_idx].clone(),
+        rest: positional[(pos_idx + 1)..].to_vec(),
+    })
+}
+
+async fn run_browser(
+    client: &mut Client,
+    args: &[String],
+    json_output: bool,
+) -> Result<CommandOutput> {
+    let BrowserInvocation {
+        browser_args,
+        local_json,
+        workspace,
+        surface,
+        subcommand: sub,
+        rest,
+    } = parse_browser_invocation(args, json_output)?;
+    let ws = workspace.as_deref();
 
     let output = match sub.as_str() {
         "open" | "open-split" | "new" => {
@@ -3218,8 +3525,8 @@ async fn run_browser(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "about:blank".to_string());
-            if let Some(surface) = surface.clone() {
-                let payload = browser_call(client, Some(surface), "browser.navigate", {
+            if let Some(surface) = surface.as_deref() {
+                let payload = browser_call(client, ws, Some(surface), "browser.navigate", {
                     let mut p = Map::new();
                     p.insert("url".to_string(), Value::String(url));
                     p
@@ -3238,10 +3545,14 @@ async fn run_browser(
             }
         }
         "url" | "get-url" => {
-            let sid = surface
-                .clone()
-                .ok_or_else(|| anyhow!("browser url requires a surface"))?;
-            let payload = browser_call(client, Some(sid), "browser.url.get", Map::new()).await?;
+            let payload = browser_call(
+                client,
+                ws,
+                surface.as_deref(),
+                "browser.url.get",
+                Map::new(),
+            )
+            .await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3249,21 +3560,22 @@ async fn run_browser(
             }
         }
         "goto" | "navigate" => {
-            let sid = surface
-                .clone()
-                .ok_or_else(|| anyhow!("browser navigate requires a surface"))?;
             let url = rest
                 .first()
                 .cloned()
                 .ok_or_else(|| anyhow!("browser navigate requires a URL"))?;
-            let payload = browser_call(client, Some(sid.clone()), "browser.navigate", {
+            let payload = browser_call(client, ws, surface.as_deref(), "browser.navigate", {
                 let mut p = Map::new();
                 p.insert("url".to_string(), Value::String(url));
                 p
             })
             .await?;
             if parse_flag(&browser_args, "--snapshot-after") {
-                let snap = browser_call(client, Some(sid), "browser.snapshot", Map::new()).await?;
+                let sid = surface.as_deref().ok_or_else(|| {
+                    anyhow!("browser navigate --snapshot-after requires a surface")
+                })?;
+                let snap =
+                    browser_call(client, ws, Some(sid), "browser.snapshot", Map::new()).await?;
                 if local_json {
                     let mut merged = payload;
                     if let Some(obj) = merged.as_object_mut() {
@@ -3280,9 +3592,14 @@ async fn run_browser(
                 CommandOutput::Json(payload)
             }
         }
+        "back" | "forward" | "reload" => {
+            let method = format!("browser.{}", sub);
+            let payload = browser_call(client, ws, surface.as_deref(), &method, Map::new()).await?;
+            CommandOutput::Json(payload)
+        }
         "wait" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser wait requires a surface"))?;
             let mut p = Map::new();
             if let Some(selector) = parse_opt(&browser_args, "--selector") {
@@ -3293,7 +3610,7 @@ async fn run_browser(
                     p.insert("timeout_ms".to_string(), Value::Number(ms.into()));
                 }
             }
-            let payload = browser_call(client, Some(sid), "browser.wait", p).await?;
+            let payload = browser_call(client, ws, Some(sid), "browser.wait", p).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3302,9 +3619,10 @@ async fn run_browser(
         }
         "snapshot" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser snapshot requires a surface"))?;
-            let payload = browser_call(client, Some(sid), "browser.snapshot", Map::new()).await?;
+            let payload =
+                browser_call(client, ws, Some(sid), "browser.snapshot", Map::new()).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3330,10 +3648,10 @@ async fn run_browser(
         }
         "screenshot" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser screenshot requires a surface"))?;
             let mut payload =
-                browser_call(client, Some(sid), "browser.screenshot", Map::new()).await?;
+                browser_call(client, ws, Some(sid), "browser.screenshot", Map::new()).await?;
             let out = parse_opt(&browser_args, "--out");
             let mut path = match get_string(&payload, &["path"]) {
                 Some(path) => path,
@@ -3363,7 +3681,7 @@ async fn run_browser(
         }
         "find" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser find requires a surface"))?;
             let locator = rest.first().cloned().unwrap_or_else(|| "text".to_string());
             let value = rest.get(1).cloned().unwrap_or_default();
@@ -3388,7 +3706,7 @@ async fn run_browser(
                     params.insert(locator.clone(), Value::String(value));
                 }
             }
-            let payload = browser_call(client, Some(sid), &method, params).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, params).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3399,13 +3717,13 @@ async fn run_browser(
         }
         "frame" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser frame requires a surface"))?;
             let target = rest.first().cloned().unwrap_or_else(|| "main".to_string());
             let payload = if target == "main" {
-                browser_call(client, Some(sid), "browser.frame.main", Map::new()).await?
+                browser_call(client, ws, Some(sid), "browser.frame.main", Map::new()).await?
             } else {
-                browser_call(client, Some(sid), "browser.frame.select", {
+                browser_call(client, ws, Some(sid), "browser.frame.select", {
                     let mut p = Map::new();
                     p.insert("selector".to_string(), Value::String(target));
                     p
@@ -3416,12 +3734,12 @@ async fn run_browser(
         }
         "click" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser click requires a surface"))?;
             let selector = parse_opt(&browser_args, "--selector")
                 .or_else(|| rest.first().cloned())
                 .ok_or_else(|| anyhow!("browser click requires a selector"))?;
-            let payload = browser_call(client, Some(sid), "browser.click", {
+            let payload = browser_call(client, ws, Some(sid), "browser.click", {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
                 p
@@ -3431,7 +3749,7 @@ async fn run_browser(
         }
         "fill" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser fill requires a surface"))?;
             let selector = parse_opt(&browser_args, "--selector")
                 .or_else(|| rest.first().cloned())
@@ -3439,7 +3757,7 @@ async fn run_browser(
             let text = parse_opt(&browser_args, "--text")
                 .or_else(|| rest.get(1).cloned())
                 .unwrap_or_default();
-            let payload = browser_call(client, Some(sid), "browser.fill", {
+            let payload = browser_call(client, ws, Some(sid), "browser.fill", {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
                 p.insert("text".to_string(), Value::String(text));
@@ -3448,7 +3766,7 @@ async fn run_browser(
             .await?;
             if parse_flag(&browser_args, "--snapshot-after") {
                 let snap =
-                    browser_call(client, surface.clone(), "browser.snapshot", Map::new()).await?;
+                    browser_call(client, ws, Some(sid), "browser.snapshot", Map::new()).await?;
                 if local_json {
                     let mut merged = payload;
                     if let Some(obj) = merged.as_object_mut() {
@@ -3467,7 +3785,7 @@ async fn run_browser(
         }
         "get" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser get requires a surface"))?;
             let get_verb = rest.first().cloned().unwrap_or_else(|| "url".to_string());
             let method = match get_verb.as_str() {
@@ -3496,7 +3814,7 @@ async fn run_browser(
             if let Some(property) = parse_opt(&browser_args, "--property") {
                 p.insert("property".to_string(), Value::String(property));
             }
-            let payload = browser_call(client, Some(sid), &method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, p).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3507,7 +3825,7 @@ async fn run_browser(
         }
         "cookies" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser cookies requires a surface"))?;
             let op = rest.first().cloned().unwrap_or_else(|| "get".to_string());
             let method = match op.as_str() {
@@ -3531,12 +3849,12 @@ async fn run_browser(
             {
                 p.insert("value".to_string(), Value::String(value));
             }
-            let payload = browser_call(client, Some(sid), method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), method, p).await?;
             CommandOutput::Json(payload)
         }
         "storage" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser storage requires a surface"))?;
             if rest.len() < 2 {
                 bail!("browser storage requires <local|session> <get|set|clear>");
@@ -3557,12 +3875,12 @@ async fn run_browser(
             if let Some(value) = rest.get(3) {
                 p.insert("value".to_string(), Value::String(value.clone()));
             }
-            let payload = browser_call(client, Some(sid), method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), method, p).await?;
             CommandOutput::Json(payload)
         }
         "tab" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser tab requires a surface"))?;
             let tab_verb = rest.first().cloned().unwrap_or_else(|| "list".to_string());
             let (method, p) = match tab_verb.as_str() {
@@ -3596,12 +3914,12 @@ async fn run_browser(
                 }
                 _ => bail!("Unsupported browser tab subcommand: {}", tab_verb),
             };
-            let payload = browser_call(client, Some(sid), method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), method, p).await?;
             CommandOutput::Json(payload)
         }
         "addscript" | "addinitscript" | "addstyle" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
             let content = rest.join(" ");
             if content.trim().is_empty() {
@@ -3611,24 +3929,24 @@ async fn run_browser(
             let method = format!("browser.{}", sub);
             let mut p = Map::new();
             p.insert(field.to_string(), Value::String(content));
-            let payload = browser_call(client, Some(sid), &method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, p).await?;
             CommandOutput::Json(payload)
         }
         "console" | "errors" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
             let op = rest.first().cloned().unwrap_or_else(|| "list".to_string());
             let method = format!("browser.{}.{}", sub, op);
-            let payload = browser_call(client, Some(sid), &method, Map::new()).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, Map::new()).await?;
             CommandOutput::Json(payload)
         }
         "highlight" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser highlight requires a surface"))?;
             let selector = rest.first().cloned().unwrap_or_default();
-            let payload = browser_call(client, Some(sid), "browser.highlight", {
+            let payload = browser_call(client, ws, Some(sid), "browser.highlight", {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
                 p
@@ -3638,7 +3956,7 @@ async fn run_browser(
         }
         "state" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser state requires a surface"))?;
             let op = rest.first().cloned().unwrap_or_else(|| "save".to_string());
             let path = rest
@@ -3650,7 +3968,7 @@ async fn run_browser(
                 "load" => "browser.state.load",
                 _ => bail!("Unsupported browser state subcommand: {}", op),
             };
-            let payload = browser_call(client, Some(sid), method, {
+            let payload = browser_call(client, ws, Some(sid), method, {
                 let mut p = Map::new();
                 p.insert("path".to_string(), Value::String(path));
                 p
@@ -3664,10 +3982,10 @@ async fn run_browser(
         _ => {
             // Generic passthrough to browser.<sub>
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
-            let method = format!("browser.{}", sub);
-            let payload = browser_call(client, Some(sid), &method, Map::new()).await?;
+            let method = format!("browser.{}", sub.replace('-', "_"));
+            let payload = browser_call(client, ws, Some(sid), &method, Map::new()).await?;
             CommandOutput::Json(payload)
         }
     };
@@ -3677,6 +3995,97 @@ async fn run_browser(
 
 fn is_unsupported_tmux_cmd(cmd: &str) -> bool {
     matches!(cmd, "popup" | "bind-key" | "unbind-key" | "copy-mode")
+}
+
+fn is_gui_hook_event_name(name: &str) -> bool {
+    matches!(
+        name,
+        "on-workspace-create"
+            | "after-workspace-create"
+            | "on-workspace-delete"
+            | "after-workspace-delete"
+    )
+}
+
+fn parse_set_hook_options(args: &[String]) -> (bool, Option<String>) {
+    let mut list_mode = false;
+    let mut unset = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--" {
+            break;
+        }
+        if arg == "--list" {
+            list_mode = true;
+            idx += 1;
+            continue;
+        }
+        if arg == "--unset" {
+            unset = args.get(idx + 1).cloned();
+            idx += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--unset=") {
+            unset = Some(val.to_string());
+            idx += 1;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--workspace" | "--surface" | "--pane" | "--tab" | "-t"
+        ) {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    (list_mode, unset)
+}
+
+fn parse_set_hook_positional(args: &[String]) -> Result<(String, String)> {
+    let mut idx = 0;
+    let mut name: Option<String> = None;
+    let mut options_ended = false;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if !options_ended {
+            if arg == "--" {
+                options_ended = true;
+                idx += 1;
+                continue;
+            }
+            if matches!(
+                arg.as_str(),
+                "--workspace" | "--unset" | "--surface" | "--pane" | "--tab" | "-t"
+            ) {
+                idx += 2;
+                continue;
+            }
+            if arg == "--list" || arg.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+        }
+        name = Some(arg.clone());
+        idx += 1;
+        break;
+    }
+    let Some(name) = name else {
+        bail!("set-hook requires <name> <command>");
+    };
+    if !options_ended && args.get(idx).map(String::as_str) == Some("--") {
+        idx += 1;
+    }
+    let body = args.get(idx..).unwrap_or_default().join(" ");
+    if name.trim().is_empty() || body.trim().is_empty() {
+        bail!("set-hook requires <name> <command>");
+    }
+    Ok((name, body))
 }
 
 async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) -> Result<Value> {
@@ -3777,27 +4186,13 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             let target = parse_opt(args, "--target-pane")
                 .ok_or_else(|| anyhow!("swap-pane requires --target-pane"))?;
 
-            let source_surface =
-                selected_surface_for_pane(client, workspace.clone(), &pane).await?;
-            let target_surface =
-                selected_surface_for_pane(client, workspace.clone(), &target).await?;
-
-            let _ = call_in_workspace_scope(
+            call_in_workspace_scope(
                 client,
-                workspace.clone(),
-                "surface.move",
-                json!({"surface_id": source_surface, "target_pane_id": target, "index": 0}),
+                workspace,
+                "pane.swap",
+                json!({"pane_id": pane, "target_pane_id": target}),
             )
-            .await?;
-            let _ = call_in_workspace_scope(
-                client,
-                workspace.clone(),
-                "surface.move",
-                json!({"surface_id": target_surface, "target_pane_id": pane, "index": 0}),
-            )
-            .await?;
-
-            Ok(json!({"ok": true}))
+            .await
         }
         "break-pane" => {
             let workspace = parse_opt(args, "--workspace");
@@ -3843,34 +4238,78 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
                 .await
         }
         "set-hook" => {
-            let list_mode = parse_flag(args, "--list");
-            let unset = parse_opt(args, "--unset");
-            with_locked_json_map(&client.socket, "hooks", |hooks, path| {
-                if list_mode {
-                    let text = hooks
+            let (list_mode, unset) = parse_set_hook_options(args);
+            if list_mode {
+                let gui_entries = client
+                    .call("gui_hook.list", json!({}))
+                    .await
+                    .ok()
+                    .and_then(|payload| {
+                        payload.get("hooks").and_then(Value::as_array).map(|hooks| {
+                            hooks
+                                .iter()
+                                .filter(|hook| {
+                                    hook.get("configured").and_then(Value::as_bool) == Some(true)
+                                })
+                                .filter_map(|hook| {
+                                    let event = get_string(hook, &["event"])?;
+                                    let command = get_string(hook, &["command"])?;
+                                    Some((event, command))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .unwrap_or_default();
+                return with_locked_json_map(&client.socket, "hooks", |hooks, path| {
+                    let mut merged = hooks.clone();
+                    for (event, command) in gui_entries {
+                        merged.insert(event, command);
+                    }
+                    let text = merged
                         .iter()
                         .map(|(k, v)| format!("{}={}", k, v))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    return Ok(json!({
+                    Ok(json!({
                         "text": text,
                         "path": path.display().to_string(),
-                    }));
-                }
-                if let Some(name) = unset {
-                    hooks.remove(&name);
-                    write_json_map(path, hooks)?;
+                    }))
+                });
+            }
+            if let Some(name) = unset {
+                if is_gui_hook_event_name(&name)
+                    && client
+                        .call("gui_hook.clear", json!({ "event": name }))
+                        .await
+                        .is_ok()
+                {
+                    let _ = with_locked_json_map(&client.socket, "hooks", |hooks, path| {
+                        if hooks.remove(&name).is_some() {
+                            write_json_map(path, hooks)?;
+                        }
+                        Ok(json!({"ok": true}))
+                    });
                     return Ok(json!({"ok": true}));
                 }
-                let name = args
-                    .iter()
-                    .find(|a| !a.starts_with('-'))
-                    .cloned()
-                    .unwrap_or_default();
-                let body = trailing_title(args).unwrap_or_default();
-                if name.is_empty() || body.is_empty() {
-                    bail!("set-hook requires <name> <command>");
-                }
+                return with_locked_json_map(&client.socket, "hooks", |hooks, path| {
+                    hooks.remove(&name);
+                    write_json_map(path, hooks)?;
+                    Ok(json!({"ok": true}))
+                });
+            }
+            let (name, body) = parse_set_hook_positional(args)?;
+            if is_gui_hook_event_name(&name)
+                && client
+                    .call(
+                        "gui_hook.set",
+                        json!({ "event": name, "command": body, "enabled": true }),
+                    )
+                    .await
+                    .is_ok()
+            {
+                return Ok(json!({"ok": true}));
+            }
+            with_locked_json_map(&client.socket, "hooks", |hooks, path| {
                 hooks.insert(name, body);
                 write_json_map(path, hooks)?;
                 Ok(json!({"ok": true}))
@@ -4018,11 +4457,12 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
-        "claude-hook" | "opencode-hook" | "gemini-hook" => {
+        "claude-hook" | "opencode-hook" | "gemini-hook" | "agy-hook" => {
             let agent = match command {
                 "claude-hook" => agent_hooks::AgentKind::Claude,
                 "opencode-hook" => agent_hooks::AgentKind::OpenCode,
                 "gemini-hook" => agent_hooks::AgentKind::Gemini,
+                "agy-hook" => agent_hooks::AgentKind::Agy,
                 _ => unreachable!(),
             };
             let payload = run_agent_hook(client, agent, args).await?;
@@ -4214,31 +4654,31 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(get_string(&payload, &["text"]).unwrap_or_default())
             }
         }
-        "browser" => return run_browser(client, args, opts.json_output).await,
+        "browser" => run_browser(client, args, opts.json_output).await?,
         "open-browser" => {
             let mut bridged = vec!["open".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "navigate-browser" => {
             let mut bridged = vec!["navigate".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "browser-back" => {
             let mut bridged = vec!["back".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "browser-forward" => {
             let mut bridged = vec!["forward".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "browser-reload" => {
             let mut bridged = vec!["reload".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "pipe-pane" | "wait-for" | "find-window" | "last-window" | "next-window"
         | "previous-window" | "swap-pane" | "break-pane" | "join-pane" | "last-pane"
@@ -4613,6 +5053,7 @@ mod cli_arg_tests {
                 agent_hooks::AgentKind::Codex,
                 agent_hooks::AgentKind::Claude,
                 agent_hooks::AgentKind::Gemini,
+                agent_hooks::AgentKind::Agy,
             ]
         );
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
@@ -4641,7 +5082,11 @@ mod cli_arg_tests {
 
     #[test]
     fn stop_hook_output_matches_codex_schema_shape() {
-        let output = agent_hook_output("stop", &json!({ "session_id": "session-a" }));
+        let output = agent_hook_output(
+            agent_hooks::AgentKind::Codex,
+            "stop",
+            &json!({ "session_id": "session-a" }),
+        );
 
         assert_eq!(
             output,
@@ -4655,6 +5100,7 @@ mod cli_arg_tests {
     #[test]
     fn session_start_hook_output_uses_camel_case_specific_output() {
         let output = agent_hook_output(
+            agent_hooks::AgentKind::Claude,
             "session-start",
             &json!({ "additionalContext": "Limux session restore tracking active." }),
         );
@@ -4669,6 +5115,116 @@ mod cli_arg_tests {
                     "additionalContext": "Limux session restore tracking active."
                 }
             })
+        );
+    }
+
+    #[test]
+    fn agy_hook_output_matches_antigravity_schema() {
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
+                "stop",
+                &json!({ "conversationId": "conv-1" }),
+            ),
+            json!({ "decision": "allow" })
+        );
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
+                "session-start",
+                &json!({ "conversationId": "conv-1" }),
+            ),
+            json!({})
+        );
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
+                "session-start",
+                &json!({
+                    "conversationId": "conv-1",
+                    "additionalContext": "Injected context"
+                }),
+            ),
+            json!({
+                "injectSteps": [{
+                    "systemMessage": {
+                        "systemMessage": "Injected context"
+                    }
+                }]
+            })
+        );
+        assert!(agy_stop_suppresses_notification(
+            &json!({ "terminationReason": "USER_CANCELED" })
+        ));
+        assert!(agy_stop_suppresses_notification(
+            &json!({ "fullyIdle": false })
+        ));
+        assert!(!agy_stop_suppresses_notification(
+            &json!({ "terminationReason": "NO_TOOL_CALL", "fullyIdle": true })
+        ));
+    }
+
+    #[test]
+    fn agy_hook_install_and_uninstall_preserve_other_named_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hooks.json");
+        let original = json!({
+            "my-linter": {
+                "PostToolUse": [{
+                    "matcher": "write_file",
+                    "type": "command",
+                    "command": "echo lint"
+                }]
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        install_agy_hooks(&path, true).expect("install agy hooks");
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(installed["my-linter"], original["my-linter"]);
+        assert_eq!(installed["limux"]["SessionStart"][0]["timeout"], 5);
+        assert!(installed["limux"]["SessionStart"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("env LIMUX_NOTIFY_OSC=1"));
+        assert!(installed["limux"]["SessionStart"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hooks agy session-start"));
+        assert!(installed["limux"]["Stop"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("{\"decision\":\"allow\"}"));
+
+        uninstall_agy_hooks(&path).expect("uninstall agy hooks");
+        let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, original);
+    }
+
+    #[test]
+    fn gemini_and_agy_config_paths_resolve_canonical_locations() {
+        assert_eq!(
+            gemini_settings_path_from(
+                Some(PathBuf::from("/custom/gemini-home")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/custom/gemini-home/.gemini/settings.json")
+        );
+        assert_eq!(
+            gemini_settings_path_from(None, Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.gemini/settings.json")
+        );
+        assert_eq!(
+            gemini_settings_path_from(None, None),
+            PathBuf::from(".gemini/settings.json")
+        );
+        assert_eq!(
+            agy_hooks_path_from(Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.gemini/config/hooks.json")
+        );
+        assert_eq!(
+            agy_hooks_path_from(None),
+            PathBuf::from(".gemini/config/hooks.json")
         );
     }
 
@@ -4791,7 +5347,7 @@ mod cli_arg_tests {
         });
 
         assert_eq!(
-            hook_session_id(&payload).as_deref(),
+            hook_session_id_with_env(agent_hooks::AgentKind::Claude, &payload, |_| None).as_deref(),
             Some("268746f1-5a8f-471c-85db-dc50649c2f9c")
         );
     }
@@ -4804,8 +5360,44 @@ mod cli_arg_tests {
         });
 
         assert_eq!(
-            hook_session_id(&payload).as_deref(),
+            hook_session_id_with_env(agent_hooks::AgentKind::Claude, &payload, |_| None).as_deref(),
             Some("explicit-session")
+        );
+    }
+
+    #[test]
+    fn hook_session_id_isolates_claude_env_and_supports_agy_conversation_id() {
+        let claude_env = |name: &str| {
+            (name == "CLAUDE_CODE_SESSION_ID").then(|| "claude-parent-session".to_string())
+        };
+        assert_eq!(
+            hook_session_id_with_env(agent_hooks::AgentKind::Claude, &json!({}), claude_env)
+                .as_deref(),
+            Some("claude-parent-session")
+        );
+        assert_eq!(
+            hook_session_id_with_env(agent_hooks::AgentKind::Codex, &json!({}), claude_env),
+            None
+        );
+        assert_eq!(
+            hook_session_id_with_env(
+                agent_hooks::AgentKind::Agy,
+                &json!({ "conversationId": "agy-conv-42" }),
+                claude_env
+            )
+            .as_deref(),
+            Some("agy-conv-42")
+        );
+        assert_eq!(
+            hook_session_id_with_env(
+                agent_hooks::AgentKind::Agy,
+                &json!({
+                    "transcriptPath": "/home/u/.gemini/antigravity-cli/brain/fe490dbf-794d-4c6d-8aa0-71d50673e523/.system_generated/logs/transcript.jsonl"
+                }),
+                |_| None
+            )
+            .as_deref(),
+            Some("fe490dbf-794d-4c6d-8aa0-71d50673e523")
         );
     }
 }
@@ -4879,6 +5471,9 @@ mod agent_team_tests {
             "opencode",
             "gemini",
             "gemini-cli",
+            "agy",
+            "antigravity",
+            "antigravity-cli",
         ] {
             assert!(
                 agent_launch_command(agent).is_some(),
@@ -4941,7 +5536,7 @@ mod agent_team_tests {
         assert!(md.contains("LIMUX_WORKSPACE_ID"));
         assert!(md.contains("LIMUX_SURFACE_ID"));
         assert!(md.contains("limux new-pane --direction right --command bash"));
-        assert!(md.contains("Live GTK self-spawn currently supports terminal"));
+        assert!(md.contains("Live GTK self-spawn supports both terminal and browser"));
     }
 }
 
@@ -5285,6 +5880,147 @@ mod new_pane_tests {
     }
 
     #[test]
+    fn read_screen_params_forward_scrollback_and_lines() {
+        assert_eq!(
+            build_read_screen_params(&args(&[
+                "--workspace",
+                "ws-1",
+                "--surface",
+                "4:tab-a",
+                "--scrollback",
+                "--lines",
+                "80",
+            ]))
+            .unwrap(),
+            json!({
+                "workspace_id": "ws-1",
+                "surface_id": "4:tab-a",
+                "scrollback": true,
+                "lines": 80,
+            })
+        );
+        assert_eq!(build_read_screen_params(&args(&[])).unwrap(), json!({}));
+        assert!(build_read_screen_params(&args(&["--lines", "0"])).is_err());
+        assert!(build_read_screen_params(&args(&["--lines"])).is_err());
+    }
+
+    #[test]
+    fn set_hook_positional_separates_event_name_from_command_body() {
+        assert_eq!(
+            parse_set_hook_positional(&args(&["after-workspace-create", "echo", "ready"])).unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "echo ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "after-workspace-create",
+                "bash",
+                "-lc",
+                "echo ready",
+            ]))
+            .unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "bash -lc echo ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "after-workspace-create",
+                "notify-send",
+                "-u",
+                "critical",
+                "Done",
+            ]))
+            .unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "notify-send -u critical Done".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "--workspace",
+                "ws1",
+                "on-workspace-create",
+                "echo",
+                "-n",
+                "ready",
+            ]))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "--workspace=ws1",
+                "-g",
+                "on-workspace-create",
+                "echo",
+                "-n",
+                "ready",
+            ]))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(
+                &["on-workspace-create", "--", "echo", "-n", "ready",]
+            ))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&[
+                "on-workspace-create",
+                "cmd",
+                "--list",
+                "--unset",
+                "x"
+            ])),
+            (false, None)
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&["--workspace", "ws1", "--list"])),
+            (true, None)
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&["--unset", "on-workspace-create"])),
+            (false, Some("on-workspace-create".to_string()))
+        );
+        assert!(parse_set_hook_positional(&args(&["only-name"])).is_err());
+        assert!(parse_set_hook_positional(&args(&["on-workspace-create", "--"])).is_err());
+        assert!(is_gui_hook_event_name("on-workspace-create"));
+        assert!(!is_gui_hook_event_name("pane-focus-in"));
+    }
+
+    #[test]
+    fn new_pane_serializes_browser_type_and_url() {
+        let (_, params) = build_new_pane_request(
+            &args(&["--type", "browser", "--url", "https://example.com"]),
+            |_| None,
+        );
+        assert_eq!(
+            params,
+            json!({
+                "direction": "right",
+                "type": "browser",
+                "url": "https://example.com"
+            })
+        );
+    }
+
+    #[test]
     fn new_pane_serializes_env_defaults_and_command() {
         let (workspace, params) = build_new_pane_request(&args(&["--command", "claude"]), test_env);
 
@@ -5517,5 +6253,56 @@ mod new_pane_tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn browser_invocation_preserves_hyphenated_subcommands_and_positional_surfaces() {
+        let flagged = parse_browser_invocation(
+            &args(&[
+                "--surface",
+                "15:36580cc0-ce6a-47a7-9a02-aeea222d4d38",
+                "get-url",
+            ]),
+            false,
+        )
+        .expect("flagged get-url");
+        assert_eq!(
+            flagged.surface.as_deref(),
+            Some("15:36580cc0-ce6a-47a7-9a02-aeea222d4d38")
+        );
+        assert_eq!(flagged.subcommand, "get-url");
+        assert!(flagged.rest.is_empty());
+
+        let positional_surface = parse_browser_invocation(
+            &args(&[
+                "15:36580cc0-ce6a-47a7-9a02-aeea222d4d38",
+                "get-url",
+                "--json",
+            ]),
+            false,
+        )
+        .expect("positional surface get-url");
+        assert_eq!(
+            positional_surface.surface.as_deref(),
+            Some("15:36580cc0-ce6a-47a7-9a02-aeea222d4d38")
+        );
+        assert_eq!(positional_surface.subcommand, "get-url");
+        assert!(positional_surface.local_json);
+
+        let workspace_scoped =
+            parse_browser_invocation(&args(&["--workspace", "ws-1", "focus-webview"]), false)
+                .expect("workspace focus-webview");
+        assert_eq!(workspace_scoped.workspace.as_deref(), Some("ws-1"));
+        assert_eq!(workspace_scoped.surface, None);
+        assert_eq!(workspace_scoped.subcommand, "focus-webview");
+
+        let click = parse_browser_invocation(
+            &args(&["--surface", "surface:3", "click", "--selector", "#go"]),
+            false,
+        )
+        .expect("click with --selector");
+        assert_eq!(click.surface.as_deref(), Some("surface:3"));
+        assert_eq!(click.subcommand, "click");
+        assert!(click.rest.is_empty());
     }
 }
