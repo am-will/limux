@@ -1,5 +1,140 @@
 use super::*;
 
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn terminal_commands_retry_until_ready_then_reply_without_a_timer() {
+    use std::time::{Duration, Instant};
+
+    let pump_for = |duration: Duration| {
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            for _ in 0..100 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    for key in [
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config"),
+        "command = direct:/bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+    std::env::set_var("LIMUX_AGENT_HOOK_STATE_DIR", temp.path().join("hooks"));
+    std::env::set_var("LIMUX_EAGER_RESTORE", "0");
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.TerminalCommandReadinessTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (workspace_id, shortcuts) = {
+        let state = state.borrow();
+        (
+            state.active_workspace().unwrap().id.clone(),
+            state.shortcuts.clone(),
+        )
+    };
+    let pane = create_pane_for_workspace(
+        &state,
+        &shortcuts,
+        &workspace_id,
+        temp.path().to_str(),
+        Rc::new(RefCell::new(None)),
+        PaneCreationOptions {
+            initial_state: None,
+            skip_default_tab: false,
+            suppress_initial_autostart: true,
+            initial_command: None,
+        },
+    );
+    let marker = temp.path().join("commands");
+    let response = serde_json::json!({"accepted": true});
+    let (reply, rx) = std::sync::mpsc::channel();
+    send_response_after_terminal_command(
+        "pane.create",
+        pane.clone().upcast(),
+        None,
+        format!("printf 'retry\\n' >> '{}'", marker.display()),
+        response.clone(),
+        reply,
+    );
+    // An unrooted terminal cannot realize, so delivery must remain pending.
+    assert!(matches!(
+        rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+
+    let pane_window = gtk::Window::builder().child(&pane).build();
+    pane_window.present();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let retried = loop {
+        if let Ok(result) = rx.try_recv() {
+            break result.unwrap();
+        }
+        assert!(Instant::now() < deadline, "unrooted command never retried");
+        pump_for(Duration::from_millis(10));
+    };
+    assert_eq!(retried, response);
+
+    let (reply, rx) = std::sync::mpsc::channel();
+    send_response_after_terminal_command(
+        "pane.create",
+        pane.clone().upcast(),
+        None,
+        format!("printf 'ready\\n' >> '{}'", marker.display()),
+        response.clone(),
+        reply,
+    );
+    assert_eq!(
+        rx.try_recv()
+            .expect("ready terminal waited for a timer")
+            .unwrap(),
+        response
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_to_string(&marker).unwrap_or_default() != "retry\nready\n" {
+        assert!(
+            Instant::now() < deadline,
+            "commands did not execute in order"
+        );
+        pump_for(Duration::from_millis(10));
+    }
+    pump_for(Duration::from_millis(
+        PANE_CREATE_COMMAND_READY_INTERVAL_MS * 3,
+    ));
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "retry\nready\n");
+
+    pane_window.close();
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
 // Review of #200: the split's teardown waits for a frame, and until the
 // rebuild the new pane is in no workspace root, where pane lookups search. A
 // caller targeting the pane from `pane.create`'s reply got "pane not found".

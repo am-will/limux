@@ -236,65 +236,53 @@ fn send_response_after_terminal_command(
     response: serde_json::Value,
     reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
 ) {
-    if let Some((_, handle)) =
-        pane::terminal_handle_for_surface(&root_or_pane, surface_id.as_deref()).or_else(|| {
-            surface_id
-                .is_none()
-                .then(|| pane::terminal_handle_for_root(&root_or_pane))
-                .flatten()
-        })
-    {
-        if !handle.health().realized {
-            handle.realize_in_background();
-        }
-    }
-
     let mut attempts = 0;
     let mut command_sent = false;
     let mut reply = Some(reply);
 
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(PANE_CREATE_COMMAND_READY_INTERVAL_MS),
-        move || {
-            attempts += 1;
-
-            if let Some((_, handle)) =
-                pane::terminal_handle_for_surface(&root_or_pane, surface_id.as_deref()).or_else(
-                    || {
-                        surface_id
-                            .is_none()
-                            .then(|| pane::terminal_handle_for_root(&root_or_pane))
-                            .flatten()
-                    },
-                )
-            {
-                if !handle.health().realized {
-                    handle.realize_in_background();
-                }
-                if !command_sent {
-                    command_sent = handle.send_text(&command);
-                }
-                if command_sent && handle.send_key("Enter") {
-                    if let Some(reply) = reply.take() {
-                        let _ = reply.send(Ok(response.clone()));
-                    }
-                    return glib::ControlFlow::Break;
-                }
+    let mut attempt = move || {
+        if let Some((_, handle)) =
+            pane::terminal_handle_for_surface(&root_or_pane, surface_id.as_deref()).or_else(|| {
+                surface_id
+                    .is_none()
+                    .then(|| pane::terminal_handle_for_root(&root_or_pane))
+                    .flatten()
+            })
+        {
+            if !handle.health().realized {
+                handle.realize_in_background();
             }
-
-            if attempts >= PANE_CREATE_COMMAND_READY_ATTEMPTS {
+            if !command_sent {
+                command_sent = handle.send_text(&command);
+            }
+            if command_sent && handle.send_key("Enter") {
                 if let Some(reply) = reply.take() {
-                    let label = surface_id.as_deref().unwrap_or("initial");
-                    let _ = reply.send(Err(BridgeError::internal(format!(
-                        "{method} command target surface {label} never became writable"
-                    ))));
+                    let _ = reply.send(Ok(response.clone()));
                 }
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
+                return glib::ControlFlow::Break;
             }
-        },
-    );
+        }
+
+        if attempts >= PANE_CREATE_COMMAND_READY_ATTEMPTS {
+            if let Some(reply) = reply.take() {
+                let label = surface_id.as_deref().unwrap_or("initial");
+                let _ = reply.send(Err(BridgeError::internal(format!(
+                    "{method} command target surface {label} never became writable"
+                ))));
+            }
+            glib::ControlFlow::Break
+        } else {
+            attempts += 1;
+            glib::ControlFlow::Continue
+        }
+    };
+
+    if attempt().is_continue() {
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(PANE_CREATE_COMMAND_READY_INTERVAL_MS),
+            attempt,
+        );
+    }
 }
 
 fn normalize_workspace_handle(raw: &str) -> &str {
