@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${LIMUX_CLAUDE_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks claude stop || echo '{\"continue\":true,\"suppressOutput\":false}'",
+            "command": "[ \"${LIMUX_CLAUDE_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks claude notification || echo '{\"continue\":true,\"suppressOutput\":false}'",
             "statusMessage": "Limux Claude session restore",
             "timeout": 5
           }

@@ -5365,6 +5365,150 @@ mod cli_arg_tests {
         );
     }
 
+    #[tokio::test]
+    async fn protocol_cli_subcommands_execute_and_call_canonical_rpc_method() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("mock.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind mock socket");
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded_server = std::sync::Arc::clone(&recorded);
+
+        let server_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded_conn = std::sync::Arc::clone(&recorded_server);
+                tokio::spawn(async move {
+                    let (reader_half, mut writer_half) = stream.into_split();
+                    let mut reader = BufReader::new(reader_half);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let req: V2Request = serde_json::from_str(line.trim()).expect("valid request");
+                    recorded_conn
+                        .lock()
+                        .expect("recorded lock")
+                        .push(req.method.clone());
+                    let resp = V2Response::success(
+                        req.id,
+                        json!({
+                            "workspace_id": "ws-1",
+                            "workspace_ref": "workspace:1",
+                            "surface_id": "1:tab-1",
+                            "surface_ref": "surface:1:tab-1",
+                            "pane_id": "1",
+                            "pane_ref": "pane:1",
+                            "url": "https://example.com",
+                        }),
+                    );
+                    let mut encoded = serde_json::to_string(&resp).expect("encode response");
+                    encoded.push('\n');
+                    let _ = writer_half.write_all(encoded.as_bytes()).await;
+                    let _ = writer_half.flush().await;
+                });
+            }
+        });
+
+        let mut client = Client::new(socket_path.clone());
+        let mut tested_count = 0usize;
+
+        for spec in &limux_protocol::methods::ALL_METHOD_SPECS {
+            for &sub in spec.cli_subcommands {
+                tested_count += 1;
+                assert_eq!(
+                    limux_protocol::methods::resolve_cli_subcommand_spec(sub).map(|s| s.name),
+                    Some(spec.name),
+                    "CLI subcommand {sub} should resolve to {}",
+                    spec.name
+                );
+
+                if sub == "notify" && terminal_notifications::forced() {
+                    continue;
+                }
+
+                recorded.lock().expect("recorded lock").clear();
+                let command_args = match sub {
+                    "send" => args(&["send", "hello"]),
+                    "send-key" => args(&["send-key", "Enter"]),
+                    "notify" => args(&["notify", "--workspace", "ws-1", "hello"]),
+                    "select-workspace" | "close-workspace" => args(&[sub, "--workspace", "ws-1"]),
+                    "rename-workspace" | "rename-window" => {
+                        args(&[sub, "--workspace", "ws-1", "Title"])
+                    }
+                    "set-workspace-color" => {
+                        args(&["set-workspace-color", "--workspace", "ws-1", "blue"])
+                    }
+                    "set-workspace-group" => {
+                        args(&["set-workspace-group", "--workspace", "ws-1", "Ops"])
+                    }
+                    "rename-group" => args(&["rename-group", "--group", "g1", "Ops"]),
+                    "set-group-color" => args(&["set-group-color", "--group", "g1", "blue"]),
+                    "collapse-group" | "expand-group" | "delete-group" => {
+                        args(&[sub, "--group", "g1"])
+                    }
+                    "tab-action" => args(&["tab-action", "--action", "pin"]),
+                    "rename-tab" => args(&["rename-tab", "Title"]),
+                    "swap-pane" => args(&["swap-pane", "--pane", "1", "--target-pane", "2"]),
+                    "join-pane" => args(&["join-pane", "--target-pane", "2"]),
+                    "resize-pane" => args(&["resize-pane", "--pane", "1"]),
+                    "open-browser" => args(&["open-browser", "https://example.com"]),
+                    "navigate-browser" => args(&[
+                        "navigate-browser",
+                        "--surface",
+                        "1:tab-1",
+                        "https://example.com",
+                    ]),
+                    "browser-back" | "browser-forward" | "browser-reload" => {
+                        args(&[sub, "--surface", "1:tab-1"])
+                    }
+                    _ => args(&[sub]),
+                };
+
+                execute_command(&mut client, &default_opts(command_args))
+                    .await
+                    .unwrap_or_else(|err| panic!("CLI subcommand {sub} failed: {err:#}"));
+
+                let calls = recorded.lock().expect("recorded lock").clone();
+                assert!(
+                    calls.iter().any(|method| method == spec.name),
+                    "CLI subcommand {sub} expected RPC {}, got {calls:?}",
+                    spec.name
+                );
+            }
+        }
+        assert!(tested_count >= 40, "expected full CLI subcommand coverage");
+
+        for non_cli in [
+            "ping",
+            "send-text",
+            "workspace.activate",
+            "activate-workspace",
+            "capabilities",
+            "list-windows",
+            "new-window",
+            "focus-window",
+            "close-window",
+            "next-workspace",
+            "previous-workspace",
+            "last-workspace",
+            "new-split",
+            "browser.open-split",
+        ] {
+            assert!(
+                limux_protocol::methods::resolve_cli_subcommand_spec(non_cli).is_none(),
+                "{non_cli} must not be registered as a CLI subcommand"
+            );
+            let err = execute_command(&mut client, &default_opts(args(&[non_cli])))
+                .await
+                .expect_err("non-CLI name must fail");
+            assert!(
+                err.to_string().contains("unknown command:"),
+                "unexpected error for {non_cli}: {err:#}"
+            );
+        }
+
+        server_task.abort();
+    }
+
     #[test]
     fn hook_session_id_isolates_claude_env_and_supports_agy_conversation_id() {
         let claude_env = |name: &str| {

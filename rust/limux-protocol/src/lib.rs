@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+pub mod methods;
+
 fn default_params() -> Value {
     Value::Object(Map::new())
 }
