@@ -822,6 +822,46 @@ mod tests {
         assert!(!record.environment.contains_key("GEMINI_CONFIG_DIR"));
     }
 
+    #[test]
+    fn launch_record_omits_credentials_from_captured_codex_config() {
+        const CHILD: &str = "LIMUX_TEST_CAPTURE_CONFIG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "agent_hooks::tests::launch_record_omits_credentials_from_captured_codex_config",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("LIMUX_AGENT_LAUNCH_ARGV")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let proc_args = [
+            "codex",
+            "-c",
+            r#"model_providers.custom.http_headers={Authorization="Bearer sentinel"}"#,
+            "--config",
+            r#"model_reasoning_effort="high""#,
+            "--full-auto",
+        ]
+        .map(str::to_string);
+        let record =
+            launch_record_from_context(AgentKind::Codex, None, Some(&proc_args), None, None)
+                .expect("launch record");
+        assert_eq!(
+            record.arguments,
+            [
+                "codex",
+                "--config",
+                r#"model_reasoning_effort="high""#,
+                "--full-auto",
+            ]
+        );
+    }
+
     fn await_marker(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !path.exists() {

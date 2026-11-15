@@ -236,8 +236,10 @@ pub fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -> Vec<S
                 .get(index + 1)
                 .filter(|next| !next.starts_with('-') && !next.trim().is_empty())
             {
-                result.push(arg.clone());
-                result.push(next.clone());
+                if option_value_is_safe(kind, arg, next) {
+                    result.push(arg.clone());
+                    result.push(next.clone());
+                }
                 index += 2;
             } else {
                 index += 1;
@@ -475,6 +477,46 @@ fn option_takes_safe_value(kind: AgentKind, arg: &str) -> bool {
     )
 }
 
+fn option_value_is_safe(kind: AgentKind, option: &str, value: &str) -> bool {
+    if kind != AgentKind::Codex || !matches!(option, "-c" | "--config") {
+        return !value.trim().is_empty();
+    }
+    let Some((key, value)) = value.split_once('=') else {
+        return false;
+    };
+    // Provider and MCP overrides can nest credentials under arbitrary keys.
+    // Capture only scalar preferences, not arbitrary configuration tables.
+    if !matches!(
+        key.trim(),
+        "model"
+            | "model_provider"
+            | "profile"
+            | "approval_policy"
+            | "sandbox_mode"
+            | "model_reasoning_effort"
+            | "model_reasoning_summary"
+            | "model_verbosity"
+            | "model_context_window"
+            | "model_auto_compact_token_limit"
+            | "web_search"
+    ) {
+        return false;
+    }
+    let value = value.trim();
+    if value.is_empty() || value.contains(['\n', '\r']) {
+        return false;
+    }
+    if value.starts_with('"') {
+        return serde_json::from_str::<String>(value).is_ok();
+    }
+    if let Some(literal) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        return !literal.contains('\'');
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_./-:+".contains(&byte))
+}
+
 fn option_is_safe_flag_or_assignment(kind: AgentKind, arg: &str) -> bool {
     if arg == "--sandbox" && matches!(kind, AgentKind::Agy | AgentKind::Gemini) {
         return true;
@@ -501,7 +543,7 @@ fn option_is_safe_flag_or_assignment(kind: AgentKind, arg: &str) -> bool {
     if name == "--sandbox" && matches!(kind, AgentKind::Agy | AgentKind::Gemini) {
         return matches!(value.trim(), "true" | "false");
     }
-    option_takes_safe_value(kind, name) && !value.trim().is_empty()
+    option_takes_safe_value(kind, name) && option_value_is_safe(kind, name, value)
 }
 
 #[cfg(test)]
@@ -563,6 +605,60 @@ mod tests {
                 "high",
                 "--dangerously-skip-permissions",
             ])
+        );
+    }
+
+    #[test]
+    fn sanitizer_drops_codex_config_credentials_in_all_option_forms() {
+        for value in [
+            r#"model_providers.custom.http_headers={Authorization="Bearer sentinel"}"#,
+            r#"model_providers.custom={http_headers={Authorization="Bearer sentinel"}}"#,
+            r#"model_providers.custom.experimental_bearer_token="sentinel""#,
+            r#"mcp_servers.private.env={API_KEY="sentinel"}"#,
+            r#"profiles.work={model_providers={custom={http_headers={Authorization="sentinel"}}}}"#,
+            r#""model_providers"."custom"."http_headers"={Authorization="sentinel"}"#,
+            r#"model={http_headers={Authorization="sentinel"}}"#,
+            r#"model=[{Authorization="sentinel"}]"#,
+            "model=custom\n[model_providers.custom]\nexperimental_bearer_token='sentinel'",
+        ] {
+            for option in ["-c", "--config"] {
+                for args in [
+                    vec_str(&["codex", option, value, "--full-auto"]),
+                    vec_str(&["codex", &format!("{option}={value}"), "--full-auto"]),
+                ] {
+                    assert_eq!(
+                        sanitize_launch_arguments(AgentKind::Codex, &args),
+                        vec_str(&["codex", "--full-auto"]),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sanitizer_preserves_codex_preference_overrides_and_other_config_paths() {
+        let args = vec_str(&[
+            "codex",
+            "-c",
+            "profile=work",
+            "--config=model=custom-model",
+            "-c=model_reasoning_effort=high",
+            "--config",
+            "sandbox_mode=workspace-write",
+            "--config=approval_policy=on-request",
+            "--config=web_search='cached'",
+        ]);
+        assert_eq!(sanitize_launch_arguments(AgentKind::Codex, &args), args);
+
+        let args = vec_str(&["opencode", "--config", "/tmp/custom-settings.json"]);
+        assert_eq!(sanitize_launch_arguments(AgentKind::OpenCode, &args), args);
+
+        assert_eq!(
+            sanitize_launch_arguments(
+                AgentKind::Codex,
+                &vec_str(&["codex", "-cmodel=custom-model", "--full-auto"]),
+            ),
+            vec_str(&["codex", "--full-auto"])
         );
     }
 
