@@ -161,11 +161,11 @@ printf 'command = /bin/sh\n' > "$XDG_CONFIG_HOME/ghostty/config"
 echo
 echo "== stage 0: agent-team --dry-run (no host) =="
 "$LIMUX_CLI" agent-team --dry-run \
-  --agents codex,claude,opencode,gemini \
+  --agents codex,claude,opencode,gemini,agy \
   --cwd "$DEMO_DIR" \
   2>&1 | tee "$LOG_DIR/stage0.txt"
 
-grep -q "peers=\[codex, claude, opencode, gemini\]" \
+grep -q "peers=\[codex, claude, opencode, gemini, agy\]" \
   "$LOG_DIR/stage0.txt" \
   || { echo "FAIL: stage 0 dry-run did not report expected peers"; exit 1; }
 echo "stage 0: OK"
@@ -980,11 +980,22 @@ echo "stage 6c: OK (scoped lifecycle, background focus, pins, and saved tab sele
 
 # --- 10. Stage 7: hook translators end-to-end -----------------------------
 echo
-echo "== stage 7: claude-hook event translation =="
+echo "== stage 7: claude-hook and agy-hook event translation =="
 echo '{"hook_event_name":"Notification","message":"hello from smoke"}' \
   | LIMUX_WORKSPACE_ID="" "$LIMUX_CLI" claude-hook 2>&1 \
   | tee "$LOG_DIR/stage7.txt"
-echo "stage 7: OK (claude-hook accepted JSON on stdin)"
+AGY_SMOKE_HOME="$DEMO_DIR/agy-home"
+mkdir -p "$AGY_SMOKE_HOME" "$DEMO_DIR/agy-sessions"
+HOME="$AGY_SMOKE_HOME" "$LIMUX_CLI" hooks agy install >"$LOG_DIR/stage7-agy-install.txt"
+[ -f "$AGY_SMOKE_HOME/.gemini/config/hooks.json" ] \
+  || { echo "FAIL: hooks agy install did not write ~/.gemini/config/hooks.json"; exit 1; }
+echo '{"conversationId":"smoke-conv-1","message":"agy done"}' \
+  | HOME="$AGY_SMOKE_HOME" LIMUX_SESSION_DIR="$DEMO_DIR/agy-sessions" LIMUX_WORKSPACE_ID="" \
+    "$LIMUX_CLI" --json hooks agy stop >"$LOG_DIR/stage7-agy-stop.json"
+jq -e '.decision == "allow"' "$LOG_DIR/stage7-agy-stop.json" >/dev/null \
+  || { echo "FAIL: hooks agy stop did not emit {\"decision\":\"allow\"}"; exit 1; }
+HOME="$AGY_SMOKE_HOME" "$LIMUX_CLI" hooks agy uninstall >"$LOG_DIR/stage7-agy-uninstall.txt"
+echo "stage 7: OK (claude-hook and agy-hook accepted JSON on stdin)"
 
 # --- 11. Stage 8: session persistence and clean process restart -----------
 echo
