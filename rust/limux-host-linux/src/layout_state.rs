@@ -949,6 +949,13 @@ fn limux_cli_candidates(exe: &Path) -> Vec<PathBuf> {
     if let Some(dir) = exe.parent() {
         candidates.push(dir.join("limux-cli"));
 
+        #[cfg(test)]
+        if let Some(test_cli) = cargo_test_profile_limux_cli(exe) {
+            if !candidates.contains(&test_cli) {
+                candidates.push(test_cli);
+            }
+        }
+
         if let Some(libexec_dir) = dir.parent() {
             if let Some(prefix) = libexec_dir.parent() {
                 candidates.push(prefix.join("bin/limux"));
@@ -958,6 +965,37 @@ fn limux_cli_candidates(exe: &Path) -> Vec<PathBuf> {
 
     candidates.push(PathBuf::from("limux"));
     candidates
+}
+
+#[cfg(test)]
+fn cargo_test_profile_limux_cli(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    if dir.file_name().is_some_and(|name| name == "deps") {
+        return Some(dir.parent()?.join("limux-cli"));
+    }
+    if dir.file_name().is_some_and(|name| name == "out") {
+        for ancestor in dir.ancestors().skip(1).take(4) {
+            if ancestor.file_name().is_some_and(|name| name == "build") {
+                return Some(ancestor.parent()?.join("limux-cli"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn test_limux_cli_path_from_exe(exe: &Path) -> PathBuf {
+    cargo_test_profile_limux_cli(exe).unwrap_or_else(|| {
+        exe.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("limux-cli")
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_limux_cli_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current test executable");
+    test_limux_cli_path_from_exe(&exe)
 }
 
 fn sanitize_launch_arguments(kind: RestorableAgentKind, arguments: &[String]) -> Vec<String> {
@@ -1143,6 +1181,35 @@ mod tests {
         let candidates = limux_cli_candidates(dev);
         assert!(candidates.contains(&PathBuf::from("/repo/target/debug/limux-cli")));
         assert!(candidates.contains(&PathBuf::from("limux")));
+    }
+
+    #[test]
+    fn test_limux_cli_path_handles_deps_and_cargo_build_dir_layouts() {
+        let deps_bin = Path::new("/repo/target/release/deps/limux-89e919ff7179bb04");
+        assert_eq!(
+            test_limux_cli_path_from_exe(deps_bin),
+            PathBuf::from("/repo/target/release/limux-cli")
+        );
+        assert!(limux_cli_candidates(deps_bin)
+            .contains(&PathBuf::from("/repo/target/release/limux-cli")));
+
+        let cargo_1_100_bin = Path::new(
+            "/repo/target/release/build/limux-host-linux/7d6eb6e61a9954d1/out/limux-89e919ff7179bb04",
+        );
+        assert_eq!(
+            test_limux_cli_path_from_exe(cargo_1_100_bin),
+            PathBuf::from("/repo/target/release/limux-cli")
+        );
+        assert!(limux_cli_candidates(cargo_1_100_bin)
+            .contains(&PathBuf::from("/repo/target/release/limux-cli")));
+
+        let hashed_build_bin = Path::new(
+            "/repo/target/debug/build/limux-host-linux-7d6eb6e61a9954d1/out/limux-89e919ff7179bb04",
+        );
+        assert_eq!(
+            test_limux_cli_path_from_exe(hashed_build_bin),
+            PathBuf::from("/repo/target/debug/limux-cli")
+        );
     }
 
     #[test]

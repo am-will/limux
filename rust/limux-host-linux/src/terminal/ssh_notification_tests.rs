@@ -100,13 +100,7 @@ esac
     };
     window.present();
     pump_until(|| tty_file.exists() && handles.iter().all(|h| h.health().realized));
-    let cli = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("limux-cli");
+    let cli = crate::layout_state::test_limux_cli_path();
     let run_hook = |pane: &str, agent: &str, message: &str| {
         use std::io::Write;
         let mut child = std::process::Command::new("setsid")
@@ -290,13 +284,7 @@ fn linked_tmux_sessions_keep_the_originating_notification_client() {
             .count()
             == 2
     });
-    let cli = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("limux-cli");
+    let cli = crate::layout_state::test_limux_cli_path();
     let run_hook = |context: &str, message: &str| {
         use std::io::Write;
         let mut child = std::process::Command::new("setsid")
