@@ -165,11 +165,11 @@ printf 'command = /bin/sh\n' > "$XDG_CONFIG_HOME/ghostty/config"
 echo
 echo "== stage 0: agent-team --dry-run (no host) =="
 "$LIMUX_CLI" agent-team --dry-run \
-  --agents codex,claude,opencode,gemini \
+  --agents codex,claude,opencode,gemini,agy \
   --cwd "$DEMO_DIR" \
   2>&1 | tee "$LOG_DIR/stage0.txt"
 
-grep -q "peers=\[codex, claude, opencode, gemini\]" \
+grep -q "peers=\[codex, claude, opencode, gemini, agy\]" \
   "$LOG_DIR/stage0.txt" \
   || { echo "FAIL: stage 0 dry-run did not report expected peers"; exit 1; }
 echo "stage 0: OK"
@@ -432,6 +432,12 @@ for regression in \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
+  pane::tests::pane_summaries_for_widgets_preserves_caller_leaf_order \
+  pane::tests::pre_map_browser_navigation_survives_first_map \
+  pane::tests::browser_back_and_forward_report_destination_uri_immediately \
+  split_tree::tests::split_node_swaps_leaf_panes_and_locates_nearest_split_ratio \
+  window::tests::swapped_split_node_panes_report_swapped_order_and_indices \
+  window::pane_create_tests::pane_swap_and_list_preserve_swapped_leaf_order \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
   window::ssh_launch_tests::persistent_ssh_restores_retries_moves_and_closes \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
@@ -982,13 +988,137 @@ echo "stage 6e: OK (on-* and after-* gui-hooks set, list and clear; socket reque
 wait_for_healthy_surfaces limux "$LOG_DIR/stage6c-final-health.json"
 echo "stage 6c: OK (scoped lifecycle, background focus, pins, and saved tab selection)"
 
+echo
+echo "== stage 6f: tmux and browser parity commands =="
+PARITY_READY="$DEMO_DIR/parity-ws-ready"
+"$LIMUX_CLI" --json --id-format both new-workspace \
+  --cwd "$DEMO_DIR" \
+  --command "printf 'line-one\\nline-two\\nline-three\\n'; printf ready > '$PARITY_READY'" \
+  >"$LOG_DIR/stage6f-new-ws.json"
+PARITY_WORKSPACE="$(jq -r '.workspace_id' "$LOG_DIR/stage6f-new-ws.json")"
+for _ in $(seq 1 50); do
+  [ -f "$PARITY_READY" ] && break
+  sleep 0.1
+done
+[ -f "$PARITY_READY" ] \
+  || { echo "FAIL: readiness-gated new-workspace --command did not execute"; exit 1; }
+
+"$LIMUX_CLI" select-workspace --workspace "$WORKSPACE_ID" >"$LOG_DIR/stage6f-select-main.txt"
+"$LIMUX_CLI" --json --id-format both next-window >"$LOG_DIR/stage6f-next-win.json"
+jq -e --arg ws "$PARITY_WORKSPACE" '.workspace_id == $ws' "$LOG_DIR/stage6f-next-win.json" >/dev/null \
+  || { echo "FAIL: next-window did not select parity workspace"; exit 1; }
+"$LIMUX_CLI" --json --id-format both previous-window >"$LOG_DIR/stage6f-prev-win.json"
+jq -e --arg ws "$WORKSPACE_ID" '.workspace_id == $ws' "$LOG_DIR/stage6f-prev-win.json" >/dev/null \
+  || { echo "FAIL: previous-window did not return to main workspace"; exit 1; }
+"$LIMUX_CLI" --json --id-format both last-window >"$LOG_DIR/stage6f-last-win.json"
+jq -e --arg ws "$PARITY_WORKSPACE" '.workspace_id == $ws' "$LOG_DIR/stage6f-last-win.json" >/dev/null \
+  || { echo "FAIL: last-window did not toggle back to parity workspace"; exit 1; }
+
+for _ in $(seq 1 50); do
+  "$LIMUX_CLI" read-screen --workspace "$PARITY_WORKSPACE" --scrollback --lines 3 \
+    >"$LOG_DIR/stage6f-lines.txt"
+  if grep -Fq "line-three" "$LOG_DIR/stage6f-lines.txt"; then
+    break
+  fi
+  sleep 0.1
+done
+grep -Fq "line-three" "$LOG_DIR/stage6f-lines.txt" \
+  || { echo "FAIL: read-screen --scrollback --lines did not return trailing output"; exit 1; }
+[ "$(wc -l < "$LOG_DIR/stage6f-lines.txt")" -le 4 ] \
+  || { echo "FAIL: read-screen --lines 3 did not bound line count"; exit 1; }
+"$LIMUX_CLI" clear-history --workspace "$PARITY_WORKSPACE" >"$LOG_DIR/stage6f-clear-history.txt"
+
+"$LIMUX_CLI" --json --id-format both list-panes --workspace "$PARITY_WORKSPACE" \
+  >"$LOG_DIR/stage6f-panes-initial.json"
+PARITY_PANE_A="$(jq -r '.panes[0].pane_id' "$LOG_DIR/stage6f-panes-initial.json")"
+"$LIMUX_CLI" --json --id-format both new-pane --workspace "$PARITY_WORKSPACE" --direction right \
+  >"$LOG_DIR/stage6f-pane-b.json"
+PARITY_PANE_B="$(jq -r '.pane_id' "$LOG_DIR/stage6f-pane-b.json")"
+wait_for_healthy_surfaces "$PARITY_WORKSPACE" "$LOG_DIR/stage6f-health.json"
+
+"$LIMUX_CLI" swap-pane --workspace "$PARITY_WORKSPACE" \
+  --pane "$PARITY_PANE_A" --target-pane "$PARITY_PANE_B" >"$LOG_DIR/stage6f-swap.txt"
+"$LIMUX_CLI" --json --id-format both list-panes --workspace "$PARITY_WORKSPACE" \
+  >"$LOG_DIR/stage6f-panes-swapped.json"
+jq -e --arg a "$PARITY_PANE_A" --arg b "$PARITY_PANE_B" \
+  '(.panes | map(.pane_id)) == [$b, $a]' "$LOG_DIR/stage6f-panes-swapped.json" >/dev/null \
+  || { echo "FAIL: swap-pane did not swap leaf pane order"; exit 1; }
+
+"$LIMUX_CLI" resize-pane --workspace "$PARITY_WORKSPACE" --pane "$PARITY_PANE_B" -R --amount 5 \
+  >"$LOG_DIR/stage6f-resize.txt"
+"$LIMUX_CLI" --request "$(jq -nc --arg ws "$PARITY_WORKSPACE" --arg p "$PARITY_PANE_A" \
+  '{method:"pane.focus",params:{workspace_id:$ws,pane_id:$p}}')" >"$LOG_DIR/stage6f-focus-a.json"
+"$LIMUX_CLI" --json --id-format both last-pane --workspace "$PARITY_WORKSPACE" \
+  >"$LOG_DIR/stage6f-last-pane.json"
+jq -e --arg b "$PARITY_PANE_B" '.pane_id == $b' "$LOG_DIR/stage6f-last-pane.json" >/dev/null \
+  || { echo "FAIL: last-pane did not restore previously focused pane"; exit 1; }
+
+"$LIMUX_CLI" --json --id-format both break-pane --workspace "$PARITY_WORKSPACE" \
+  --pane "$PARITY_PANE_B" >"$LOG_DIR/stage6f-break.json"
+BROKEN_WORKSPACE="$(jq -r '.workspace_id' "$LOG_DIR/stage6f-break.json")"
+BROKEN_PANE="$(jq -r '.pane_id' "$LOG_DIR/stage6f-break.json")"
+[ -n "$BROKEN_WORKSPACE" ] && [ "$BROKEN_WORKSPACE" != "$PARITY_WORKSPACE" ] \
+  || { echo "FAIL: break-pane did not create a distinct workspace"; exit 1; }
+"$LIMUX_CLI" --json --id-format both join-pane \
+  --pane "$BROKEN_PANE" --target-pane "$PARITY_PANE_A" >"$LOG_DIR/stage6f-join.json"
+"$LIMUX_CLI" --json --id-format both list-panes --workspace "$PARITY_WORKSPACE" \
+  >"$LOG_DIR/stage6f-panes-joined.json"
+jq -e --arg a "$PARITY_PANE_A" \
+  '(.panes | length) == 1 and .panes[0].pane_id == $a and .panes[0].surface_count == 2' \
+  "$LOG_DIR/stage6f-panes-joined.json" >/dev/null \
+  || { echo "FAIL: join-pane did not merge broken tab back into target pane"; exit 1; }
+
+"$LIMUX_CLI" --json --id-format both browser --workspace "$PARITY_WORKSPACE" \
+  open-split "data:text/plain,parity-one" >"$LOG_DIR/stage6f-browser-open.json"
+PARITY_BROWSER_SURFACE="$(jq -r '.surface_id' "$LOG_DIR/stage6f-browser-open.json")"
+"$LIMUX_CLI" --json --id-format both browser --surface "$PARITY_BROWSER_SURFACE" \
+  navigate "data:text/plain,parity-two" >"$LOG_DIR/stage6f-browser-nav.json"
+PARITY_URL="$("$LIMUX_CLI" browser --surface "$PARITY_BROWSER_SURFACE" get-url)"
+[ "$PARITY_URL" = "data:text/plain,parity-two" ] \
+  || { echo "FAIL: browser get-url returned '$PARITY_URL' instead of 'data:text/plain,parity-two'"; exit 1; }
+
+PARITY_BROWSER_PANE="${PARITY_BROWSER_SURFACE%%:*}"
+PARITY_BROWSER_TAB="${PARITY_BROWSER_SURFACE#*:}"
+"$LIMUX_CLI" --json --id-format both new-surface --workspace "$PARITY_WORKSPACE" \
+  --pane "$PARITY_BROWSER_PANE" --type browser --url "data:text/plain,other-tab" \
+  >"$LOG_DIR/stage6f-browser-other.json"
+for _ in $(seq 1 60); do
+  PARITY_URL="$("$LIMUX_CLI" browser --surface "$PARITY_BROWSER_SURFACE" get-url)"
+  [ "$PARITY_URL" = "data:text/plain,parity-two" ] && break
+  sleep 0.1
+done
+[ "$PARITY_URL" = "data:text/plain,parity-two" ] \
+  || { echo "FAIL: inactive browser source did not retain its URL"; exit 1; }
+"$LIMUX_CLI" --id-format both --request "$(jq -nc \
+  --arg ws "$PARITY_WORKSPACE" --arg surface "$PARITY_BROWSER_TAB" \
+  '{method:"browser.open_split",params:{workspace_id:$ws,surface_id:$surface}}')" \
+  >"$LOG_DIR/stage6f-browser-inherited.json"
+jq -e '.browser.url == "data:text/plain,parity-two"' \
+  "$LOG_DIR/stage6f-browser-inherited.json" >/dev/null \
+  || { echo "FAIL: browser split did not inherit the explicitly selected tab URL"; exit 1; }
+
+"$LIMUX_CLI" close-workspace --workspace "$PARITY_WORKSPACE" >"$LOG_DIR/stage6f-close-ws.txt"
+"$LIMUX_CLI" select-workspace --workspace "$WORKSPACE_ID" >"$LOG_DIR/stage6f-restore-ws.txt"
+echo "stage 6f: OK (tmux window/pane/history and browser bridge parity verified)"
+
 # --- 10. Stage 7: hook translators end-to-end -----------------------------
 echo
-echo "== stage 7: claude-hook event translation =="
+echo "== stage 7: claude-hook and agy-hook event translation =="
 echo '{"hook_event_name":"Notification","message":"hello from smoke"}' \
   | LIMUX_WORKSPACE_ID="" "$LIMUX_CLI" claude-hook 2>&1 \
   | tee "$LOG_DIR/stage7.txt"
-echo "stage 7: OK (claude-hook accepted JSON on stdin)"
+AGY_SMOKE_HOME="$DEMO_DIR/agy-home"
+mkdir -p "$AGY_SMOKE_HOME" "$DEMO_DIR/agy-sessions"
+HOME="$AGY_SMOKE_HOME" "$LIMUX_CLI" hooks agy install >"$LOG_DIR/stage7-agy-install.txt"
+[ -f "$AGY_SMOKE_HOME/.gemini/config/hooks.json" ] \
+  || { echo "FAIL: hooks agy install did not write ~/.gemini/config/hooks.json"; exit 1; }
+echo '{"conversationId":"smoke-conv-1","message":"agy done"}' \
+  | HOME="$AGY_SMOKE_HOME" LIMUX_SESSION_DIR="$DEMO_DIR/agy-sessions" LIMUX_WORKSPACE_ID="" \
+    "$LIMUX_CLI" --json hooks agy stop >"$LOG_DIR/stage7-agy-stop.json"
+jq -e '.decision == "allow"' "$LOG_DIR/stage7-agy-stop.json" >/dev/null \
+  || { echo "FAIL: hooks agy stop did not emit {\"decision\":\"allow\"}"; exit 1; }
+HOME="$AGY_SMOKE_HOME" "$LIMUX_CLI" hooks agy uninstall >"$LOG_DIR/stage7-agy-uninstall.txt"
+echo "stage 7: OK (claude-hook and agy-hook accepted JSON on stdin)"
 
 # --- 11. Stage 8: session persistence and clean process restart -----------
 echo

@@ -5556,16 +5556,45 @@ fn handle_command(
             let params = params_object(params)?;
             let workspace_id = optional_u64_param_any(params, &["workspace_id"])?;
             let surface_hint = optional_u64_param_any(params, &["surface_id", "id"])?;
+            let _scrollback = optional_bool_param(params, "scrollback")?.unwrap_or(false);
+            let lines = match optional_u64_param(params, "lines")? {
+                Some(0) => {
+                    return Err(CommandError::invalid_params("lines must be greater than 0"));
+                }
+                Some(limit) => Some(limit as usize),
+                None => None,
+            };
             let (workspace_id, surface_id) =
                 resolve_surface_target(state, workspace_id, surface_hint)?;
             let surface = update_surface_metadata(state, workspace_id, surface_id, |_| {})
                 .ok_or_else(|| CommandError::not_found("surface not found"))?;
+            let text = match lines {
+                Some(limit) => {
+                    let has_trailing_newline = surface.text.ends_with('\n');
+                    let trimmed = surface
+                        .text
+                        .strip_suffix('\n')
+                        .unwrap_or(surface.text.as_str());
+                    if trimmed.is_empty() {
+                        String::new()
+                    } else {
+                        let mut kept: Vec<&str> = trimmed.split('\n').rev().take(limit).collect();
+                        kept.reverse();
+                        let mut out = kept.join("\n");
+                        if has_trailing_newline {
+                            out.push('\n');
+                        }
+                        out
+                    }
+                }
+                None => surface.text,
+            };
             Ok(json!({
                 "workspace_id": encode_handle_id(workspace_id),
                 "workspace_ref": workspace_ref(workspace_id),
                 "surface_id": encode_handle_id(surface.id),
                 "surface_ref": surface_ref(surface.id),
-                "text": surface.text
+                "text": text
             }))
         }
         "surface.send_text" => {
@@ -7109,5 +7138,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn surface_read_text_slices_trailing_lines_and_validates_params() {
+        let dispatcher = Dispatcher::default();
+        let _ = dispatcher
+            .dispatch(request(
+                "surface.send_text",
+                json!({ "text": "one\ntwo\nthree\nfour\n" }),
+            ))
+            .await;
+
+        let tail = dispatcher
+            .dispatch(request(
+                "surface.read_text",
+                json!({ "scrollback": true, "lines": 2 }),
+            ))
+            .await;
+        assert_eq!(tail.result.expect("tail read")["text"], "three\nfour\n");
+
+        let zero_lines = dispatcher
+            .dispatch(request("surface.read_text", json!({ "lines": 0 })))
+            .await;
+        assert_eq!(zero_lines.error.expect("zero lines error").code, -32602);
     }
 }
