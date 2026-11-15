@@ -6289,7 +6289,7 @@ fn break_tabs_into_new_workspace(
     let payload = serde_json::json!({
         "workspace_id": new_workspace_id,
         "workspace_ref": workspace_ref(&new_workspace_id),
-        "pane_id": summary.pane_id,
+        "pane_id": summary.pane_id.to_string(),
         "pane_ref": pane_ref(summary.pane_id),
         "surface_id": summary.surface_id,
         "surface_ref": surface_ref(&summary.surface_id),
@@ -7451,7 +7451,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .then_some(container)
             });
             let response = serde_json::json!({
-                "pane_id": dest_pane_id,
+                "pane_id": dest_pane_id.to_string(),
                 "pane_ref": pane_ref(dest_pane_id),
                 "ok": true,
             });
@@ -7495,7 +7495,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             );
             focus_control_surface(state, index, &pane_widget, &tab_id);
             let _ = reply.send(Ok(serde_json::json!({
-                "pane_id": pane_id,
+                "pane_id": pane_id.to_string(),
                 "pane_ref": pane_ref(pane_id),
                 "ok": true,
             })));
@@ -7555,7 +7555,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     None => (pane_widget.width(), pane_widget.height()),
                 };
             let _ = reply.send(Ok(serde_json::json!({
-                "pane_id": parsed_pane_id,
+                "pane_id": parsed_pane_id.to_string(),
                 "pane_ref": pane_ref(parsed_pane_id),
                 "direction": dir_label,
                 "amount": amount,
@@ -7672,9 +7672,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 "workspace_ref": workspace_ref(&resolved.workspace_id),
                 "surface_id": surface.surface_id,
                 "surface_ref": surface_ref(&surface.surface_id),
-                "pane_id": surface.pane_id,
+                "pane_id": surface.pane_id.to_string(),
                 "pane_ref": pane_ref(surface.pane_id),
-                "target_pane_id": surface.pane_id,
+                "target_pane_id": surface.pane_id.to_string(),
                 "created_split": created_split,
                 "browser": {
                     "open": true,
