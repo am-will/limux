@@ -6395,7 +6395,9 @@ mod tests {
 
     #[cfg(feature = "webkit")]
     #[test]
+    #[ignore = "requires a graphical display"]
     fn configure_browser_settings_disables_popups_file_access_and_clipboard() {
+        gtk4::init().expect("GTK display required");
         let settings = webkit6::Settings::new();
         super::configure_browser_settings(&settings);
         assert!(settings.enables_developer_extras());
