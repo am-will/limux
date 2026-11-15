@@ -3958,38 +3958,9 @@ fn append_debug_log(event: &str) {
 #[cfg(all(test, unix))]
 mod runtime_dir_tests {
     use super::{
-        core_private_runtime_dir, current_core_euid, ensure_private_core_dir, open_core_debug_log,
-        select_core_runtime_dir,
+        current_core_euid, ensure_private_core_dir, open_core_debug_log, select_core_runtime_dir,
     };
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Mutex;
-
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        key: &'static str,
-        old: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
-            let old = std::env::var_os(key);
-            match value {
-                Some(val) => unsafe { std::env::set_var(key, val) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.old {
-                Some(val) => unsafe { std::env::set_var(self.key, val) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     #[test]
     fn ensure_private_core_dir_creates_and_tightens_owned_directory() {
@@ -4035,11 +4006,9 @@ mod runtime_dir_tests {
     }
 
     #[test]
-    fn core_private_runtime_dir_rejects_unsafe_xdg_runtime_dir_and_falls_back() {
-        let _lock = ENV_TEST_LOCK.lock().unwrap();
+    fn select_core_runtime_dir_rejects_unsafe_xdg_runtime_dir_and_falls_back() {
         let temp = tempfile::tempdir().unwrap();
         let tmp_root = tempfile::tempdir().unwrap();
-        let _tmpdir = EnvGuard::set("TMPDIR", Some(tmp_root.path().as_os_str()));
         let euid = current_core_euid();
         let expected_fallback = tmp_root.path().join(format!("limux-{euid}"));
 
@@ -4068,9 +4037,9 @@ mod runtime_dir_tests {
             mode_755.as_os_str(),
             mode_777.as_os_str(),
         ] {
-            let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(invalid));
-            let resolved = core_private_runtime_dir().expect("fallback runtime dir");
+            let resolved = select_core_runtime_dir(Some(invalid), tmp_root.path(), euid);
             assert_eq!(resolved, expected_fallback, "case: {invalid:?}");
+            ensure_private_core_dir(&resolved, euid).expect("fallback runtime dir");
             let mode = std::fs::symlink_metadata(&resolved)
                 .unwrap()
                 .permissions()
