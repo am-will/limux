@@ -111,8 +111,9 @@ impl AgentHookSessionStore {
             ended.session_id != session_id
                 || tab_identity(&ended.surface_id) != tab_identity(&record.surface_id)
         });
-        let session_refs = SessionReferences::load(&self.session_dir);
-        prune_ended_sessions(&mut file.ended_sessions, now_seconds(), &session_refs);
+        prune_ended_sessions(&mut file.ended_sessions, now_seconds(), || {
+            SessionReferences::load(&self.session_dir)
+        });
         file.version = 1;
         file.sessions.insert(session_id, record);
         self.save(&file)
@@ -155,8 +156,9 @@ impl AgentHookSessionStore {
                 updated_at: now,
             });
         }
-        let session_refs = SessionReferences::load(&self.session_dir);
-        prune_ended_sessions(&mut file.ended_sessions, now, &session_refs);
+        prune_ended_sessions(&mut file.ended_sessions, now, || {
+            SessionReferences::load(&self.session_dir)
+        });
         self.save(&file)
     }
 
@@ -393,14 +395,17 @@ fn collect_layout_value_references(
 fn prune_ended_sessions(
     ended: &mut Vec<EndedAgentHookSession>,
     now: f64,
-    refs: &SessionReferences,
+    load_refs: impl FnOnce() -> SessionReferences,
 ) {
-    if now > 0.0 {
-        let cutoff = now - ENDED_SESSION_RETENTION_SECS;
-        ended.retain(|entry| {
-            refs.is_referenced(entry) || entry.updated_at <= 0.0 || entry.updated_at >= cutoff
-        });
+    let cutoff = now - ENDED_SESSION_RETENTION_SECS;
+    let expired = |entry: &EndedAgentHookSession| {
+        now > 0.0 && !(entry.updated_at <= 0.0 || entry.updated_at >= cutoff)
+    };
+    if ended.len() <= MAX_ENDED_SESSIONS && !ended.iter().any(expired) {
+        return;
     }
+    let refs = load_refs();
+    ended.retain(|entry| !expired(entry) || refs.is_referenced(entry));
     if ended.len() > MAX_ENDED_SESSIONS {
         let mut drop_budget = ended.len() - MAX_ENDED_SESSIONS;
         ended.retain(|entry| {
@@ -588,6 +593,42 @@ mod tests {
         let persisted = store.load().unwrap();
         assert_eq!(persisted.ended_sessions.len(), MAX_ENDED_SESSIONS);
         assert_eq!(persisted.ended_sessions[0].session_id, "sess-20");
+    }
+
+    #[test]
+    fn session_references_are_loaded_only_when_tombstones_can_be_pruned() {
+        let now = ENDED_SESSION_RETENTION_SECS * 2.0;
+        let cutoff = now - ENDED_SESSION_RETENTION_SECS;
+        for (count, updated_at, should_load, retained) in [
+            (0, now, false, 0),
+            (MAX_ENDED_SESSIONS, now, false, MAX_ENDED_SESSIONS),
+            (MAX_ENDED_SESSIONS, 0.0, false, MAX_ENDED_SESSIONS),
+            (1, cutoff, false, 1),
+            (1, cutoff - 1.0, true, 0),
+            (MAX_ENDED_SESSIONS + 1, now, true, MAX_ENDED_SESSIONS),
+        ] {
+            let mut ended = (0..count)
+                .map(|index| EndedAgentHookSession {
+                    session_id: format!("session-{index}"),
+                    workspace_id: "workspace".to_string(),
+                    surface_id: format!("1:tab-{index}"),
+                    updated_at,
+                })
+                .collect();
+            let mut loaded = false;
+            prune_ended_sessions(&mut ended, now, || {
+                loaded = true;
+                SessionReferences::Known {
+                    tab_ids: BTreeSet::new(),
+                    session_ids: BTreeSet::new(),
+                }
+            });
+            assert_eq!(
+                loaded, should_load,
+                "count={count}, updated_at={updated_at}"
+            );
+            assert_eq!(ended.len(), retained);
+        }
     }
 
     #[test]
