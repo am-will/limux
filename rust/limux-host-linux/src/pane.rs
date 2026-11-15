@@ -3490,7 +3490,7 @@ impl BrowserLoadState {
     }
 
     fn accept_notified_uri(&self, uri: &str) -> bool {
-        if self.restoring.get() && !is_non_blank_browser_uri(Some(uri)) {
+        if uri.is_empty() || (self.restoring.get() && !is_non_blank_browser_uri(Some(uri))) {
             return false;
         }
         self.restoring.set(false);
@@ -5759,6 +5759,10 @@ mod tests {
             "transient blank notifications must not clobber explicit pre-map target"
         );
         assert!(restored.accept_notified_uri("https://explicit.example/page"));
+        assert!(
+            !restored.accept_notified_uri(""),
+            "transient empty notifications must not clear the current URL"
+        );
         assert!(restored.accept_notified_uri("about:blank"));
 
         let restored_to_blank = super::BrowserLoadState::new(Some("https://restored.example/old"));
