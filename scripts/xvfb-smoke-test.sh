@@ -421,6 +421,7 @@ for regression in \
   terminal::tests::context_menu_the_compositor_refuses_is_detached \
   terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
+  window::pane_create_tests::terminal_commands_retry_until_ready_then_reply_without_a_timer \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
