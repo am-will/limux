@@ -2192,12 +2192,12 @@ fn add_terminal_tab_inner(
     );
     let mut initial_input = None;
     if let Some(command) = workspace_autostart_command.as_deref() {
-        if terminal::terminal_command_accepts_shell_input() {
+        if let Some(shell_kind) = terminal::terminal_autostart_shell_kind() {
             eprintln!(
                 "limux: running workspace autostart workspace={} surface={}:{}",
                 internals.callbacks.workspace_id, internals.pane_id, tab_id
             );
-            initial_input = prepare_workspace_autostart(command);
+            initial_input = prepare_workspace_autostart(command, shell_kind);
         } else {
             eprintln!(
                 "limux: skipping workspace autostart for non-shell terminal command workspace={} surface={}:{}",
@@ -2305,42 +2305,81 @@ fn select_terminal_commands(
     (None, autostart_command)
 }
 
-fn prepare_workspace_autostart(command: &str) -> Option<String> {
+fn prepare_workspace_autostart(
+    command: &str,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<String> {
     if command.contains('\0') {
         eprintln!("limux: workspace autostart contains a NUL byte; refusing to run it");
         return None;
     }
 
-    let script_path = create_workspace_autostart_script(command)?;
-    workspace_autostart_initial_input(&script_path)
+    let script_path = create_workspace_autostart_script(command, shell_kind)?;
+    workspace_autostart_initial_input(&script_path, shell_kind)
 }
 
-fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-    if runtime_dir.is_empty() {
-        eprintln!("limux: XDG_RUNTIME_DIR is unset; workspace autostart was not started");
+fn autostart_script_extension(
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> &'static str {
+    match shell_kind {
+        crate::ghostty_config::AutostartShellKind::Posix => "sh",
+        crate::ghostty_config::AutostartShellKind::Fish => "fish",
+        crate::ghostty_config::AutostartShellKind::Nushell => "nu",
+    }
+}
+
+fn is_usable_autostart_runtime_dir(
+    dir: &Path,
+    flatpak_id: Option<&std::ffi::OsStr>,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+) -> bool {
+    if !flatpak_id.is_some_and(|id| id == crate::APP_ID) {
+        return true;
+    }
+    xdg_runtime_dir
+        .filter(|xdg| !xdg.is_empty())
+        .map(Path::new)
+        .is_some_and(|xdg| xdg.is_absolute() && dir.starts_with(xdg.join("limux")))
+}
+
+fn create_workspace_autostart_script(
+    command: &str,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<PathBuf> {
+    static NEXT_AUTOSTART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let dir = match limux_control::socket_path::ensure_private_runtime_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("limux: failed to prepare private autostart runtime directory: {error}");
+            return None;
+        }
+    };
+    if !is_usable_autostart_runtime_dir(
+        &dir,
+        std::env::var_os("FLATPAK_ID").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    ) {
+        eprintln!(
+            "limux: refusing fallback autostart directory {} inside Flatpak because XDG_RUNTIME_DIR/limux is required for the host shell",
+            dir.display()
+        );
         return None;
     }
 
-    let dir = PathBuf::from(runtime_dir).join("limux");
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!("limux: failed to create autostart runtime directory: {error}");
-        return None;
-    }
-
-    for suffix in 0..100_u8 {
-        let path = dir.join(format!(
-            "workspace-autostart-{}-{suffix}.sh",
-            std::process::id()
-        ));
-        let Some(script) = workspace_autostart_script(command, &path) else {
+    let ext = autostart_script_extension(shell_kind);
+    let pid = std::process::id();
+    for _ in 0..1024_u16 {
+        let seq = NEXT_AUTOSTART_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("workspace-autostart-{pid}-{seq}.{ext}"));
+        let Some(script) = workspace_autostart_script(command, &path, shell_kind) else {
             eprintln!("limux: workspace autostart path is not valid UTF-8");
             return None;
         };
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o700)
+            .mode(0o600)
             .open(&path);
         match file {
             Ok(mut file) => {
@@ -2363,30 +2402,90 @@ fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
     None
 }
 
-fn workspace_autostart_script(command: &str, script_path: &Path) -> Option<String> {
+fn workspace_autostart_script(
+    command: &str,
+    script_path: &Path,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<String> {
     let script_path = script_path.to_str()?;
-    Some(format!(
-        "#!/bin/sh\nrm -f -- {}\n{command}\n",
-        shell_quote(script_path)
-    ))
+    Some(match shell_kind {
+        crate::ghostty_config::AutostartShellKind::Posix => format!(
+            "#!/bin/sh\nrm -f -- {}\n{command}\n",
+            shell_quote(script_path)
+        ),
+        crate::ghostty_config::AutostartShellKind::Fish => format!(
+            "#!/usr/bin/env fish\ncommand rm -f -- {}\n{command}\n",
+            fish_quote(script_path)
+        ),
+        crate::ghostty_config::AutostartShellKind::Nushell => {
+            format!("^rm -f -- {}\n{command}\n", nushell_quote(script_path))
+        }
+    })
 }
 
-fn workspace_autostart_initial_input(script_path: &Path) -> Option<String> {
+fn workspace_autostart_initial_input(
+    script_path: &Path,
+    shell_kind: crate::ghostty_config::AutostartShellKind,
+) -> Option<String> {
     let script_path = script_path.to_str()?;
     // Only the private script path enters terminal input. The configured
     // autostart text stays out of shell history and scrollback, while Ghostty's
     // configured interactive shell remains untouched.
-    Some(format!(". {}\n", shell_quote(script_path)))
+    Some(match shell_kind {
+        crate::ghostty_config::AutostartShellKind::Posix => {
+            format!(". {}\n", shell_quote(script_path))
+        }
+        crate::ghostty_config::AutostartShellKind::Fish => {
+            format!("source {}\n", fish_quote(script_path))
+        }
+        crate::ghostty_config::AutostartShellKind::Nushell => {
+            format!("source {}\n", nushell_quote(script_path))
+        }
+    })
+}
+
+fn is_safe_shell_bareword(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
 }
 
 fn shell_quote(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
-    {
+    if is_safe_shell_bareword(value) {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn fish_quote(value: &str) -> String {
+    if is_safe_shell_bareword(value) {
+        value.to_string()
+    } else {
+        let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("'{escaped}'")
+    }
+}
+
+fn nushell_quote(value: &str) -> String {
+    if is_safe_shell_bareword(value) {
+        value.to_string()
+    } else {
+        let mut escaped = String::with_capacity(value.len() + 2);
+        escaped.push('"');
+        for ch in value.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped.push('"');
+        escaped
     }
 }
 
@@ -4542,7 +4641,7 @@ fn remove_tab(
 // ---------------------------------------------------------------------------
 
 #[cfg(any(feature = "webkit", test))]
-const DEFAULT_BROWSER_URI: &str = "https://google.com";
+const DEFAULT_BROWSER_URI: &str = "about:blank";
 
 #[cfg(any(feature = "webkit", test))]
 fn is_non_blank_browser_uri(uri: Option<&str>) -> bool {
@@ -5148,9 +5247,43 @@ fn is_kde_wayland_session() -> bool {
 }
 
 #[cfg(feature = "webkit")]
+fn prepare_private_webkit_dir(base: Option<PathBuf>, leaf: &str) -> Option<String> {
+    let root = base?.join("limux");
+    std::fs::create_dir_all(&root).ok()?;
+    let dir = root.join(leaf);
+    limux_control::socket_path::ensure_private_dir(&dir).ok()?;
+    dir.to_str().map(str::to_string)
+}
+
+#[cfg(feature = "webkit")]
+fn shared_browser_network_session() -> webkit6::NetworkSession {
+    thread_local! {
+        static SESSION: std::cell::OnceCell<webkit6::NetworkSession> =
+            const { std::cell::OnceCell::new() };
+    }
+    SESSION.with(|cell| {
+        cell.get_or_init(|| {
+            let data_dir = prepare_private_webkit_dir(dirs::data_local_dir(), "webkit-data");
+            let cache_dir = prepare_private_webkit_dir(dirs::cache_dir(), "webkit-cache");
+            let session = match (data_dir.as_deref(), cache_dir.as_deref()) {
+                (Some(data), Some(cache)) => webkit6::NetworkSession::new(Some(data), Some(cache)),
+                _ => webkit6::NetworkSession::new_ephemeral(),
+            };
+            session.set_tls_errors_policy(webkit6::TLSErrorsPolicy::Fail);
+            session.set_itp_enabled(true);
+            session
+        })
+        .clone()
+    })
+}
+
+#[cfg(feature = "webkit")]
 fn configure_browser_settings(settings: &webkit6::Settings) {
     settings.set_enable_developer_extras(true);
-    settings.set_javascript_can_open_windows_automatically(true);
+    settings.set_javascript_can_open_windows_automatically(false);
+    settings.set_allow_file_access_from_file_urls(false);
+    settings.set_allow_universal_access_from_file_urls(false);
+    settings.set_javascript_can_access_clipboard(false);
 
     if is_kde_wayland_session() {
         settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
@@ -5248,7 +5381,9 @@ fn create_browser_widget(
         );
     }
 
+    let browser_network_session = shared_browser_network_session();
     let webview = webkit6::WebView::builder()
+        .network_session(&browser_network_session)
         .user_content_manager(&user_content_manager)
         .hexpand(true)
         .vexpand(true)
@@ -5565,12 +5700,13 @@ fn create_browser_widget(
 mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolve_surface_hint, resolved_link_destination, select_terminal_commands,
-        select_terminal_tab, surface_hint_match, workspace_autostart_initial_input,
-        workspace_autostart_script, ContentDropZone, HintResolution, SurfaceHintMatch,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        effective_drop_target_dimensions, is_localhost_input, is_usable_autostart_runtime_dir,
+        next_active_after_tab_removal, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, resolve_surface_hint,
+        resolved_link_destination, select_terminal_commands, select_terminal_tab,
+        surface_hint_match, workspace_autostart_initial_input, workspace_autostart_script,
+        ContentDropZone, HintResolution, SurfaceHintMatch, TabDragPayload,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -5644,23 +5780,84 @@ mod tests {
 
     #[test]
     fn workspace_autostart_uses_hidden_initial_input() {
+        use crate::ghostty_config::AutostartShellKind;
+
+        let posix_path = std::path::Path::new("/run/user/1000/limux/workspace-autostart-42-0.sh");
         assert_eq!(
-            workspace_autostart_initial_input(std::path::Path::new(
-                "/run/user/1000/limux/workspace-autostart-42-0.sh"
-            ))
-            .as_deref(),
+            workspace_autostart_initial_input(posix_path, AutostartShellKind::Posix).as_deref(),
             Some(". /run/user/1000/limux/workspace-autostart-42-0.sh\n")
         );
         assert_eq!(
-            workspace_autostart_script(
-                "echo ready",
-                std::path::Path::new("/run/user/1000/limux/workspace-autostart-42-0.sh")
-            )
-            .as_deref(),
+            workspace_autostart_script("echo ready", posix_path, AutostartShellKind::Posix)
+                .as_deref(),
             Some(
                 "#!/bin/sh\nrm -f -- /run/user/1000/limux/workspace-autostart-42-0.sh\necho ready\n"
             )
         );
+
+        let fish_path =
+            std::path::Path::new("/run/user/1000/limux dir/workspace-autostart-42-1.fish");
+        assert_eq!(
+            workspace_autostart_initial_input(fish_path, AutostartShellKind::Fish).as_deref(),
+            Some("source '/run/user/1000/limux dir/workspace-autostart-42-1.fish'\n")
+        );
+        assert_eq!(
+            workspace_autostart_script("echo ready", fish_path, AutostartShellKind::Fish)
+                .as_deref(),
+            Some(
+                "#!/usr/bin/env fish\ncommand rm -f -- '/run/user/1000/limux dir/workspace-autostart-42-1.fish'\necho ready\n"
+            )
+        );
+
+        let nu_path = std::path::Path::new("/run/user/1000/limux dir/workspace-autostart-42-2.nu");
+        assert_eq!(
+            workspace_autostart_initial_input(nu_path, AutostartShellKind::Nushell).as_deref(),
+            Some("source \"/run/user/1000/limux dir/workspace-autostart-42-2.nu\"\n")
+        );
+        assert_eq!(
+            workspace_autostart_script("print ready", nu_path, AutostartShellKind::Nushell)
+                .as_deref(),
+            Some(
+                "^rm -f -- \"/run/user/1000/limux dir/workspace-autostart-42-2.nu\"\nprint ready\n"
+            )
+        );
+    }
+
+    #[test]
+    fn flatpak_autostart_refuses_tmp_fallback_outside_xdg_runtime_dir() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        assert!(is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            None,
+            None,
+        ));
+        assert!(is_usable_autostart_runtime_dir(
+            Path::new("/run/user/1000/limux"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/tmp/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            None,
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("/run/user/1000/limux-1000"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("/run/user/1000")),
+        ));
+        assert!(!is_usable_autostart_runtime_dir(
+            Path::new("relative/limux"),
+            Some(OsStr::new(crate::APP_ID)),
+            Some(OsStr::new("relative")),
+        ));
     }
 
     #[test]
@@ -6701,12 +6898,41 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "webkit")]
+    #[test]
+    fn prepare_private_webkit_dir_creates_0700_dir_and_rejects_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let created =
+            super::prepare_private_webkit_dir(Some(temp.path().to_path_buf()), "webkit-data")
+                .expect("private webkit dir");
+        let created_path = std::path::Path::new(&created);
+        assert_eq!(created_path, temp.path().join("limux").join("webkit-data"));
+        let mode = std::fs::symlink_metadata(created_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let symlink_leaf = temp.path().join("limux").join("webkit-cache");
+        std::os::unix::fs::symlink(&outside, &symlink_leaf).expect("symlink");
+        assert!(
+            super::prepare_private_webkit_dir(Some(temp.path().to_path_buf()), "webkit-cache",)
+                .is_none(),
+            "symlinked webkit cache leaf must be rejected"
+        );
+    }
+
     #[test]
     fn browser_load_state_cancels_first_map_after_explicit_navigation() {
         let default_state = super::BrowserLoadState::new(None);
         assert_eq!(
             default_state.take_first_map_uri().as_deref(),
-            Some(super::DEFAULT_BROWSER_URI)
+            Some("about:blank")
         );
         assert_eq!(default_state.take_first_map_uri(), None);
 
@@ -6810,6 +7036,20 @@ mod tests {
 
         retire_pane(&first);
         retire_pane(&second);
+    }
+
+    #[cfg(feature = "webkit")]
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn configure_browser_settings_disables_popups_file_access_and_clipboard() {
+        gtk4::init().expect("GTK display required");
+        let settings = webkit6::Settings::new();
+        super::configure_browser_settings(&settings);
+        assert!(settings.enables_developer_extras());
+        assert!(!settings.is_javascript_can_open_windows_automatically());
+        assert!(!settings.allows_file_access_from_file_urls());
+        assert!(!settings.allows_universal_access_from_file_urls());
+        assert!(!settings.is_javascript_can_access_clipboard());
     }
 
     #[cfg(feature = "webkit")]

@@ -432,6 +432,7 @@ for regression in \
   window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
   window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
   pane::tests::moved_browser_tab_reports_to_its_new_pane \
+  pane::tests::configure_browser_settings_disables_popups_file_access_and_clipboard \
   pane::tests::pane_summaries_for_widgets_preserves_caller_leaf_order \
   pane::tests::pre_map_browser_navigation_survives_first_map \
   pane::tests::browser_back_and_forward_report_destination_uri_immediately \
