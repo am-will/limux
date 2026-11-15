@@ -93,6 +93,38 @@ expected_selection=$(printf '%s\n' "$TMP_DIR/src/zig-x86_64-linux-0.16.0/zig" 0.
 [ "$selected" = "$expected_selection" ]
 [ "$metadata" = "$expected" ]
 
+# Verify package() installs the packaged files including install-apparmor-profile.sh.
+SRC_REPO="$TMP_DIR/src/limux-1.2.3"
+mkdir -p \
+    "$SRC_REPO/target/release" \
+    "$SRC_REPO/ghostty/zig-out/lib" \
+    "$SRC_REPO/ghostty/zig-out/share/ghostty/themes" \
+    "$SRC_REPO/ghostty/zig-out/share/terminfo/x" \
+    "$SRC_REPO/rust/limux-host-linux/icons/app" \
+    "$TMP_DIR/pkg"
+cp /bin/true "$SRC_REPO/target/release/limux-cli"
+cp /bin/true "$SRC_REPO/target/release/limux"
+printf 'ghostty\n' > "$SRC_REPO/ghostty/zig-out/lib/libghostty-internal.so"
+printf 'MIT\n' > "$SRC_REPO/LICENSE"
+printf 'theme\n' > "$SRC_REPO/ghostty/zig-out/share/ghostty/themes/default"
+printf 'terminfo\n' > "$SRC_REPO/ghostty/zig-out/share/terminfo/x/xterm-ghostty"
+cp "$ROOT_DIR/scripts/install-apparmor-profile.sh" "$SRC_REPO/scripts/install-apparmor-profile.sh"
+cp "$ROOT_DIR/rust/limux-host-linux/dev.limux.linux.desktop" "$SRC_REPO/rust/limux-host-linux/"
+cp "$ROOT_DIR/rust/limux-host-linux/dev.limux.linux.metainfo.xml" "$SRC_REPO/rust/limux-host-linux/"
+for size in 16 32 128 256 512; do
+    printf 'png\n' > "$SRC_REPO/rust/limux-host-linux/icons/app/$size.png"
+done
+printf '<svg/>\n' > "$SRC_REPO/rust/limux-host-linux/icons/limux-globe-symbolic.svg"
+bash -c '
+    set -euo pipefail
+    srcdir=$1
+    pkgdir=$2
+    source "$3"
+    package
+' bash "$TMP_DIR/src" "$TMP_DIR/pkg" "$OUTPUT"
+[ -x "$TMP_DIR/pkg/usr/share/limux/install-apparmor-profile.sh" ]
+cmp "$ROOT_DIR/scripts/install-apparmor-profile.sh" "$TMP_DIR/pkg/usr/share/limux/install-apparmor-profile.sh"
+
 if "$ROOT_DIR/scripts/render-aur-source-pkgbuild.sh" \
     "$ROOT_DIR/PKGBUILD-source.template" \
     "$OUTPUT" \

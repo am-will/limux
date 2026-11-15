@@ -1,5 +1,6 @@
 mod app_config;
 mod browser_link;
+mod browser_sandbox;
 mod control_bridge;
 mod ghostty_config;
 mod gui_hooks;
@@ -229,6 +230,9 @@ fn prepare_ghostty_runtime() {
 }
 
 fn main() {
+    if let Some(code) = browser_sandbox::run_if_requested() {
+        std::process::exit(code);
+    }
     // Handle --version flag
     if std::env::args().any(|a| a == "--version" || a == "-v") {
         println!("Limux {VERSION}");
@@ -237,12 +241,11 @@ fn main() {
 
     prepare_ghostty_runtime();
     sanitize_terminal_child_env();
-
-    // WebKitGTK's bubblewrap sandbox requires unprivileged user namespaces,
-    // which may not be available. Disable it to prevent crashes on launch.
-    if std::env::var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_err() {
-        std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+    #[cfg(feature = "webkit")]
+    if let Err(error) = browser_sandbox::availability() {
+        eprintln!("limux: {error}");
     }
+    std::env::remove_var("LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE");
 
     // Initialize Ghostty before GTK app starts
     terminal::init_ghostty();

@@ -44,10 +44,14 @@ if [ "${1:-}" != --inside-dbus ]; then
   command -v jq >/dev/null || { echo "FAIL: jq missing"; exit 2; }
   DEMO_DIR="$(mktemp -d -t limux-smoke-XXXXXX)"
   export LIMUX_SMOKE_RUN_DIR="$DEMO_DIR"
+  export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+  export HOME="$DEMO_DIR/home"
   export XDG_DATA_HOME="$DEMO_DIR/data" XDG_STATE_HOME="$DEMO_DIR/state"
   export XDG_CONFIG_HOME="$DEMO_DIR/config" XDG_CACHE_HOME="$DEMO_DIR/cache"
   export XDG_RUNTIME_DIR="$DEMO_DIR/runtime"
-  mkdir -p "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+  export XDG_DATA_DIRS=/usr/local/share:/usr/share
+  mkdir -p "$HOME" "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
   chmod 700 "$XDG_RUNTIME_DIR"
   export GTK_USE_PORTAL=0 GIO_USE_VFS=local GTK_A11Y=none
   unset DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE DISPLAY WAYLAND_DISPLAY
@@ -68,8 +72,8 @@ if [ "${1:-}" != --inside-dbus ]; then
 </busconfig>
 SMOKE_DBUS
 
-  # D-Bus activation inherits the private paths too. Only this outer invocation
-  # owns directory cleanup, after its private bus and smoke command have exited.
+  # Keep D-Bus and the smoke host inside private paths. Only this outer
+  # invocation owns cleanup, after the private bus and smoke command exit.
   result=0
   dbus-run-session --config-file="$DEMO_DIR/dbus.conf" -- bash "$0" --inside-dbus || result=$?
   if [ "$result" -eq 0 ] && [ "$KEEP_ARTIFACTS" = 0 ]; then

@@ -125,10 +125,14 @@ pub enum PaneEmptyReason {
 const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
 const TAB_RENAME_ENTRY_CSS_CLASS: &str = "limux-tab-rename-entry";
 const TAB_RENAME_ENTRY_CSS_CLASSES: [&str; 2] = [HOST_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASS];
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_URL_ENTRY_CSS_CLASS: &str = "limux-browser-url-entry";
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_URL_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASS];
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_SEARCH_ENTRY_CSS_CLASS: &str = "limux-browser-search-entry";
+#[cfg(any(feature = "webkit", test))]
 const BROWSER_SEARCH_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASS];
 #[cfg(feature = "webkit")]
@@ -4634,7 +4638,7 @@ fn step_webview_history(
 
 #[cfg(feature = "webkit")]
 #[derive(Clone)]
-struct BrowserHandles {
+struct LiveBrowserHandles {
     webview: webkit6::WebView,
     url_entry: gtk::Entry,
     search_bar: gtk::SearchBar,
@@ -4642,6 +4646,13 @@ struct BrowserHandles {
     find_controller: webkit6::FindController,
     dom_editable: Rc<Cell<bool>>,
     load_state: BrowserLoadState,
+}
+
+#[cfg(feature = "webkit")]
+#[derive(Clone)]
+enum BrowserHandles {
+    Ready(Rc<LiveBrowserHandles>),
+    Unavailable(gtk::Widget),
 }
 
 #[cfg(not(feature = "webkit"))]
@@ -4707,7 +4718,7 @@ impl BrowserShortcutTarget {
 }
 
 #[cfg(feature = "webkit")]
-impl BrowserHandles {
+impl LiveBrowserHandles {
     fn prepare_for_removal(&self) {
         self.find_controller.search_finish();
         self.search_bar.set_search_mode(false);
@@ -4875,6 +4886,127 @@ impl BrowserHandles {
 
     fn search_for_entry_text(&self) {
         search_for_browser_text(&self.find_controller, self.search_entry.text().as_str());
+    }
+}
+
+#[cfg(feature = "webkit")]
+impl BrowserHandles {
+    fn prepare_for_removal(&self) {
+        if let Self::Ready(handles) = self {
+            handles.prepare_for_removal();
+        }
+    }
+
+    fn navigate(&self, url: &str) {
+        if let Self::Ready(handles) = self {
+            handles.navigate(url);
+        }
+    }
+
+    fn focus_content(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.focus_content(),
+            Self::Unavailable(widget) => widget.grab_focus(),
+        }
+    }
+
+    fn is_find_active(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.is_find_active(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn is_page_editable(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.is_page_editable(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn focus_location(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.focus_location(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn go_back(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        match self {
+            Self::Ready(handles) => handles.go_back(saved_uri, callbacks),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn go_forward(
+        &self,
+        saved_uri: &RefCell<Option<String>>,
+        callbacks: &RefCell<Rc<PaneCallbacks>>,
+    ) -> bool {
+        match self {
+            Self::Ready(handles) => handles.go_forward(saved_uri, callbacks),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn reload(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.reload(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn show_inspector(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.show_inspector(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn show_console(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.show_console(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn show_find(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.show_find(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn find_next(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.find_next(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn find_previous(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.find_previous(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn hide_find(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.hide_find(),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    fn use_selection_for_find(&self) -> bool {
+        match self {
+            Self::Ready(handles) => handles.use_selection_for_find(),
+            Self::Unavailable(_) => false,
+        }
     }
 }
 
@@ -5088,9 +5220,9 @@ fn create_browser_widget(
 ) -> (gtk::Widget, String, BrowserHandles) {
     use webkit6::prelude::*;
 
-    // Use a NetworkSession to avoid sandbox issues
-    let network_session = webkit6::NetworkSession::default();
-    let web_context = webkit6::WebContext::default();
+    if let Some(error) = crate::browser_sandbox::unavailable_reason() {
+        return unavailable_browser_widget(error);
+    }
     let user_content_manager = webkit6::UserContentManager::new();
     let dom_editable = Rc::new(Cell::new(false));
     let _ = user_content_manager
@@ -5292,7 +5424,7 @@ fn create_browser_widget(
     vbox.set_overflow(gtk::Overflow::Hidden);
     vbox.add_css_class("limux-browser");
 
-    let browser_handles = BrowserHandles {
+    let browser_handles = BrowserHandles::Ready(Rc::new(LiveBrowserHandles {
         webview: webview.clone(),
         url_entry: url_entry.clone(),
         search_bar: search_bar.clone(),
@@ -5300,7 +5432,7 @@ fn create_browser_widget(
         find_controller: find_controller.clone(),
         dom_editable,
         load_state: load_state.clone(),
-    };
+    }));
 
     {
         let find_controller = find_controller.downgrade();
@@ -5325,13 +5457,49 @@ fn create_browser_widget(
         });
     }
 
-    // Suppress unused variable warnings
-    let _ = network_session;
-    let _ = web_context;
-
     (vbox.upcast(), "Browser".to_string(), browser_handles)
 }
 
+#[cfg(feature = "webkit")]
+fn unavailable_browser_widget(error: &str) -> (gtk::Widget, String, BrowserHandles) {
+    let placeholder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .hexpand(true)
+        .vexpand(true)
+        .focusable(true)
+        .build();
+    let title = gtk::Label::new(Some("Browser unavailable"));
+    title.add_css_class("title-3");
+    let guidance = gtk::Label::builder()
+        .label("WebKit could not start its sandbox. Check this installation's user-namespace policy and sandbox helpers, then restart Limux.")
+        .wrap(true)
+        .max_width_chars(75)
+        .build();
+    let explanation = gtk::Label::builder()
+        .label(error)
+        .wrap(true)
+        .selectable(true)
+        .max_width_chars(75)
+        .build();
+    let details = gtk::Expander::new(Some("Technical details"));
+    details.set_child(Some(&explanation));
+    let saved = gtk::Label::new(Some(
+        "Your browser tab is saved. Terminals remain available.",
+    ));
+    placeholder.append(&title);
+    placeholder.append(&guidance);
+    placeholder.append(&saved);
+    placeholder.append(&details);
+    let widget = placeholder.upcast::<gtk::Widget>();
+    (
+        widget.clone(),
+        "Browser".to_string(),
+        BrowserHandles::Unavailable(widget),
+    )
+}
+
+#[cfg(any(feature = "webkit", test))]
 fn normalize_browser_entry_input(input: &str) -> String {
     if input.starts_with("http://") || input.starts_with("https://") {
         return input.to_string();
@@ -5349,6 +5517,7 @@ fn normalize_browser_entry_input(input: &str) -> String {
     }
 }
 
+#[cfg(any(feature = "webkit", test))]
 fn is_localhost_input(input: &str) -> bool {
     input == "localhost"
         || input
@@ -6713,11 +6882,14 @@ mod tests {
         let TabKind::Browser { state } = &tab_state.tabs[0].kind else {
             panic!("expected browser tab");
         };
-        assert_eq!(state.handles.load_state.take_first_map_uri(), None);
+        let super::BrowserHandles::Ready(handles) = &state.handles else {
+            panic!("expected available browser");
+        };
+        assert_eq!(handles.load_state.take_first_map_uri(), None);
         assert_eq!(state.uri.borrow().as_deref(), Some(target_url));
-        assert_eq!(state.handles.url_entry.text().as_str(), target_url);
+        assert_eq!(handles.url_entry.text().as_str(), target_url);
         assert_eq!(
-            webkit6::prelude::WebViewExt::uri(&state.handles.webview).as_deref(),
+            webkit6::prelude::WebViewExt::uri(&handles.webview).as_deref(),
             Some(target_url)
         );
         drop(tab_state);
@@ -6790,7 +6962,10 @@ mod tests {
             let TabKind::Browser { state } = &tab_state.tabs[0].kind else {
                 panic!("expected browser tab");
             };
-            state.handles.webview.clone()
+            let super::BrowserHandles::Ready(handles) = &state.handles else {
+                panic!("expected available browser");
+            };
+            handles.webview.clone()
         };
 
         let wait_until = |pred: &dyn Fn() -> bool| {

@@ -324,15 +324,25 @@ fn resolve_host_binary() -> Result<PathBuf> {
 
 fn launch_host() -> Result<()> {
     let host = resolve_host_binary()?;
-    let err = Command::new(&host)
-        .spawn()
-        .with_context(|| format!("failed to launch {}", host.display()))?
-        .wait()
-        .with_context(|| format!("failed to wait for {}", host.display()))?;
-    if err.success() {
-        Ok(())
-    } else {
-        bail!("{} exited with {}", host.display(), err)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let error = Command::new(&host).exec();
+        Err(error).with_context(|| format!("failed to launch {}", host.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = Command::new(&host)
+            .spawn()
+            .with_context(|| format!("failed to launch {}", host.display()))?
+            .wait()
+            .with_context(|| format!("failed to wait for {}", host.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("{} exited with {}", host.display(), status)
+        }
     }
 }
 

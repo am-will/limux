@@ -108,7 +108,14 @@ class CleanupTests(unittest.TestCase):
             ):
                 root = Path(directory)
                 args = mock.Mock(
-                    prefix=root, cli=root, library_dir=root, appimage=False
+                    prefix=root,
+                    cli=root,
+                    library_dir=root,
+                    appimage=False,
+                    deny_userns=False,
+                    expect_browser_unavailable=False,
+                    explicit_disable_sandbox=False,
+                    expected_apparmor_profile=None,
                 )
                 with self.assertRaisesRegex(RuntimeError, "wrapper exited"):
                     smoke.run(args, root)
@@ -145,7 +152,16 @@ class CleanupTests(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()) as diagnostics,
         ):
             root = Path(directory)
-            args = mock.Mock(prefix=root, cli=root, library_dir=root, appimage=False)
+            args = mock.Mock(
+                prefix=root,
+                cli=root,
+                library_dir=root,
+                appimage=False,
+                deny_userns=False,
+                expect_browser_unavailable=False,
+                explicit_disable_sandbox=False,
+                expected_apparmor_profile=None,
+            )
             with self.assertRaisesRegex(RuntimeError, "functional failure"):
                 smoke.run(args, root)
             self.assertEqual(len(stop.call_args.args[0]), 2)
