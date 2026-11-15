@@ -344,13 +344,7 @@ fn eager_restore_preserves_live_selection_focus_and_agent_bindings() {
     });
     let workspace_id = state.borrow().active_workspace().unwrap().id.clone();
     let surface = pane::terminal_handle_for_surface(&b, Some("b1")).unwrap().0;
-    let cli = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("limux-cli");
+    let cli = crate::layout_state::test_limux_cli_path();
     let mut cleanup = std::process::Command::new(cli)
         .args(["--json", "hooks", "claude", "cleanup"])
         .env("LIMUX_WORKSPACE_ID", workspace_id)
