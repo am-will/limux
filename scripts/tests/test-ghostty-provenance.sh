@@ -27,7 +27,11 @@ if [ "$1" = version ]; then printf '%s\n' "${TEST_ZIG_VERSION:-0.16.0}"; exit; f
 if [ "${TEST_ZIG_FAIL:-0}" = 1 ]; then exit 42; fi
 if [ "${TEST_ZIG_NO_OUTPUT:-0}" = 1 ]; then exit; fi
 mkdir -p zig-out/lib
-printf 'library from %s\n' "$(git rev-parse HEAD)" > zig-out/lib/libghostty-internal.so
+if [[ " $* " == *' -Dstrip=false '* ]] && [ "${TEST_ZIG_IGNORE_DEBUG:-0}" = 0 ]; then
+  printf 'void ghostty_debug_fixture(void) {}\n' | cc -g -shared -x c - -o zig-out/lib/libghostty-internal.so
+else
+  printf 'library from %s\n' "$(git rev-parse HEAD)" > zig-out/lib/libghostty-internal.so
+fi
 if [ "${TEST_ZIG_DIRTY:-0}" = 1 ]; then printf 'changed during build\n' >> build.zig; fi
 STUB
 chmod +x "$TMP_DIR/bin/"*
@@ -109,6 +113,16 @@ reject 'source has local changes' env TEST_ZIG_DIRTY=1 "$FIXTURE/scripts/build-g
 [ ! -e "$PROVENANCE" ]
 git -C "$FIXTURE/ghostty" restore build.zig
 reject 'requires Zig 0.16.0' env TEST_ZIG_VERSION=0.15.2 "$FIXTURE/scripts/build-ghostty.sh"
+
+if LIMUX_GHOSTTY_DEBUG_SYMBOLS=invalid "$FIXTURE/scripts/build-ghostty.sh" >"$TMP_DIR/output" 2>&1; then
+  echo 'FAIL: accepted invalid debug-symbol mode' >&2
+  exit 1
+fi
+grep -Fq 'LIMUX_GHOSTTY_DEBUG_SYMBOLS must be 0 or 1' "$TMP_DIR/output"
+LIMUX_GHOSTTY_DEBUG_SYMBOLS=1 "$FIXTURE/scripts/build-ghostty.sh" >/dev/null
+"$FIXTURE/scripts/check-ghostty.sh" >/dev/null
+reject 'did not retain requested debug symbols' env LIMUX_GHOSTTY_DEBUG_SYMBOLS=1 TEST_ZIG_IGNORE_DEBUG=1 "$FIXTURE/scripts/build-ghostty.sh"
+[ ! -e "$PROVENANCE" ]
 
 # AUR builds use a symlink to a separate Git checkout as the source submodule.
 mv "$FIXTURE/ghostty" "$TMP_DIR/aur-ghostty"

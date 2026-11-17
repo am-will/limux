@@ -5,9 +5,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT_DIR/scripts/check-ghostty.sh"
 if [ "$#" -ne 0 ]; then
-  echo 'Usage: [ZIG=/path/to/zig] [LIMUX_BUILD_JOBS=4] ./scripts/build-ghostty.sh' >&2
+  echo 'Usage: [ZIG=/path/to/zig] [LIMUX_BUILD_JOBS=4] [LIMUX_GHOSTTY_DEBUG_SYMBOLS=0|1] ./scripts/build-ghostty.sh' >&2
   exit 2
 fi
+DEBUG_SYMBOLS="${LIMUX_GHOSTTY_DEBUG_SYMBOLS:-0}"
+case "$DEBUG_SYMBOLS" in
+  0|1) ;;
+  *) echo 'ERROR: LIMUX_GHOSTTY_DEBUG_SYMBOLS must be 0 or 1.' >&2; exit 2 ;;
+esac
 JOBS="${LIMUX_BUILD_JOBS:-4}"
 if [[ ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
   echo 'ERROR: LIMUX_BUILD_JOBS must be a positive integer.' >&2
@@ -41,6 +46,7 @@ flock 9
 # removes only the link, so the build cannot overwrite an installed library.
 rm -f "$PROVENANCE" "$LIBRARY"
 ZIG_ARGS=(-Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline -Demit-docs=false -fno-sys=gtk4-layer-shell)
+if [ "$DEBUG_SYMBOLS" = 1 ]; then ZIG_ARGS+=(-Dstrip=false); fi
 (
   cd "$ROOT_DIR/ghostty"
   unset DESTDIR
@@ -53,6 +59,14 @@ fi
 if [ ! -f "$LIBRARY" ] || [ -L "$LIBRARY" ]; then
   ghostty_build_error "$ROOT_DIR" 'The build did not produce a local Ghostty shared library.'
   exit 1
+fi
+if [ "$DEBUG_SYMBOLS" = 1 ]; then
+  if ! sections="$(readelf --wide --sections "$LIBRARY")" \
+    || ! grep -q '\.debug_info ' <<< "$sections" \
+    || ! grep -q '\.symtab ' <<< "$sections"; then
+    ghostty_build_error "$ROOT_DIR" 'Ghostty build did not retain requested debug symbols.'
+    exit 1
+  fi
 fi
 HASH="$(sha256sum < "$LIBRARY")"
 TEMP_RECORD="$(mktemp "$PROVENANCE.XXXXXX")"
