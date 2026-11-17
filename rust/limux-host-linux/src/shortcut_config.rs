@@ -45,6 +45,9 @@ pub enum ShortcutId {
     ActivateWorkspace7,
     ActivateWorkspace8,
     ActivateLastWorkspace,
+    RecentWorkspace,
+    NextUnreadTerminal,
+    PrevUnreadTerminal,
     OpenBrowserInSplit,
     BrowserFocusLocation,
     BrowserBack,
@@ -97,6 +100,9 @@ pub enum ShortcutCommand {
     ActivateWorkspace7,
     ActivateWorkspace8,
     ActivateLastWorkspace,
+    RecentWorkspace,
+    NextUnreadTerminal,
+    PrevUnreadTerminal,
     OpenBrowserInSplit,
     BrowserFocusLocation,
     BrowserBack,
@@ -313,7 +319,7 @@ struct ShortcutConfigFile {
     shortcuts: HashMap<String, serde_json::Value>,
 }
 
-const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 49] = [
+const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 52] = [
     ShortcutDefinition {
         id: ShortcutId::NewWorkspace,
         config_key: "new_workspace",
@@ -652,6 +658,39 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 49] = [
         label: "Activate Last Workspace",
         registers_gtk_accel: false,
         command: ShortcutCommand::ActivateLastWorkspace,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::RecentWorkspace,
+        config_key: "recent_workspace",
+        action_name: "win.recent-workspace",
+        default_accel: "<Ctrl><Alt>o",
+        label: "Switch to Most Recent Workspace",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::RecentWorkspace,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::NextUnreadTerminal,
+        config_key: "next_unread_terminal",
+        action_name: "win.next-unread-terminal",
+        default_accel: "<Ctrl><Alt>u",
+        label: "Next Unread Terminal",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::NextUnreadTerminal,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::PrevUnreadTerminal,
+        config_key: "prev_unread_terminal",
+        action_name: "win.prev-unread-terminal",
+        default_accel: "<Ctrl><Alt><Shift>u",
+        label: "Previous Unread Terminal",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::PrevUnreadTerminal,
         scope: ShortcutScope::Window,
         editable_capture_policy: EditableCapturePolicy::BypassInEditable,
     },
@@ -1715,7 +1754,7 @@ mod tests {
 
     #[test]
     fn definitions_cover_current_host_shortcuts() {
-        assert_eq!(definitions().len(), 49);
+        assert_eq!(definitions().len(), 52);
     }
 
     #[test]

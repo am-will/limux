@@ -35,6 +35,7 @@ fn pane_callbacks(
         on_empty: Box::new(|_, _| {}),
         on_state_changed: Box::new(|| {}),
         on_unread_changed: Box::new(|| {}),
+        on_terminal_exited: Box::new(|_, _, _, _| {}),
         is_pane_visible: Box::new(|_| true),
         on_split_with_tab: Box::new(|_, _, _, _, _| {}),
         current_config: Box::new(move || config.clone()),

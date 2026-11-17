@@ -235,7 +235,8 @@ os.execv('/bin/sh', ['/bin/sh'])
     pump_for(std::time::Duration::from_millis(200));
     // Schedule a retry, then move the exited tab before the timer fires.
     let (_, handle) = pane::terminal_handle_for_surface(&source, Some(&tab.id)).unwrap();
-    assert!(handle.send_text("exit 255\n"));
+    assert!(handle.send_text("exit 255"));
+    assert!(handle.send_key("enter"));
     pump_for(std::time::Duration::from_millis(400));
     assert!(pane::move_tab_to_pane(&source, &tab.id, &target));
     pump_until("retry must follow a moved tab", || attempts() >= 4);
@@ -266,7 +267,8 @@ os.execv('/bin/sh', ['/bin/sh'])
     let root = state.borrow().active_workspace().unwrap().root.clone();
     let target = find_leaf_pane(&root, gtk::Orientation::Horizontal, false);
     let (_, handle) = pane::terminal_handle_for_surface(&target, Some(&tab.id)).unwrap();
-    assert!(handle.send_text("exit 255\n"));
+    assert!(handle.send_text("exit 255"));
+    assert!(handle.send_key("enter"));
     pump_for(std::time::Duration::from_millis(300));
     assert!(pane::set_tab_pinned_in_pane(&target, &tab.id, false));
     assert!(pane::close_tab_in_pane(&target, &tab.id));
@@ -283,7 +285,8 @@ os.execv('/bin/sh', ['/bin/sh'])
     pump_until("remaining remote shell must be live", || {
         handle.health().realized && !handle.health().process_exited
     });
-    assert!(handle.send_text("exit 127\n"));
+    assert!(handle.send_text("exit 127"));
+    assert!(handle.send_key("enter"));
     pump_until("remote command failure", || handle.health().process_exited);
     pump_for(std::time::Duration::from_secs(2));
     assert!(handle.health().process_exited);
@@ -306,7 +309,8 @@ os.execv('/bin/sh', ['/bin/sh'])
         pane::tab_working_directory(&source, &clean_tab).as_deref(),
         Some("/nonexistent-remote-directory")
     );
-    assert!(handle.send_text("exit 0\n"));
+    assert!(handle.send_text("exit 0"));
+    assert!(handle.send_key("enter"));
     pump_until("clean exit must remove the tab", || {
         pane::tab_count_in_pane(&source) == 0
     });

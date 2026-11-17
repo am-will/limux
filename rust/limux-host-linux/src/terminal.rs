@@ -302,6 +302,20 @@ impl BackgroundRealizeState {
 }
 
 impl TerminalHandle {
+    /// Float a widget over the terminal (e.g. the exited-process banner). It
+    /// goes away with the terminal widget. Returns false without an overlay.
+    pub(crate) fn add_overlay(&self, widget: &gtk::Widget) -> bool {
+        let Some(overlay) = self
+            .gl_area
+            .ancestor(gtk::Overlay::static_type())
+            .and_downcast::<gtk::Overlay>()
+        else {
+            return false;
+        };
+        overlay.add_overlay(widget);
+        true
+    }
+
     /// Start a rooted terminal without mapping it or changing input ownership.
     pub(crate) fn realize_in_background(&self) {
         self.background_realize

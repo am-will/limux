@@ -48,6 +48,7 @@ impl Fixture {
                     on_empty: Box::new(|_, _| {}),
                     on_state_changed: Box::new(|| {}),
                     on_unread_changed: Box::new(|| {}),
+                    on_terminal_exited: Box::new(|_, _, _, _| {}),
                     is_pane_visible: Box::new(|_| true),
                     on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                     current_config: Box::new(|| Rc::new(RefCell::new(AppConfig::default()))),
@@ -680,4 +681,47 @@ while True:
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
+}
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn restart_replays_workspace_autostart() {
+    let fixture = Fixture::new();
+    assert!(
+        terminal::terminal_autostart_shell_kind().is_some(),
+        "the test shell must accept workspace autostart"
+    );
+    *fixture.panes[2].callbacks.autostart_command.borrow_mut() =
+        Some("echo LIMUX_AUTOSTART_$((6*7))".to_string());
+    let directory = fixture.directory.path().to_str().unwrap();
+    add_terminal_tab_inner(
+        &fixture.panes[2],
+        Some(directory),
+        Some(TerminalTabOptions {
+            id: None,
+            custom_name: None,
+            pinned: false,
+            cwd: Some(directory),
+            agent: None,
+            ssh: None,
+        }),
+    );
+    let id = fixture.panes[2]
+        .tab_state
+        .borrow()
+        .active_tab
+        .clone()
+        .unwrap();
+    let shows_marker = || {
+        terminal_handle_for_surface(fixture.panes[2].pane_outer.upcast_ref(), Some(&id))
+            .and_then(|(_, handle)| handle.read_viewport_text())
+            .is_some_and(|text| text.contains("LIMUX_AUTOSTART_42"))
+    };
+    pump_until(shows_marker);
+
+    let generation = fixture.generation(2, &id);
+    respawn_terminal_tab(&id, &generation);
+    pump_until(|| !Rc::ptr_eq(&fixture.generation(2, &id), &generation));
+    // The first script removed itself; the restart must write and run a new one.
+    pump_until(shows_marker);
 }

@@ -2924,6 +2924,18 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             activate_last_workspace_shortcut(state);
             true
         }
+        ShortcutCommand::RecentWorkspace => {
+            switch_to_recent_workspace(state);
+            true
+        }
+        ShortcutCommand::NextUnreadTerminal => {
+            cycle_unread_terminal(state, true);
+            true
+        }
+        ShortcutCommand::PrevUnreadTerminal => {
+            cycle_unread_terminal(state, false);
+            true
+        }
         ShortcutCommand::OpenBrowserInSplit
         | ShortcutCommand::BrowserFocusLocation
         | ShortcutCommand::BrowserBack
@@ -3961,6 +3973,30 @@ fn activate_workspace_shortcut(state: &State, idx: usize) {
         switch_workspace(state, idx);
         list.select_row(Some(&row));
     }
+}
+
+/// Switch to the workspace the user was in before the current one. Returns
+/// its index, or `None` when there is no other recent workspace.
+fn switch_to_recent_workspace(state: &State) -> Option<usize> {
+    let (index, row, sidebar_list) = {
+        let app_state = state.borrow();
+        let last_id = app_state.last_workspace_id.as_deref()?;
+        let index = app_state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == last_id)?;
+        if index == app_state.active_idx {
+            return None;
+        }
+        (
+            index,
+            app_state.workspaces[index].sidebar_row.clone(),
+            app_state.sidebar_list.clone(),
+        )
+    };
+    switch_workspace(state, index);
+    sidebar_list.select_row(Some(&row));
+    Some(index)
 }
 
 fn activate_last_workspace_shortcut(state: &State) {
@@ -6734,29 +6770,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let _ = reply.send(result.ok_or_else(|| BridgeError::not_found("workspace not found")));
         }
         ControlCommand::LastWorkspace { reply } => {
-            let selected = {
-                let app_state = state.borrow();
-                let last_id = app_state.last_workspace_id.as_deref();
-                last_id.and_then(|last_id| {
-                    let index = app_state
-                        .workspaces
-                        .iter()
-                        .position(|workspace| workspace.id == last_id)?;
-                    (index != app_state.active_idx).then(|| {
-                        (
-                            index,
-                            app_state.workspaces[index].sidebar_row.clone(),
-                            app_state.sidebar_list.clone(),
-                        )
-                    })
-                })
-            };
-            let Some((index, row, sidebar_list)) = selected else {
+            let Some(index) = switch_to_recent_workspace(state) else {
                 let _ = reply.send(Err(BridgeError::not_found("last workspace not found")));
                 return;
             };
-            switch_workspace(state, index);
-            sidebar_list.select_row(Some(&row));
             let result = {
                 let app_state = state.borrow();
                 workspace_payload(&app_state, index)
@@ -7732,6 +7749,45 @@ pub(crate) fn create_pane_for_workspace(
         on_unread_changed: Box::new(move || {
             sync_workspace_unread(&state_for_unread, &ws_id_unread);
         }),
+        on_terminal_exited: Box::new({
+            let state = state.clone();
+            let ws_id = ws_id.to_string();
+            move |pane_id: u32, tab_id: &str, message: &str, failed: bool| {
+                let state = state.clone();
+                let ws_id = ws_id.clone();
+                let message = message.to_string();
+                let target = DesktopNotificationTarget {
+                    workspace_id: ws_id.clone(),
+                    pane_id: Some(pane_id),
+                    tab_id: Some(tab_id.to_string()),
+                };
+                // Marks the tab and project unread with the exit message. Only
+                // a failure also raises a desktop notification (when enabled);
+                // a clean exit is explained by the sidebar row alone.
+                let tab_id = tab_id.to_string();
+                glib::idle_add_local_once(move || {
+                    // The user may have opened the tab since it exited.
+                    let shown = {
+                        let s = state.borrow();
+                        s.window.is_active()
+                            && s.active_workspace().is_some_and(|workspace| {
+                                workspace.id == ws_id
+                                    && pane::tab_is_visible_in_workspace(
+                                        &ws_id,
+                                        &workspace.root,
+                                        pane_id,
+                                        &tab_id,
+                                    )
+                            })
+                    };
+                    let request =
+                        mark_workspace_unread_with_message(&state, &ws_id, &message, shown, target);
+                    if let Some(request) = request.filter(|_| failed) {
+                        show_desktop_notification(&state, request);
+                    }
+                });
+            }
+        }),
         is_pane_visible: Box::new(move |pane_widget| {
             let s = state_for_visibility.borrow();
             s.window.is_active()
@@ -7991,7 +8047,7 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
         return;
     }
 
-    let (stack, stack_name, focus_root, workspace_id) = {
+    let (stack, stack_name, focus_root, workspace_id, remembered_pane) = {
         let mut s = state.borrow_mut();
         if let Some(prev_id) = s
             .workspaces
@@ -8007,8 +8063,11 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
         let stack_name = format!("ws-{}", s.workspaces[idx].id);
         let focus_root = s.workspaces[idx].root.clone();
         let workspace_id = s.workspaces[idx].id.clone();
+        // Read before the stack switch: GTK may move focus into the new
+        // workspace and overwrite this entry.
+        let remembered_pane = s.current_pane_by_workspace.get(&workspace_id).copied();
 
-        (stack, stack_name, focus_root, workspace_id)
+        (stack, stack_name, focus_root, workspace_id, remembered_pane)
     };
 
     stack.set_visible_child_name(&stack_name);
@@ -8017,7 +8076,7 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
     sidebar_groups::sync_row_visibility(state);
     if focus_entrypoint {
         glib::idle_add_local_once(move || {
-            focus_workspace_entrypoint(&focus_root);
+            focus_workspace_remembered_pane(&focus_root, remembered_pane);
         });
     }
 
@@ -8043,6 +8102,20 @@ fn cycle_workspace(state: &State, direction: i32) {
     };
     switch_workspace(state, new_idx);
     sidebar_list.select_row(Some(&row));
+}
+
+/// Return to the pane the user last focused in this workspace (its active tab
+/// is kept by the pane), else the workspace's first pane.
+fn focus_workspace_remembered_pane(root: &gtk::Widget, pane_id: Option<u32>) {
+    let remembered = pane_id
+        .and_then(pane::find_pane_widget_by_id)
+        .filter(|pane_widget| pane::is_live_pane(pane_widget) && pane_widget.is_ancestor(root));
+    if let Some(pane_widget) = remembered {
+        if pane::focus_active_tab_in_pane(&pane_widget) {
+            return;
+        }
+    }
+    focus_workspace_entrypoint(root);
 }
 
 fn focus_workspace_entrypoint(root: &gtk::Widget) {
@@ -9439,6 +9512,30 @@ mod tests {
     }
 
     #[test]
+    fn unread_terminal_cycle_walks_sidebar_order_and_wraps() {
+        let stops = [(0, 1, 0), (2, 0, 1), (2, 1, 0), (4, 0, 0)];
+        // Forward: the first stop after the focused terminal.
+        assert_eq!(super::next_unread_stop(&stops, (0, 0, 0), true), Some(0));
+        assert_eq!(super::next_unread_stop(&stops, (2, 0, 0), true), Some(1));
+        assert_eq!(super::next_unread_stop(&stops, (2, 0, 1), true), Some(2));
+        assert_eq!(super::next_unread_stop(&stops, (4, 0, 0), true), Some(0));
+        // Backward: the last stop before it.
+        assert_eq!(super::next_unread_stop(&stops, (2, 1, 0), false), Some(1));
+        assert_eq!(super::next_unread_stop(&stops, (0, 1, 0), false), Some(3));
+        assert_eq!(super::next_unread_stop(&stops, (3, 0, 0), false), Some(2));
+        // A lone stop is always the destination; nothing unread is a no-op.
+        assert_eq!(
+            super::next_unread_stop(&[(1, 0, 0)], (1, 0, 0), true),
+            Some(0)
+        );
+        assert_eq!(
+            super::next_unread_stop(&[(1, 0, 0)], (1, 0, 0), false),
+            Some(0)
+        );
+        assert_eq!(super::next_unread_stop(&[], (0, 0, 0), true), None);
+    }
+
+    #[test]
     fn workspace_badge_stays_unread_while_any_tab_is_unread() {
         assert!(has_unread(false, true));
         assert!(has_unread(true, false));
@@ -9480,6 +9577,32 @@ mod tests {
                 gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK
             ),
             Some(ShortcutCommand::NextWorkspace)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::o,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK
+            ),
+            Some(ShortcutCommand::RecentWorkspace)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::u,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK
+            ),
+            Some(ShortcutCommand::NextUnreadTerminal)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::U,
+                gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SHIFT_MASK
+            ),
+            Some(ShortcutCommand::PrevUnreadTerminal)
         );
         assert_eq!(
             shortcut_command_from_key_event(
@@ -10083,6 +10206,7 @@ mod tests {
                 on_empty: Box::new(|_, _| {}),
                 on_state_changed: Box::new(|| {}),
                 on_unread_changed: Box::new(|| {}),
+                on_terminal_exited: Box::new(|_, _, _, _| {}),
                 is_pane_visible: Box::new(|_| true),
                 on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                 current_config: Box::new(move || config.clone()),

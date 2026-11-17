@@ -333,6 +333,95 @@ pub(super) fn surface_tab_target(
     pane::resolve_surface_hint(candidates)
 }
 
+/// Where a terminal sits in sidebar order: workspace index, pane index in
+/// split order, tab index in its pane.
+pub(super) type TerminalPosition = (usize, usize, usize);
+
+/// The next (or previous) unread stop after `current`, wrapping around.
+/// `stops` is in ascending sidebar order.
+pub(super) fn next_unread_stop(
+    stops: &[TerminalPosition],
+    current: TerminalPosition,
+    forward: bool,
+) -> Option<usize> {
+    if stops.is_empty() {
+        return None;
+    }
+    if forward {
+        stops.iter().position(|stop| *stop > current).or(Some(0))
+    } else {
+        stops
+            .iter()
+            .rposition(|stop| *stop < current)
+            .or(Some(stops.len() - 1))
+    }
+}
+
+/// Jump to the next (or previous) unread terminal in sidebar order, across
+/// projects and collapsed groups, and focus that exact tab.
+pub(super) fn cycle_unread_terminal(state: &State, forward: bool) {
+    let (workspaces, active_idx) = {
+        let s = state.borrow();
+        let workspaces = s
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    workspace.id.clone(),
+                    // Every pane, including ones a zoom keeps out of the root.
+                    workspace.split_container.panes(),
+                    workspace.unread || workspace.manual_unread,
+                )
+            })
+            .collect::<Vec<_>>();
+        (workspaces, s.active_idx)
+    };
+    let focused = find_focused_pane(state);
+    let mut current = (active_idx, 0, 0);
+    let mut stops = Vec::new();
+    let mut targets = Vec::new();
+    for (workspace_idx, (workspace_id, panes, workspace_unread)) in workspaces.iter().enumerate() {
+        let mut tab_unread = false;
+        for (pane_idx, pane_widget) in panes.iter().enumerate() {
+            let Some(pane::PaneUnreadTabs {
+                pane_id,
+                unread: unread_tabs,
+                active_tab,
+            }) = pane::unread_tabs_in_pane(pane_widget)
+            else {
+                continue;
+            };
+            if focused
+                .as_ref()
+                .is_some_and(|(id, focused_pane)| id == workspace_id && focused_pane == pane_widget)
+            {
+                current = (workspace_idx, pane_idx, active_tab);
+            }
+            for (tab_idx, tab_id) in unread_tabs {
+                tab_unread = true;
+                stops.push((workspace_idx, pane_idx, tab_idx));
+                targets.push(DesktopNotificationTarget {
+                    workspace_id: workspace_id.clone(),
+                    pane_id: Some(pane_id),
+                    tab_id: Some(tab_id),
+                });
+            }
+        }
+        // A project marked unread without a tab target counts once.
+        if *workspace_unread && !tab_unread {
+            stops.push((workspace_idx, 0, 0));
+            targets.push(DesktopNotificationTarget {
+                workspace_id: workspace_id.clone(),
+                pane_id: None,
+                tab_id: None,
+            });
+        }
+    }
+    if let Some(index) = next_unread_stop(&stops, current, forward) {
+        activate_desktop_notification_target(state, &targets[index], None);
+    }
+}
+
 pub(super) fn has_unread(workspace_unread: bool, tab_unread: bool) -> bool {
     workspace_unread || tab_unread
 }

@@ -32,6 +32,7 @@ use crate::terminal::{self, LinkOpenRequest, TerminalCallbacks};
 #[cfg(test)]
 mod activity_tests;
 mod drag_drop;
+mod exit_hold;
 #[cfg(test)]
 mod ssh_reconnect_tests;
 mod tab_header;
@@ -259,6 +260,10 @@ type PaneBellCallback = dyn Fn(bool, u32, &str);
 type PanePathCallback = dyn Fn(&str);
 type PaneDesktopNotificationCallback = dyn Fn(&str, &str, bool, u32, &str);
 type PaneEmptyCallback = dyn Fn(&gtk::Widget, PaneEmptyReason);
+/// A terminal process ended while nobody watched it: pane id, tab id, message.
+/// `(pane_id, tab_id, message, failed)`: a held exit nobody saw. `failed`
+/// means a non-zero code (or a signal), which also earns a desktop notice.
+type PaneTerminalExitedCallback = dyn Fn(u32, &str, &str, bool);
 type PaneOpenBrowserHereCallback = dyn Fn(&gtk::Widget);
 type PaneOpenUrlInBrowserCallback = dyn Fn(&gtk::Widget, &str);
 type PaneVisibilityCallback = dyn Fn(&gtk::Widget) -> bool;
@@ -291,6 +296,7 @@ pub struct PaneCallbacks {
     pub on_empty: Box<PaneEmptyCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
     pub on_unread_changed: Box<PaneSignalCallback>,
+    pub on_terminal_exited: Box<PaneTerminalExitedCallback>,
     pub is_pane_visible: Box<PaneVisibilityCallback>,
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
     pub current_config: Box<PaneConfigCallback>,
@@ -307,6 +313,12 @@ struct TerminalTabState {
     generation: Rc<()>,
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
+    /// The command the tab was started with (`None` is the default shell), so
+    /// an exited terminal can be restarted the same way.
+    startup_command: Option<Rc<String>>,
+    /// The workspace autostart command typed into this tab's shell. Its
+    /// script removes itself after one run, so a restart writes a new one.
+    workspace_autostart: Option<Rc<String>>,
     /// Preserve restored bindings even when no external hook record remains,
     /// until cleanup invalidates the binding.
     agent: Rc<RefCell<Option<RestorableAgentState>>>,
@@ -470,6 +482,14 @@ pub const PANE_CSS: &str = r#"
 .limux-pin-icon {
     font-size: 9px;
     margin-right: 2px;
+}
+.limux-tab-exited {
+    opacity: 0.55;
+    font-style: italic;
+}
+.limux-exit-banner {
+    padding: 4px 6px;
+    border-radius: 8px;
 }
 .limux-tab-unread-dot {
     color: #f59e0b;
@@ -826,6 +846,37 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
         &internals.callbacks,
     );
     true
+}
+
+/// A pane's unread tabs, for jumping between unread terminals.
+pub struct PaneUnreadTabs {
+    pub pane_id: u32,
+    /// (index in tab order, tab id) of each unread tab.
+    pub unread: Vec<(usize, String)>,
+    /// Index of the active tab in tab order.
+    pub active_tab: usize,
+}
+
+pub fn unread_tabs_in_pane(pane_widget: &gtk::Widget) -> Option<PaneUnreadTabs> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tabs = internals.tab_state.borrow();
+    let unread = tabs
+        .tabs
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.unread && matches!(entry.kind, TabKind::Terminal { .. }))
+        .map(|(index, entry)| (index, entry.id.clone()))
+        .collect();
+    let active_tab = tabs
+        .active_tab
+        .as_deref()
+        .and_then(|active| tabs.tabs.iter().position(|entry| entry.id == active))
+        .unwrap_or(0);
+    Some(PaneUnreadTabs {
+        pane_id: internals.pane_id,
+        unread,
+        active_tab,
+    })
 }
 
 pub fn active_tab_in_pane(pane_widget: &gtk::Widget) -> Option<String> {
@@ -1357,6 +1408,15 @@ enum TabFocusTarget {
 impl TabFocusTarget {
     fn from_entry(entry: &TabEntry) -> Self {
         match &entry.kind {
+            TabKind::Terminal { .. }
+                if entry
+                    .title_label
+                    .has_css_class(exit_hold::EXITED_TAB_CSS_CLASS) =>
+            {
+                exit_hold::restart_button_in(&entry.content)
+                    .map(|button| Self::Widget(button.upcast()))
+                    .unwrap_or_else(|| Self::Widget(entry.content.clone()))
+            }
             TabKind::Terminal { state } => Self::Terminal(state.handle.clone()),
             TabKind::Browser { state } => Self::Browser(state.handles.clone()),
             TabKind::Keybinds => Self::Widget(entry.content.clone()),
@@ -1978,8 +2038,14 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
     let Some(internals) = terminal_tab_owner(tab_id) else {
         return;
     };
-    let retry = {
+    enum ExitStep {
+        Reconnect(Rc<()>, std::time::Duration),
+        Decide(std::time::Duration, bool),
+        Hold(String, bool),
+    }
+    let step = {
         let mut tabs = internals.tab_state.borrow_mut();
+        let is_active_tab = tabs.active_tab.as_deref() == Some(tab_id);
         let Some(entry) = tabs.find_tab_mut(tab_id) else {
             return;
         };
@@ -1991,8 +2057,8 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
         if !Rc::ptr_eq(&state.generation, generation) {
             return;
         }
-        if let Some(ssh) = &state.ssh {
-            if crate::ssh_session::should_reconnect(code, ssh.auto_reconnect) {
+        match &state.ssh {
+            Some(ssh) if crate::ssh_session::should_reconnect(code, ssh.auto_reconnect) => {
                 if state.spawned_at.elapsed() >= std::time::Duration::from_secs(60) {
                     state.retry_attempt = 0;
                 }
@@ -2000,27 +2066,111 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
                 entry.title_label.set_tooltip_text(Some(
                     "SSH disconnected; reconnecting. Close the tab to stop.",
                 ));
-                Some((
+                ExitStep::Reconnect(
                     state.generation.clone(),
                     crate::ssh_session::retry_delay(state.retry_attempt),
-                ))
-            } else if code.is_some_and(|code| code != 0) {
-                // Retain errors and the saved target (e.g. tmux is not installed).
-                entry.title_label.set_tooltip_text(Some(
-                    "SSH exited with an error. Restore the workspace to retry, or close this tab.",
-                ));
-                return;
-            } else {
-                None
+                )
             }
-        } else {
-            None
+            // Retain errors and the saved target (e.g. tmux is not installed).
+            Some(_) if code.is_some_and(|code| code != 0) => ExitStep::Hold(
+                format!("SSH exited with code {}", code.unwrap_or_default()),
+                !is_active_tab,
+            ),
+            _ => ExitStep::Decide(state.spawned_at.elapsed(), is_active_tab),
         }
     };
-    if let Some((generation, delay)) = retry {
-        let tab_id = tab_id.to_string();
-        glib::timeout_add_local_once(delay, move || respawn_terminal_tab(&tab_id, &generation));
-    } else {
+    match step {
+        ExitStep::Reconnect(generation, delay) => {
+            let tab_id = tab_id.to_string();
+            glib::timeout_add_local_once(delay, move || respawn_terminal_tab(&tab_id, &generation));
+        }
+        ExitStep::Hold(message, background) => {
+            let attended = !background && pane_is_visible(&internals);
+            hold_exited_terminal(&internals, tab_id, &message, !attended, true);
+        }
+        ExitStep::Decide(runtime, is_active_tab) => {
+            let attended = is_active_tab && pane_is_visible(&internals);
+            match exit_hold::exit_disposition(code, attended, runtime) {
+                exit_hold::ExitDisposition::Close => remove_terminal_tab(&internals, tab_id),
+                exit_hold::ExitDisposition::Hold { notify } => {
+                    let message = exit_hold::exit_message(code.unwrap_or_default());
+                    let failed = exit_hold::exit_failed(code);
+                    hold_exited_terminal(&internals, tab_id, &message, notify, failed);
+                }
+            }
+        }
+    }
+}
+
+fn pane_is_visible(internals: &Rc<PaneInternals>) -> bool {
+    (internals.callbacks.is_pane_visible)(&internals.pane_outer.clone().upcast())
+}
+
+/// Keep an exited terminal's tab, output and project, with a banner to
+/// restart or close it. `notify` marks it unread for a user who did not see
+/// the exit.
+fn hold_exited_terminal(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    message: &str,
+    notify: bool,
+    failed: bool,
+) {
+    let (title_label, content, handle, generation) = {
+        let tabs = internals.tab_state.borrow();
+        let Some(entry) = tabs.tabs.iter().find(|entry| entry.id == tab_id) else {
+            return;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return;
+        };
+        (
+            entry.title_label.clone(),
+            entry.content.clone(),
+            state.handle.clone(),
+            state.generation.clone(),
+        )
+    };
+    title_label.add_css_class(exit_hold::EXITED_TAB_CSS_CLASS);
+    title_label.set_tooltip_text(Some(&format!("{message}. Restart or close this tab.")));
+
+    let banner = exit_hold::build_exit_banner(
+        message,
+        {
+            let tab_id = tab_id.to_string();
+            let generation = generation.clone();
+            move || respawn_terminal_tab(&tab_id, &generation)
+        },
+        {
+            let tab_id = tab_id.to_string();
+            move || close_exited_terminal_tab(&tab_id, &generation)
+        },
+    );
+    if !handle.add_overlay(&banner.root) {
+        // No terminal overlay to hold the tab in; fall back to closing it.
+        remove_terminal_tab(internals, tab_id);
+        return;
+    }
+    if terminal::focus_is_within(&content) {
+        banner.restart_button.grab_focus();
+    }
+    if notify {
+        (internals.callbacks.on_terminal_exited)(internals.pane_id, tab_id, message, failed);
+    }
+}
+
+fn close_exited_terminal_tab(tab_id: &str, generation: &Rc<()>) {
+    let Some(internals) = terminal_tab_owner(tab_id) else {
+        return;
+    };
+    let current = {
+        let tabs = internals.tab_state.borrow();
+        tabs.tabs.iter().any(|entry| {
+            entry.id == tab_id
+                && matches!(&entry.kind, TabKind::Terminal { state } if Rc::ptr_eq(&state.generation, generation))
+        })
+    };
+    if current {
         remove_terminal_tab(&internals, tab_id);
     }
 }
@@ -2064,7 +2214,7 @@ fn finish_terminal_respawn(
     let Some(internals) = terminal_tab_owner(tab_id) else {
         return;
     };
-    let (label, cwd, command, active, activity) = {
+    let (label, cwd, command, autostart, active, activity) = {
         let tabs = internals.tab_state.borrow();
         let Some(entry) = tabs.tabs.iter().find(|entry| entry.id == tab_id) else {
             return;
@@ -2075,13 +2225,19 @@ fn finish_terminal_respawn(
         if !Rc::ptr_eq(&state.generation, generation) || entry.content != *old_widget {
             return;
         }
-        let Some(ssh) = &state.ssh else {
-            return;
-        };
         (
             entry.title_label.clone(),
             state.cwd.clone(),
-            ssh.command(),
+            state
+                .ssh
+                .as_ref()
+                .map(|ssh| ssh.command())
+                .or_else(|| state.startup_command.as_deref().cloned()),
+            state
+                .ssh
+                .is_none()
+                .then(|| state.workspace_autostart.clone())
+                .flatten(),
             tabs.active_tab.as_deref() == Some(tab_id),
             entry.activity.clone(),
         )
@@ -2102,7 +2258,11 @@ fn finish_terminal_respawn(
         &cwd,
         directory.as_deref(),
         terminal::TerminalOptions {
-            startup_command: Some(command),
+            startup_command: command,
+            initial_input: autostart.and_then(|command| {
+                let shell_kind = terminal::terminal_autostart_shell_kind()?;
+                prepare_workspace_autostart(&command, shell_kind)
+            }),
             suppress_initial_focus: true,
             ..Default::default()
         },
@@ -2125,6 +2285,7 @@ fn finish_terminal_respawn(
     }
     term.handle.realize_in_background();
     label.set_tooltip_text(None);
+    label.remove_css_class(exit_hold::EXITED_TAB_CSS_CLASS);
     if active {
         internals.content_stack.set_visible_child_name(tab_id);
     }
@@ -2196,6 +2357,7 @@ fn add_terminal_tab_inner(
         suppress_autostart,
     );
     let mut initial_input = None;
+    let mut workspace_autostart = None;
     if let Some(command) = workspace_autostart_command.as_deref() {
         if let Some(shell_kind) = terminal::terminal_autostart_shell_kind() {
             eprintln!(
@@ -2203,6 +2365,9 @@ fn add_terminal_tab_inner(
                 internals.callbacks.workspace_id, internals.pane_id, tab_id
             );
             initial_input = prepare_workspace_autostart(command, shell_kind);
+            workspace_autostart = initial_input
+                .is_some()
+                .then(|| Rc::new(command.to_string()));
         } else {
             eprintln!(
                 "limux: skipping workspace autostart for non-shell terminal command workspace={} surface={}:{}",
@@ -2218,7 +2383,7 @@ fn add_terminal_tab_inner(
         &term_cwd,
         working_directory,
         terminal::TerminalOptions {
-            startup_command,
+            startup_command: startup_command.clone(),
             initial_input,
             ..Default::default()
         },
@@ -2251,6 +2416,8 @@ fn add_terminal_tab_inner(
                     generation: Rc::new(()),
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
+                    startup_command: startup_command.map(Rc::new),
+                    workspace_autostart,
                     agent: Rc::new(RefCell::new(
                         options.as_ref().and_then(|value| value.agent.clone()),
                     )),
@@ -5125,6 +5292,7 @@ mod tests {
                 on_empty: Box::new(|_, _| {}),
                 on_state_changed: Box::new(|| {}),
                 on_unread_changed: Box::new(|| {}),
+                on_terminal_exited: Box::new(|_, _, _, _| {}),
                 is_pane_visible: Box::new(|_| true),
                 on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                 current_config: Box::new(|| Rc::new(RefCell::new(AppConfig::default()))),
@@ -5268,6 +5436,7 @@ mod tests {
                 on_empty: Box::new(|_, _| {}),
                 on_state_changed: Box::new(|| {}),
                 on_unread_changed: Box::new(|| {}),
+                on_terminal_exited: Box::new(|_, _, _, _| {}),
                 is_pane_visible: Box::new(|_| true),
                 on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                 current_config: Box::new(|| Rc::new(RefCell::new(AppConfig::default()))),
@@ -5391,6 +5560,7 @@ mod tests {
                 on_empty: Box::new(|_, _| {}),
                 on_state_changed: Box::new(|| {}),
                 on_unread_changed: Box::new(|| {}),
+                on_terminal_exited: Box::new(|_, _, _, _| {}),
                 is_pane_visible: Box::new(|_| true),
                 on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                 current_config: Box::new(|| Rc::new(RefCell::new(AppConfig::default()))),
@@ -5521,6 +5691,7 @@ mod tests {
                 on_empty: Box::new(|_, _| {}),
                 on_state_changed: Box::new(|| {}),
                 on_unread_changed: Box::new(|| {}),
+                on_terminal_exited: Box::new(|_, _, _, _| {}),
                 is_pane_visible: Box::new(|_| true),
                 on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                 current_config: Box::new(move || config.clone()),
@@ -5674,6 +5845,7 @@ mod tests {
                 on_empty: Box::new(|_, _| {}),
                 on_state_changed: Box::new(|| {}),
                 on_unread_changed: Box::new(|| {}),
+                on_terminal_exited: Box::new(|_, _, _, _| {}),
                 is_pane_visible: Box::new(|_| true),
                 on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                 current_config: Box::new(move || config.clone()),
@@ -5826,6 +5998,7 @@ mod tests {
                 on_empty: Box::new(|_, _| {}),
                 on_state_changed: Box::new(|| {}),
                 on_unread_changed: Box::new(|| {}),
+                on_terminal_exited: Box::new(|_, _, _, _| {}),
                 is_pane_visible: Box::new(|_| true),
                 on_split_with_tab: Box::new(|_, _, _, _, _| {}),
                 current_config: Box::new(move || config.clone()),
@@ -5907,6 +6080,7 @@ mod tests {
             on_empty: Box::new(|_, _| {}),
             on_state_changed: Box::new(|| {}),
             on_unread_changed: Box::new(|| {}),
+            on_terminal_exited: Box::new(|_, _, _, _| {}),
             is_pane_visible: Box::new(|_| true),
             on_split_with_tab: Box::new(|_, _, _, _, _| {}),
             current_config: Box::new(move || config.clone()),
@@ -5995,6 +6169,7 @@ mod tests {
                 state_changes_cb.set(state_changes_cb.get() + 1);
             }),
             on_unread_changed: Box::new(|| {}),
+            on_terminal_exited: Box::new(|_, _, _, _| {}),
             is_pane_visible: Box::new(|_| true),
             on_split_with_tab: Box::new(|_, _, _, _, _| {}),
             current_config: Box::new(move || config.clone()),
