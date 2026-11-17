@@ -133,9 +133,11 @@ jobs:
             blueprint-compiler \
             bubblewrap \
             build-essential \
+            gdb \
             gettext \
             jq \
             libadwaita-1-dev \
+            libc6-dbg \
             libepoxy-dev \
             libgl1-mesa-dri \
             libgtk-4-dev \
@@ -155,34 +157,43 @@ jobs:
             xdg-dbus-proxy \
             xvfb
 
+      - name: Enable native crash diagnostics
+        id: native-crashes
+        run: uv run scripts/ci-native-crashes.py setup
+
+      - name: Verify native crash capture
+        run: ./scripts/tests/test-native-crash-diagnostics.sh --kernel
+
       - name: Build libghostty for embedding
+        env:
+          LIMUX_GHOSTTY_DEBUG_SYMBOLS: "1"
         run: ./scripts/build-ghostty.sh
 
       - name: Check terminal IBus lifecycle
-        run: ./scripts/tests/test-terminal-ime-lifecycle.sh
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/tests/test-terminal-ime-lifecycle.sh
 
       - name: Run live GTK host smoke test
         env:
           LIMUX_SMOKE_PROFILE: debug
-        run: ./scripts/ci-webkit-sandbox.sh -- ./scripts/xvfb-smoke-test.sh
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/ci-webkit-sandbox.sh -- ./scripts/xvfb-smoke-test.sh
 
       - name: Check X11 input-seat removal
-        run: uv run scripts/tests/test-input-seat-removal.py
+        run: uv run scripts/ci-native-crashes.py run -- uv run scripts/tests/test-input-seat-removal.py
 
       - name: Check terminal directory inheritance
-        run: ./scripts/tests/test-terminal-cwd.sh
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/tests/test-terminal-cwd.sh
 
       - name: Check tab double-click rename
-        run: ./scripts/tests/test-tab-rename.sh
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/tests/test-tab-rename.sh
 
       - name: Check existing-window activation
-        run: ./scripts/tests/test-window-activate.sh
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/tests/test-window-activate.sh
 
       - name: Check workspace row clicks and inline rename focus after switching
         timeout-minutes: 3
         env:
           LIMUX_TEST_ARTIFACT_DIR: ${{ runner.temp }}/limux-rename-focus
-        run: ./scripts/tests/test-workspace-rename-focus.sh
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/tests/test-workspace-rename-focus.sh
 
       - name: Upload inline rename test captures
         if: always()
@@ -199,7 +210,21 @@ jobs:
         env:
           LIMUX_VISUAL_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/limux-visual-smoke
           LIMUX_VISUAL_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: ./scripts/ci-webkit-sandbox.sh -- ./scripts/tests/visual-smoke-test.sh
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/ci-webkit-sandbox.sh -- ./scripts/tests/visual-smoke-test.sh
+
+      - name: Collect native crash diagnostics
+        if: always() && steps.native-crashes.outcome == 'success'
+        timeout-minutes: 7
+        run: uv run scripts/ci-native-crashes.py collect
+
+      - name: Upload native crash diagnostics
+        if: always() && steps.native-crashes.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: limux-native-crashes
+          path: ${{ runner.temp }}/limux-native-crashes/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload visual smoke gallery
         id: visual-gallery
@@ -302,10 +327,12 @@ jobs:
             bubblewrap \
             build-essential \
             dbus-x11 \
+            gdb \
             gettext \
             imagemagick \
             jq \
             libadwaita-1-dev \
+            libc6-dbg \
             libepoxy-dev \
             libgl1-mesa-dri \
             libgtk-4-dev \
@@ -318,8 +345,17 @@ jobs:
             xdg-dbus-proxy \
             xvfb
 
+      - name: Enable native crash diagnostics with trusted harness
+        id: native-crashes
+        run: uv run tooling/scripts/ci-native-crashes.py setup
+
+      - name: Verify native crash capture with trusted harness
+        run: ./tooling/scripts/tests/test-native-crash-diagnostics.sh --kernel
+
       - name: Build libghostty from requested PR source
         working-directory: source
+        env:
+          LIMUX_GHOSTTY_DEBUG_SYMBOLS: "1"
         run: ./scripts/build-ghostty.sh
 
       - name: Build GUI host and CLI from requested PR source
@@ -333,7 +369,23 @@ jobs:
           LIMUX_TEST_ROOT: ${{ github.workspace }}/source
           LIMUX_VISUAL_SOURCE_SHA: ${{ steps.pr.outputs.head_sha }}
           LIMUX_VISUAL_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/limux-visual-smoke
-        run: tooling/scripts/ci-webkit-sandbox.sh -- tooling/scripts/tests/visual-smoke-test.sh
+        run: uv run tooling/scripts/ci-native-crashes.py run -- tooling/scripts/ci-webkit-sandbox.sh -- tooling/scripts/tests/visual-smoke-test.sh
+
+      - name: Collect native crash diagnostics with trusted harness
+        if: always() && steps.native-crashes.outcome == 'success'
+        timeout-minutes: 7
+        env:
+          LIMUX_TEST_ROOT: ${{ github.workspace }}/source
+        run: uv run tooling/scripts/ci-native-crashes.py collect
+
+      - name: Upload native crash diagnostics
+        if: always() && steps.native-crashes.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: limux-native-crashes
+          path: ${{ runner.temp }}/limux-native-crashes/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload visual smoke gallery
         id: visual-gallery
