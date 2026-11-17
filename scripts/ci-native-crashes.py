@@ -166,9 +166,22 @@ def collect(directory):
                 raise RuntimeError(
                     f"GDB exited {result.returncode}; inspect {trace.name}"
                 )
-            if (
-                "truncated" in text.lower()
-                or "may not match specified executable" in text
+            diagnostics = [
+                line.lower()
+                for line in text.splitlines()
+                if line.startswith(
+                    ("warning:", "BFD: warning:", f'"{core}" is not a core dump:')
+                )
+            ]
+            if any(
+                problem in line
+                for line in diagnostics
+                for problem in (
+                    "truncated",
+                    "extending past end of file",
+                    "may not match specified executable",
+                    "is not a core dump:",
+                )
             ):
                 errors.append(
                     f"{core.name}: GDB reported incomplete or mismatched core data"

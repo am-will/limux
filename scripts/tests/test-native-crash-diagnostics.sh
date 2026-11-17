@@ -27,7 +27,11 @@ static void *waiting_worker(void *unused) {
     for (;;) pause();
     return NULL;
 }
-static void crash_here(void) { abort(); }
+static void crash_here(void) {
+    const char *message = "truncated is application data";
+    (void)message;
+    abort();
+}
 int main(void) {
     pthread_t worker;
     if (pthread_create(&worker, NULL, waiting_worker, NULL)) return 2;
@@ -56,7 +60,20 @@ uv run "$ROOT_DIR/scripts/ci-native-crashes.py" --directory "$TEST_DIR" collect
 grep -q 'crash_here .*abort-fixture.c:' "$TEST_DIR"/*.backtrace.txt
 grep -q 'waiting_worker .*abort-fixture.c:' "$TEST_DIR"/*.backtrace.txt
 grep -q 'SIGABRT' "$TEST_DIR"/*.backtrace.txt
+grep -q 'message = .*truncated is application data' "$TEST_DIR"/*.backtrace.txt
 tar -tzf "$TEST_DIR/objects.tar.gz" | grep '/limux-abort-fixture-0123456789abcdef$' >/dev/null
+
+# Removing core data must fail collection, even when GDB itself returns success.
+mkdir -p "$TEST_DIR/partial-core/cores"
+partial_core="$TEST_DIR/partial-core/cores/$(basename "${cores[0]}")"
+cp "${cores[0]}" "$partial_core"
+truncate -s "$(( $(stat -c %s "$partial_core") / 2 ))" "$partial_core"
+result=0
+uv run "$ROOT_DIR/scripts/ci-native-crashes.py" --directory "$TEST_DIR/partial-core" collect \
+  > "$TEST_DIR/partial-core/collector.log" 2>&1 || result=$?
+[ "$result" -eq 1 ] || { echo "FAIL: partial core was not a collection failure"; exit 1; }
+jq -e '.errors[] | contains("GDB reported incomplete or mismatched core data")' \
+  "$TEST_DIR/partial-core/manifest.json" >/dev/null
 
 # A collection error must remain visible without losing the raw core.
 mkdir -p "$TEST_DIR/missing-executable/cores"
