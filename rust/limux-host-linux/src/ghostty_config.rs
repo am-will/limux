@@ -135,12 +135,123 @@ pub fn read_font_size() -> f32 {
         .unwrap_or(DEFAULT_FONT_SIZE)
 }
 
+pub(crate) fn strip_optional_quotes(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+pub(crate) fn parse_primary_font_family(contents: &str) -> Option<String> {
+    let mut families: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("font-family") {
+            let rest = rest.trim_start();
+            if let Some(raw_val) = rest.strip_prefix('=') {
+                let unquoted = strip_optional_quotes(raw_val).trim();
+                if unquoted.is_empty() {
+                    families.clear();
+                } else if let Some(clean) = crate::terminal_font::sanitize_font_token(unquoted) {
+                    families.push(clean);
+                }
+            }
+        }
+    }
+    families.into_iter().next()
+}
+
+pub(crate) fn parse_use_ligatures(contents: &str) -> bool {
+    let mut enabled = true;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("font-feature") {
+            let rest = rest.trim_start();
+            if let Some(raw_val) = rest.strip_prefix('=') {
+                let unquoted = strip_optional_quotes(raw_val).trim();
+                if unquoted.is_empty() {
+                    enabled = true;
+                    continue;
+                }
+                for token in unquoted.split(',').map(str::trim) {
+                    let normalized = token.trim_matches(['"', '\'']).trim();
+                    if matches!(
+                        normalized,
+                        "-calt" | "calt=0" | "calt off" | "-liga" | "liga=0" | "liga off"
+                    ) {
+                        enabled = false;
+                    } else if matches!(
+                        normalized,
+                        "calt"
+                            | "+calt"
+                            | "calt=1"
+                            | "calt on"
+                            | "liga"
+                            | "+liga"
+                            | "liga=1"
+                            | "liga on"
+                    ) {
+                        enabled = true;
+                    }
+                }
+            }
+        }
+    }
+    enabled
+}
+
+pub(crate) fn parse_anti_aliased(contents: &str) -> bool {
+    let Some(raw) = read_ghostty_value(contents, "freetype-load-flags") else {
+        return true;
+    };
+    let unquoted = strip_optional_quotes(&raw).trim();
+    if unquoted.is_empty() || unquoted.eq_ignore_ascii_case("false") {
+        return true;
+    }
+    if unquoted.eq_ignore_ascii_case("true") {
+        return false;
+    }
+    let mut monochrome = false;
+    for part in unquoted.split(',').map(str::trim) {
+        if part.eq_ignore_ascii_case("monochrome") {
+            monochrome = true;
+        } else if part.eq_ignore_ascii_case("no-monochrome") {
+            monochrome = false;
+        }
+    }
+    !monochrome
+}
+
+pub fn read_font_family() -> Option<String> {
+    ghostty_config_contents().and_then(|c| parse_primary_font_family(&c))
+}
+
+pub fn read_use_ligatures() -> bool {
+    ghostty_config_contents()
+        .map(|c| parse_use_ligatures(&c))
+        .unwrap_or(true)
+}
+
+pub fn read_anti_aliased() -> bool {
+    ghostty_config_contents()
+        .map(|c| parse_anti_aliased(&c))
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_interactive_shell, read_ghostty_value,
-        terminal_command_autostart_shell_with_fallback, terminal_commands_autostart_shell,
-        AutostartShellKind,
+        classify_interactive_shell, parse_anti_aliased, parse_primary_font_family,
+        parse_use_ligatures, read_ghostty_value, terminal_command_autostart_shell_with_fallback,
+        terminal_commands_autostart_shell, AutostartShellKind,
     };
     use std::ffi::OsStr;
 
@@ -258,5 +369,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn font_helpers_respect_repeatable_resets_ligature_toggles_and_monochrome() {
+        let contents = "\
+font-family = JetBrains Mono
+font-family = \"\"
+font-family = \"MesloLGS NF\"
+font-family = Noto Color Emoji
+font-feature = -calt, -liga
+freetype-load-flags = light, monochrome
+";
+        assert_eq!(
+            parse_primary_font_family(contents).as_deref(),
+            Some("MesloLGS NF")
+        );
+        assert!(!parse_use_ligatures(contents));
+        assert!(!parse_anti_aliased(contents));
+
+        let reset = format!("{contents}font-family = \"\"\nfont-feature = +calt\nfreetype-load-flags = no-monochrome\n");
+        assert_eq!(parse_primary_font_family(&reset), None);
+        assert!(parse_use_ligatures(&reset));
+        assert!(parse_anti_aliased(&reset));
     }
 }

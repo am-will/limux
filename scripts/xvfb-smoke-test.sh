@@ -413,6 +413,8 @@ for regression in \
   settings_editor::tests::hook_controls_restore_effective_values_after_save_failure \
   settings_editor::tests::hook_rows_show_socket_changes_without_saving_them_again \
   settings_editor::tests::hooks_is_the_second_settings_tab \
+  settings_editor::terminal_font_group::tests::terminal_font_controls_update_auto_style_rollback_and_reset \
+  window::terminal_font_tests::terminal_font_config_updates_live_and_new_ghostty_surfaces \
   window::tests::hidden_workspace_path_does_not_reserve_sidebar_row_height \
   terminal::tests::submenu_popovers_never_grab \
   terminal::tests::clipboard_toast_never_retains_its_terminal \

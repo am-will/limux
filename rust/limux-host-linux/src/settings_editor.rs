@@ -13,6 +13,9 @@ use crate::gui_hooks::{GuiHook, GuiHookEvent, GuiHooksConfig};
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
+mod terminal_font_group;
+pub use terminal_font_group::refresh_terminal_font_rows;
+
 pub const SETTINGS_CSS: &str = r#"
 .limux-settings-window {
     background-color: @window_bg_color;
@@ -154,7 +157,7 @@ pub fn present_settings_dialog(parent: &impl IsA<gtk::Widget>, input: SettingsEd
     window.present();
 }
 
-fn apply_config_change<F, G>(
+pub(super) fn apply_config_change<F, G>(
     config: &Rc<RefCell<AppConfig>>,
     on_changed: &F,
     update: G,
@@ -718,6 +721,9 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     group.add(&controls_row);
 
     page.add(&group);
+    page.add(&terminal_font_group::build_terminal_font_group(
+        input, &page,
+    ));
 
     {
         let config = input.config.clone();
@@ -1414,6 +1420,22 @@ mod tests {
             .filter_map(|page| page.name().map(|name| name.to_string()))
             .collect();
         assert_eq!(names, ["general", "hooks", "notifications", "keybindings"]);
+
+        fn collect_group_titles(widget: &gtk::Widget, out: &mut Vec<String>) {
+            if let Some(group) = widget.downcast_ref::<adw::PreferencesGroup>() {
+                out.push(group.title().to_string());
+                return;
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                collect_group_titles(&next, out);
+                child = next.next_sibling();
+            }
+        }
+        let general = stack.child_by_name("general").expect("general page");
+        let mut group_titles = Vec::new();
+        collect_group_titles(&general, &mut group_titles);
+        assert_eq!(group_titles, ["", "Terminal font"]);
     }
 
     #[test]

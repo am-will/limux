@@ -1765,6 +1765,7 @@ pub fn build_window(app: &adw::Application) {
     for warning in &loaded_config.warnings {
         eprintln!("limux: {warning}");
     }
+    crate::terminal::apply_terminal_font_config(&loaded_config.config.terminal_font, false);
     let config = Rc::new(RefCell::new(loaded_config.config));
     let background_opacity =
         sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
@@ -3072,6 +3073,12 @@ fn handle_config_change(
         eprintln!("limux: {detail}");
         show_runtime_error(state, "Failed to save settings", &detail);
         return;
+    }
+    let font_size_cleared = previous.font_size.is_some() && updated.font_size.is_none();
+    if previous.terminal_font != updated.terminal_font || font_size_cleared {
+        let reset_zoom =
+            previous.terminal_font.size != updated.terminal_font.size || font_size_cleared;
+        crate::terminal::apply_terminal_font_config(&updated.terminal_font, reset_zoom);
     }
     if previous.interface.show_tab_activity != updated.interface.show_tab_activity
         || previous.interface.tab_activity_seconds != updated.interface.tab_activity_seconds
@@ -8727,18 +8734,24 @@ fn dispatch_terminal_command(state: &State, command: ShortcutCommand) -> bool {
 }
 
 fn persist_font_size_delta(state: &State, delta: f32) -> bool {
-    let current = {
+    let (current, base_size) = {
         let s = state.borrow();
-        let current = s.config.borrow().font_size;
-        current
+        let cfg = s.config.borrow();
+        (
+            cfg.font_size,
+            cfg.terminal_font
+                .size
+                .unwrap_or_else(crate::terminal::default_font_size),
+        )
     };
-    let new_size = font_size_after_delta(current, crate::terminal::default_font_size(), delta);
+    let new_size = font_size_after_delta(current, base_size, delta);
 
     if let Err(err) = persist_font_size(state, Some(new_size)) {
         show_font_size_save_error(state, err);
         return false;
     }
 
+    settings_editor::refresh_terminal_font_rows(&state.borrow().config.borrow());
     broadcast_font_size(new_size);
     true
 }
@@ -8749,6 +8762,7 @@ fn persist_font_size_reset(state: &State) -> bool {
         return false;
     }
 
+    settings_editor::refresh_terminal_font_rows(&state.borrow().config.borrow());
     crate::terminal::broadcast_binding_action("reset_font_size");
     true
 }
@@ -10169,6 +10183,10 @@ mod pane_create_tests;
 #[cfg(test)]
 #[path = "pane_close_tests.rs"]
 mod pane_close_tests;
+
+#[cfg(test)]
+#[path = "terminal_font_tests.rs"]
+mod terminal_font_tests;
 
 #[cfg(test)]
 #[path = "session_save_tests.rs"]
