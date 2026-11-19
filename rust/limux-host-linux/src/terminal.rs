@@ -57,6 +57,8 @@ static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIG
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static CURRENT_AUTOSTART_SHELL_KIND: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(1);
+static CURRENT_TERMINAL_FONT: LazyLock<Mutex<crate::terminal_font::TerminalFontConfig>> =
+    LazyLock::new(|| Mutex::new(crate::terminal_font::TerminalFontConfig::default()));
 static GHOSTTY_WAKEUP: LazyLock<wakeup::Wakeup> = LazyLock::new(wakeup::Wakeup::default);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
 
@@ -334,6 +336,40 @@ impl TerminalHandle {
             10.0,
             0,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_font_size_for_test(&self) -> Option<f32> {
+        let surface = (*self.surface_cell.borrow())?;
+        Some(unsafe { ghostty_surface_font_size(surface) })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_font_cluster_json_for_test(
+        &self,
+        cluster: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Option<serde_json::Value> {
+        let surface = (*self.surface_cell.borrow())?;
+        let raw = unsafe {
+            ghostty_surface_font_resolve_json(
+                surface,
+                cluster.as_ptr().cast::<c_char>(),
+                cluster.len(),
+                bold,
+                italic,
+                1,
+            )
+        };
+        let parsed = if raw.ptr.is_null() || raw.len == 0 {
+            None
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(raw.ptr.cast::<u8>(), raw.len) };
+            serde_json::from_slice(bytes).ok()
+        };
+        unsafe { ghostty_string_free(raw) };
+        parsed
     }
 
     pub fn replace_callbacks(&self, callbacks: TerminalCallbacks) {
@@ -753,10 +789,39 @@ fn refresh_realized_surface_display(
 }
 
 fn load_ghostty_config() -> ghostty_config_t {
+    let terminal_font = CURRENT_TERMINAL_FONT
+        .lock()
+        .expect("terminal font lock poisoned")
+        .clone();
+    load_ghostty_config_with_font(&terminal_font)
+}
+
+fn load_ghostty_config_with_font(
+    terminal_font: &crate::terminal_font::TerminalFontConfig,
+) -> ghostty_config_t {
+    const OVERLAY_PATH: &[u8] = b"/limux/terminal-font.ghostty\0";
+
     unsafe {
         let config = ghostty_config_new();
         ghostty_config_load_default_files(config);
         ghostty_config_load_recursive_files(config);
+        if !terminal_font.is_default() {
+            let base_flags = if terminal_font.anti_aliased.is_some() {
+                serialized_config(config).and_then(|contents| {
+                    crate::ghostty_config::read_ghostty_value(&contents, "freetype-load-flags")
+                })
+            } else {
+                None
+            };
+            if let Some(overlay) = terminal_font.ghostty_overlay(base_flags.as_deref()) {
+                ghostty_config_load_string(
+                    config,
+                    overlay.as_ptr().cast::<c_char>(),
+                    overlay.len(),
+                    OVERLAY_PATH.as_ptr().cast::<c_char>(),
+                );
+            }
+        }
         if flatpak::enabled() {
             if let Some(contents) = serialized_config(config) {
                 flatpak::load_config(&contents);
@@ -828,6 +893,19 @@ pub fn init_ghostty() {
             ghostty_init(0, ptr::null_mut());
         }
 
+        {
+            let mut current = CURRENT_TERMINAL_FONT
+                .lock()
+                .expect("terminal font lock poisoned");
+            if current.is_default() {
+                if let Some(path) = crate::app_config::settings_path() {
+                    *current = crate::app_config::load_from_path(&path)
+                        .config
+                        .terminal_font;
+                }
+            }
+        }
+
         let config = load_ghostty_config();
         let background_opacity = load_background_opacity(config);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
@@ -852,6 +930,53 @@ pub fn init_ghostty() {
             background_opacity,
         }
     });
+}
+
+pub fn apply_terminal_font_config(
+    terminal_font: &crate::terminal_font::TerminalFontConfig,
+    reset_zoom: bool,
+) {
+    init_ghostty();
+    let sanitized = terminal_font.sanitized();
+    let changed = {
+        let mut current = CURRENT_TERMINAL_FONT
+            .lock()
+            .expect("terminal font lock poisoned");
+        if *current == sanitized {
+            false
+        } else {
+            *current = sanitized.clone();
+            true
+        }
+    };
+    if !changed && !reset_zoom {
+        return;
+    }
+
+    if changed {
+        let config = load_ghostty_config_with_font(&sanitized);
+        CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
+        CURRENT_AUTOSTART_SHELL_KIND.store(load_autostart_shell_kind(config), Ordering::Relaxed);
+        let app = ghostty_app();
+        unsafe {
+            ghostty_app_update_config(app, config);
+            ghostty_config_free(config);
+        }
+    }
+
+    if reset_zoom {
+        broadcast_binding_action("reset_font_size");
+    }
+
+    let surfaces: Vec<(ghostty_surface_t, gtk::GLArea)> = SURFACE_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .map(|(&key, entry)| (key as ghostty_surface_t, entry.gl_area.clone()))
+            .collect()
+    });
+    for (surface, gl_area) in surfaces {
+        refresh_surface_display(surface, &gl_area);
+    }
 }
 
 fn ghostty_app() -> ghostty_app_t {

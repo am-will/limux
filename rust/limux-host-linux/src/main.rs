@@ -21,6 +21,7 @@ mod ssh_session;
 mod ssh_transfer;
 mod tab_activity;
 mod terminal;
+mod terminal_font;
 mod window;
 mod workspace_color;
 mod workspace_group;
