@@ -176,8 +176,51 @@ impl UnreadColor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiTheme {
+    #[default]
+    Default,
+    Omarchy,
+}
+
+impl UiTheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Omarchy => "omarchy",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "default" => Some(Self::Default),
+            "omarchy" => Some(Self::Omarchy),
+            _ => None,
+        }
+    }
+
+    pub fn labels() -> &'static [&'static str] {
+        &["Default", "Omarchy"]
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::Default => 0,
+            Self::Omarchy => 1,
+        }
+    }
+
+    pub fn from_dropdown_index(index: u32) -> Self {
+        match index {
+            1 => Self::Omarchy,
+            _ => Self::Default,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppearanceConfig {
+    pub ui_theme: UiTheme,
     pub color_scheme: ColorScheme,
     pub ghostty_color_scheme: ColorScheme,
     pub ui_scale: UiScale,
@@ -188,6 +231,7 @@ pub struct AppearanceConfig {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
+            ui_theme: UiTheme::default(),
             color_scheme: ColorScheme::default(),
             ghostty_color_scheme: ColorScheme::default(),
             ui_scale: UiScale::default(),
@@ -479,6 +523,12 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
 
     let appearance = root.get("appearance").and_then(Value::as_object);
 
+    let ui_theme = appearance
+        .and_then(|appearance| appearance.get("ui_theme"))
+        .and_then(Value::as_str)
+        .and_then(UiTheme::from_str)
+        .unwrap_or_default();
+
     let color_scheme = appearance
         .and_then(|appearance| appearance.get("color_scheme"))
         .and_then(Value::as_str)
@@ -590,6 +640,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             hover_terminal_focus,
         },
         appearance: AppearanceConfig {
+            ui_theme,
             color_scheme,
             ghostty_color_scheme,
             ui_scale,
@@ -724,6 +775,12 @@ fn config_to_map(config: &AppConfig) -> Map<String, Value> {
         appearance.insert(
             "unread_color".to_string(),
             json!(config.appearance.unread_color.as_str()),
+        );
+    }
+    if config.appearance.ui_theme != UiTheme::default() {
+        appearance.insert(
+            "ui_theme".to_string(),
+            json!(config.appearance.ui_theme.as_str()),
         );
     }
     root.insert("appearance".to_string(), Value::Object(appearance));
@@ -1800,5 +1857,44 @@ mod tests {
             assert_eq!(mode & 0o777, 0o640);
         }
         assert_eq!(fs::read_dir(&dotfiles).expect("list dotfiles").count(), 1);
+    }
+
+    #[test]
+    fn ui_theme_round_trips_and_omits_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+
+        let default_config = AppConfig::default();
+        save_over(&path, &default_config).expect("save default config");
+        let raw_default = fs::read_to_string(&path).expect("read default config");
+        let parsed_default: Value = serde_json::from_str(&raw_default).expect("parse default");
+        assert!(parsed_default["appearance"].get("ui_theme").is_none());
+
+        let mut omarchy_config = AppConfig::default();
+        omarchy_config.appearance.ui_theme = UiTheme::Omarchy;
+        save_over(&path, &omarchy_config).expect("save omarchy config");
+        let raw_omarchy = fs::read_to_string(&path).expect("read omarchy config");
+        let parsed_omarchy: Value = serde_json::from_str(&raw_omarchy).expect("parse omarchy");
+        assert_eq!(
+            parsed_omarchy["appearance"]["ui_theme"],
+            Value::String("omarchy".to_string())
+        );
+
+        let loaded = load_from_path(&path);
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.appearance.ui_theme, UiTheme::Omarchy);
+    }
+
+    #[test]
+    fn unknown_ui_theme_falls_back_to_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"appearance": {"ui_theme": "unknown-theme"}}"#).expect("write config");
+
+        let loaded = load_from_path(&path);
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.appearance.ui_theme, UiTheme::Default);
     }
 }

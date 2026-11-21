@@ -9,6 +9,7 @@ mod input_seats;
 mod keybind_editor;
 mod layout_state;
 mod link_uri;
+mod omarchy_theme;
 mod pane;
 mod session_store;
 mod settings_editor;
