@@ -8,6 +8,7 @@ use libadwaita as adw;
 
 use super::{apply_config_change, SettingsEditorInput};
 use crate::app_config::AppConfig;
+use crate::ghostty_config::GhosttyFontDefaults;
 use crate::terminal_font::{
     preferred_style_for_family_change, sanitize_font_token, sort_face_styles, TerminalFontConfig,
     MAX_CELL_METRIC_PERCENT, MAX_UI_TERMINAL_FONT_SIZE, MIN_CELL_METRIC_PERCENT,
@@ -113,25 +114,6 @@ impl FontCatalog {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct GhosttyFontDefaults {
-    pub family: Option<String>,
-    pub size: f32,
-    pub use_ligatures: bool,
-    pub anti_aliased: bool,
-}
-
-impl GhosttyFontDefaults {
-    fn load() -> Self {
-        Self {
-            family: crate::ghostty_config::read_font_family(),
-            size: crate::terminal::default_font_size(),
-            use_ligatures: crate::ghostty_config::read_use_ligatures(),
-            anti_aliased: crate::ghostty_config::read_anti_aliased(),
-        }
-    }
-}
-
 struct TerminalFontRowWidgets {
     catalog: Rc<FontCatalog>,
     defaults: GhosttyFontDefaults,
@@ -180,13 +162,19 @@ impl TerminalFontRowWidgets {
         }
 
         let width_spin = self.width_spin.upgrade()?;
-        if width_spin.value_as_int() != i32::from(font.cell_width_percent) {
-            width_spin.set_value(f64::from(font.cell_width_percent));
+        let cell_width = font
+            .cell_width_percent
+            .unwrap_or(self.defaults.cell_width_percent);
+        if width_spin.value_as_int() != i32::from(cell_width) {
+            width_spin.set_value(f64::from(cell_width));
         }
 
         let height_spin = self.height_spin.upgrade()?;
-        if height_spin.value_as_int() != i32::from(font.cell_height_percent) {
-            height_spin.set_value(f64::from(font.cell_height_percent));
+        let cell_height = font
+            .cell_height_percent
+            .unwrap_or(self.defaults.cell_height_percent);
+        if height_spin.value_as_int() != i32::from(cell_height) {
+            height_spin.set_value(f64::from(cell_height));
         }
 
         let ligatures_switch = self.ligatures_switch.upgrade()?;
@@ -283,7 +271,7 @@ pub(super) fn build_terminal_font_group(
         host_widget,
         &input.config.borrow().terminal_font,
     ));
-    let defaults = GhosttyFontDefaults::load();
+    let defaults = crate::terminal::base_ghostty_font_defaults();
     build_terminal_font_group_with_catalog(input, catalog, defaults)
 }
 
@@ -382,22 +370,27 @@ pub(super) fn build_terminal_font_group_with_catalog(
         .valign(gtk::Align::Center)
         .width_chars(4)
         .build();
-    let format_size_spin = |spin: &gtk::SpinButton| {
+    size_spin.connect_output(|spin| {
         let value = (spin.value() * 10.0).round() / 10.0;
-        let text = if (value - value.round()).abs() < f64::EPSILON {
-            format!("{:.0}", value.round())
+        if (value - value.round()).abs() < f64::EPSILON {
+            let text = format!("{:.0}", value.round());
+            if spin.text() != text {
+                spin.set_text(&text);
+            }
+            gtk::glib::Propagation::Stop
         } else {
-            format!("{value:.1}")
-        };
-        if spin.text() != text {
-            spin.set_text(&text);
+            // Defer fractional values to GTK's default locale-aware formatter so
+            // comma-decimal locales never reject an ASCII '.' under numeric(true).
+            gtk::glib::Propagation::Proceed
         }
-    };
-    size_spin.connect_output(move |spin| {
-        format_size_spin(spin);
-        gtk::glib::Propagation::Stop
     });
-    format_size_spin(&size_spin);
+    let rounded_initial = (initial_size * 10.0).round() / 10.0;
+    if (rounded_initial - rounded_initial.round()).abs() < f64::EPSILON {
+        let text = format!("{:.0}", rounded_initial.round());
+        if size_spin.text() != text {
+            size_spin.set_text(&text);
+        }
+    }
     size_row.add_suffix(&size_spin);
     size_row.set_activatable_widget(Some(&size_spin));
     group.add(&size_row);
@@ -409,7 +402,11 @@ pub(super) fn build_terminal_font_group_with_catalog(
     width_row.set_title_lines(1);
     width_row.set_subtitle_lines(2);
     let width_adjustment = gtk::Adjustment::new(
-        f64::from(initial_font.cell_width_percent),
+        f64::from(
+            initial_font
+                .cell_width_percent
+                .unwrap_or(defaults.cell_width_percent),
+        ),
         f64::from(MIN_CELL_METRIC_PERCENT),
         f64::from(MAX_CELL_METRIC_PERCENT),
         1.0,
@@ -434,7 +431,11 @@ pub(super) fn build_terminal_font_group_with_catalog(
     height_row.set_title_lines(1);
     height_row.set_subtitle_lines(2);
     let height_adjustment = gtk::Adjustment::new(
-        f64::from(initial_font.cell_height_percent),
+        f64::from(
+            initial_font
+                .cell_height_percent
+                .unwrap_or(defaults.cell_height_percent),
+        ),
         f64::from(MIN_CELL_METRIC_PERCENT),
         f64::from(MAX_CELL_METRIC_PERCENT),
         1.0,
@@ -479,7 +480,9 @@ pub(super) fn build_terminal_font_group_with_catalog(
     group.add(&anti_aliased_row);
 
     TERMINAL_FONT_ROWS.with(|rows| {
-        rows.borrow_mut().push(TerminalFontRowWidgets {
+        let mut rows = rows.borrow_mut();
+        rows.retain(|row| row.family_dropdown.upgrade().is_some());
+        rows.push(TerminalFontRowWidgets {
             catalog: catalog.clone(),
             defaults: defaults.clone(),
             reset_button: reset_button.downgrade(),
@@ -582,6 +585,8 @@ pub(super) fn build_terminal_font_group_with_catalog(
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
+        let default_width = defaults.cell_width_percent;
+        let has_width_modifier = defaults.has_cell_width_modifier;
         width_spin.connect_value_changed(move |spin| {
             if REFRESHING_TERMINAL_FONT_ROWS.with(Cell::get) {
                 return;
@@ -590,11 +595,21 @@ pub(super) fn build_terminal_font_group_with_catalog(
                 i32::from(MIN_CELL_METRIC_PERCENT),
                 i32::from(MAX_CELL_METRIC_PERCENT),
             ) as u16;
-            if config.borrow().terminal_font.cell_width_percent == pct {
-                return;
+            let next_value = if pct == default_width && !has_width_modifier {
+                None
+            } else {
+                Some(pct)
+            };
+            {
+                let cfg = config.borrow();
+                if cfg.terminal_font.cell_width_percent == next_value
+                    || (cfg.terminal_font.cell_width_percent.is_none() && pct == default_width)
+                {
+                    return;
+                }
             }
             let effective = apply_config_change(&config, &*on_changed, move |c| {
-                c.terminal_font.cell_width_percent = pct;
+                c.terminal_font.cell_width_percent = next_value;
             });
             refresh_terminal_font_rows(&effective);
         });
@@ -603,6 +618,8 @@ pub(super) fn build_terminal_font_group_with_catalog(
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
+        let default_height = defaults.cell_height_percent;
+        let has_height_modifier = defaults.has_cell_height_modifier;
         height_spin.connect_value_changed(move |spin| {
             if REFRESHING_TERMINAL_FONT_ROWS.with(Cell::get) {
                 return;
@@ -611,11 +628,21 @@ pub(super) fn build_terminal_font_group_with_catalog(
                 i32::from(MIN_CELL_METRIC_PERCENT),
                 i32::from(MAX_CELL_METRIC_PERCENT),
             ) as u16;
-            if config.borrow().terminal_font.cell_height_percent == pct {
-                return;
+            let next_value = if pct == default_height && !has_height_modifier {
+                None
+            } else {
+                Some(pct)
+            };
+            {
+                let cfg = config.borrow();
+                if cfg.terminal_font.cell_height_percent == next_value
+                    || (cfg.terminal_font.cell_height_percent.is_none() && pct == default_height)
+                {
+                    return;
+                }
             }
             let effective = apply_config_change(&config, &*on_changed, move |c| {
-                c.terminal_font.cell_height_percent = pct;
+                c.terminal_font.cell_height_percent = next_value;
             });
             refresh_terminal_font_rows(&effective);
         });
@@ -741,12 +768,7 @@ mod tests {
             ("DejaVu Sans Mono", &["Book", "Bold", "Oblique"]),
             ("MesloLGS NF", &["Bold Italic", "Italic", "Bold", "Regular"]),
         ]));
-        let defaults = GhosttyFontDefaults {
-            family: None,
-            size: 12.0,
-            use_ligatures: true,
-            anti_aliased: true,
-        };
+        let defaults = GhosttyFontDefaults::default();
         let group = build_terminal_font_group_with_catalog(
             &SettingsEditorInput {
                 config: config.clone(),
@@ -764,7 +786,7 @@ mod tests {
                     }
                 }),
             },
-            catalog,
+            catalog.clone(),
             defaults,
         );
         let root: gtk::Widget = group.upcast();
@@ -834,7 +856,13 @@ mod tests {
         assert_eq!(style_dropdown.selected(), 1);
 
         size_spin.set_value(13.5);
-        assert_eq!(size_spin.text(), "13.5");
+        assert!(
+            matches!(size_spin.text().as_str(), "13.5" | "13,5"),
+            "unexpected fractional font size text: {:?}",
+            size_spin.text()
+        );
+        size_spin.update();
+        assert!((size_spin.value() - 13.5).abs() < 0.05);
         assert_eq!(config.borrow().terminal_font.size, Some(13.5));
         size_spin.set_value(13.0);
         assert_eq!(size_spin.text(), "13");
@@ -844,8 +872,8 @@ mod tests {
         height_spin.set_value(95.0);
         ligatures_switch.set_active(false);
         anti_aliased_switch.set_active(false);
-        assert_eq!(config.borrow().terminal_font.cell_width_percent, 110);
-        assert_eq!(config.borrow().terminal_font.cell_height_percent, 95);
+        assert_eq!(config.borrow().terminal_font.cell_width_percent, Some(110));
+        assert_eq!(config.borrow().terminal_font.cell_height_percent, Some(95));
         assert_eq!(config.borrow().terminal_font.use_ligatures, Some(false));
         assert_eq!(config.borrow().terminal_font.anti_aliased, Some(false));
 
@@ -887,5 +915,148 @@ mod tests {
         assert_eq!(height_spin.value_as_int(), 100);
         assert!(ligatures_switch.is_active());
         assert!(anti_aliased_switch.is_active());
+
+        // Drop the first group's widgets so the next build must prune its dead row entry.
+        drop((
+            family_row,
+            family_dropdown,
+            reset_button,
+            style_row,
+            style_dropdown,
+            size_spin,
+            width_spin,
+            height_spin,
+            ligatures_switch,
+            anti_aliased_switch,
+            root,
+        ));
+
+        // Explicit 100% override when Ghostty base config sets adjust-cell-width = 20%.
+        let spaced_defaults = GhosttyFontDefaults {
+            cell_width_percent: 120,
+            has_cell_width_modifier: true,
+            ..GhosttyFontDefaults::default()
+        };
+        let spaced_config = Rc::new(RefCell::new(AppConfig::default()));
+        let spaced_group = build_terminal_font_group_with_catalog(
+            &SettingsEditorInput {
+                config: spaced_config.clone(),
+                shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+                on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+                on_config_changed: Rc::new(|_, _| {}),
+            },
+            catalog.clone(),
+            spaced_defaults,
+        );
+        TERMINAL_FONT_ROWS.with(|rows| {
+            assert_eq!(
+                rows.borrow().len(),
+                1,
+                "dead widget entries must be pruned when building a new settings group"
+            );
+        });
+        let spaced_root: gtk::Widget = spaced_group.upcast();
+        let spaced_width_spin = find_row(&spaced_root, "Horizontal spacing")
+            .unwrap()
+            .activatable_widget()
+            .unwrap()
+            .downcast::<gtk::SpinButton>()
+            .unwrap();
+        let spaced_reset = find_button_by_label(
+            find_row(&spaced_root, "Font family").unwrap().upcast_ref(),
+            "Default",
+        )
+        .unwrap();
+        assert_eq!(spaced_width_spin.value_as_int(), 120);
+        spaced_width_spin.set_value(100.0);
+        assert_eq!(
+            spaced_config.borrow().terminal_font.cell_width_percent,
+            Some(100)
+        );
+        assert!(spaced_reset.is_sensitive());
+        spaced_reset.emit_clicked();
+        assert_eq!(
+            spaced_config.borrow().terminal_font.cell_width_percent,
+            None
+        );
+        assert_eq!(spaced_width_spin.value_as_int(), 120);
+        drop((spaced_width_spin, spaced_reset, spaced_root));
+
+        // Verify fractional font sizes stay valid and never blank/collapse to 4pt
+        // under comma-decimal locales (e.g. en_DK.utf8, de_DE.UTF-8, pt_BR.UTF-8).
+        struct NumericLocaleGuard(std::ffi::CString);
+        impl NumericLocaleGuard {
+            fn activate_comma_locale() -> Option<Self> {
+                unsafe {
+                    let prev_ptr = libc::setlocale(libc::LC_NUMERIC, std::ptr::null());
+                    if prev_ptr.is_null() {
+                        return None;
+                    }
+                    let prev = std::ffi::CStr::from_ptr(prev_ptr).to_owned();
+                    for candidate in [
+                        c"en_DK.utf8",
+                        c"en_DK.UTF-8",
+                        c"de_DE.utf8",
+                        c"de_DE.UTF-8",
+                        c"fr_FR.utf8",
+                        c"fr_FR.UTF-8",
+                        c"pt_BR.utf8",
+                        c"pt_BR.UTF-8",
+                    ] {
+                        if !libc::setlocale(libc::LC_NUMERIC, candidate.as_ptr()).is_null() {
+                            return Some(Self(prev));
+                        }
+                    }
+                    None
+                }
+            }
+        }
+        impl Drop for NumericLocaleGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::setlocale(libc::LC_NUMERIC, self.0.as_ptr());
+                }
+            }
+        }
+
+        if let Some(_locale_guard) = NumericLocaleGuard::activate_comma_locale() {
+            let mut initial_cfg = AppConfig::default();
+            initial_cfg.terminal_font.size = Some(13.5);
+            let comma_config = Rc::new(RefCell::new(initial_cfg));
+            let comma_group = build_terminal_font_group_with_catalog(
+                &SettingsEditorInput {
+                    config: comma_config.clone(),
+                    shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+                    on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+                    on_config_changed: Rc::new(|_, _| {}),
+                },
+                catalog,
+                GhosttyFontDefaults::default(),
+            );
+            let comma_root: gtk::Widget = comma_group.upcast();
+            let comma_size_spin = find_row(&comma_root, "Font size")
+                .unwrap()
+                .activatable_widget()
+                .unwrap()
+                .downcast::<gtk::SpinButton>()
+                .unwrap();
+
+            assert_eq!(comma_size_spin.text(), "13,5");
+            comma_size_spin.update();
+            assert!((comma_size_spin.value() - 13.5).abs() < 0.05);
+            assert_eq!(comma_config.borrow().terminal_font.size, Some(13.5));
+
+            comma_size_spin.set_value(14.5);
+            assert_eq!(comma_size_spin.text(), "14,5");
+            comma_size_spin.update();
+            assert!((comma_size_spin.value() - 14.5).abs() < 0.05);
+            assert_eq!(comma_config.borrow().terminal_font.size, Some(14.5));
+
+            comma_size_spin.set_value(14.0);
+            assert_eq!(comma_size_spin.text(), "14");
+            comma_size_spin.update();
+            assert!((comma_size_spin.value() - 14.0).abs() < 0.05);
+            assert_eq!(comma_config.borrow().terminal_font.size, Some(14.0));
+        }
     }
 }

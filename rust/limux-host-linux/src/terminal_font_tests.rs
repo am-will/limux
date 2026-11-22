@@ -34,8 +34,13 @@ fn terminal_font_config_updates_live_and_new_ghostty_surfaces() {
     let ghostty_dir = temp.path().join("XDG_CONFIG_HOME/ghostty");
     std::fs::create_dir_all(&ghostty_dir).unwrap();
     std::fs::write(
-        ghostty_dir.join("config"),
-        "command = direct:/bin/sh\nshell-integration = none\nfont-size = 12\n",
+        ghostty_dir.join("extra.ghostty"),
+        "font-size = 14\nadjust-cell-width = 20%\nfont-feature = \"calt\" = 0\nfreetype-load-flags = monochrome\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ghostty_dir.join("config.ghostty"),
+        "command = direct:/bin/sh\nshell-integration = none\nconfig-file = extra.ghostty\n",
     )
     .unwrap();
     let socket = temp.path().join("limux.sock");
@@ -47,6 +52,15 @@ fn terminal_font_config_updates_live_and_new_ghostty_surfaces() {
     crate::prepare_ghostty_runtime();
     adw::init().unwrap();
     crate::terminal::init_ghostty();
+
+    // Verify base Ghostty font defaults resolve `config.ghostty` and recursive `config-file`.
+    let base_defaults = crate::terminal::base_ghostty_font_defaults();
+    assert_eq!(base_defaults.size, 14.0);
+    assert_eq!(crate::terminal::default_font_size(), 14.0);
+    assert_eq!(base_defaults.cell_width_percent, 120);
+    assert!(base_defaults.has_cell_width_modifier);
+    assert!(!base_defaults.use_ligatures);
+    assert!(!base_defaults.anti_aliased);
 
     let app = adw::Application::builder()
         .application_id("dev.limux.TerminalFontLiveTest")
@@ -60,19 +74,42 @@ fn terminal_font_config_updates_live_and_new_ghostty_surfaces() {
         (s.active_workspace().unwrap().root.clone(), s.window.clone())
     };
 
+    const PREFERRED_LATIN_MONO_FAMILIES: &[&str] = &[
+        "MesloLGS NF",
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Noto Sans Mono",
+        "Ubuntu Sans Mono",
+        "Ubuntu Mono",
+        "JetBrains Mono",
+        "Fira Code",
+        "Hack",
+        "Cascadia Mono",
+        "FreeMono",
+        "Nimbus Mono PS",
+    ];
     let (chosen_family, chosen_style) = {
         let font_map = host_window
             .pango_context()
             .font_map()
             .expect("Pango font map");
         let families = font_map.list_families();
-        let preferred = families
+        let preferred = PREFERRED_LATIN_MONO_FAMILIES
             .iter()
-            .find(|f| f.name().eq_ignore_ascii_case("MesloLGS NF"))
-            .or_else(|| {
+            .find_map(|candidate| {
                 families
                     .iter()
-                    .find(|f| f.is_monospace() && !f.name().eq_ignore_ascii_case("Monospace"))
+                    .find(|f| f.name().eq_ignore_ascii_case(candidate))
+            })
+            .or_else(|| {
+                families.iter().find(|f| {
+                    let lower = f.name().to_ascii_lowercase();
+                    f.is_monospace()
+                        && lower != "monospace"
+                        && !lower.contains("emoji")
+                        && !lower.contains("symbol")
+                        && !lower.contains("signwriting")
+                })
             })
             .or_else(|| families.first())
             .expect("at least one installed font family");
@@ -103,14 +140,36 @@ fn terminal_font_config_updates_live_and_new_ghostty_surfaces() {
         assert!(Instant::now() < deadline, "initial surface never realized");
     };
 
-    let base_cfg = TerminalFontConfig {
+    // Inheriting Ghostty's `adjust-cell-width = 20%` produces wider cells than explicit 100% (`0%`).
+    let inherited_width_cfg = TerminalFontConfig {
         family: Some(chosen_family.clone()),
-        style: chosen_style,
+        style: chosen_style.clone(),
         size: Some(13.0),
-        cell_width_percent: 100,
-        cell_height_percent: 100,
+        cell_width_percent: None,
+        cell_height_percent: None,
         use_ligatures: Some(false),
         anti_aliased: Some(true),
+    };
+    {
+        let previous = state.borrow().config.borrow().clone();
+        let mut updated = previous.clone();
+        updated.terminal_font = inherited_width_cfg.clone();
+        state.borrow().config.borrow_mut().clone_from(&updated);
+        handle_config_change(&state, &previous, &updated);
+    }
+    pump_for(Duration::from_millis(40));
+
+    let resolved_inherited_120 = handle
+        .resolve_font_cluster_json_for_test("M", false, false)
+        .expect("resolve cluster with Ghostty base 20% width");
+    let width_inherited_120 = resolved_inherited_120["metrics"]["cell_width"]
+        .as_u64()
+        .unwrap();
+
+    let base_cfg = TerminalFontConfig {
+        cell_width_percent: Some(100),
+        cell_height_percent: Some(100),
+        ..inherited_width_cfg
     };
     {
         let previous = state.borrow().config.borrow().clone();
@@ -134,10 +193,14 @@ fn terminal_font_config_updates_live_and_new_ghostty_surfaces() {
     );
     let width_100 = resolved_100["metrics"]["cell_width"].as_u64().unwrap();
     let height_100 = resolved_100["metrics"]["cell_height"].as_u64().unwrap();
+    assert!(
+        width_100 < width_inherited_120,
+        "expected explicit 100% width override to shrink cells below Ghostty's 20% base: {width_inherited_120} -> {width_100}"
+    );
 
     let spaced_cfg = TerminalFontConfig {
-        cell_width_percent: 140,
-        cell_height_percent: 135,
+        cell_width_percent: Some(140),
+        cell_height_percent: Some(135),
         ..base_cfg
     };
     {

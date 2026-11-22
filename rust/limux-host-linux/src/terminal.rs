@@ -59,6 +59,9 @@ static CURRENT_AUTOSTART_SHELL_KIND: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(1);
 static CURRENT_TERMINAL_FONT: LazyLock<Mutex<crate::terminal_font::TerminalFontConfig>> =
     LazyLock::new(|| Mutex::new(crate::terminal_font::TerminalFontConfig::default()));
+static BASE_GHOSTTY_FONT_DEFAULTS: LazyLock<
+    Mutex<Option<crate::ghostty_config::GhosttyFontDefaults>>,
+> = LazyLock::new(|| Mutex::new(None));
 static GHOSTTY_WAKEUP: LazyLock<wakeup::Wakeup> = LazyLock::new(wakeup::Wakeup::default);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
 
@@ -805,10 +808,18 @@ fn load_ghostty_config_with_font(
         let config = ghostty_config_new();
         ghostty_config_load_default_files(config);
         ghostty_config_load_recursive_files(config);
+        let base_contents = serialized_config(config);
+        if let Some(contents) = base_contents.as_deref() {
+            let defaults =
+                crate::ghostty_config::GhosttyFontDefaults::from_config_contents(contents);
+            *BASE_GHOSTTY_FONT_DEFAULTS
+                .lock()
+                .expect("base ghostty font defaults lock poisoned") = Some(defaults);
+        }
         if !terminal_font.is_default() {
             let base_flags = if terminal_font.anti_aliased.is_some() {
-                serialized_config(config).and_then(|contents| {
-                    crate::ghostty_config::read_ghostty_value(&contents, "freetype-load-flags")
+                base_contents.as_deref().and_then(|contents| {
+                    crate::ghostty_config::read_ghostty_value(contents, "freetype-load-flags")
                 })
             } else {
                 None
@@ -1614,11 +1625,55 @@ pub struct TerminalOptions {
     pub extra_env: Vec<(String, String)>,
 }
 
-/// Default font-size from ghostty config (cached on first access).
+/// Resolve effective base font defaults from Ghostty's default files and
+/// recursive `config-file` includes (before Limux's terminal-font overlay).
+pub(crate) fn base_ghostty_font_defaults() -> crate::ghostty_config::GhosttyFontDefaults {
+    if GHOSTTY.get().is_some() {
+        let parsed = unsafe {
+            let config = ghostty_config_new();
+            if config.is_null() {
+                None
+            } else {
+                ghostty_config_load_default_files(config);
+                ghostty_config_load_recursive_files(config);
+                let contents = serialized_config(config);
+                ghostty_config_free(config);
+                contents
+                    .map(|c| crate::ghostty_config::GhosttyFontDefaults::from_config_contents(&c))
+            }
+        };
+        if let Some(defaults) = parsed {
+            *BASE_GHOSTTY_FONT_DEFAULTS
+                .lock()
+                .expect("base ghostty font defaults lock poisoned") = Some(defaults.clone());
+            return defaults;
+        }
+    }
+
+    if let Some(cached) = BASE_GHOSTTY_FONT_DEFAULTS
+        .lock()
+        .expect("base ghostty font defaults lock poisoned")
+        .as_ref()
+    {
+        return cached.clone();
+    }
+
+    crate::ghostty_config::read_font_defaults()
+}
+
+/// Default font-size from Ghostty's resolved base configuration.
 pub(crate) fn default_font_size() -> f32 {
-    use std::sync::OnceLock;
-    static SIZE: OnceLock<f32> = OnceLock::new();
-    *SIZE.get_or_init(crate::ghostty_config::read_font_size)
+    if let Some(cached) = BASE_GHOSTTY_FONT_DEFAULTS
+        .lock()
+        .expect("base ghostty font defaults lock poisoned")
+        .as_ref()
+    {
+        return cached.size;
+    }
+    if GHOSTTY.get().is_some() {
+        return base_ghostty_font_defaults().size;
+    }
+    crate::ghostty_config::read_font_size()
 }
 
 fn free_terminal_surface(

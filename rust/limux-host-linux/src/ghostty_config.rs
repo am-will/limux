@@ -1,12 +1,76 @@
 use std::ffi::OsStr;
+use std::path::Path;
+
+use crate::terminal_font::{
+    DEFAULT_CELL_METRIC_PERCENT, MAX_CELL_METRIC_PERCENT, MIN_CELL_METRIC_PERCENT,
+};
 
 const DEFAULT_FONT_SIZE: f32 = 12.0;
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GhosttyFontDefaults {
+    pub family: Option<String>,
+    pub size: f32,
+    pub cell_width_percent: u16,
+    pub has_cell_width_modifier: bool,
+    pub cell_height_percent: u16,
+    pub has_cell_height_modifier: bool,
+    pub use_ligatures: bool,
+    pub anti_aliased: bool,
+}
+
+impl Default for GhosttyFontDefaults {
+    fn default() -> Self {
+        Self {
+            family: None,
+            size: DEFAULT_FONT_SIZE,
+            cell_width_percent: DEFAULT_CELL_METRIC_PERCENT,
+            has_cell_width_modifier: false,
+            cell_height_percent: DEFAULT_CELL_METRIC_PERCENT,
+            has_cell_height_modifier: false,
+            use_ligatures: true,
+            anti_aliased: true,
+        }
+    }
+}
+
+impl GhosttyFontDefaults {
+    pub(crate) fn from_config_contents(contents: &str) -> Self {
+        let (cell_width_percent, has_cell_width_modifier) =
+            parse_cell_metric_modifier(contents, "adjust-cell-width");
+        let (cell_height_percent, has_cell_height_modifier) =
+            parse_cell_metric_modifier(contents, "adjust-cell-height");
+        Self {
+            family: parse_primary_font_family(contents),
+            size: parse_font_size(contents),
+            cell_width_percent,
+            has_cell_width_modifier,
+            cell_height_percent,
+            has_cell_height_modifier,
+            use_ligatures: parse_use_ligatures(contents),
+            anti_aliased: parse_anti_aliased(contents),
+        }
+    }
+}
+
+fn ghostty_config_contents_in(config_dir: &Path) -> Option<String> {
+    // Match Ghostty's loadDefaultFiles precedence: legacy `config` first, then `config.ghostty`.
+    let mut combined = String::new();
+    for rel in ["ghostty/config", "ghostty/config.ghostty"] {
+        let path = config_dir.join(rel);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&contents);
+        }
+    }
+    (!combined.is_empty()).then_some(combined)
+}
+
 fn ghostty_config_contents() -> Option<String> {
-    let path = dirs::config_dir()
-        .map(|d| d.join("ghostty/config"))
-        .filter(|p| p.exists())?;
-    std::fs::read_to_string(&path).ok()
+    let config_dir = dirs::config_dir()?;
+    ghostty_config_contents_in(&config_dir)
 }
 
 pub(crate) fn read_ghostty_value(contents: &str, key: &str) -> Option<String> {
@@ -125,13 +189,19 @@ pub fn read_background_opacity() -> f64 {
         .unwrap_or(1.0)
 }
 
-/// Read font-size from the Ghostty config file.
+pub(crate) fn parse_font_size(contents: &str) -> f32 {
+    read_ghostty_value(contents, "font-size")
+        .and_then(|v| strip_optional_quotes(&v).trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(1.0, 255.0))
+        .unwrap_or(DEFAULT_FONT_SIZE)
+}
+
+/// Read font-size from Ghostty default config files.
 /// Returns the configured size in points (default: 12.0).
 pub fn read_font_size() -> f32 {
     ghostty_config_contents()
-        .and_then(|c| read_ghostty_value(&c, "font-size"))
-        .and_then(|v| v.parse::<f32>().ok())
-        .map(|v| v.clamp(1.0, 255.0))
+        .map(|c| parse_font_size(&c))
         .unwrap_or(DEFAULT_FONT_SIZE)
 }
 
@@ -142,6 +212,34 @@ pub(crate) fn strip_optional_quotes(raw: &str) -> &str {
     } else {
         trimmed
     }
+}
+
+pub(crate) fn parse_cell_metric_modifier(contents: &str, key: &str) -> (u16, bool) {
+    let Some(raw) = read_ghostty_value(contents, key) else {
+        return (DEFAULT_CELL_METRIC_PERCENT, false);
+    };
+    let unquoted = strip_optional_quotes(&raw).trim();
+    if unquoted.is_empty() {
+        return (DEFAULT_CELL_METRIC_PERCENT, false);
+    }
+    if let Some(percent_raw) = unquoted.strip_suffix('%') {
+        if let Ok(delta) = percent_raw.trim().parse::<f64>() {
+            if delta.is_finite() {
+                let pct = (f64::from(DEFAULT_CELL_METRIC_PERCENT) + delta)
+                    .round()
+                    .clamp(
+                        f64::from(MIN_CELL_METRIC_PERCENT),
+                        f64::from(MAX_CELL_METRIC_PERCENT),
+                    ) as u16;
+                return (pct, delta.abs() >= f64::EPSILON);
+            }
+        }
+        return (DEFAULT_CELL_METRIC_PERCENT, false);
+    }
+    if let Ok(pixels) = unquoted.parse::<i32>() {
+        return (DEFAULT_CELL_METRIC_PERCENT, pixels != 0);
+    }
+    (DEFAULT_CELL_METRIC_PERCENT, false)
 }
 
 pub(crate) fn parse_primary_font_family(contents: &str) -> Option<String> {
@@ -166,6 +264,64 @@ pub(crate) fn parse_primary_font_family(contents: &str) -> Option<String> {
     families.into_iter().next()
 }
 
+fn parse_font_feature_token(token: &str) -> Option<(String, bool)> {
+    let mut rest = token.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let prefix_value = if let Some(after) = rest.strip_prefix('+') {
+        rest = after;
+        Some(true)
+    } else if let Some(after) = rest.strip_prefix('-') {
+        rest = after;
+        Some(false)
+    } else {
+        None
+    };
+
+    let mut tag = String::with_capacity(4);
+    let mut after_tag_idx = rest.len();
+    for (idx, ch) in rest.char_indices() {
+        if matches!(ch, '"' | '\'') {
+            continue;
+        }
+        tag.push(ch);
+        if tag.len() == 4 {
+            after_tag_idx = idx + ch.len_utf8();
+            break;
+        }
+    }
+    if tag.len() != 4 {
+        return None;
+    }
+
+    let mut tail = rest[after_tag_idx..].trim_start_matches([' ', '\t', '"', '\'']);
+    if let Some(after_eq) = tail.strip_prefix('=') {
+        if prefix_value.is_some() {
+            return None;
+        }
+        tail = after_eq.trim_start_matches([' ', '\t']);
+    }
+    let tail = tail.trim_end_matches([' ', '\t']);
+
+    let enabled = if tail.is_empty() {
+        prefix_value.unwrap_or(true)
+    } else if prefix_value.is_some() {
+        return None;
+    } else if tail.eq_ignore_ascii_case("on") {
+        true
+    } else if tail.eq_ignore_ascii_case("off") {
+        false
+    } else if let Ok(n) = tail.parse::<u32>() {
+        n != 0
+    } else {
+        return None;
+    };
+
+    Some((tag, enabled))
+}
+
 pub(crate) fn parse_use_ligatures(contents: &str) -> bool {
     let mut enabled = true;
     for line in contents.lines() {
@@ -181,25 +337,11 @@ pub(crate) fn parse_use_ligatures(contents: &str) -> bool {
                     enabled = true;
                     continue;
                 }
-                for token in unquoted.split(',').map(str::trim) {
-                    let normalized = token.trim_matches(['"', '\'']).trim();
-                    if matches!(
-                        normalized,
-                        "-calt" | "calt=0" | "calt off" | "-liga" | "liga=0" | "liga off"
-                    ) {
-                        enabled = false;
-                    } else if matches!(
-                        normalized,
-                        "calt"
-                            | "+calt"
-                            | "calt=1"
-                            | "calt on"
-                            | "liga"
-                            | "+liga"
-                            | "liga=1"
-                            | "liga on"
-                    ) {
-                        enabled = true;
+                for token in unquoted.split(',') {
+                    if let Some((tag, is_enabled)) = parse_font_feature_token(token) {
+                        if matches!(tag.as_str(), "calt" | "liga") {
+                            enabled = is_enabled;
+                        }
                     }
                 }
             }
@@ -230,28 +372,19 @@ pub(crate) fn parse_anti_aliased(contents: &str) -> bool {
     !monochrome
 }
 
-pub fn read_font_family() -> Option<String> {
-    ghostty_config_contents().and_then(|c| parse_primary_font_family(&c))
-}
-
-pub fn read_use_ligatures() -> bool {
+pub(crate) fn read_font_defaults() -> GhosttyFontDefaults {
     ghostty_config_contents()
-        .map(|c| parse_use_ligatures(&c))
-        .unwrap_or(true)
-}
-
-pub fn read_anti_aliased() -> bool {
-    ghostty_config_contents()
-        .map(|c| parse_anti_aliased(&c))
-        .unwrap_or(true)
+        .map(|c| GhosttyFontDefaults::from_config_contents(&c))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_interactive_shell, parse_anti_aliased, parse_primary_font_family,
-        parse_use_ligatures, read_ghostty_value, terminal_command_autostart_shell_with_fallback,
-        terminal_commands_autostart_shell, AutostartShellKind,
+        classify_interactive_shell, ghostty_config_contents_in, parse_anti_aliased,
+        parse_cell_metric_modifier, parse_primary_font_family, parse_use_ligatures,
+        read_ghostty_value, terminal_command_autostart_shell_with_fallback,
+        terminal_commands_autostart_shell, AutostartShellKind, GhosttyFontDefaults,
     };
     use std::ffi::OsStr;
 
@@ -392,5 +525,68 @@ freetype-load-flags = light, monochrome
         assert_eq!(parse_primary_font_family(&reset), None);
         assert!(parse_use_ligatures(&reset));
         assert!(parse_anti_aliased(&reset));
+
+        // Ghostty CSS-compatible font-feature forms.
+        assert!(!parse_use_ligatures("font-feature = \"calt\" = 0\n"));
+        assert!(!parse_use_ligatures("font-feature = calt = 0\n"));
+        assert!(!parse_use_ligatures("font-feature = 'liga' off\n"));
+        assert!(!parse_use_ligatures("font-feature = \"calt\" 0\n"));
+        assert!(parse_use_ligatures(
+            "font-feature = \"calt\" = 0\nfont-feature = \"calt\" = 1\n"
+        ));
+        assert!(parse_use_ligatures("font-feature = -dlig\n"));
+
+        // Serialized float percentages and pixel cell metric modifiers.
+        assert_eq!(
+            parse_cell_metric_modifier(
+                "adjust-cell-width = 19.999999999999996%\n",
+                "adjust-cell-width"
+            ),
+            (120, true)
+        );
+        assert_eq!(
+            parse_cell_metric_modifier("adjust-cell-height = -8%\n", "adjust-cell-height"),
+            (92, true)
+        );
+        assert_eq!(
+            parse_cell_metric_modifier("adjust-cell-width = 0%\n", "adjust-cell-width"),
+            (100, false)
+        );
+        assert_eq!(
+            parse_cell_metric_modifier("adjust-cell-width = 4\n", "adjust-cell-width"),
+            (100, true)
+        );
+        assert_eq!(
+            parse_cell_metric_modifier("adjust-cell-width = \n", "adjust-cell-width"),
+            (100, false)
+        );
+    }
+
+    #[test]
+    fn config_ghostty_overrides_legacy_config_in_fallback_reader() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ghostty_dir = dir.path().join("ghostty");
+        std::fs::create_dir_all(&ghostty_dir).expect("create ghostty dir");
+        std::fs::write(
+            ghostty_dir.join("config"),
+            "font-family = DejaVu Sans Mono\nfont-size = 11\n",
+        )
+        .expect("write legacy config");
+        std::fs::write(
+            ghostty_dir.join("config.ghostty"),
+            "font-family = \"\"\nfont-family = MesloLGS NF\nfont-size = 14\nadjust-cell-width = 20%\nfont-feature = \"calt\" = 0\nfreetype-load-flags = monochrome\n",
+        )
+        .expect("write config.ghostty");
+
+        let combined = ghostty_config_contents_in(dir.path()).expect("combined config");
+        let defaults = GhosttyFontDefaults::from_config_contents(&combined);
+        assert_eq!(defaults.family.as_deref(), Some("MesloLGS NF"));
+        assert_eq!(defaults.size, 14.0);
+        assert_eq!(defaults.cell_width_percent, 120);
+        assert!(defaults.has_cell_width_modifier);
+        assert_eq!(defaults.cell_height_percent, 100);
+        assert!(!defaults.has_cell_height_modifier);
+        assert!(!defaults.use_ligatures);
+        assert!(!defaults.anti_aliased);
     }
 }

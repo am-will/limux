@@ -8,29 +8,15 @@ pub const MAX_TERMINAL_FONT_SIZE: f32 = 255.0;
 pub const MIN_UI_TERMINAL_FONT_SIZE: f64 = 4.0;
 pub const MAX_UI_TERMINAL_FONT_SIZE: f64 = 96.0;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TerminalFontConfig {
     pub family: Option<String>,
     pub style: Option<String>,
     pub size: Option<f32>,
-    pub cell_width_percent: u16,
-    pub cell_height_percent: u16,
+    pub cell_width_percent: Option<u16>,
+    pub cell_height_percent: Option<u16>,
     pub use_ligatures: Option<bool>,
     pub anti_aliased: Option<bool>,
-}
-
-impl Default for TerminalFontConfig {
-    fn default() -> Self {
-        Self {
-            family: None,
-            style: None,
-            size: None,
-            cell_width_percent: DEFAULT_CELL_METRIC_PERCENT,
-            cell_height_percent: DEFAULT_CELL_METRIC_PERCENT,
-            use_ligatures: None,
-            anti_aliased: None,
-        }
-    }
 }
 
 impl TerminalFontConfig {
@@ -48,10 +34,10 @@ impl TerminalFontConfig {
         let size = self.size.and_then(sanitize_font_size);
         let cell_width_percent = self
             .cell_width_percent
-            .clamp(MIN_CELL_METRIC_PERCENT, MAX_CELL_METRIC_PERCENT);
+            .map(|v| v.clamp(MIN_CELL_METRIC_PERCENT, MAX_CELL_METRIC_PERCENT));
         let cell_height_percent = self
             .cell_height_percent
-            .clamp(MIN_CELL_METRIC_PERCENT, MAX_CELL_METRIC_PERCENT);
+            .map(|v| v.clamp(MIN_CELL_METRIC_PERCENT, MAX_CELL_METRIC_PERCENT));
 
         Self {
             family,
@@ -88,14 +74,12 @@ impl TerminalFontConfig {
             .get("cell_width_percent")
             .and_then(Value::as_u64)
             .and_then(|v| u16::try_from(v).ok())
-            .filter(|v| (MIN_CELL_METRIC_PERCENT..=MAX_CELL_METRIC_PERCENT).contains(v))
-            .unwrap_or(DEFAULT_CELL_METRIC_PERCENT);
+            .filter(|v| (MIN_CELL_METRIC_PERCENT..=MAX_CELL_METRIC_PERCENT).contains(v));
         let cell_height_percent = obj
             .get("cell_height_percent")
             .and_then(Value::as_u64)
             .and_then(|v| u16::try_from(v).ok())
-            .filter(|v| (MIN_CELL_METRIC_PERCENT..=MAX_CELL_METRIC_PERCENT).contains(v))
-            .unwrap_or(DEFAULT_CELL_METRIC_PERCENT);
+            .filter(|v| (MIN_CELL_METRIC_PERCENT..=MAX_CELL_METRIC_PERCENT).contains(v));
         let use_ligatures = obj.get("use_ligatures").and_then(Value::as_bool);
         let anti_aliased = obj.get("anti_aliased").and_then(Value::as_bool);
 
@@ -126,16 +110,13 @@ impl TerminalFontConfig {
         if let Some(size) = clean.size {
             map.insert("size".to_string(), json!(f64::from(size)));
         }
-        if clean.cell_width_percent != DEFAULT_CELL_METRIC_PERCENT {
-            map.insert(
-                "cell_width_percent".to_string(),
-                json!(clean.cell_width_percent),
-            );
+        if let Some(cell_width_percent) = clean.cell_width_percent {
+            map.insert("cell_width_percent".to_string(), json!(cell_width_percent));
         }
-        if clean.cell_height_percent != DEFAULT_CELL_METRIC_PERCENT {
+        if let Some(cell_height_percent) = clean.cell_height_percent {
             map.insert(
                 "cell_height_percent".to_string(),
-                json!(clean.cell_height_percent),
+                json!(cell_height_percent),
             );
         }
         if let Some(use_ligatures) = clean.use_ligatures {
@@ -170,14 +151,12 @@ impl TerminalFontConfig {
         if let Some(size) = clean.size {
             lines.push(format!("font-size = {}", format_font_size(size)));
         }
-        if clean.cell_width_percent != DEFAULT_CELL_METRIC_PERCENT {
-            let delta =
-                i32::from(clean.cell_width_percent) - i32::from(DEFAULT_CELL_METRIC_PERCENT);
+        if let Some(cell_width_percent) = clean.cell_width_percent {
+            let delta = i32::from(cell_width_percent) - i32::from(DEFAULT_CELL_METRIC_PERCENT);
             lines.push(format!("adjust-cell-width = {delta}%"));
         }
-        if clean.cell_height_percent != DEFAULT_CELL_METRIC_PERCENT {
-            let delta =
-                i32::from(clean.cell_height_percent) - i32::from(DEFAULT_CELL_METRIC_PERCENT);
+        if let Some(cell_height_percent) = clean.cell_height_percent {
+            let delta = i32::from(cell_height_percent) - i32::from(DEFAULT_CELL_METRIC_PERCENT);
             lines.push(format!("adjust-cell-height = {delta}%"));
         }
         if let Some(use_ligatures) = clean.use_ligatures {
@@ -337,8 +316,8 @@ mod tests {
             family: Some("MesloLGS NF".to_string()),
             style: Some("Regular".to_string()),
             size: Some(13.0),
-            cell_width_percent: 100,
-            cell_height_percent: 100,
+            cell_width_percent: None,
+            cell_height_percent: None,
             use_ligatures: Some(false),
             anti_aliased: Some(true),
         };
@@ -360,13 +339,27 @@ mod tests {
     #[test]
     fn cell_spacing_percentages_translate_to_ghostty_metric_modifiers() {
         let cfg = TerminalFontConfig {
-            cell_width_percent: 112,
-            cell_height_percent: 92,
+            cell_width_percent: Some(112),
+            cell_height_percent: Some(92),
             ..TerminalFontConfig::default()
         };
         let overlay = cfg.ghostty_overlay(None).expect("overlay");
         assert!(overlay.contains("adjust-cell-width = 12%\n"));
         assert!(overlay.contains("adjust-cell-height = -8%\n"));
+
+        let explicit_normal = TerminalFontConfig {
+            cell_width_percent: Some(100),
+            cell_height_percent: Some(100),
+            ..TerminalFontConfig::default()
+        };
+        let explicit_json = explicit_normal.to_json().expect("explicit 100% json");
+        assert_eq!(
+            TerminalFontConfig::from_json(Some(&explicit_json)),
+            explicit_normal
+        );
+        let explicit_overlay = explicit_normal.ghostty_overlay(None).expect("0% overlay");
+        assert!(explicit_overlay.contains("adjust-cell-width = 0%\n"));
+        assert!(explicit_overlay.contains("adjust-cell-height = 0%\n"));
     }
 
     #[test]
