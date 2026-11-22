@@ -869,9 +869,16 @@ pub fn close_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
 
 pub fn refresh_terminal_displays_in_root(root: &gtk::Widget) {
     for internals in pane_internals_for_root(root) {
-        for entry in &internals.tab_state.borrow().tabs {
+        let tab_state = internals.tab_state.borrow();
+        let active_id = tab_state.active_tab.as_deref();
+        for entry in &tab_state.tabs {
+            if active_id.is_some_and(|id| id != entry.id) {
+                continue;
+            }
             if let TabKind::Terminal { state } = &entry.kind {
-                state.handle.refresh_display();
+                if state.handle.is_mapped() {
+                    state.handle.refresh_display();
+                }
             }
         }
     }

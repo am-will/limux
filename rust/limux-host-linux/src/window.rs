@@ -36,6 +36,7 @@ mod session_persistence;
 mod sidebar_groups;
 pub(crate) use navigation_notifications::find_gl_area;
 use navigation_notifications::*;
+pub(crate) use session_persistence::request_session_save;
 use session_persistence::*;
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
@@ -1296,11 +1297,14 @@ pub(crate) fn apply_ratio_value(
     if size <= 0 {
         return false;
     }
-    applying.set(true);
-    paned.set_position(crate::split_tree::clamp_paned_position(
+    let clamped = crate::split_tree::clamp_paned_position(
         paned,
         layout_state::split_position_from_ratio(ratio, size),
-    ));
+    );
+    applying.set(true);
+    if paned.position() != clamped {
+        paned.set_position(clamped);
+    }
     update_split_ratio_state(paned, ratio);
     applying.set(false);
     true
@@ -1311,15 +1315,17 @@ pub(crate) fn apply_split_ratio_after_layout(
     orientation: gtk::Orientation,
     ratio_cell: Rc<RefCell<f64>>,
     applying: Rc<Cell<bool>>,
+    last_size: Rc<Cell<i32>>,
 ) {
     // Capture the ratio by value for the initial retry loop so that early
     // position_notify events (which may corrupt the cell) don't affect it.
     let initial_ratio = *ratio_cell.borrow();
 
-    // GTK doesn't expose a reliable "allocation done" signal on GtkWidget.
-    // Poll via add_tick_callback until the paned actually has a non-zero
-    // width, then apply the ratio once and stop.
+    // Poll via a one-shot tick callback until the paned actually has a non-zero
+    // extent, apply the initial ratio once, then return Break so GdkFrameClock
+    // can sleep when idle. Subsequent resizes are handled via notify::max-position.
     let applying_tick = applying.clone();
+    let last_size_tick = last_size.clone();
     paned.add_tick_callback(move |paned, _clock| {
         let size = if orientation == gtk::Orientation::Horizontal {
             paned.width()
@@ -1331,6 +1337,7 @@ pub(crate) fn apply_split_ratio_after_layout(
         }
         let ok = apply_ratio_value(paned, orientation, initial_ratio, &applying_tick);
         if ok {
+            last_size_tick.set(size);
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
@@ -1341,30 +1348,16 @@ pub(crate) fn apply_split_ratio_after_layout(
     // Reads from the cell so drag-adjusted ratios are restored correctly.
     paned.connect_map(move |paned| {
         let ratio = *ratio_cell.borrow();
-        apply_ratio_value(paned, orientation, ratio, &applying);
-    });
-    // Note: width/height change handling (for sidebar toggles and window
-    // resizes) lives on the paned in split_tree.rs, where it has direct
-    // access to the shared ratio cell and the position-notify guard state.
-}
-
-pub(crate) fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
-    update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
-    let state = state.clone();
-    paned.connect_position_notify(move |paned| {
-        let allocation = paned.allocation();
-        let size = if paned.orientation() == gtk::Orientation::Horizontal {
-            allocation.width()
-        } else {
-            allocation.height()
-        };
-        let ratio = layout_state::snapshot_split_ratio(
-            paned.position(),
-            size,
-            split_ratio_state(paned).map(|ratio| *ratio.borrow()),
-        );
-        update_split_ratio_state(paned, ratio);
-        request_session_save(&state);
+        if apply_ratio_value(paned, orientation, ratio, &applying) {
+            let size = if orientation == gtk::Orientation::Horizontal {
+                paned.width()
+            } else {
+                paned.height()
+            };
+            if size > 0 {
+                last_size.set(size);
+            }
+        }
     });
 }
 
@@ -2498,10 +2491,12 @@ fn install_sidebar_resize(
 ) {
     let resizing_sidebar = Rc::new(Cell::new(false));
     let drag_origin = Rc::new(Cell::new(SIDEBAR_WIDTH));
+    let drag_min_width = Rc::new(Cell::new(0i32));
     let drag = gtk::GestureDrag::new();
 
     {
         let drag_origin = drag_origin.clone();
+        let drag_min_width = drag_min_width.clone();
         let sidebar = sidebar.clone();
         let sidebar_shell = sidebar_shell.clone();
         let resizing_sidebar = resizing_sidebar.clone();
@@ -2513,15 +2508,17 @@ fn install_sidebar_resize(
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
+            let min_width = sidebar_min_width(&sidebar);
+            drag_min_width.set(min_width);
             resizing_sidebar.set(true);
-            drag_origin.set(current_width.max(sidebar_min_width(&sidebar)));
+            drag_origin.set(current_width.max(min_width));
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
     }
 
     {
         let drag_origin = drag_origin.clone();
-        let sidebar = sidebar.clone();
+        let drag_min_width = drag_min_width.clone();
         let sidebar_shell = sidebar_shell.clone();
         let resizing_sidebar = resizing_sidebar.clone();
         let state = state.clone();
@@ -2529,7 +2526,7 @@ fn install_sidebar_resize(
             if !resizing_sidebar.get() {
                 return;
             }
-            let min_width = sidebar_min_width(&sidebar);
+            let min_width = drag_min_width.get();
             let width = (drag_origin.get() as f64 + offset_x).round() as i32;
             let width = width.max(min_width);
             set_sidebar_width(&sidebar_shell, width);
