@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -67,6 +67,8 @@ struct Workspace {
     unread: bool,
     /// True when the user explicitly marked this workspace unread via the context menu.
     manual_unread: bool,
+    /// Cached `(unread, notify_label_visible)` applied to sidebar and top-bar widgets.
+    unread_visual: Cell<Option<(bool, bool)>>,
     /// Background colour of the sidebar row, if the user picked one.
     color: Option<WorkspaceColor>,
     /// Last known working directory from the terminal (via OSC 7).
@@ -144,6 +146,8 @@ pub(crate) struct AppState {
     workspace_dragging: Option<String>,
     group_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
+    desktop_notification_route_order: VecDeque<u32>,
+    desktop_notification_proxy: Option<gio::DBusProxy>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
@@ -2110,6 +2114,8 @@ pub fn build_window(app: &adw::Application) {
         workspace_dragging: None,
         group_dragging: None,
         desktop_notification_routes: HashMap::new(),
+        desktop_notification_route_order: VecDeque::new(),
+        desktop_notification_proxy: None,
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
@@ -3377,6 +3383,7 @@ fn connect_desktop_notification_watch_async(state: State) {
             let closed_subscription =
                 connect_desktop_notification_closed_watch(&proxy, state.clone());
             let mut s = state.borrow_mut();
+            s.desktop_notification_proxy = Some(proxy);
             s._desktop_notification_token_signal = token_subscription;
             s._desktop_notification_action_signal = action_subscription;
             s._desktop_notification_closed_signal = closed_subscription;
@@ -3458,6 +3465,8 @@ fn connect_desktop_notification_action_watch(
 
             let route = {
                 let mut s = state.borrow_mut();
+                s.desktop_notification_route_order
+                    .retain(|id| *id != notification_id);
                 s.desktop_notification_routes.remove(&notification_id)
             };
             let Some(route) = route else {
@@ -3492,10 +3501,10 @@ fn connect_desktop_notification_closed_watch(
                 return;
             };
 
-            state
-                .borrow_mut()
-                .desktop_notification_routes
-                .remove(&notification_id);
+            let mut s = state.borrow_mut();
+            s.desktop_notification_route_order
+                .retain(|id| *id != notification_id);
+            s.desktop_notification_routes.remove(&notification_id);
         },
     ))
 }
@@ -5116,6 +5125,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_label,
             unread: false,
             manual_unread: false,
+            unread_visual: Cell::new(None),
             color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
@@ -5831,6 +5841,7 @@ fn break_tabs_into_new_workspace(
             notify_label,
             unread: false,
             manual_unread: false,
+            unread_visual: Cell::new(None),
             color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
@@ -7545,6 +7556,7 @@ fn add_workspace_with_initial_command(
         notify_label,
         unread: false,
         manual_unread: false,
+        unread_visual: Cell::new(None),
         color: workspace.color,
         cwd,
         folder_path: workspace.folder_path.clone(),
@@ -7717,7 +7729,10 @@ pub(crate) fn create_pane_for_workspace(
             glib::idle_add_local_once(move || {
                 let s = state.borrow();
                 if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
-                    *ws.cwd.borrow_mut() = Some(pwd);
+                    let mut current = ws.cwd.borrow_mut();
+                    if current.as_deref() != Some(pwd.as_str()) {
+                        *current = Some(pwd);
+                    }
                 }
             });
         }),
@@ -10165,6 +10180,33 @@ mod tests {
         super::record_pane_focus_history(&mut current, &mut last, "ws-1", 2, cur2);
         assert_eq!(current.get("ws-1"), Some(&2));
         assert_eq!(last.get("ws-1"), Some(&1));
+    }
+
+    #[test]
+    fn desktop_notification_routes_stay_bounded_and_evict_oldest() {
+        let mut routes = std::collections::HashMap::new();
+        let mut order = std::collections::VecDeque::new();
+        for id in 1..=300u32 {
+            super::record_desktop_notification_route(
+                &mut routes,
+                &mut order,
+                id,
+                super::DesktopNotificationRoute {
+                    target: super::DesktopNotificationTarget {
+                        workspace_id: format!("ws-{id}"),
+                        pane_id: None,
+                        tab_id: None,
+                    },
+                    activation_token: None,
+                },
+            );
+        }
+        assert_eq!(routes.len(), 256);
+        assert_eq!(order.len(), 256);
+        assert!(!routes.contains_key(&1));
+        assert!(!routes.contains_key(&44));
+        assert!(routes.contains_key(&45));
+        assert!(routes.contains_key(&300));
     }
 }
 
