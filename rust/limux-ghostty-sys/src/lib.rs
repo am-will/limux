@@ -569,6 +569,12 @@ extern "C" {
     ) -> bool;
     pub fn ghostty_config_load_default_files(config: ghostty_config_t);
     pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
+    pub fn ghostty_config_load_string(
+        config: ghostty_config_t,
+        contents: *const c_char,
+        contents_len: usize,
+        path: *const c_char,
+    );
     pub fn ghostty_config_finalize(config: ghostty_config_t);
     pub fn ghostty_config_serialize(config: ghostty_config_t) -> ghostty_string_s;
     pub fn ghostty_string_free(value: ghostty_string_s);
@@ -635,6 +641,15 @@ extern "C" {
     );
     pub fn ghostty_surface_request_close(surface: ghostty_surface_t);
     pub fn ghostty_surface_update_config(surface: ghostty_surface_t, config: ghostty_config_t);
+    pub fn ghostty_surface_font_size(surface: ghostty_surface_t) -> f32;
+    pub fn ghostty_surface_font_resolve_json(
+        surface: ghostty_surface_t,
+        cluster: *const c_char,
+        cluster_len: usize,
+        bold: bool,
+        italic: bool,
+        constraint_width: u8,
+    ) -> ghostty_string_s;
     pub fn ghostty_surface_set_color_scheme(surface: ghostty_surface_t, scheme: c_int);
 
     // Binding actions

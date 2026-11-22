@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::gui_hooks::GuiHooksConfig;
 use crate::shortcut_config;
+use crate::terminal_font::TerminalFontConfig;
 
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 pub const DEFAULT_UI_SCALE: f32 = 1.0;
@@ -86,7 +87,17 @@ pub struct AppConfig {
     #[serde(skip)]
     pub font_size: Option<f32>,
     #[serde(skip)]
+    pub terminal_font: TerminalFontConfig,
+    #[serde(skip)]
     pub hooks: GuiHooksConfig,
+}
+
+impl AppConfig {
+    pub fn effective_font_size(&self, default_size: f32) -> f32 {
+        self.font_size
+            .or(self.terminal_font.size)
+            .unwrap_or(default_size)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -602,6 +613,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         links: LinkConfig { open_destination },
         font_size,
+        terminal_font: TerminalFontConfig::from_json(root.get("terminal_font")),
         hooks: GuiHooksConfig::from_value(root.get("hooks")),
     }
 }
@@ -691,6 +703,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         root.insert("font_size".to_string(), json!(size));
     } else {
         root.remove("font_size");
+    }
+
+    if let Some(terminal_font) = config.terminal_font.to_json() {
+        root.insert("terminal_font".to_string(), terminal_font);
+    } else {
+        root.remove("terminal_font");
     }
 
     if let Some(hooks) = config.hooks.to_value() {
@@ -1536,5 +1554,38 @@ mod tests {
         assert_eq!(loaded.config, AppConfig::default());
         assert_eq!(loaded.warnings.len(), 1);
         assert!(loaded.warnings[0].contains("failed to load app config"));
+    }
+
+    #[test]
+    fn save_and_load_roundtrips_terminal_font_and_clears_when_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+
+        let mut config = AppConfig {
+            terminal_font: TerminalFontConfig {
+                family: Some("MesloLGS NF".to_string()),
+                style: Some("Regular".to_string()),
+                size: Some(13.0),
+                cell_width_percent: Some(105),
+                cell_height_percent: Some(110),
+                use_ligatures: Some(false),
+                anti_aliased: Some(true),
+            },
+            ..AppConfig::default()
+        };
+        save_to_path(&path, &config).expect("save terminal font");
+
+        let loaded = load_from_path(&path);
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.terminal_font, config.terminal_font);
+        assert_eq!(loaded.config.effective_font_size(12.0), 13.0);
+
+        config.terminal_font = TerminalFontConfig::default();
+        save_to_path(&path, &config).expect("clear terminal font");
+        let parsed: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read cleared config"))
+                .expect("parse cleared config");
+        assert!(parsed.get("terminal_font").is_none());
     }
 }
