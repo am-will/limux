@@ -499,7 +499,7 @@ impl TerminalHandle {
         let keycode = keycode_for_keyval(self.gl_area.upcast_ref(), keyval);
         let text_keyval =
             translated_keyval_for_keycode(self.gl_area.upcast_ref(), keyval, keycode, modifier);
-        let text = key_event_text(text_keyval);
+        let text = StackKeyText::from_keyval(text_keyval);
 
         let mut press = translate_key_event(
             GHOSTTY_ACTION_PRESS,
@@ -509,7 +509,7 @@ impl TerminalHandle {
             keycode,
             modifier,
         );
-        // The CString must outlive the ghostty call below; `text` owns it until the
+        // The stack buffer must outlive the ghostty call below; `text` owns it until the
         // end of this function.
         if let Some(text) = text.as_ref() {
             press.input.text = text.as_ptr();
@@ -529,7 +529,6 @@ impl TerminalHandle {
             ghostty_surface_key_with_key(surface, press.input, press.resolved_key);
             ghostty_surface_key_with_key(surface, release.input, release.resolved_key);
         }
-        drop(text);
         true
     }
 
@@ -2368,7 +2367,6 @@ pub fn create_terminal(
                     .current_event()
                     .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
                 let widget = ctrl.widget();
-                let fallback_text = key_event_text(keyval);
 
                 if let Some(current_event) = current_event.as_ref() {
                     pane_ime_press.state.borrow_mut().begin_key_event();
@@ -2389,12 +2387,16 @@ pub fn create_terminal(
                     keycode,
                     modifier,
                 );
-                let c_text = pane_ime_press
-                    .state
-                    .borrow_mut()
-                    .take_event_text(fallback_text);
-                if let Some(ref ct) = c_text {
+                let pending_text = pane_ime_press.state.borrow_mut().take_pending_key_text();
+                let stack_text = if pending_text.is_none() {
+                    StackKeyText::from_keyval(keyval)
+                } else {
+                    None
+                };
+                if let Some(ref ct) = pending_text {
                     event.input.text = ct.as_ptr();
+                } else if let Some(ref st) = stack_text {
+                    event.input.text = st.as_ptr();
                 }
 
                 let consumed = unsafe {
@@ -2566,17 +2568,33 @@ pub fn create_terminal(
         gl_area.add_controller(motion);
     }
 
-    // Mouse scroll
+    // Mouse scroll (supports both smooth touchpad precision scrolling and discrete mouse wheels)
     {
         let surface_cell = surface_cell.clone();
-        let scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
-        );
+        let precision_scroll = Rc::new(Cell::new(false));
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        {
+            let precision_scroll = precision_scroll.clone();
+            scroll.connect_scroll_begin(move |_| {
+                precision_scroll.set(true);
+            });
+        }
+        {
+            let precision_scroll = precision_scroll.clone();
+            scroll.connect_scroll_end(move |_| {
+                precision_scroll.set(false);
+            });
+        }
         scroll.connect_scroll(move |ctrl, dx, dy| {
             if let Some(surface) = *surface_cell.borrow() {
-                let mods = translate_mouse_mods(ctrl.current_event_state());
-                // GTK and Ghostty use opposite scroll conventions — negate both axes
-                unsafe { ghostty_surface_mouse_scroll(surface, -dx, -dy, mods) };
+                let precision =
+                    precision_scroll.get() || ctrl.unit() == gtk::gdk::ScrollUnit::Surface;
+                let scale_factor = ctrl
+                    .widget()
+                    .map(|widget| widget.scale_factor())
+                    .unwrap_or(1);
+                let (x, y, scroll_mods) = encode_terminal_scroll(dx, dy, scale_factor, precision);
+                unsafe { ghostty_surface_mouse_scroll(surface, x, y, scroll_mods) };
             }
             glib::Propagation::Stop
         });
@@ -3614,6 +3632,26 @@ mod tests {
         // Non-textual keys have no unicode at all.
         assert!(key_event_text(gtk::gdk::Key::Up).is_none());
         assert!(key_event_text(gtk::gdk::Key::F1).is_none());
+
+        // Multibyte UTF-8 characters fit in the stack buffer without allocation.
+        assert_eq!(
+            key_event_text(gtk::gdk::Key::EuroSign)
+                .and_then(|s| s.into_string().ok())
+                .as_deref(),
+            Some("€")
+        );
+    }
+
+    #[test]
+    fn encode_terminal_scroll_distinguishes_precision_and_discrete_modes() {
+        // Discrete mouse wheel passes negated ticks with scroll_mods = 0 (not precision).
+        assert_eq!(encode_terminal_scroll(0.0, 1.0, 2, false), (-0.0, -1.0, 0));
+        assert_eq!(encode_terminal_scroll(-2.0, 3.0, 1, false), (2.0, -3.0, 0));
+
+        // Precision touchpad scroll scales by -scale_factor * 10.0 with precision bit set (1).
+        assert_eq!(encode_terminal_scroll(0.5, -1.5, 2, true), (-10.0, 30.0, 1));
+        // Zero/negative scale factor clamps to 1.
+        assert_eq!(encode_terminal_scroll(0.0, 1.0, 0, true), (-0.0, -10.0, 1));
     }
 
     #[test]

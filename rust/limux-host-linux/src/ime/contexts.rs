@@ -33,11 +33,13 @@ pub struct PaneIme {
     /// compose can finish without [`Self::primary`] (the Wayland
     /// slave) intercepting and swallowing the follow-up.
     fallback_composing: Rc<Cell<bool>>,
+    last_cursor_rect: Cell<Option<(i32, i32, i32, i32)>>,
 }
 
 impl PaneIme {
     /// Bind only after GTK has created the widget's native surface.
     pub fn attach(&self, gl_area: &gtk::GLArea) {
+        self.last_cursor_rect.set(None);
         self.primary.set_client_widget(Some(gl_area));
         self.fallback.set_client_widget(Some(gl_area));
         if gl_area.has_focus() {
@@ -50,6 +52,7 @@ impl PaneIme {
     /// queues cursor-location work on focus_in, and focus_out does not cancel
     /// that work. A detached context makes those callbacks return safely.
     pub fn detach(&self) {
+        self.last_cursor_rect.set(None);
         self.primary.focus_out();
         self.fallback.focus_out();
         self.primary.set_client_widget(gtk::Widget::NONE);
@@ -98,6 +101,7 @@ pub fn create_pane_ime(surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>) ->
         fallback,
         state,
         fallback_composing,
+        last_cursor_rect: Cell::new(None),
     }
 }
 
@@ -116,8 +120,13 @@ pub fn filter_key_event(
     ime: &PaneIme,
     event: &gtk::gdk::KeyEvent,
 ) -> ImeFilterOutcome {
-    update_ime_cursor_location(surface, ime.primary.upcast_ref());
-    update_ime_cursor_location(surface, ime.fallback.upcast_ref());
+    // Only refresh the external IME candidate popup anchor on key press, and
+    // only on the primary multicontext (GtkIMContextSimple has no candidate
+    // window). Skipping key release and fallback avoids 3 of 4 renderer_state
+    // mutex locks and redundant D-Bus/Wayland SetCursorLocation IPCs per key.
+    if event.event_type() == gtk::gdk::EventType::KeyPress {
+        update_primary_ime_cursor_location(surface, ime);
+    }
 
     let in_compose = ime.fallback_composing.get();
     let is_initiator = is_compose_initiator(event.keyval());
@@ -151,7 +160,27 @@ pub fn clear_ghostty_preedit(surface: ghostty_surface_t) {
     unsafe { ghostty_surface_preedit(surface, ptr::null(), 0) };
 }
 
-pub fn update_ime_cursor_location(surface: ghostty_surface_t, im_context: &gtk::IMContext) {
+fn ime_cursor_rect_tuple(x: f64, y: f64, width: f64, height: f64) -> (i32, i32, i32, i32) {
+    (
+        x.round() as i32,
+        y.round() as i32,
+        width.max(1.0).round() as i32,
+        height.max(1.0).round() as i32,
+    )
+}
+
+fn should_update_ime_cursor_rect(
+    cache: &Cell<Option<(i32, i32, i32, i32)>>,
+    next: (i32, i32, i32, i32),
+) -> bool {
+    if cache.get() == Some(next) {
+        return false;
+    }
+    cache.set(Some(next));
+    true
+}
+
+fn update_primary_ime_cursor_location(surface: ghostty_surface_t, ime: &PaneIme) {
     let mut x = 0.0;
     let mut y = 0.0;
     let mut width = 1.0;
@@ -159,12 +188,11 @@ pub fn update_ime_cursor_location(surface: ghostty_surface_t, im_context: &gtk::
     unsafe {
         ghostty_surface_ime_point(surface, &mut x, &mut y, &mut width, &mut height);
     }
-    im_context.set_cursor_location(&gtk::gdk::Rectangle::new(
-        x.round() as i32,
-        y.round() as i32,
-        width.max(1.0).round() as i32,
-        height.max(1.0).round() as i32,
-    ));
+    let next = ime_cursor_rect_tuple(x, y, width, height);
+    if should_update_ime_cursor_rect(&ime.last_cursor_rect, next) {
+        ime.primary
+            .set_cursor_location(&gtk::gdk::Rectangle::new(next.0, next.1, next.2, next.3));
+    }
 }
 
 pub fn send_committed_text(surface: ghostty_surface_t, text: &str) {
@@ -268,7 +296,9 @@ fn register_im_signal_handlers(
 
 #[cfg(test)]
 mod tests {
-    use super::preedit_payload;
+    use std::cell::Cell;
+
+    use super::{ime_cursor_rect_tuple, preedit_payload, should_update_ime_cursor_rect};
 
     #[test]
     fn hangul_preedit_passes_full_utf8_length_to_ghostty() {
@@ -277,5 +307,21 @@ mod tests {
             assert_eq!(byte_len, expected_len);
             assert_eq!(text.to_str().unwrap(), preedit);
         }
+    }
+
+    #[test]
+    fn ime_cursor_rect_cache_deduplicates_unchanged_rects() {
+        let cache = Cell::new(None);
+        let first = ime_cursor_rect_tuple(12.4, 24.6, 0.2, 16.0);
+        assert_eq!(first, (12, 25, 1, 16));
+        assert!(should_update_ime_cursor_rect(&cache, first));
+        assert!(!should_update_ime_cursor_rect(&cache, first));
+
+        let moved = ime_cursor_rect_tuple(20.0, 25.0, 1.0, 16.0);
+        assert!(should_update_ime_cursor_rect(&cache, moved));
+        assert!(!should_update_ime_cursor_rect(&cache, moved));
+
+        cache.set(None);
+        assert!(should_update_ime_cursor_rect(&cache, moved));
     }
 }

@@ -2141,7 +2141,7 @@ pub fn build_window(app: &adw::Application) {
                 let rename_entry = state
                     .try_borrow()
                     .ok()
-                    .and_then(|s| find_active_rename_entry(&s.sidebar_list));
+                    .and_then(|s| active_inline_rename_entry_in(&s.sidebar_list));
                 if let Some(entry) = rename_entry {
                     let target = state
                         .try_borrow()
@@ -2231,13 +2231,11 @@ pub fn build_window(app: &adw::Application) {
     // Any click anywhere in the window commits an active inline rename,
     // unless the click is inside the rename entry itself.
     {
-        let sl = sidebar_list.clone();
         let win = window.clone();
         let click_anywhere = gtk::GestureClick::new();
         click_anywhere.set_propagation_phase(gtk::PropagationPhase::Capture);
         click_anywhere.connect_pressed(move |_, _, x, y| {
-            let entry = find_active_rename_entry(&sl).or_else(|| pane::find_tab_rename_entry(&win));
-            if let Some(entry) = entry {
+            if let Some(entry) = active_inline_rename_entry_in(&win) {
                 let allocation = entry.allocation();
                 commit_inline_rename_for_click(
                     win.translate_coordinates(&entry, x, y),
@@ -2663,25 +2661,24 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
 
     let state = state.clone();
     key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
-        let focused_listening_editor = controller
-            .widget()
-            .and_then(|widget| widget.downcast::<gtk::Window>().ok())
-            .map(|window| focused_widget_is_listening_for_keybind_capture(&window))
-            .unwrap_or(false);
-        if focused_listening_editor {
-            return glib::Propagation::Proceed;
-        }
-
         let matched = {
             let s = state.borrow();
             let display = controller.widget().map(|widget| widget.display());
             shortcut_match_from_key_press(&s.shortcuts, display.as_ref(), keyval, keycode, modifier)
         }
         .filter(|matched| {
-            let context = controller
+            let window = controller
                 .widget()
-                .and_then(|widget| widget.downcast::<gtk::Window>().ok())
-                .map(|window| focused_editable_capture_context(&state, &window))
+                .and_then(|widget| widget.downcast::<gtk::Window>().ok());
+            if window
+                .as_ref()
+                .is_some_and(focused_widget_is_listening_for_keybind_capture)
+            {
+                return false;
+            }
+            let context = window
+                .as_ref()
+                .map(|window| focused_editable_capture_context(&state, window))
                 .unwrap_or_default();
             !shortcut_blocked_by_editable(matched.command, matched.editable_capture_policy, context)
         })
@@ -2797,9 +2794,8 @@ fn shortcut_match_from_key_press(
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
 ) -> Option<MatchedShortcut> {
-    shortcut_config::NormalizedShortcut::from_gdk_key_event(display, keyval, keycode, modifier)
-        .map(|shortcut| shortcut.to_runtime_combo())
-        .and_then(|combo| shortcuts.shortcut_for_runtime_combo(&combo))
+    shortcuts
+        .find_for_key_press(display, keyval, keycode, modifier)
         .map(|shortcut| MatchedShortcut {
             command: shortcut.definition.command,
             editable_capture_policy: shortcut.definition.editable_capture_policy,
@@ -4727,7 +4723,62 @@ fn set_workspace_color(state: &State, workspace_id: &str, color: Option<Workspac
     true
 }
 
+thread_local! {
+    static ACTIVE_INLINE_RENAMES: RefCell<Vec<glib::WeakRef<gtk::Entry>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn register_active_inline_rename(entry: &gtk::Entry) {
+    let weak = entry.downgrade();
+    ACTIVE_INLINE_RENAMES.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        entries.retain(|w| {
+            w.upgrade()
+                .is_some_and(|e| e.parent().is_some() && e != *entry)
+        });
+        entries.push(weak);
+    });
+    entry.connect_notify_local(Some("parent"), |entry, _| {
+        if entry.parent().is_none() {
+            clear_active_inline_rename(entry);
+        }
+    });
+}
+
+pub(crate) fn clear_active_inline_rename(entry: &gtk::Entry) {
+    ACTIVE_INLINE_RENAMES.with(|slot| {
+        slot.borrow_mut()
+            .retain(|w| w.upgrade().is_some_and(|e| e != *entry));
+    });
+}
+
+pub(crate) fn active_inline_rename_entry_in(
+    ancestor: &impl IsA<gtk::Widget>,
+) -> Option<gtk::Entry> {
+    ACTIVE_INLINE_RENAMES.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        if entries.is_empty() {
+            return None;
+        }
+        let mut found = None;
+        entries.retain(|w| {
+            let Some(entry) = w.upgrade() else {
+                return false;
+            };
+            if entry.parent().is_none() {
+                return false;
+            }
+            if found.is_none() && entry.is_ancestor(ancestor) {
+                found = Some(entry);
+            }
+            true
+        });
+        found
+    })
+}
+
 /// Find an active rename Entry in the sidebar (if any).
+#[cfg(test)]
 fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
     fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
         if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
@@ -4829,6 +4880,7 @@ fn begin_inline_rename(
 
     label.set_visible(false);
     parent.insert_child_after(&entry, Some(label));
+    register_active_inline_rename(&entry);
     entry.grab_focus();
     entry.select_region(0, -1);
 

@@ -96,6 +96,13 @@ impl TerminalImeState {
         }
     }
 
+    pub fn take_pending_key_text(&mut self) -> Option<CString> {
+        self.pending_key_text
+            .take()
+            .and_then(|text| CString::new(text).ok())
+    }
+
+    #[cfg(test)]
     pub fn take_event_text(&mut self, fallback: Option<CString>) -> Option<CString> {
         match self.pending_key_text.take() {
             Some(text) => CString::new(text).ok(),

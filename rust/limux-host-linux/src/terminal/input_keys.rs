@@ -152,15 +152,51 @@ pub(super) fn translated_keyval_for_keycode(
         .unwrap_or(keyval)
 }
 
-pub(super) fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {
-    let ch = keyval.to_unicode()?;
-    if ch.is_control() {
-        return None;
+pub(super) struct StackKeyText {
+    buf: [u8; 5],
+}
+
+impl StackKeyText {
+    pub(super) fn from_keyval(keyval: gtk::gdk::Key) -> Option<Self> {
+        let ch = keyval.to_unicode()?;
+        if ch.is_control() {
+            return None;
+        }
+        let mut buf = [0u8; 5];
+        let encoded = ch.encode_utf8(&mut buf[..4]);
+        buf[encoded.len()] = 0;
+        Some(Self { buf })
     }
 
-    let mut buf = [0u8; 4];
-    let s = ch.encode_utf8(&mut buf);
-    CString::new(s.as_bytes()).ok()
+    pub(super) fn as_ptr(&self) -> *const c_char {
+        self.buf.as_ptr().cast::<c_char>()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {
+    let stack = StackKeyText::from_keyval(keyval)?;
+    let cstr = unsafe { std::ffi::CStr::from_ptr(stack.as_ptr()) };
+    Some(cstr.to_owned())
+}
+
+pub(super) fn encode_terminal_scroll(
+    dx: f64,
+    dy: f64,
+    scale_factor: i32,
+    precision: bool,
+) -> (f64, f64, c_int) {
+    // Ghostty decodes `scroll_mods` as a packed bitfield (bit 0 = precision,
+    // bits 1..3 = momentum), NOT keyboard modifiers. For precision touchpad
+    // scrolls, Ghostty expects physical pixels (matching Ghostty's GTK apprt
+    // scale_factor * 10.0 multiplier). For discrete wheel ticks, Ghostty
+    // multiplies by its physical cell_height directly.
+    if precision {
+        let factor = -(scale_factor.max(1) as f64) * 10.0;
+        (dx * factor, dy * factor, 1)
+    } else {
+        (-dx, -dy, 0)
+    }
 }
 
 pub(super) fn keyval_unicode_unshifted(

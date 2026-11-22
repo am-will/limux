@@ -561,6 +561,7 @@ pub(super) fn show_rename_dialog(
     label.set_visible(false);
     // Insert entry before the close button
     parent.insert_child_after(&entry, Some(label));
+    crate::window::register_active_inline_rename(&entry);
     tab_state.borrow_mut().active_rename_tab = Some(tab_id.to_string());
     focus_tab_rename_entry(&entry);
 
