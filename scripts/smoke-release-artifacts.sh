@@ -29,11 +29,9 @@ if [ ! -d "$DIST_DIR" ]; then
 fi
 DIST_DIR="$(cd "$DIST_DIR" && pwd)"
 
-ARCH="$(uname -m)"
-DEB_ARCH="amd64"
-[ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
-RPM_ARCH="x86_64"
-[ "$ARCH" = "aarch64" ] && RPM_ARCH="aarch64"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/release-arch.sh"
+resolve_release_arch
 EXPECTED_VERSION="limux $VERSION"
 SMOKE_ROOT="$(mktemp -d -t limux-release-smoke-XXXXXX)"
 trap 'find "$SMOKE_ROOT" -depth -delete' EXIT

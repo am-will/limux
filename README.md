@@ -21,16 +21,18 @@ https://github.com/user-attachments/assets/6f3047c2-e2b6-49f2-b536-570a1570d0f8
 ## Install
 
 Download the latest release from [GitHub Releases](https://github.com/am-will/limux/releases).
+Each release includes x86_64 and ARM64 builds. ARM64 files are named `aarch64`, except the `.deb`, which uses `arm64`.
 
 **Debian/Ubuntu (.deb)** — recommended:
 ```bash
-sudo dpkg -i ./limux_*_amd64.deb
+sudo dpkg -i ./limux_*_amd64.deb   # x86_64
+sudo dpkg -i ./limux_*_arm64.deb   # aarch64
 ```
 
 **AppImage** — portable across Ubuntu 24.04-era desktops and newer, with no
 Limux installation needed:
 ```bash
-chmod +x Limux-*-x86_64.AppImage
+chmod +x Limux-*-x86_64.AppImage   # or Limux-*-aarch64.AppImage
 ./Limux-*-x86_64.AppImage
 ```
 
@@ -62,7 +64,7 @@ host tools such as Flatpak do not load AppImage-private libraries first.
 
 **Tarball** — manual install:
 ```bash
-tar xzf limux-*-linux-x86_64.tar.gz
+tar xzf limux-*-linux-x86_64.tar.gz   # or limux-*-linux-aarch64.tar.gz
 cd limux-*-linux-x86_64
 sudo ./install.sh
 ```
@@ -83,7 +85,7 @@ yay -S limux-bin
 yay -S limux
 ```
 
-Both [`limux-bin`](https://aur.archlinux.org/packages/limux-bin) and the source-built [`limux`](https://aur.archlinux.org/packages/limux) package are published from this repository. Thanks to [Anton Barchukov](https://github.com/antonbarchukov) for creating the original Arch packaging in [PR #50](https://github.com/am-will/limux/pull/50).
+Both [`limux-bin`](https://aur.archlinux.org/packages/limux-bin) and the source-built [`limux`](https://aur.archlinux.org/packages/limux) package are published from this repository for `x86_64` and `aarch64` (Arch Linux ARM). Thanks to [Anton Barchukov](https://github.com/antonbarchukov) for creating the original Arch packaging in [PR #50](https://github.com/am-will/limux/pull/50).
 
 To uninstall:
 ```bash
