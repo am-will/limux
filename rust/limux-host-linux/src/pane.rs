@@ -2901,7 +2901,10 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
             .borrow()
             .values()
             .filter_map(|weak| weak.upgrade())
-            .filter(|internals| internals.pane_outer.is_ancestor(root))
+            .filter(|internals| {
+                internals.pane_outer.upcast_ref::<gtk::Widget>() == root
+                    || internals.pane_outer.is_ancestor(root)
+            })
             .collect::<Vec<_>>()
     });
     panes.sort_by_key(|internals| internals.pane_id);

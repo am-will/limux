@@ -708,9 +708,6 @@ impl SplitTreeContainer {
                 );
             },
             move || {
-                for widget in hidden.borrow_mut().drain(..) {
-                    widget.set_visible(true);
-                }
                 let Some(container) = container.upgrade() else {
                     return;
                 };
@@ -719,17 +716,30 @@ impl SplitTreeContainer {
                 container.teardown_pending.set(false);
 
                 if fallback || parent_slot.current_child().as_ref() != Some(&target_widget) {
+                    // Trigger the full rebuild first so `old` is hidden/detached
+                    // before restoring inner child visibility (avoids a spurious
+                    // map -> refresh -> unmap cycle while still mounted).
                     container.trigger_rebuild();
+                    for widget in hidden.borrow_mut().drain(..) {
+                        widget.set_visible(true);
+                    }
                     return;
                 }
+
+                // Defensively clear focus before detaching (handles unrealized
+                // no-clock paths and focus re-entry during the repaint frame).
+                crate::terminal::unset_focus_within(&target_widget);
 
                 // Replace `target` in its parent slot with a temporary
                 // placeholder for one idle tick: `target` unrealizes now while
                 // the parent Paned keeps its exact slot allocation (so sibling
                 // panes never resize or flicker), and the new split mounts on
-                // tick N+1.
+                // tick N+1. Restore inner visibility only after unparenting.
                 let placeholder = make_surgery_placeholder();
                 parent_slot.replace(&target_widget, Some(placeholder.upcast_ref()));
+                for widget in hidden.borrow_mut().drain(..) {
+                    widget.set_visible(true);
+                }
 
                 container.schedule_localized_mount(
                     parent_slot,
@@ -807,9 +817,6 @@ impl SplitTreeContainer {
                 );
             },
             move || {
-                for widget in sibling_hidden.borrow_mut().drain(..) {
-                    widget.set_visible(true);
-                }
                 let Some(container) = container.upgrade() else {
                     return;
                 };
@@ -821,18 +828,32 @@ impl SplitTreeContainer {
                     || grandparent_slot.current_child().as_ref()
                         != Some(parent_paned.upcast_ref::<gtk::Widget>())
                 {
+                    // Trigger the full rebuild first so `old` is hidden/detached
+                    // before restoring inner visibility on surviving children.
                     container.trigger_rebuild();
+                    for widget in sibling_hidden.borrow_mut().drain(..) {
+                        widget.set_visible(true);
+                    }
                     return;
                 }
+
+                // Defensively clear focus inside `parent_paned` (including the
+                // GtkPaned divider itself) before unparenting.
+                crate::terminal::unset_focus_within(parent_paned.upcast_ref());
 
                 // Detach `parent_paned` (replacing it with a placeholder in the
                 // grandparent slot so outer splits keep their allocation) and
                 // release both children immediately so the removed pane and old
                 // Paned drop cleanly while `sibling` unrealizes on tick N.
+                // Restore `sibling` inner visibility only after unparenting so
+                // nothing maps spuriously before unrealize.
                 let placeholder = make_surgery_placeholder();
                 grandparent_slot.replace(parent_paned.upcast_ref(), Some(placeholder.upcast_ref()));
                 parent_paned.set_start_child(gtk::Widget::NONE);
                 parent_paned.set_end_child(gtk::Widget::NONE);
+                for widget in sibling_hidden.borrow_mut().drain(..) {
+                    widget.set_visible(true);
+                }
 
                 container.schedule_localized_mount(
                     grandparent_slot,
@@ -856,9 +877,12 @@ impl SplitTreeContainer {
         if let Some(source) = self.rebuild_source.take() {
             source.remove();
         }
-        let container = Rc::clone(self);
+        let container = Rc::downgrade(self);
         let mut mount = Some(mount);
         let source = glib::idle_add_local_full(glib::Priority::HIGH, move || {
+            let Some(container) = container.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             container.rebuild_source.replace(None);
             if slot.current_child().as_ref() != Some(placeholder.upcast_ref::<gtk::Widget>()) {
                 container.trigger_rebuild();

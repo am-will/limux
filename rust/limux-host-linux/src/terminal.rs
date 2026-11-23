@@ -1716,20 +1716,16 @@ fn free_terminal_surface(
     drop(entry);
 }
 
-/// Hide `widget`, then run `detach` once its window has painted a frame
-/// without it.
+/// Wait for one compositor frame after running `hide`, then run `detach`.
 ///
 /// Unrealizing a GLArea whose last frame the renderer still holds makes GTK
 /// copy that frame back to the CPU (`gdk_gl_texture_release`). On NVIDIA the
 /// copy can segfault inside the driver, and when GTK shares the frame as a
 /// dmabuf it also leaks the copy. After one frame without the widget,
 /// unrealize just deletes the textures. An unrealized widget is in no frame
-/// and is detached at once. An unmapped one still waits: the last frame may
-/// show it from before an ancestor was hidden or its workspace switched away.
-/// Wait for one compositor frame after running `hide` (matching the
-/// `after_paint` + 100 ms fallback semantics of [`detach_after_repaint`]), then
-/// run `detach`. If `anchor` has no frame clock yet (unrealized), runs `detach`
-/// immediately without calling `hide`.
+/// and is detached at once without calling `hide`. An unmapped one still waits:
+/// the last frame may show it from before an ancestor was hidden or its
+/// workspace switched away.
 pub(crate) fn run_after_repaint(
     anchor: &gtk::Widget,
     hide: impl FnOnce(),
@@ -1798,6 +1794,8 @@ pub(crate) fn run_after_repaint(
     *timeout.borrow_mut() = Some(source);
 }
 
+/// Hide `widget`, then run `detach` once its window has painted a frame
+/// without it (see [`run_after_repaint`]).
 pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() + 'static) {
     let widget_for_hide = widget.clone();
     run_after_repaint(

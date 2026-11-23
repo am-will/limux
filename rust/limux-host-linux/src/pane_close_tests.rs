@@ -906,12 +906,23 @@ fn localized_split_and_remove_keep_sibling_gl_areas_realized() {
         });
         count
     };
+    let track_map = |pane: &gtk::Widget| -> Rc<Cell<u32>> {
+        let count = Rc::new(Cell::new(0u32));
+        let count_cb = count.clone();
+        let gl = find_gl_area(pane).expect("terminal GLArea");
+        gl.connect_map(move |_| {
+            count_cb.set(count_cb.get() + 1);
+        });
+        count
+    };
     let unrealize_a = track_unrealize(&pane_a);
+    let map_a = track_map(&pane_a);
     let unrealize_b = track_unrealize(&pane_b);
     let unrealize_c = track_unrealize(&pane_c);
     let unrealize_d = track_unrealize(&pane_d);
 
     // 1. Splitting A horizontally only reparents A; B, C, and D stay realized.
+    // A must map only once (on tick N+1 remount), never spuriously before detach.
     let pane_e = split_pane(
         &state,
         &ws_id,
@@ -923,47 +934,58 @@ fn localized_split_and_remove_keep_sibling_gl_areas_realized() {
     pump_until(wait, || shown(&pane_e) && shown(&pane_a));
     pump_for(std::time::Duration::from_millis(120));
     assert_eq!(unrealize_a.get(), 1, "split target A reparents once");
+    assert_eq!(map_a.get(), 1, "split target A must not map before detach");
     assert_eq!(unrealize_b.get(), 0, "sibling B must not unrealize");
     assert_eq!(unrealize_c.get(), 0, "outer sibling C must not unrealize");
     assert_eq!(unrealize_d.get(), 0, "outer sibling D must not unrealize");
     assert_focus_within("localized split focuses new pane E", &state, &pane_e);
 
-    // 2. Closing E promotes A back into its parent slot without touching B, C, or D.
+    // 2. Closing B promotes nested Paned (A | E) into OuterPaned.start without
+    // touching C or D, and preserves focus in E.
+    let refs_b = weak_refs(&widget_tree(&pane_b));
+    remove_pane(&state, &ws_id, &pane_b);
+    drop(pane_b);
+    assert_freed("localized removed pane B", &refs_b);
+    pump_until(wait, || shown(&pane_a) && shown(&pane_e));
+    assert_eq!(map_a.get(), 2, "promoted nested A maps once on remount");
+    assert_eq!(unrealize_c.get(), 0, "closing B must not unrealize C");
+    assert_eq!(unrealize_d.get(), 0, "closing B must not unrealize D");
+    assert_focus_within("closing unfocused B keeps focus in E", &state, &pane_e);
+
+    // 3. Focus unaffected pane D, then close E: single-leaf A is promoted into
+    // OuterPaned.start while D keeps focus and C & D stay realized.
+    assert!(pane::focus_active_tab_in_pane(&pane_d));
+    pump_for(std::time::Duration::from_millis(80));
+    assert_focus_within("focus moved to unaffected pane D", &state, &pane_d);
     let refs_e = weak_refs(&widget_tree(&pane_e));
     remove_pane(&state, &ws_id, &pane_e);
     drop(pane_e);
     assert_freed("localized removed pane E", &refs_e);
     pump_until(wait, || shown(&pane_a));
-    assert_eq!(unrealize_b.get(), 0, "closing E must not unrealize B");
+    assert_eq!(
+        map_a.get(),
+        3,
+        "promoted single-leaf A maps once on remount"
+    );
     assert_eq!(unrealize_c.get(), 0, "closing E must not unrealize C");
     assert_eq!(unrealize_d.get(), 0, "closing E must not unrealize D");
-    assert_focus_within("closing E restores focus to A", &state, &pane_a);
+    assert_focus_within("closing unfocused E preserves focus in D", &state, &pane_d);
 
-    // 3. Closing A promotes B into the outer start slot without touching C or D.
-    let refs_a = weak_refs(&widget_tree(&pane_a));
-    remove_pane(&state, &ws_id, &pane_a);
-    drop(pane_a);
-    assert_freed("localized removed pane A", &refs_a);
-    pump_until(wait, || shown(&pane_b));
-    assert_eq!(unrealize_c.get(), 0, "closing A must not unrealize C");
-    assert_eq!(unrealize_d.get(), 0, "closing A must not unrealize D");
-    assert_focus_within("closing A restores focus to B", &state, &pane_b);
-
-    // 4. Same-frame compound mutation (split B + close C in one tick) falls back
+    // 4. Same-frame compound mutation (split A + close C in one tick) falls back
     // cleanly to a full rebuild without leaking C or stranding hidden children.
     let refs_c = weak_refs(&widget_tree(&pane_c));
     let pane_f = split_pane(
         &state,
         &ws_id,
-        &pane_b,
+        &pane_a,
         gtk::Orientation::Horizontal,
         split_options(),
     )
-    .expect("split B before same-frame close");
+    .expect("split A before same-frame close");
     remove_pane(&state, &ws_id, &pane_c);
     drop(pane_c);
     assert_freed("same-frame closed pane C", &refs_c);
-    pump_until(wait, || shown(&pane_b) && shown(&pane_f) && shown(&pane_d));
+    pump_until(wait, || shown(&pane_a) && shown(&pane_f) && shown(&pane_d));
     assert_eq!(container.panes().len(), 3);
     assert!(container.panes().iter().all(shown));
 
