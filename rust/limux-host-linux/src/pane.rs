@@ -1787,16 +1787,24 @@ fn make_terminal_callbacks(
         }),
         on_close: Box::new(move |code| {
             let tab_id = tid_for_close.clone();
-            let generation = terminal_tab_owner(&tab_id).and_then(|pane| {
-                let tabs = pane.tab_state.borrow();
-                let entry = tabs.tabs.iter().find(|entry| entry.id == tab_id)?;
-                match &entry.kind {
-                    TabKind::Terminal { state } => Some(state.generation.clone()),
-                    _ => None,
-                }
+            // Whether someone watched it end is decided now: the user may open
+            // the tab before the deferred handler runs.
+            let exit = terminal_tab_owner(&tab_id).and_then(|pane| {
+                let generation = {
+                    let tabs = pane.tab_state.borrow();
+                    let entry = tabs.tabs.iter().find(|entry| entry.id == tab_id)?;
+                    let TabKind::Terminal { state } = &entry.kind else {
+                        return None;
+                    };
+                    let active = tabs.active_tab.as_deref() == Some(tab_id.as_str());
+                    (state.generation.clone(), active)
+                };
+                Some((generation.0, generation.1 && pane_is_visible(&pane)))
             });
-            if let Some(generation) = generation {
-                glib::idle_add_local_once(move || handle_terminal_exit(&tab_id, code, &generation));
+            if let Some((generation, attended)) = exit {
+                glib::idle_add_local_once(move || {
+                    handle_terminal_exit(&tab_id, code, &generation, attended)
+                });
             }
         }),
         on_open_url: Box::new({
@@ -2067,7 +2075,9 @@ fn terminal_tab_owner(tab_id: &str) -> Option<Rc<PaneInternals>> {
     })
 }
 
-fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
+/// `attended`: the tab was the active tab of a visible pane when its process
+/// ended.
+fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>, attended: bool) {
     let Some(internals) = terminal_tab_owner(tab_id) else {
         return;
     };
@@ -2078,7 +2088,6 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
     }
     let step = {
         let mut tabs = internals.tab_state.borrow_mut();
-        let is_active_tab = tabs.active_tab.as_deref() == Some(tab_id);
         let Some(entry) = tabs.find_tab_mut(tab_id) else {
             return;
         };
@@ -2107,9 +2116,9 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
             // Retain errors and the saved target (e.g. tmux is not installed).
             Some(_) if code.is_some_and(|code| code != 0) => ExitStep::Hold(
                 format!("SSH exited with code {}", code.unwrap_or_default()),
-                !is_active_tab,
+                !attended,
             ),
-            _ => ExitStep::Decide(state.spawned_at.elapsed(), is_active_tab),
+            _ => ExitStep::Decide(state.spawned_at.elapsed(), attended),
         }
     };
     match step {
@@ -2118,11 +2127,9 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>) {
             glib::timeout_add_local_once(delay, move || respawn_terminal_tab(&tab_id, &generation));
         }
         ExitStep::Hold(message, background) => {
-            let attended = !background && pane_is_visible(&internals);
-            hold_exited_terminal(&internals, tab_id, &message, !attended, true);
+            hold_exited_terminal(&internals, tab_id, &message, background, true);
         }
-        ExitStep::Decide(runtime, is_active_tab) => {
-            let attended = is_active_tab && pane_is_visible(&internals);
+        ExitStep::Decide(runtime, attended) => {
             match exit_hold::exit_disposition(code, attended, runtime) {
                 exit_hold::ExitDisposition::Close => remove_terminal_tab(&internals, tab_id),
                 exit_hold::ExitDisposition::Hold { notify } => {
@@ -2247,7 +2254,7 @@ fn finish_terminal_respawn(
     let Some(internals) = terminal_tab_owner(tab_id) else {
         return;
     };
-    let (label, cwd, command, autostart, active, activity) = {
+    let (label, cwd, command, autostart, active, activity, is_ssh) = {
         let tabs = internals.tab_state.borrow();
         let Some(entry) = tabs.tabs.iter().find(|entry| entry.id == tab_id) else {
             return;
@@ -2273,6 +2280,7 @@ fn finish_terminal_respawn(
                 .flatten(),
             tabs.active_tab.as_deref() == Some(tab_id),
             entry.activity.clone(),
+            state.ssh.is_some(),
         )
     };
     // A click or tab switch while repainting takes precedence over the old
@@ -2289,7 +2297,7 @@ fn finish_terminal_respawn(
         tab_id,
         &label,
         &cwd,
-        true,
+        is_ssh,
         directory.as_deref(),
         terminal::TerminalOptions {
             startup_command: command,
