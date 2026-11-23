@@ -36,6 +36,11 @@ mod async_probe {
     enum ProbeSlot {
         Unstarted,
         Running,
+        /// Probe finished and main-thread waiter notification is in progress.
+        /// `peek_ready` observes the result immediately (preventing missed
+        /// registrations), while `ensure_started_with` and `wait_for_ready`
+        /// wait until `Ready` so control commands cannot bypass upgrades.
+        Publishing(Result<BrowserSandbox, String>),
         Ready(Result<BrowserSandbox, String>),
     }
 
@@ -62,9 +67,36 @@ mod async_probe {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &*slot {
-                ProbeSlot::Ready(result) => Some(result.clone()),
+                ProbeSlot::Publishing(result) | ProbeSlot::Ready(result) => Some(result.clone()),
                 ProbeSlot::Unstarted | ProbeSlot::Running => None,
             }
+        }
+
+        fn publish_result<N>(&self, result: Result<BrowserSandbox, String>, notify_fn: Option<N>)
+        where
+            N: FnOnce(Result<BrowserSandbox, String>),
+        {
+            {
+                let mut slot = self
+                    .slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *slot = ProbeSlot::Publishing(result.clone());
+            }
+            // Queue main-thread waiter upgrades BEFORE transitioning to `Ready`
+            // and waking blocked control-socket threads so pending browser tabs
+            // upgrade ahead of control commands dispatched onto MainContext.
+            if let Some(notify_fn) = notify_fn {
+                notify_fn(result.clone());
+            }
+            {
+                let mut slot = self
+                    .slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *slot = ProbeSlot::Ready(result);
+            }
+            self.condvar.notify_all();
         }
 
         pub(super) fn ensure_started_with<F, N>(
@@ -76,7 +108,7 @@ mod async_probe {
             F: FnOnce(&AtomicBool) -> Result<BrowserSandbox, String> + Send + 'static,
             N: FnOnce(Result<BrowserSandbox, String>) + Send + 'static,
         {
-            // Fast path: already running or ready without contending on worker lock.
+            // Fast path: already running, publishing, or ready without contending on worker lock.
             {
                 let slot = self
                     .slot
@@ -84,7 +116,7 @@ mod async_probe {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match &*slot {
                     ProbeSlot::Ready(result) => return Some(result.clone()),
-                    ProbeSlot::Running => return None,
+                    ProbeSlot::Running | ProbeSlot::Publishing(_) => return None,
                     ProbeSlot::Unstarted => {}
                 }
             }
@@ -104,15 +136,13 @@ mod async_probe {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match &*slot {
                     ProbeSlot::Ready(result) => return Some(result.clone()),
-                    ProbeSlot::Running => return None,
+                    ProbeSlot::Running | ProbeSlot::Publishing(_) => return None,
                     ProbeSlot::Unstarted => {
                         if self.cancel.load(Ordering::Acquire) {
                             let cancelled =
                                 Err("Browser startup check cancelled during shutdown.".to_string());
-                            *slot = ProbeSlot::Ready(cancelled.clone());
                             drop(slot);
-                            notify_main_thread(cancelled.clone());
-                            self.condvar.notify_all();
+                            self.publish_result(cancelled.clone(), Some(notify_main_thread));
                             return Some(cancelled);
                         }
                         *slot = ProbeSlot::Running;
@@ -132,24 +162,11 @@ mod async_probe {
                             eprintln!("limux: {error}");
                         }
                     }
-                    {
-                        let mut slot = controller
-                            .slot
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        *slot = ProbeSlot::Ready(result.clone());
-                    }
-                    // Queue main-thread waiter upgrades BEFORE waking blocked
-                    // control-socket threads so pending browser tabs upgrade
-                    // ahead of control commands dispatched onto MainContext.
-                    if let Some(notify_fn) = notify_bg
+                    let notify_fn = notify_bg
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                    {
-                        notify_fn(result);
-                    }
-                    controller.condvar.notify_all();
+                        .take();
+                    controller.publish_result(result, notify_fn);
                 });
 
             match handle {
@@ -161,21 +178,11 @@ mod async_probe {
                     let err = Err(format!(
                         "Could not start browser sandbox probe thread: {error}"
                     ));
-                    {
-                        let mut slot = self
-                            .slot
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        *slot = ProbeSlot::Ready(err.clone());
-                    }
-                    if let Some(notify_fn) = notify
+                    let notify_fn = notify
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                    {
-                        notify_fn(err.clone());
-                    }
-                    self.condvar.notify_all();
+                        .take();
+                    self.publish_result(err.clone(), notify_fn);
                     Some(err)
                 }
             }
@@ -189,7 +196,7 @@ mod async_probe {
             loop {
                 match &*slot {
                     ProbeSlot::Ready(result) => return result.clone(),
-                    ProbeSlot::Unstarted | ProbeSlot::Running => {
+                    ProbeSlot::Unstarted | ProbeSlot::Running | ProbeSlot::Publishing(_) => {
                         slot = self
                             .condvar
                             .wait(slot)
@@ -367,9 +374,13 @@ mod tests {
         let release_probe = Arc::new(Barrier::new(2));
 
         let runs_bg = runs.clone();
+        let notify_entered = Arc::new(Barrier::new(2));
+        let release_notify = Arc::new(Barrier::new(2));
         let start_bg = start_barrier.clone();
         let release_bg = release_probe.clone();
         let notified_bg = notified_before_waiter.clone();
+        let notify_entered_bg = notify_entered.clone();
+        let release_notify_bg = release_notify.clone();
         let first = controller.ensure_started_with(
             move |_cancel| {
                 runs_bg.fetch_add(1, Ordering::SeqCst);
@@ -378,6 +389,8 @@ mod tests {
                 Ok(BrowserSandbox { sandboxed: true })
             },
             move |_result| {
+                notify_entered_bg.wait();
+                release_notify_bg.wait();
                 notified_bg.store(true, Ordering::SeqCst);
             },
         );
@@ -404,11 +417,26 @@ mod tests {
         });
 
         release_probe.wait();
+        // Hold inside `notify_fn` (`Publishing` state): `peek_ready` sees the
+        // result, while `ensure_started_with` and `wait_for_ready` must wait
+        // until `notify_fn` finishes.
+        notify_entered.wait();
+        assert_eq!(
+            controller.peek_ready(),
+            Some(Ok(BrowserSandbox { sandboxed: true }))
+        );
+        assert_eq!(
+            controller.ensure_started_with(|_| unreachable!(), |_| {}),
+            None,
+            "ensure_started_with must not bypass in-flight main-thread notification"
+        );
+        release_notify.wait();
+
         let (res, saw_notify) = waiter.join().unwrap();
         assert_eq!(res, Ok(BrowserSandbox { sandboxed: true }));
         assert!(
             saw_notify,
-            "main-thread waiter notification must run before waking condvar waiters"
+            "main-thread waiter notification must finish before waking condvar waiters"
         );
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         controller.cancel_and_join();

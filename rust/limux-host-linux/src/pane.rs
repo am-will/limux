@@ -4305,6 +4305,10 @@ fn register_pending_browser_upgrade(
             )
         };
 
+        let Some(owner) = terminal_tab_owner(&tab_id).or_else(|| initial_owner.upgrade()) else {
+            return;
+        };
+
         let had_focus = crate::terminal::focus_is_within(container.upcast_ref());
         while let Some(child) = container.first_child() {
             container.remove(&child);
@@ -4334,7 +4338,7 @@ fn register_pending_browser_upgrade(
         let _ = child_widget;
 
         pending.borrow_mut().resolved = Some(Box::new(resolved_handles.clone()));
-        if let Some(owner) = terminal_tab_owner(&tab_id).or_else(|| initial_owner.upgrade()) {
+        {
             let mut tabs = owner.tab_state.borrow_mut();
             if let Some(entry) = tabs.find_tab_mut(&tab_id) {
                 if let TabKind::Browser { state } = &mut entry.kind {

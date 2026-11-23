@@ -6142,6 +6142,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let app_state = state.borrow();
                 surface_health_payload(state, &app_state.workspaces[index], surface)
             };
+            // If the background probe transitioned to Ready while building the
+            // payload, flush pending browser tab upgrades before replying so
+            // `realized: true` never races ahead of WebView creation.
+            crate::browser_sandbox::flush_ready_waiters();
             let _ = reply.send(result);
         }
         ControlCommand::CreateWorkspace {

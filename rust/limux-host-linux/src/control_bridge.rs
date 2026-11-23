@@ -1803,10 +1803,16 @@ fn command_needs_browser_sandbox(command: &ControlCommand) -> bool {
 pub fn start(dispatch: fn(ControlCommand)) {
     let context = glib::MainContext::default();
     let dispatch = std::sync::Arc::new(move |command: ControlCommand| {
-        if command_needs_browser_sandbox(&command) {
+        let needs_browser_sandbox = command_needs_browser_sandbox(&command);
+        if needs_browser_sandbox {
             let _ = crate::browser_sandbox::wait_for_availability_blocking();
         }
-        context.invoke(move || dispatch(command));
+        context.invoke(move || {
+            if needs_browser_sandbox {
+                crate::browser_sandbox::flush_ready_waiters();
+            }
+            dispatch(command);
+        });
     });
 
     std::thread::Builder::new()
