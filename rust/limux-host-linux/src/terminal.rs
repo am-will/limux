@@ -1726,13 +1726,20 @@ fn free_terminal_surface(
 /// unrealize just deletes the textures. An unrealized widget is in no frame
 /// and is detached at once. An unmapped one still waits: the last frame may
 /// show it from before an ancestor was hidden or its workspace switched away.
-pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() + 'static) {
-    let Some(clock) = widget.frame_clock() else {
+/// Wait for one compositor frame after running `hide` (matching the
+/// `after_paint` + 100 ms fallback semantics of [`detach_after_repaint`]), then
+/// run `detach`. If `anchor` has no frame clock yet (unrealized), runs `detach`
+/// immediately without calling `hide`.
+pub(crate) fn run_after_repaint(
+    anchor: &gtk::Widget,
+    hide: impl FnOnce(),
+    detach: impl FnOnce() + 'static,
+) {
+    let Some(clock) = anchor.frame_clock() else {
         detach();
         return;
     };
-    unset_focus_within(widget);
-    widget.set_visible(false);
+    hide();
 
     let detach = Rc::new(RefCell::new(Some(detach)));
     let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
@@ -1789,6 +1796,18 @@ pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() +
             }
         });
     *timeout.borrow_mut() = Some(source);
+}
+
+pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() + 'static) {
+    let widget_for_hide = widget.clone();
+    run_after_repaint(
+        widget,
+        move || {
+            unset_focus_within(&widget_for_hide);
+            widget_for_hide.set_visible(false);
+        },
+        detach,
+    );
 }
 
 /// Unset the window's focus when it is inside `widget`, before `widget` is
