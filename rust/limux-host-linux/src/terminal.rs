@@ -105,6 +105,8 @@ struct SurfaceEntry {
     scrollbar: gtk::Scrollbar,
     scrollbar_adjustment: gtk::Adjustment,
     scrollbar_syncing: Rc<Cell<bool>>,
+    scrollbar_state: Cell<Option<ScrollbarMetrics>>,
+    scrollbar_dirty: Cell<bool>,
     on_title_changed: Option<Box<TitleChangedCallback>>,
     on_pwd_changed: Option<Box<PwdChangedCallback>>,
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
@@ -132,6 +134,14 @@ struct ClipboardContext {
     callbacks: Rc<RefCell<TerminalCallbacks>>,
     url_probe: RefCell<Option<String>>,
     url_probe_active: Cell<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScrollbarMetrics {
+    total: u64,
+    offset: u64,
+    len: u64,
+    visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -553,7 +563,7 @@ impl TerminalHandle {
         let keycode = keycode_for_keyval(self.gl_area.upcast_ref(), keyval);
         let text_keyval =
             translated_keyval_for_keycode(self.gl_area.upcast_ref(), keyval, keycode, modifier);
-        let text = key_event_text(text_keyval);
+        let text = StackKeyText::from_keyval(text_keyval);
 
         let mut press = translate_key_event(
             GHOSTTY_ACTION_PRESS,
@@ -563,7 +573,7 @@ impl TerminalHandle {
             keycode,
             modifier,
         );
-        // The CString must outlive the ghostty call below; `text` owns it until the
+        // The stack buffer must outlive the ghostty call below; `text` owns it until the
         // end of this function.
         if let Some(text) = text.as_ref() {
             press.input.text = text.as_ptr();
@@ -583,7 +593,6 @@ impl TerminalHandle {
             ghostty_surface_key_with_key(surface, press.input, press.resolved_key);
             ghostty_surface_key_with_key(surface, release.input, release.resolved_key);
         }
-        drop(text);
         true
     }
 
@@ -903,6 +912,7 @@ fn load_ghostty_config_with_font(
                 .lock()
                 .expect("base ghostty font defaults lock poisoned") = Some(defaults);
         }
+        let mut applied_overlay = false;
         if !terminal_font.is_default() {
             let base_flags = if terminal_font.anti_aliased.is_some() {
                 base_contents.as_deref().and_then(|contents| {
@@ -918,10 +928,16 @@ fn load_ghostty_config_with_font(
                     overlay.len(),
                     OVERLAY_PATH.as_ptr().cast::<c_char>(),
                 );
+                applied_overlay = true;
             }
         }
         if flatpak::enabled() {
-            if let Some(contents) = serialized_config(config) {
+            let flatpak_contents = if applied_overlay {
+                serialized_config(config)
+            } else {
+                base_contents
+            };
+            if let Some(contents) = flatpak_contents {
                 flatpak::load_config(&contents);
             } else {
                 eprintln!(
@@ -931,6 +947,13 @@ fn load_ghostty_config_with_font(
             }
         }
         ghostty_config_finalize(config);
+        // Resolve the autostart shell kind AFTER finalize() so Ghostty's
+        // default shell resolution ($SHELL / passwd.shell) and themes are included.
+        let finalized_contents = serialized_config(config);
+        CURRENT_AUTOSTART_SHELL_KIND.store(
+            autostart_shell_kind_from_contents(finalized_contents.as_deref()),
+            Ordering::Relaxed,
+        );
         config
     }
 }
@@ -953,14 +976,11 @@ fn decode_autostart_shell_kind(raw: u8) -> Option<crate::ghostty_config::Autosta
     }
 }
 
-fn load_autostart_shell_kind(config: ghostty_config_t) -> u8 {
-    let contents = serialized_config(config);
-
+fn autostart_shell_kind_from_contents(contents: Option<&str>) -> u8 {
     let command = contents
-        .as_deref()
-        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "command"));
+        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "command"))
+        .filter(|command| !command.trim().is_empty());
     let initial_command = contents
-        .as_deref()
         .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "initial-command"))
         .filter(|command| !command.trim().is_empty());
 
@@ -1007,7 +1027,6 @@ pub fn init_ghostty() {
         let config = load_ghostty_config();
         let background_opacity = load_background_opacity(config);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
-        CURRENT_AUTOSTART_SHELL_KIND.store(load_autostart_shell_kind(config), Ordering::Relaxed);
 
         let runtime_config = ghostty_runtime_config_s {
             userdata: ptr::null_mut(),
@@ -1054,7 +1073,6 @@ pub fn apply_terminal_font_config(
     if changed {
         let config = load_ghostty_config_with_font(&sanitized);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
-        CURRENT_AUTOSTART_SHELL_KIND.store(load_autostart_shell_kind(config), Ordering::Relaxed);
         let app = ghostty_app();
         unsafe {
             ghostty_app_update_config(app, config);
@@ -1281,6 +1299,33 @@ unsafe extern "C" fn ghostty_wakeup_cb(_userdata: *mut c_void) {
     });
 }
 
+fn apply_scrollbar_metrics(entry: &SurfaceEntry, metrics: ScrollbarMetrics) {
+    entry.scrollbar_syncing.set(true);
+    entry.scrollbar_adjustment.configure(
+        metrics.offset as f64,
+        0.0,
+        metrics.total as f64,
+        1.0,
+        metrics.len as f64,
+        metrics.len as f64,
+    );
+    entry.scrollbar_syncing.set(false);
+    if entry.scrollbar.get_visible() != metrics.visible {
+        entry.scrollbar.set_visible(metrics.visible);
+    }
+}
+
+fn should_update_scrollbar_metrics(
+    cache: &Cell<Option<ScrollbarMetrics>>,
+    next: ScrollbarMetrics,
+) -> bool {
+    if cache.get() == Some(next) {
+        return false;
+    }
+    cache.set(Some(next));
+    true
+}
+
 fn link_popover_anchor_point(x: f64, y: f64) -> (i32, i32) {
     (
         x as i32,
@@ -1358,7 +1403,6 @@ impl MotionCoalescer {
         self.clear();
     }
 }
-
 unsafe extern "C" fn ghostty_action_cb(
     app: ghostty_app_t,
     target: ghostty_target_s,
@@ -1371,22 +1415,23 @@ unsafe extern "C" fn ghostty_action_cb(
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
                 let scrollbar = unsafe { action.action.scrollbar };
+                let next = ScrollbarMetrics {
+                    total: scrollbar.total,
+                    offset: scrollbar.offset,
+                    len: scrollbar.len,
+                    visible: CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed)
+                        && scrollbar.total > scrollbar.len,
+                };
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
-                        entry.scrollbar_syncing.set(true);
-                        entry.scrollbar_adjustment.configure(
-                            scrollbar.offset as f64,
-                            0.0,
-                            scrollbar.total as f64,
-                            1.0,
-                            scrollbar.len as f64,
-                            scrollbar.len as f64,
-                        );
-                        entry.scrollbar_syncing.set(false);
-                        entry.scrollbar.set_visible(
-                            CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed)
-                                && scrollbar.total > scrollbar.len,
-                        );
+                        if !should_update_scrollbar_metrics(&entry.scrollbar_state, next) {
+                            return;
+                        }
+                        if !entry.gl_area.is_mapped() {
+                            entry.scrollbar_dirty.set(true);
+                            return;
+                        }
+                        apply_scrollbar_metrics(entry, next);
                     }
                 });
             }
@@ -1397,7 +1442,9 @@ unsafe extern "C" fn ghostty_action_cb(
                 let surface_key = unsafe { target.target.surface } as usize;
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
-                        entry.gl_area.queue_render();
+                        if entry.gl_area.is_mapped() {
+                            entry.gl_area.queue_render();
+                        }
                     }
                 });
             }
@@ -1616,8 +1663,6 @@ unsafe extern "C" fn ghostty_action_cb(
         GHOSTTY_ACTION_RELOAD_CONFIG => {
             let config = load_ghostty_config();
             CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
-            CURRENT_AUTOSTART_SHELL_KIND
-                .store(load_autostart_shell_kind(config), Ordering::Relaxed);
             match target.tag {
                 GHOSTTY_TARGET_APP => unsafe {
                     ghostty_app_update_config(app, config);
@@ -2190,6 +2235,16 @@ pub fn create_terminal(
         let handler = gl_area.connect_map(move |gl_area| {
             gl_area.set_auto_render(true);
             if let Some(surface) = *surface_cell.borrow() {
+                SURFACE_MAP.with(|map| {
+                    if let Some(entry) = map.borrow().get(&(surface as usize)) {
+                        entry.output_activity.set_mapped(true);
+                        if entry.scrollbar_dirty.replace(false) {
+                            if let Some(metrics) = entry.scrollbar_state.get() {
+                                apply_scrollbar_metrics(entry, metrics);
+                            }
+                        }
+                    }
+                });
                 unsafe {
                     ghostty_surface_set_occlusion(surface, true);
                     ghostty_surface_set_focus(surface, gl_area.is_focus());
@@ -2209,6 +2264,11 @@ pub fn create_terminal(
             motion_for_unmap.cancel_and_clear();
             gl_area.set_auto_render(false);
             if let Some(surface) = *surface_cell.borrow() {
+                SURFACE_MAP.with(|map| {
+                    if let Some(entry) = map.borrow().get(&(surface as usize)) {
+                        entry.output_activity.set_mapped(false);
+                    }
+                });
                 unsafe {
                     ghostty_surface_set_occlusion(surface, false);
                     ghostty_surface_set_focus(surface, false);
@@ -2255,8 +2315,16 @@ pub fn create_terminal(
                 return;
             }
 
+            let surface = *surface_cell.borrow();
+            if let Some(surface) = surface {
+                SURFACE_MAP.with(|map| {
+                    if let Some(entry) = map.borrow().get(&(surface as usize)) {
+                        entry.scrollbar_state.set(None);
+                    }
+                });
+            }
             let row = adj.value().round() as usize;
-            surface_action(*surface_cell.borrow(), &format!("scroll_to_row:{row}"));
+            surface_action(surface, &format!("scroll_to_row:{row}"));
         });
         track_signal(&signal_handlers, &scrollbar_adjustment, handler);
     }
@@ -2307,8 +2375,9 @@ pub fn create_terminal(
 
             let app = ghostty_app();
             let mut config = unsafe { ghostty_surface_config_new() };
+            let is_mapped = gl_area.is_mapped();
             let output_activity =
-                output_activity::OutputActivity::new(output_activity_enabled.get());
+                output_activity::OutputActivity::new(output_activity_enabled.get(), is_mapped);
             config.pty_tee_cb = Some(output_activity::pty_output_cb);
             config.pty_tee_userdata = std::sync::Arc::as_ptr(&output_activity).cast_mut().cast();
             let clipboard_context = Box::into_raw(Box::new(ClipboardContext {
@@ -2429,13 +2498,28 @@ pub fn create_terminal(
                 }
             }
 
+            // A restored background terminal may never receive an initial unmap.
+            // Keep its renderer paused before sizing so it does not schedule an
+            // offscreen draw pass before its first map.
+            let is_mapped = gl_area.is_mapped();
+            gl_area.set_auto_render(is_mapped);
+            unsafe { ghostty_surface_set_occlusion(surface, is_mapped) };
+
             // Set initial size in physical pixels. GTK allocation is logical
             // CSS pixels; Ghostty's GL renderer expects the backing FBO size.
             let alloc = gl_area.allocation();
             let initial_display_size =
                 physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor());
-            if initial_display_size.is_some() {
-                refresh_surface_display(surface, gl_area);
+            if let Some((width, height, scale_factor)) = initial_display_size {
+                let scale = scale_factor as f64;
+                unsafe {
+                    ghostty_surface_set_content_scale(surface, scale, scale);
+                    ghostty_surface_set_size(surface, width, height);
+                }
+                if is_mapped {
+                    unsafe { ghostty_surface_refresh(surface) };
+                    gl_area.queue_render();
+                }
             }
 
             SURFACE_MAP.with(|map| {
@@ -2451,6 +2535,8 @@ pub fn create_terminal(
                         scrollbar: scrollbar_for_map.clone(),
                         scrollbar_adjustment: scrollbar_adjustment_for_map.clone(),
                         scrollbar_syncing: scrollbar_syncing.clone(),
+                        scrollbar_state: Cell::new(None),
+                        scrollbar_dirty: Cell::new(false),
                         on_title_changed: Some(Box::new({
                             let cb = callbacks.clone();
                             move |title| {
@@ -2510,10 +2596,6 @@ pub fn create_terminal(
 
             display_realized.adopt_realized();
             *surface_cell.borrow_mut() = Some(surface);
-            // A restored background terminal may never receive an initial unmap.
-            // Keep its renderer paused until the normal map callback shows it.
-            gl_area.set_auto_render(gl_area.is_mapped());
-            unsafe { ghostty_surface_set_occlusion(surface, gl_area.is_mapped()) };
 
             let suppress_focus = background_realize.suppress_focus.get();
             unsafe {
@@ -2547,7 +2629,9 @@ pub fn create_terminal(
         let surface_cell = surface_cell.clone();
         let gl_for_resize = gl_area.clone();
         let had_focus = had_focus.clone();
+        let pane_ime_resize = pane_ime.clone();
         let handler = gl_area.connect_resize(move |gl_area, width, height| {
+            pane_ime_resize.invalidate_cursor_location();
             if let Some(surface) = *surface_cell.borrow() {
                 let w = width as u32;
                 let h = height as u32;
@@ -2607,7 +2691,6 @@ pub fn create_terminal(
                     .current_event()
                     .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
                 let widget = ctrl.widget();
-                let fallback_text = key_event_text(keyval);
 
                 if let Some(current_event) = current_event.as_ref() {
                     pane_ime_press.state.borrow_mut().begin_key_event();
@@ -2628,12 +2711,16 @@ pub fn create_terminal(
                     keycode,
                     modifier,
                 );
-                let c_text = pane_ime_press
-                    .state
-                    .borrow_mut()
-                    .take_event_text(fallback_text);
-                if let Some(ref ct) = c_text {
+                let pending_text = pane_ime_press.state.borrow_mut().take_pending_key_text();
+                let stack_text = if pending_text.is_none() {
+                    StackKeyText::from_keyval(keyval)
+                } else {
+                    None
+                };
+                if let Some(ref ct) = pending_text {
                     event.input.text = ct.as_ptr();
+                } else if let Some(ref st) = stack_text {
+                    event.input.text = st.as_ptr();
                 }
 
                 let consumed = unsafe {
@@ -2764,6 +2851,8 @@ pub fn create_terminal(
         gl_area.add_controller(right_click);
     }
 
+    let precision_scroll = Rc::new(Cell::new(false));
+
     // Mouse motion (frame-coalesced to avoid 1000 Hz renderer_state.mutex contention)
     {
         let surface_cell_for_enter = surface_cell.clone();
@@ -2782,6 +2871,7 @@ pub fn create_terminal(
         let motion_for_enter = motion_coalescer.clone();
         let motion_for_move = motion_coalescer.clone();
         let motion_for_leave = motion_coalescer.clone();
+        let precision_scroll_leave = precision_scroll.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
             if !gl_for_focus.is_focus() && (callbacks.borrow().hover_focus)() {
@@ -2837,6 +2927,7 @@ pub fn create_terminal(
             }
         });
         motion.connect_leave(move |ctrl| {
+            precision_scroll_leave.set(false);
             last_popover_point_leave.set(None);
             if link_popover_leave.get_visible() {
                 link_popover_leave.popdown();
@@ -2857,19 +2948,39 @@ pub fn create_terminal(
         gl_area.add_controller(motion);
     }
 
-    // Mouse scroll
+    // Mouse scroll (supports both smooth touchpad precision scrolling and discrete mouse wheels)
     {
         let surface_cell = surface_cell.clone();
         let motion_for_scroll = motion_coalescer.clone();
-        let scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
-        );
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        {
+            let precision_scroll = precision_scroll.clone();
+            scroll.connect_scroll_begin(move |_| {
+                precision_scroll.set(true);
+            });
+        }
+        {
+            let precision_scroll = precision_scroll.clone();
+            scroll.connect_scroll_end(move |_| {
+                precision_scroll.set(false);
+            });
+        }
+        let precision_scroll_scroll = precision_scroll.clone();
         scroll.connect_scroll(move |ctrl, dx, dy| {
             if let Some(surface) = *surface_cell.borrow() {
                 motion_for_scroll.flush_to_surface(surface);
-                let mods = translate_mouse_mods(ctrl.current_event_state());
-                // GTK and Ghostty use opposite scroll conventions — negate both axes
-                unsafe { ghostty_surface_mouse_scroll(surface, -dx, -dy, mods) };
+                let scale_factor = ctrl
+                    .widget()
+                    .map(|widget| widget.scale_factor())
+                    .unwrap_or(1);
+                let (x, y, scroll_mods) = encode_terminal_scroll(
+                    dx,
+                    dy,
+                    scale_factor,
+                    ctrl.unit(),
+                    precision_scroll_scroll.get(),
+                );
+                unsafe { ghostty_surface_mouse_scroll(surface, x, y, scroll_mods) };
             }
             glib::Propagation::Stop
         });
@@ -2886,10 +2997,14 @@ pub fn create_terminal(
         let im_context_leave = im_context.clone();
         let im_fallback_enter = im_fallback.clone();
         let im_fallback_leave = im_fallback.clone();
+        let pane_ime_enter = pane_ime.clone();
+        let pane_ime_leave = pane_ime.clone();
+        let precision_scroll_focus_leave = precision_scroll.clone();
         let focus_ctrl = gtk::EventControllerFocus::new();
         let sc = surface_cell.clone();
         focus_ctrl.connect_enter(move |_| {
             had_focus_enter.set(true);
+            pane_ime_enter.invalidate_cursor_location();
             im_context_enter.focus_in();
             im_fallback_enter.focus_in();
             if let Some(surface) = *sc.borrow() {
@@ -2898,6 +3013,8 @@ pub fn create_terminal(
         });
         focus_ctrl.connect_leave(move |_| {
             had_focus_leave.set(false);
+            precision_scroll_focus_leave.set(false);
+            pane_ime_leave.invalidate_cursor_location();
             im_context_leave.focus_out();
             im_fallback_leave.focus_out();
             if let Some(surface) = *surface_cell.borrow() {
@@ -3909,6 +4026,70 @@ mod tests {
         // Non-textual keys have no unicode at all.
         assert!(key_event_text(gtk::gdk::Key::Up).is_none());
         assert!(key_event_text(gtk::gdk::Key::F1).is_none());
+
+        // Multibyte UTF-8 characters fit in the stack buffer without allocation.
+        assert_eq!(
+            key_event_text(gtk::gdk::Key::EuroSign)
+                .and_then(|s| s.into_string().ok())
+                .as_deref(),
+            Some("€")
+        );
+    }
+
+    #[test]
+    fn encode_terminal_scroll_distinguishes_surface_precision_and_discrete_modes() {
+        // Discrete mouse wheel passes negated ticks with scroll_mods = 0 (not precision).
+        assert_eq!(
+            encode_terminal_scroll(0.0, 1.0, 2, gtk::gdk::ScrollUnit::Wheel, false),
+            (-0.0, -1.0, 0)
+        );
+        assert_eq!(
+            encode_terminal_scroll(-2.0, 3.0, 1, gtk::gdk::ScrollUnit::Wheel, false),
+            (2.0, -3.0, 0)
+        );
+
+        // GTK 4.8+ Wayland surface-unit touchpad deltas are already in logical pixels:
+        // scale 1x by scale_factor (no 10x overscaling) with precision bit set (1).
+        assert_eq!(
+            encode_terminal_scroll(4.0, -20.0, 2, gtk::gdk::ScrollUnit::Surface, true),
+            (-8.0, 40.0, 1)
+        );
+        assert_eq!(
+            encode_terminal_scroll(0.0, 12.0, 0, gtk::gdk::ScrollUnit::Surface, false),
+            (-0.0, -12.0, 1)
+        );
+
+        // X11 smooth touchpad scroll (Wheel unit with scroll_begin active) applies * 10.0.
+        assert_eq!(
+            encode_terminal_scroll(0.5, -1.5, 2, gtk::gdk::ScrollUnit::Wheel, true),
+            (-10.0, 30.0, 1)
+        );
+    }
+
+    #[test]
+    fn scrollbar_metrics_deduplicate_unchanged_updates() {
+        let cache = Cell::new(None);
+        let initial = ScrollbarMetrics {
+            total: 200,
+            offset: 160,
+            len: 40,
+            visible: true,
+        };
+        assert!(should_update_scrollbar_metrics(&cache, initial));
+        assert!(!should_update_scrollbar_metrics(&cache, initial));
+
+        let scrolled = ScrollbarMetrics {
+            offset: 120,
+            ..initial
+        };
+        assert!(should_update_scrollbar_metrics(&cache, scrolled));
+        assert!(!should_update_scrollbar_metrics(&cache, scrolled));
+
+        let hidden = ScrollbarMetrics {
+            visible: false,
+            ..scrolled
+        };
+        assert!(should_update_scrollbar_metrics(&cache, hidden));
     }
 
     #[test]
@@ -4173,5 +4354,30 @@ mod tests {
     #[test]
     fn shell_escape_joined_bytes_rejects_empty_input() {
         assert!(shell_escape_joined_bytes(std::iter::empty::<&[u8]>()).is_none());
+    }
+
+    #[test]
+    fn autostart_shell_kind_handles_empty_serialized_command_and_explicit_shells() {
+        // An empty serialized `command = ` (before or without explicit command)
+        // must fall back to the default shell rather than disabling autostart.
+        let empty_cmd = decode_autostart_shell_kind(autostart_shell_kind_from_contents(Some(
+            "command = \ninitial-command = \n",
+        )));
+        assert!(
+            empty_cmd.is_some(),
+            "empty serialized command must not disable workspace autostart"
+        );
+        assert_eq!(
+            decode_autostart_shell_kind(autostart_shell_kind_from_contents(Some(
+                "command = /usr/bin/fish\n"
+            ))),
+            Some(crate::ghostty_config::AutostartShellKind::Fish)
+        );
+        assert_eq!(
+            decode_autostart_shell_kind(autostart_shell_kind_from_contents(Some(
+                "command = /usr/bin/top\n"
+            ))),
+            None
+        );
     }
 }

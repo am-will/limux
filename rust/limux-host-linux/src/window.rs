@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -67,6 +67,8 @@ struct Workspace {
     unread: bool,
     /// True when the user explicitly marked this workspace unread via the context menu.
     manual_unread: bool,
+    /// Cached `(unread, notify_label_visible)` applied to sidebar and top-bar widgets.
+    unread_visual: Cell<Option<(bool, bool)>>,
     /// Background colour of the sidebar row, if the user picked one.
     color: Option<WorkspaceColor>,
     /// Last known working directory from the terminal (via OSC 7).
@@ -145,6 +147,8 @@ pub(crate) struct AppState {
     workspace_dragging: Option<String>,
     group_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
+    desktop_notification_route_order: VecDeque<u32>,
+    desktop_notification_proxy: Option<gio::DBusProxy>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
@@ -2112,6 +2116,8 @@ pub fn build_window(app: &adw::Application) {
         workspace_dragging: None,
         group_dragging: None,
         desktop_notification_routes: HashMap::new(),
+        desktop_notification_route_order: VecDeque::new(),
+        desktop_notification_proxy: None,
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
@@ -2143,7 +2149,7 @@ pub fn build_window(app: &adw::Application) {
                 let rename_entry = state
                     .try_borrow()
                     .ok()
-                    .and_then(|s| find_active_rename_entry(&s.sidebar_list));
+                    .and_then(|s| active_inline_rename_entry_in(&s.sidebar_list));
                 if let Some(entry) = rename_entry {
                     let target = state
                         .try_borrow()
@@ -2233,13 +2239,11 @@ pub fn build_window(app: &adw::Application) {
     // Any click anywhere in the window commits an active inline rename,
     // unless the click is inside the rename entry itself.
     {
-        let sl = sidebar_list.clone();
         let win = window.clone();
         let click_anywhere = gtk::GestureClick::new();
         click_anywhere.set_propagation_phase(gtk::PropagationPhase::Capture);
         click_anywhere.connect_pressed(move |_, _, x, y| {
-            let entry = find_active_rename_entry(&sl).or_else(|| pane::find_tab_rename_entry(&win));
-            if let Some(entry) = entry {
+            if let Some(entry) = active_inline_rename_entry_in(&win) {
                 let allocation = entry.allocation();
                 commit_inline_rename_for_click(
                     win.translate_coordinates(&entry, x, y),
@@ -2665,25 +2669,29 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
 
     let state = state.clone();
     key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
-        let focused_listening_editor = controller
-            .widget()
-            .and_then(|widget| widget.downcast::<gtk::Window>().ok())
-            .map(|window| focused_widget_is_listening_for_keybind_capture(&window))
-            .unwrap_or(false);
-        if focused_listening_editor {
-            return glib::Propagation::Proceed;
-        }
-
         let matched = {
             let s = state.borrow();
-            let display = controller.widget().map(|widget| widget.display());
-            shortcut_match_from_key_press(&s.shortcuts, display.as_ref(), keyval, keycode, modifier)
+            shortcut_match_from_key_press(
+                &s.shortcuts,
+                || controller.widget().map(|widget| widget.display()),
+                keyval,
+                keycode,
+                modifier,
+            )
         }
         .filter(|matched| {
-            let context = controller
+            let window = controller
                 .widget()
-                .and_then(|widget| widget.downcast::<gtk::Window>().ok())
-                .map(|window| focused_editable_capture_context(&state, &window))
+                .and_then(|widget| widget.downcast::<gtk::Window>().ok());
+            if window
+                .as_ref()
+                .is_some_and(focused_widget_is_listening_for_keybind_capture)
+            {
+                return false;
+            }
+            let context = window
+                .as_ref()
+                .map(|window| focused_editable_capture_context(&state, window))
                 .unwrap_or_default();
             !shortcut_blocked_by_editable(matched.command, matched.editable_capture_policy, context)
         })
@@ -2794,14 +2802,13 @@ struct EditableCaptureContext {
 
 fn shortcut_match_from_key_press(
     shortcuts: &ResolvedShortcutConfig,
-    display: Option<&gtk::gdk::Display>,
+    display: impl FnOnce() -> Option<gtk::gdk::Display>,
     keyval: gtk::gdk::Key,
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
 ) -> Option<MatchedShortcut> {
-    shortcut_config::NormalizedShortcut::from_gdk_key_event(display, keyval, keycode, modifier)
-        .map(|shortcut| shortcut.to_runtime_combo())
-        .and_then(|combo| shortcuts.shortcut_for_runtime_combo(&combo))
+    shortcuts
+        .find_for_key_press_with_display(display, keyval, keycode, modifier)
         .map(|shortcut| MatchedShortcut {
             command: shortcut.definition.command,
             editable_capture_policy: shortcut.definition.editable_capture_policy,
@@ -3379,6 +3386,7 @@ fn connect_desktop_notification_watch_async(state: State) {
             let closed_subscription =
                 connect_desktop_notification_closed_watch(&proxy, state.clone());
             let mut s = state.borrow_mut();
+            s.desktop_notification_proxy = Some(proxy);
             s._desktop_notification_token_signal = token_subscription;
             s._desktop_notification_action_signal = action_subscription;
             s._desktop_notification_closed_signal = closed_subscription;
@@ -3460,6 +3468,8 @@ fn connect_desktop_notification_action_watch(
 
             let route = {
                 let mut s = state.borrow_mut();
+                s.desktop_notification_route_order
+                    .retain(|id| *id != notification_id);
                 s.desktop_notification_routes.remove(&notification_id)
             };
             let Some(route) = route else {
@@ -3494,10 +3504,10 @@ fn connect_desktop_notification_closed_watch(
                 return;
             };
 
-            state
-                .borrow_mut()
-                .desktop_notification_routes
-                .remove(&notification_id);
+            let mut s = state.borrow_mut();
+            s.desktop_notification_route_order
+                .retain(|id| *id != notification_id);
+            s.desktop_notification_routes.remove(&notification_id);
         },
     ))
 }
@@ -4729,7 +4739,62 @@ fn set_workspace_color(state: &State, workspace_id: &str, color: Option<Workspac
     true
 }
 
+thread_local! {
+    static ACTIVE_INLINE_RENAMES: RefCell<Vec<glib::WeakRef<gtk::Entry>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn register_active_inline_rename(entry: &gtk::Entry) {
+    let weak = entry.downgrade();
+    ACTIVE_INLINE_RENAMES.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        entries.retain(|w| {
+            w.upgrade()
+                .is_some_and(|e| e.parent().is_some() && e != *entry)
+        });
+        entries.push(weak);
+    });
+    entry.connect_notify_local(Some("parent"), |entry, _| {
+        if entry.parent().is_none() {
+            clear_active_inline_rename(entry);
+        }
+    });
+}
+
+fn clear_active_inline_rename(entry: &gtk::Entry) {
+    ACTIVE_INLINE_RENAMES.with(|slot| {
+        slot.borrow_mut()
+            .retain(|w| w.upgrade().is_some_and(|e| e != *entry));
+    });
+}
+
+pub(crate) fn active_inline_rename_entry_in(
+    ancestor: &impl IsA<gtk::Widget>,
+) -> Option<gtk::Entry> {
+    ACTIVE_INLINE_RENAMES.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        if entries.is_empty() {
+            return None;
+        }
+        let mut found = None;
+        entries.retain(|w| {
+            let Some(entry) = w.upgrade() else {
+                return false;
+            };
+            if entry.parent().is_none() {
+                return false;
+            }
+            if found.is_none() && entry.is_ancestor(ancestor) {
+                found = Some(entry);
+            }
+            true
+        });
+        found
+    })
+}
+
 /// Find an active rename Entry in the sidebar (if any).
+#[cfg(test)]
 fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
     fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
         if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
@@ -4831,6 +4896,7 @@ fn begin_inline_rename(
 
     label.set_visible(false);
     parent.insert_child_after(&entry, Some(label));
+    register_active_inline_rename(&entry);
     entry.grab_focus();
     entry.select_region(0, -1);
 
@@ -5118,6 +5184,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_label,
             unread: false,
             manual_unread: false,
+            unread_visual: Cell::new(None),
             color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
@@ -5839,6 +5906,7 @@ fn break_tabs_into_new_workspace(
             notify_label,
             unread: false,
             manual_unread: false,
+            unread_visual: Cell::new(None),
             color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
@@ -7553,6 +7621,7 @@ fn add_workspace_with_initial_command(
         notify_label,
         unread: false,
         manual_unread: false,
+        unread_visual: Cell::new(None),
         color: workspace.color,
         cwd,
         folder_path: workspace.folder_path.clone(),
@@ -7719,15 +7788,46 @@ pub(crate) fn create_pane_for_workspace(
             Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
         },
         on_pwd_changed: Box::new(move |pwd: &str| {
-            let state = state_for_pwd.clone();
-            let ws_id = ws_id_pwd.clone();
-            let pwd = pwd.to_string();
-            glib::idle_add_local_once(move || {
-                let s = state.borrow();
-                if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
-                    *ws.cwd.borrow_mut() = Some(pwd);
+            let ws_changed = if let Ok(s) = state_for_pwd.try_borrow() {
+                if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id_pwd) {
+                    let mut current = ws.cwd.borrow_mut();
+                    if current.as_deref() == Some(pwd) {
+                        false
+                    } else {
+                        *current = Some(pwd.to_string());
+                        true
+                    }
+                } else {
+                    false
                 }
-            });
+            } else {
+                let state = state_for_pwd.clone();
+                let ws_id = ws_id_pwd.clone();
+                let pwd = pwd.to_string();
+                glib::idle_add_local_once(move || {
+                    let changed = {
+                        let s = state.borrow();
+                        if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
+                            let mut current = ws.cwd.borrow_mut();
+                            if current.as_deref() != Some(pwd.as_str()) {
+                                *current = Some(pwd);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        request_session_save(&state);
+                    }
+                });
+                false
+            };
+            if ws_changed {
+                request_session_save(&state_for_pwd);
+            }
         }),
         on_empty: Box::new(move |pane_widget, reason| {
             if should_keep_workspace_open_for_empty_pane(&state_for_empty, &ws_id_empty, reason) {
@@ -10191,6 +10291,33 @@ mod tests {
         super::record_pane_focus_history(&mut current, &mut last, "ws-1", 2, cur2);
         assert_eq!(current.get("ws-1"), Some(&2));
         assert_eq!(last.get("ws-1"), Some(&1));
+    }
+
+    #[test]
+    fn desktop_notification_routes_stay_bounded_and_evict_oldest() {
+        let mut routes = std::collections::HashMap::new();
+        let mut order = std::collections::VecDeque::new();
+        for id in 1..=300u32 {
+            super::record_desktop_notification_route(
+                &mut routes,
+                &mut order,
+                id,
+                super::DesktopNotificationRoute {
+                    target: super::DesktopNotificationTarget {
+                        workspace_id: format!("ws-{id}"),
+                        pane_id: None,
+                        tab_id: None,
+                    },
+                    activation_token: None,
+                },
+            );
+        }
+        assert_eq!(routes.len(), 256);
+        assert_eq!(order.len(), 256);
+        assert!(!routes.contains_key(&1));
+        assert!(!routes.contains_key(&44));
+        assert!(routes.contains_key(&45));
+        assert!(routes.contains_key(&300));
     }
 }
 

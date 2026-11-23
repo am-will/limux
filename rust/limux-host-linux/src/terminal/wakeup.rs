@@ -1,8 +1,16 @@
 use gtk4::glib;
+use std::sync::atomic::{fence, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type Tick = Box<dyn FnMut() + Send>;
+
+const PHASE_IDLE: u8 = 0;
+const PHASE_PENDING: u8 = 1;
+const PHASE_RUNNING: u8 = 2;
+const PHASE_REQUESTED: u8 = 3;
+
+const FALLBACK_DELAY: Duration = Duration::from_millis(4);
 
 struct Pending {
     idle: glib::Source,
@@ -13,33 +21,65 @@ struct Pending {
 #[derive(Default)]
 struct State {
     pending: Option<Pending>,
-    running: bool,
-    requested: bool,
+}
+
+#[derive(Default)]
+struct Shared {
+    phase: AtomicU8,
+    state: Mutex<State>,
 }
 
 /// Coalesce Ghostty mailbox notifications without polling an idle app.
 #[derive(Default)]
 pub(super) struct Wakeup {
-    state: Arc<Mutex<State>>,
+    shared: Arc<Shared>,
 }
 
 impl Wakeup {
     pub(super) fn queue(&self, context: &glib::MainContext, tick: impl FnMut() + Send + 'static) {
-        let mut state = self.state.lock().unwrap();
-        if state.running {
-            state.requested = true;
-        } else if state.pending.is_none() {
-            attach_tick(context, &self.state, &mut state, Box::new(tick));
+        // Pair with `phase.store(PHASE_RUNNING, SeqCst)` in `dispatch_tick` so a
+        // producer's mailbox push before `queue()` can never be reordered past
+        // our phase observation on weak or x86 StoreLoad paths.
+        fence(Ordering::SeqCst);
+        loop {
+            match self.shared.phase.load(Ordering::SeqCst) {
+                PHASE_PENDING | PHASE_REQUESTED => return,
+                PHASE_RUNNING => {
+                    if self
+                        .shared
+                        .phase
+                        .compare_exchange_weak(
+                            PHASE_RUNNING,
+                            PHASE_REQUESTED,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                PHASE_IDLE => break,
+                _ => unreachable!(),
+            }
+        }
+
+        let mut state = self.shared.state.lock().unwrap();
+        match self.shared.phase.load(Ordering::SeqCst) {
+            PHASE_PENDING | PHASE_REQUESTED => {}
+            PHASE_RUNNING => {
+                self.shared.phase.store(PHASE_REQUESTED, Ordering::SeqCst);
+            }
+            PHASE_IDLE => {
+                attach_tick(context, &self.shared, &mut state, Box::new(tick));
+                self.shared.phase.store(PHASE_PENDING, Ordering::SeqCst);
+            }
+            _ => unreachable!(),
         }
     }
 }
 
-fn attach_tick(
-    context: &glib::MainContext,
-    shared: &Arc<Mutex<State>>,
-    state: &mut State,
-    tick: Tick,
-) {
+fn attach_tick(context: &glib::MainContext, shared: &Arc<Shared>, state: &mut State, tick: Tick) {
     let dispatch = || {
         let context = context.clone();
         let shared = shared.clone();
@@ -53,10 +93,11 @@ fn attach_tick(
         glib::Priority::DEFAULT_IDLE,
         dispatch(),
     );
-    // Preserve the immediate idle path and the former timer's priority under
-    // busy input. The fallback exists only while mailbox work is pending.
+    // Preserve the immediate idle path and keep a default-priority fallback so
+    // mailbox work cannot starve under busy input, while leaving enough room
+    // for GTK frame paints (GDK_PRIORITY_REDRAW = 120) under sustained output.
     let fallback = glib::timeout_source_new(
-        Duration::from_millis(1),
+        FALLBACK_DELAY,
         Some("limux-ghostty-wakeup-fallback"),
         glib::Priority::DEFAULT,
         dispatch(),
@@ -72,25 +113,35 @@ fn attach_tick(
     });
 }
 
-fn dispatch_tick(context: &glib::MainContext, shared: &Arc<Mutex<State>>) {
+fn dispatch_tick(context: &glib::MainContext, shared: &Arc<Shared>) {
     let mut pending = {
-        let mut state = shared.lock().unwrap();
+        let mut state = shared.state.lock().unwrap();
         let Some(pending) = state.pending.take() else {
             return;
         };
-        state.running = true;
+        shared.phase.store(PHASE_RUNNING, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
         pending
     };
     pending.idle.destroy();
     pending.fallback.destroy();
     (pending.tick)();
 
-    let mut state = shared.lock().unwrap();
-    state.running = false;
-    if std::mem::take(&mut state.requested) {
+    let mut state = shared.state.lock().unwrap();
+    if shared
+        .phase
+        .compare_exchange(
+            PHASE_RUNNING,
+            PHASE_IDLE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
         // Arm the next fallback after the drain. It must not already be due
         // when a long tick returns and prevent GTK's frame sources from running.
         attach_tick(context, shared, &mut state, pending.tick);
+        shared.phase.store(PHASE_PENDING, Ordering::SeqCst);
     }
 }
 
@@ -204,7 +255,7 @@ mod tests {
                 }
                 // A refill arrives before a tick exceeding the timer interval
                 // completes, as it can under sustained terminal output.
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(FALLBACK_DELAY + Duration::from_millis(1));
             }
         });
         run_until(&context, || ticks.load(Ordering::Relaxed) == 10);
@@ -213,5 +264,48 @@ mod tests {
             frames.load(Ordering::Relaxed) > 0,
             "ticks starved GTK frames"
         );
+    }
+
+    #[test]
+    fn high_frequency_cross_thread_wakeups_never_lose_final_message() {
+        let context = glib::MainContext::new();
+        let wakeup = Arc::new(Wakeup::default());
+        let produced = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let total = 2_000usize;
+
+        let producer = {
+            let context = context.clone();
+            let wakeup = wakeup.clone();
+            let produced = produced.clone();
+            let observed = observed.clone();
+            std::thread::spawn(move || {
+                for seq in 1..=total {
+                    produced.store(seq, Ordering::SeqCst);
+                    let produced = produced.clone();
+                    let observed = observed.clone();
+                    wakeup.queue(&context, move || {
+                        let latest = produced.load(Ordering::SeqCst);
+                        observed.store(latest, Ordering::SeqCst);
+                    });
+                }
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observed.load(Ordering::SeqCst) < total {
+            assert!(
+                Instant::now() < deadline,
+                "lost final wakeup: observed={} expected={total}",
+                observed.load(Ordering::SeqCst)
+            );
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        producer.join().unwrap();
+        // Drain any trailing wakeup queued by the final iteration after
+        // `observed` already caught up to `total`.
+        run_until(&context, || !context.pending());
+        assert!(!context.pending());
     }
 }

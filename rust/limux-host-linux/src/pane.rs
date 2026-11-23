@@ -38,6 +38,7 @@ mod tab_header;
 #[cfg(test)]
 mod tab_overflow_tests;
 use drag_drop::*;
+#[cfg(test)]
 pub(crate) use tab_header::find_tab_rename_entry;
 use tab_header::*;
 
@@ -1624,6 +1625,7 @@ fn make_terminal_callbacks(
     tab_id: &str,
     title_label: &gtk::Label,
     term_cwd: &Rc<RefCell<Option<String>>>,
+    is_ssh: bool,
 ) -> TerminalCallbacks {
     let tid_for_title = tab_id.to_string();
     let title_label = title_label.clone();
@@ -1637,7 +1639,6 @@ fn make_terminal_callbacks(
     let callbacks_for_keybinds = internals.callbacks.clone();
     let callbacks_for_identity = internals.callbacks.clone();
     let term_cwd_for_pwd = term_cwd.clone();
-    let tid_for_pwd = tab_id.to_string();
     let tid_for_close = tab_id.to_string();
     let tid_for_notification = tab_id.to_string();
     let pane_id = internals.pane_id;
@@ -1670,6 +1671,9 @@ fn make_terminal_callbacks(
             }
             let display = display_terminal_title(title);
             if let Some(entry) = state_for_title.borrow_mut().find_tab_mut(&tid_for_title) {
+                if entry.automatic_title.as_deref() == Some(display.as_str()) {
+                    return;
+                }
                 entry.automatic_title = Some(display.clone());
                 if entry.custom_name.is_some() {
                     return;
@@ -1678,18 +1682,25 @@ fn make_terminal_callbacks(
             title_label.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
-            if terminal_tab_owner(&tid_for_pwd).is_some_and(|pane| {
-                pane.tab_state.borrow().tabs.iter().any(|entry| {
-                    entry.id == tid_for_pwd
-                        && matches!(&entry.kind, TabKind::Terminal { state } if state.ssh.is_some())
-                })
-            }) {
+            if is_ssh {
                 return;
             }
-
-            *term_cwd_for_pwd.borrow_mut() = Some(pwd.to_string());
+            let tab_changed = {
+                let mut current = term_cwd_for_pwd.borrow_mut();
+                if current.as_deref() == Some(pwd) {
+                    false
+                } else {
+                    *current = Some(pwd.to_string());
+                    true
+                }
+            };
+            // Always let the workspace check whether workspace.cwd diverged
+            // (for example after another tab changed directory); it skips
+            // work and saves when workspace.cwd already matches.
             (callbacks_for_pwd.on_pwd_changed)(pwd);
-            (callbacks_for_pwd.on_state_changed)();
+            if tab_changed {
+                (callbacks_for_pwd.on_state_changed)();
+            }
         }),
         on_desktop_notification: Box::new({
             let callbacks = internals.callbacks.clone();
@@ -1838,26 +1849,7 @@ fn resolved_link_destination(
     Some(destination)
 }
 
-fn open_url_in_external_browser(url: &str) {
-    if !link_uri::is_safe_external_url(url) {
-        eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
-        return;
-    }
-
-    // Use the GDK display's launch context so GIO emits an xdg-activation
-    // token. Without it, the target app (e.g. Firefox) receives the URL but
-    // Wayland refuses to let it raise its window — Konsole works because KIO
-    // wires the token in the same way.
-    if let Some(display) = gtk::gdk::Display::default() {
-        let context = display.app_launch_context();
-        match gtk::gio::AppInfo::launch_default_for_uri(url, Some(&context)) {
-            Ok(_) => return,
-            Err(err) => {
-                eprintln!("limux: gio launch failed, falling back to xdg-open: {err}");
-            }
-        }
-    }
-
+fn spawn_xdg_open(url: &str) {
     // Fallback: spawn xdg-open. Loses activation but at least delivers the URL
     // in AppImage / sandboxed contexts where the bundled GIO can't dispatch.
     // Reap the child in a detached thread — xdg-open exits as soon as it
@@ -1879,6 +1871,35 @@ fn open_url_in_external_browser(url: &str) {
             eprintln!("limux: failed to spawn xdg-open for {url}: {err}");
         }
     }
+}
+
+fn open_url_in_external_browser(url: &str) {
+    if !link_uri::is_safe_external_url(url) {
+        eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
+        return;
+    }
+
+    // Use the GDK display's launch context asynchronously so GIO emits an
+    // xdg-activation token without stalling the GTK main thread if a portal or
+    // D-Bus handler is slow.
+    if let Some(display) = gtk::gdk::Display::default() {
+        let context = display.app_launch_context();
+        let fallback_url = url.to_string();
+        gtk::gio::AppInfo::launch_default_for_uri_async(
+            url,
+            Some(&context),
+            gtk::gio::Cancellable::NONE,
+            move |result| {
+                if let Err(err) = result {
+                    eprintln!("limux: gio launch failed, falling back to xdg-open: {err}");
+                    spawn_xdg_open(&fallback_url);
+                }
+            },
+        );
+        return;
+    }
+
+    spawn_xdg_open(url);
 }
 
 fn build_terminal_env(internals: &Rc<PaneInternals>, tab_id: &str) -> Vec<(String, String)> {
@@ -1916,10 +1937,11 @@ fn build_terminal_widget(
     tab_id: &str,
     title_label: &gtk::Label,
     term_cwd: &Rc<RefCell<Option<String>>>,
+    is_ssh: bool,
     working_directory: Option<&str>,
     mut options: terminal::TerminalOptions,
 ) -> terminal::TerminalWidget {
-    let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd);
+    let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd, is_ssh);
     let config = (internals.callbacks.current_config)();
     options.track_output_activity = config.borrow().interface.show_tab_activity;
     options.saved_font_size = config.borrow().font_size;
@@ -2101,6 +2123,7 @@ fn finish_terminal_respawn(
         tab_id,
         &label,
         &cwd,
+        true,
         directory.as_deref(),
         terminal::TerminalOptions {
             startup_command: Some(command),
@@ -2217,6 +2240,7 @@ fn add_terminal_tab_inner(
         &tab_id,
         &title_label,
         &term_cwd,
+        ssh.is_some(),
         working_directory,
         terminal::TerminalOptions {
             startup_command,
@@ -3333,16 +3357,29 @@ fn activate_tab(
     tab_state: &Rc<RefCell<TabState>>,
     tab_id: &str,
 ) {
-    let (focus_target, has_content_child) = {
+    let (focus_target, has_content_child, needs_stack_switch) = {
         let mut ts = tab_state.borrow_mut();
-        ts.active_tab = Some(tab_id.to_string());
+        let was_active = ts.active_tab.as_deref() == Some(tab_id);
+        let tab_button_already_active = was_active
+            && ts
+                .tabs
+                .iter()
+                .find(|entry| entry.id == tab_id)
+                .is_some_and(|entry| entry.tab_button.has_css_class("limux-tab-active"));
+        if !was_active {
+            ts.active_tab = Some(tab_id.to_string());
+        }
 
-        // Update visual state on all tabs
-        for entry in &ts.tabs {
-            if entry.id == tab_id {
-                entry.tab_button.add_css_class("limux-tab-active");
-            } else {
-                entry.tab_button.remove_css_class("limux-tab-active");
+        // Update visual state on tabs only when selection or active CSS class changed.
+        if !tab_button_already_active {
+            for entry in &ts.tabs {
+                if entry.id == tab_id {
+                    if !entry.tab_button.has_css_class("limux-tab-active") {
+                        entry.tab_button.add_css_class("limux-tab-active");
+                    }
+                } else if entry.tab_button.has_css_class("limux-tab-active") {
+                    entry.tab_button.remove_css_class("limux-tab-active");
+                }
             }
         }
 
@@ -3352,7 +3389,10 @@ fn activate_tab(
             .find(|entry| entry.id == tab_id)
             .map(TabFocusTarget::from_entry);
 
-        (focus_target, content_stack.child_by_name(tab_id).is_some())
+        let has_content_child = content_stack.child_by_name(tab_id).is_some();
+        let needs_stack_switch =
+            has_content_child && content_stack.visible_child_name().as_deref() != Some(tab_id);
+        (focus_target, has_content_child, needs_stack_switch)
         // `ts` (the RefCell borrow_mut guard) is dropped here, before we touch
         // content_stack. set_visible_child_name() synchronously fires GTK
         // unmap/map signals (hover-out on the old surface, etc.), and those
@@ -3361,7 +3401,7 @@ fn activate_tab(
         // panic on rapid repeated tab switches (Ctrl+Tab x2-4 fast).
     };
 
-    if has_content_child {
+    if needs_stack_switch {
         content_stack.set_visible_child_name(tab_id);
     }
     queue_active_tab_reveal(tab_strip, tab_state);
