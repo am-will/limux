@@ -1794,6 +1794,7 @@ fn command_needs_browser_sandbox(command: &ControlCommand) -> bool {
                 ..
             }
             | ControlCommand::BrowserOpenSplit { .. }
+            | ControlCommand::BrowserAction { .. }
     )
 }
 
@@ -3070,5 +3071,70 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn command_needs_browser_sandbox_covers_browser_creation_and_actions() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert!(command_needs_browser_sandbox(
+            &ControlCommand::CreateSurface {
+                target: WorkspaceTarget::Active,
+                pane_hint: None,
+                browser: true,
+                url: None,
+                reply: tx.clone(),
+            }
+        ));
+        assert!(!command_needs_browser_sandbox(
+            &ControlCommand::CreateSurface {
+                target: WorkspaceTarget::Active,
+                pane_hint: None,
+                browser: false,
+                url: None,
+                reply: tx.clone(),
+            }
+        ));
+        assert!(command_needs_browser_sandbox(&ControlCommand::CreatePane {
+            request: CreatePaneRequest {
+                target: WorkspaceTarget::Active,
+                source_pane_id: None,
+                source_surface_id: None,
+                direction: PaneCreateDirection::Right,
+                pane_type: PaneCreateType::Browser,
+                command: None,
+                url: None,
+            },
+            reply: tx.clone(),
+        }));
+        assert!(!command_needs_browser_sandbox(
+            &ControlCommand::CreatePane {
+                request: CreatePaneRequest {
+                    target: WorkspaceTarget::Active,
+                    source_pane_id: None,
+                    source_surface_id: None,
+                    direction: PaneCreateDirection::Right,
+                    pane_type: PaneCreateType::Terminal,
+                    command: None,
+                    url: None,
+                },
+                reply: tx.clone(),
+            }
+        ));
+        assert!(command_needs_browser_sandbox(
+            &ControlCommand::BrowserOpenSplit {
+                target: WorkspaceTarget::Active,
+                surface_hint: None,
+                url: None,
+                reply: tx.clone(),
+            }
+        ));
+        assert!(command_needs_browser_sandbox(
+            &ControlCommand::BrowserAction {
+                target: WorkspaceTarget::Active,
+                surface_hint: None,
+                action: BrowserControlAction::Reload,
+                reply: tx,
+            }
+        ));
     }
 }

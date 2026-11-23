@@ -1086,8 +1086,7 @@ fn surface_health_row(
             row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
         }
     } else if surface.kind == "browser" {
-        match crate::browser_sandbox::status_nonblocking_or_start() {
-            #[cfg(feature = "webkit")]
+        match crate::browser_sandbox::status_nonblocking_or_start_without_flush() {
             crate::browser_sandbox::ProbeState::Pending => {
                 row.insert("healthy".to_string(), serde_json::Value::Bool(false));
                 row.insert("realized".to_string(), serde_json::Value::Bool(false));
@@ -6138,6 +6137,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     }
                 };
 
+            crate::browser_sandbox::flush_ready_waiters();
             let result = {
                 let app_state = state.borrow();
                 surface_health_payload(state, &app_state.workspaces[index], surface)

@@ -2542,7 +2542,13 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
     }
     #[cfg(feature = "webkit")]
     if let BrowserHandles::Pending(pending) = handles {
-        register_pending_browser_upgrade(&tab_id, pending, saved_uri, callbacks);
+        register_pending_browser_upgrade(
+            &tab_id,
+            Rc::downgrade(internals),
+            pending,
+            saved_uri,
+            callbacks,
+        );
     }
     internals.tab_strip.append(
         &internals
@@ -4280,6 +4286,7 @@ fn pending_browser_widget(initial_uri: Option<&str>) -> (gtk::Widget, String, Br
 #[cfg(feature = "webkit")]
 fn register_pending_browser_upgrade(
     tab_id: &str,
+    initial_owner: std::rc::Weak<PaneInternals>,
     pending: Rc<RefCell<PendingBrowserHandles>>,
     saved_uri: Rc<RefCell<Option<String>>>,
     callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
@@ -4302,6 +4309,7 @@ fn register_pending_browser_upgrade(
         while let Some(child) = container.first_child() {
             container.remove(&child);
         }
+        container.set_focusable(false);
 
         let (child_widget, resolved_handles) = match availability {
             Ok(_) => {
@@ -4310,6 +4318,9 @@ fn register_pending_browser_upgrade(
                     build_live_browser_widget(effective_uri, saved_uri.clone(), callbacks.clone());
                 if let Some(uri) = explicit_uri.as_deref() {
                     handles.navigate(uri);
+                }
+                if is_tab_dragging() {
+                    set_browser_widget_targeting_enabled(&widget, false);
                 }
                 container.append(&widget);
                 (widget, handles)
@@ -4323,7 +4334,7 @@ fn register_pending_browser_upgrade(
         let _ = child_widget;
 
         pending.borrow_mut().resolved = Some(Box::new(resolved_handles.clone()));
-        if let Some(owner) = terminal_tab_owner(&tab_id) {
+        if let Some(owner) = terminal_tab_owner(&tab_id).or_else(|| initial_owner.upgrade()) {
             let mut tabs = owner.tab_state.borrow_mut();
             if let Some(entry) = tabs.find_tab_mut(&tab_id) {
                 if let TabKind::Browser { state } = &mut entry.kind {
@@ -6148,6 +6159,13 @@ mod tests {
             webkit6::prelude::WebViewExt::uri(&handles.webview).as_deref(),
             Some(target_url)
         );
+        // Upgraded pending container drops its temporary focus stop and
+        // responds to tab-drag targeting toggles on the nested WebView.
+        assert!(!content.is_focusable());
+        super::set_browser_targeting_enabled(&internals.content_stack, false);
+        assert!(!handles.webview.can_target());
+        super::set_browser_targeting_enabled(&internals.content_stack, true);
+        assert!(handles.webview.can_target());
         drop(tab_state);
         window.close();
     }
