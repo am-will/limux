@@ -305,6 +305,10 @@ fn closed_tabs_panes_and_workspaces_free_their_widgets() {
     remove_pane(&state, &ws_id, &closed);
     drop(closed);
     assert_freed("closed pane", &refs);
+    assert!(
+        active_inline_rename_entry_in(&state.borrow().window).is_none(),
+        "closing a pane with an open tab rename must clear the rename index"
+    );
     assert_focus_within("closed pane", &state, &first);
 
     // Two panes closed in one tick, as two shells exiting together: the

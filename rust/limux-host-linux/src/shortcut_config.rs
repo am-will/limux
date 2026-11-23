@@ -1197,9 +1197,20 @@ impl ResolvedShortcutConfig {
             .find(|shortcut| shortcut.definition.id == id)
     }
 
+    #[cfg(test)]
     pub fn find_for_key_press(
         &self,
         display: Option<&gdk::Display>,
+        keyval: gdk::Key,
+        keycode: u32,
+        modifier: gdk::ModifierType,
+    ) -> Option<&ResolvedShortcut> {
+        self.find_for_key_press_with_display(|| display.cloned(), keyval, keycode, modifier)
+    }
+
+    pub fn find_for_key_press_with_display(
+        &self,
+        display: impl FnOnce() -> Option<gdk::Display>,
         keyval: gdk::Key,
         keycode: u32,
         modifier: gdk::ModifierType,
@@ -1225,7 +1236,13 @@ impl ResolvedShortcutConfig {
                 return None;
             }
         }
-        let shortcut = NormalizedShortcut::from_gdk_key_event(display, keyval, keycode, modifier)?;
+        let resolved_display = display();
+        let shortcut = NormalizedShortcut::from_gdk_key_event(
+            resolved_display.as_ref(),
+            keyval,
+            keycode,
+            modifier,
+        )?;
         self.index
             .by_binding
             .get(&shortcut)
@@ -2729,5 +2746,43 @@ mod tests {
         assert!(disabled_fullscreen
             .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::empty())
             .is_none());
+
+        // CapsLock (LOCK_MASK) is ignored on unmodified F11; Shift+F11 is not matched.
+        assert_eq!(
+            defaults
+                .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::LOCK_MASK)
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
+        assert!(defaults
+            .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::SHIFT_MASK)
+            .is_none());
+
+        // Unmodified printable keys skip display resolution entirely.
+        let mut display_called = false;
+        assert!(defaults
+            .find_for_key_press_with_display(
+                || {
+                    display_called = true;
+                    None
+                },
+                gdk::Key::a,
+                38,
+                gdk::ModifierType::empty(),
+            )
+            .is_none());
+        assert!(!display_called);
+
+        // Loading overrides from JSON rebuilds the lookup index too.
+        let loaded =
+            resolve_shortcuts_from_str(r#"{"shortcuts": {"toggle_fullscreen": "<Shift>F12"}}"#)
+                .expect("valid shortcut JSON");
+        assert!(loaded.index.has_shift_only_binding);
+        assert_eq!(
+            loaded
+                .find_for_key_press(None, gdk::Key::F12, 96, gdk::ModifierType::SHIFT_MASK)
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
     }
 }

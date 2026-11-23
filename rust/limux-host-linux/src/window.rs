@@ -2663,8 +2663,13 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
     key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
         let matched = {
             let s = state.borrow();
-            let display = controller.widget().map(|widget| widget.display());
-            shortcut_match_from_key_press(&s.shortcuts, display.as_ref(), keyval, keycode, modifier)
+            shortcut_match_from_key_press(
+                &s.shortcuts,
+                || controller.widget().map(|widget| widget.display()),
+                keyval,
+                keycode,
+                modifier,
+            )
         }
         .filter(|matched| {
             let window = controller
@@ -2789,13 +2794,13 @@ struct EditableCaptureContext {
 
 fn shortcut_match_from_key_press(
     shortcuts: &ResolvedShortcutConfig,
-    display: Option<&gtk::gdk::Display>,
+    display: impl FnOnce() -> Option<gtk::gdk::Display>,
     keyval: gtk::gdk::Key,
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
 ) -> Option<MatchedShortcut> {
     shortcuts
-        .find_for_key_press(display, keyval, keycode, modifier)
+        .find_for_key_press_with_display(display, keyval, keycode, modifier)
         .map(|shortcut| MatchedShortcut {
             command: shortcut.definition.command,
             editable_capture_policy: shortcut.definition.editable_capture_policy,
@@ -4745,7 +4750,7 @@ pub(crate) fn register_active_inline_rename(entry: &gtk::Entry) {
     });
 }
 
-pub(crate) fn clear_active_inline_rename(entry: &gtk::Entry) {
+fn clear_active_inline_rename(entry: &gtk::Entry) {
     ACTIVE_INLINE_RENAMES.with(|slot| {
         slot.borrow_mut()
             .retain(|w| w.upgrade().is_some_and(|e| e != *entry));

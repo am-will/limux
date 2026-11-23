@@ -2326,7 +2326,9 @@ pub fn create_terminal(
         let surface_cell = surface_cell.clone();
         let gl_for_resize = gl_area.clone();
         let had_focus = had_focus.clone();
+        let pane_ime_resize = pane_ime.clone();
         let handler = gl_area.connect_resize(move |gl_area, width, height| {
+            pane_ime_resize.invalidate_cursor_location();
             if let Some(surface) = *surface_cell.borrow() {
                 let w = width as u32;
                 let h = height as u32;
@@ -2520,6 +2522,8 @@ pub fn create_terminal(
         gl_area.add_controller(right_click);
     }
 
+    let precision_scroll = Rc::new(Cell::new(false));
+
     // Mouse motion
     {
         let surface_cell = surface_cell.clone();
@@ -2530,6 +2534,7 @@ pub fn create_terminal(
         let cursor_pos_enter = cursor_pos.clone();
         let cursor_pos_motion = cursor_pos.clone();
         let link_popover_motion = link_popover.clone();
+        let precision_scroll_leave = precision_scroll.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
             if (callbacks.borrow().hover_focus)() {
@@ -2564,6 +2569,9 @@ pub fn create_terminal(
                 unsafe { ghostty_surface_mouse_pos(surface, x, y, mods) };
             }
         });
+        motion.connect_leave(move |_| {
+            precision_scroll_leave.set(false);
+        });
         controllers.borrow_mut().push(motion.clone().upcast());
         gl_area.add_controller(motion);
     }
@@ -2571,7 +2579,6 @@ pub fn create_terminal(
     // Mouse scroll (supports both smooth touchpad precision scrolling and discrete mouse wheels)
     {
         let surface_cell = surface_cell.clone();
-        let precision_scroll = Rc::new(Cell::new(false));
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
         {
             let precision_scroll = precision_scroll.clone();
@@ -2585,15 +2592,20 @@ pub fn create_terminal(
                 precision_scroll.set(false);
             });
         }
+        let precision_scroll_scroll = precision_scroll.clone();
         scroll.connect_scroll(move |ctrl, dx, dy| {
             if let Some(surface) = *surface_cell.borrow() {
-                let precision =
-                    precision_scroll.get() || ctrl.unit() == gtk::gdk::ScrollUnit::Surface;
                 let scale_factor = ctrl
                     .widget()
                     .map(|widget| widget.scale_factor())
                     .unwrap_or(1);
-                let (x, y, scroll_mods) = encode_terminal_scroll(dx, dy, scale_factor, precision);
+                let (x, y, scroll_mods) = encode_terminal_scroll(
+                    dx,
+                    dy,
+                    scale_factor,
+                    ctrl.unit(),
+                    precision_scroll_scroll.get(),
+                );
                 unsafe { ghostty_surface_mouse_scroll(surface, x, y, scroll_mods) };
             }
             glib::Propagation::Stop
@@ -2611,10 +2623,14 @@ pub fn create_terminal(
         let im_context_leave = im_context.clone();
         let im_fallback_enter = im_fallback.clone();
         let im_fallback_leave = im_fallback.clone();
+        let pane_ime_enter = pane_ime.clone();
+        let pane_ime_leave = pane_ime.clone();
+        let precision_scroll_focus_leave = precision_scroll.clone();
         let focus_ctrl = gtk::EventControllerFocus::new();
         let sc = surface_cell.clone();
         focus_ctrl.connect_enter(move |_| {
             had_focus_enter.set(true);
+            pane_ime_enter.invalidate_cursor_location();
             im_context_enter.focus_in();
             im_fallback_enter.focus_in();
             if let Some(surface) = *sc.borrow() {
@@ -2623,6 +2639,8 @@ pub fn create_terminal(
         });
         focus_ctrl.connect_leave(move |_| {
             had_focus_leave.set(false);
+            precision_scroll_focus_leave.set(false);
+            pane_ime_leave.invalidate_cursor_location();
             im_context_leave.focus_out();
             im_fallback_leave.focus_out();
             if let Some(surface) = *surface_cell.borrow() {
@@ -3643,15 +3661,33 @@ mod tests {
     }
 
     #[test]
-    fn encode_terminal_scroll_distinguishes_precision_and_discrete_modes() {
+    fn encode_terminal_scroll_distinguishes_surface_precision_and_discrete_modes() {
         // Discrete mouse wheel passes negated ticks with scroll_mods = 0 (not precision).
-        assert_eq!(encode_terminal_scroll(0.0, 1.0, 2, false), (-0.0, -1.0, 0));
-        assert_eq!(encode_terminal_scroll(-2.0, 3.0, 1, false), (2.0, -3.0, 0));
+        assert_eq!(
+            encode_terminal_scroll(0.0, 1.0, 2, gtk::gdk::ScrollUnit::Wheel, false),
+            (-0.0, -1.0, 0)
+        );
+        assert_eq!(
+            encode_terminal_scroll(-2.0, 3.0, 1, gtk::gdk::ScrollUnit::Wheel, false),
+            (2.0, -3.0, 0)
+        );
 
-        // Precision touchpad scroll scales by -scale_factor * 10.0 with precision bit set (1).
-        assert_eq!(encode_terminal_scroll(0.5, -1.5, 2, true), (-10.0, 30.0, 1));
-        // Zero/negative scale factor clamps to 1.
-        assert_eq!(encode_terminal_scroll(0.0, 1.0, 0, true), (-0.0, -10.0, 1));
+        // GTK 4.8+ Wayland surface-unit touchpad deltas are already in logical pixels:
+        // scale 1x by scale_factor (no 10x overscaling) with precision bit set (1).
+        assert_eq!(
+            encode_terminal_scroll(4.0, -20.0, 2, gtk::gdk::ScrollUnit::Surface, true),
+            (-8.0, 40.0, 1)
+        );
+        assert_eq!(
+            encode_terminal_scroll(0.0, 12.0, 0, gtk::gdk::ScrollUnit::Surface, false),
+            (-0.0, -12.0, 1)
+        );
+
+        // X11 smooth touchpad scroll (Wheel unit with scroll_begin active) applies * 10.0.
+        assert_eq!(
+            encode_terminal_scroll(0.5, -1.5, 2, gtk::gdk::ScrollUnit::Wheel, true),
+            (-10.0, 30.0, 1)
+        );
     }
 
     #[test]

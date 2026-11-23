@@ -33,13 +33,23 @@ pub struct PaneIme {
     /// compose can finish without [`Self::primary`] (the Wayland
     /// slave) intercepting and swallowing the follow-up.
     fallback_composing: Rc<Cell<bool>>,
-    last_cursor_rect: Cell<Option<(i32, i32, i32, i32)>>,
+    client_widget: RefCell<Option<gtk::glib::WeakRef<gtk::Widget>>>,
+    last_cursor_anchor: Cell<Option<ImeCursorAnchor>>,
 }
 
+/// Cached widget-local IME cursor rectangle plus its toplevel-relative widget
+/// origin (used on Wayland, where cursor rectangles are surface-relative).
+type ImeCursorAnchor = (i32, i32, i32, i32, i32, i32);
+
 impl PaneIme {
+    pub fn invalidate_cursor_location(&self) {
+        self.last_cursor_anchor.set(None);
+    }
+
     /// Bind only after GTK has created the widget's native surface.
     pub fn attach(&self, gl_area: &gtk::GLArea) {
-        self.last_cursor_rect.set(None);
+        self.last_cursor_anchor.set(None);
+        *self.client_widget.borrow_mut() = Some(gl_area.upcast_ref::<gtk::Widget>().downgrade());
         self.primary.set_client_widget(Some(gl_area));
         self.fallback.set_client_widget(Some(gl_area));
         if gl_area.has_focus() {
@@ -52,7 +62,8 @@ impl PaneIme {
     /// queues cursor-location work on focus_in, and focus_out does not cancel
     /// that work. A detached context makes those callbacks return safely.
     pub fn detach(&self) {
-        self.last_cursor_rect.set(None);
+        self.last_cursor_anchor.set(None);
+        *self.client_widget.borrow_mut() = None;
         self.primary.focus_out();
         self.fallback.focus_out();
         self.primary.set_client_widget(gtk::Widget::NONE);
@@ -101,7 +112,8 @@ pub fn create_pane_ime(surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>) ->
         fallback,
         state,
         fallback_composing,
-        last_cursor_rect: Cell::new(None),
+        client_widget: RefCell::new(None),
+        last_cursor_anchor: Cell::new(None),
     }
 }
 
@@ -169,15 +181,33 @@ fn ime_cursor_rect_tuple(x: f64, y: f64, width: f64, height: f64) -> (i32, i32, 
     )
 }
 
-fn should_update_ime_cursor_rect(
-    cache: &Cell<Option<(i32, i32, i32, i32)>>,
-    next: (i32, i32, i32, i32),
+fn should_update_ime_cursor_anchor(
+    cache: &Cell<Option<ImeCursorAnchor>>,
+    next: Option<ImeCursorAnchor>,
 ) -> bool {
-    if cache.get() == Some(next) {
+    let Some(anchor) = next else {
+        cache.set(None);
+        return true;
+    };
+    if cache.get() == Some(anchor) {
         return false;
     }
-    cache.set(Some(next));
+    cache.set(Some(anchor));
     true
+}
+
+fn cacheable_toplevel_origin(ime: &PaneIme) -> Option<(i32, i32)> {
+    let widget = ime.client_widget.borrow().as_ref()?.upgrade()?;
+    // On Wayland, IM cursor locations are surface-relative so toplevel-relative
+    // coordinates fully determine popup placement. On X11, dragging the window
+    // moves screen coordinates without changing toplevel-relative coordinates,
+    // so bypass the cache and always forward updates.
+    if !widget.display().type_().name().contains("Wayland") {
+        return None;
+    }
+    let root = widget.root()?;
+    let point = widget.compute_point(&root, &gtk::graphene::Point::zero())?;
+    Some((point.x().round() as i32, point.y().round() as i32))
 }
 
 fn update_primary_ime_cursor_location(surface: ghostty_surface_t, ime: &PaneIme) {
@@ -188,10 +218,12 @@ fn update_primary_ime_cursor_location(surface: ghostty_surface_t, ime: &PaneIme)
     unsafe {
         ghostty_surface_ime_point(surface, &mut x, &mut y, &mut width, &mut height);
     }
-    let next = ime_cursor_rect_tuple(x, y, width, height);
-    if should_update_ime_cursor_rect(&ime.last_cursor_rect, next) {
+    let rect = ime_cursor_rect_tuple(x, y, width, height);
+    let anchor =
+        cacheable_toplevel_origin(ime).map(|(ox, oy)| (rect.0, rect.1, rect.2, rect.3, ox, oy));
+    if should_update_ime_cursor_anchor(&ime.last_cursor_anchor, anchor) {
         ime.primary
-            .set_cursor_location(&gtk::gdk::Rectangle::new(next.0, next.1, next.2, next.3));
+            .set_cursor_location(&gtk::gdk::Rectangle::new(rect.0, rect.1, rect.2, rect.3));
     }
 }
 
@@ -298,7 +330,7 @@ fn register_im_signal_handlers(
 mod tests {
     use std::cell::Cell;
 
-    use super::{ime_cursor_rect_tuple, preedit_payload, should_update_ime_cursor_rect};
+    use super::{ime_cursor_rect_tuple, preedit_payload, should_update_ime_cursor_anchor};
 
     #[test]
     fn hangul_preedit_passes_full_utf8_length_to_ghostty() {
@@ -310,18 +342,22 @@ mod tests {
     }
 
     #[test]
-    fn ime_cursor_rect_cache_deduplicates_unchanged_rects() {
+    fn ime_cursor_anchor_cache_deduplicates_and_detects_origin_shifts() {
         let cache = Cell::new(None);
         let first = ime_cursor_rect_tuple(12.4, 24.6, 0.2, 16.0);
         assert_eq!(first, (12, 25, 1, 16));
-        assert!(should_update_ime_cursor_rect(&cache, first));
-        assert!(!should_update_ime_cursor_rect(&cache, first));
+        let anchor = (first.0, first.1, first.2, first.3, 220, 40);
+        assert!(should_update_ime_cursor_anchor(&cache, Some(anchor)));
+        assert!(!should_update_ime_cursor_anchor(&cache, Some(anchor)));
 
-        let moved = ime_cursor_rect_tuple(20.0, 25.0, 1.0, 16.0);
-        assert!(should_update_ime_cursor_rect(&cache, moved));
-        assert!(!should_update_ime_cursor_rect(&cache, moved));
+        // Shifting the pane origin (e.g. sidebar toggle) invalidates even with
+        // an identical widget-local cursor rect.
+        let shifted = (first.0, first.1, first.2, first.3, 0, 40);
+        assert!(should_update_ime_cursor_anchor(&cache, Some(shifted)));
+        assert!(!should_update_ime_cursor_anchor(&cache, Some(shifted)));
 
-        cache.set(None);
-        assert!(should_update_ime_cursor_rect(&cache, moved));
+        // Uncacheable (e.g. X11) always forwards and clears cached anchor.
+        assert!(should_update_ime_cursor_anchor(&cache, None));
+        assert!(should_update_ime_cursor_anchor(&cache, Some(shifted)));
     }
 }

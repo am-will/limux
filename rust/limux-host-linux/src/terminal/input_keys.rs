@@ -184,18 +184,30 @@ pub(super) fn encode_terminal_scroll(
     dx: f64,
     dy: f64,
     scale_factor: i32,
-    precision: bool,
+    unit: gtk::gdk::ScrollUnit,
+    precision_scroll: bool,
 ) -> (f64, f64, c_int) {
     // Ghostty decodes `scroll_mods` as a packed bitfield (bit 0 = precision,
-    // bits 1..3 = momentum), NOT keyboard modifiers. For precision touchpad
-    // scrolls, Ghostty expects physical pixels (matching Ghostty's GTK apprt
-    // scale_factor * 10.0 multiplier). For discrete wheel ticks, Ghostty
-    // multiplies by its physical cell_height directly.
-    if precision {
-        let factor = -(scale_factor.max(1) as f64) * 10.0;
-        (dx * factor, dy * factor, 1)
-    } else {
-        (-dx, -dy, 0)
+    // bits 1..3 = momentum), NOT keyboard modifiers.
+    //
+    // - `ScrollUnit::Surface` (GTK 4.8+ Wayland touchpads): deltas are already
+    //   in surface logical pixels; convert 1:1 to physical pixels via
+    //   `scale_factor` and set the precision bit (1).
+    // - `ScrollUnit::Wheel` with `precision_scroll` (X11 smooth touchpads
+    //   without surface units): apply Ghostty's legacy `* 10.0` heuristic with
+    //   the precision bit (1).
+    // - Discrete `ScrollUnit::Wheel`: pass negated wheel ticks with
+    //   `scroll_mods = 0` so Ghostty multiplies by its physical cell size.
+    match unit {
+        gtk::gdk::ScrollUnit::Surface => {
+            let factor = -(scale_factor.max(1) as f64);
+            (dx * factor, dy * factor, 1)
+        }
+        gtk::gdk::ScrollUnit::Wheel if precision_scroll => {
+            let factor = -(scale_factor.max(1) as f64) * 10.0;
+            (dx * factor, dy * factor, 1)
+        }
+        _ => (-dx, -dy, 0),
     }
 }
 
