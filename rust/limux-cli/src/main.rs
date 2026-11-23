@@ -1063,6 +1063,68 @@ fn agy_stop_suppresses_notification(payload: &Value) -> bool {
         || hook_str(payload, &["terminationReason"]) == Some("USER_CANCELED")
 }
 
+fn agy_stop_notification(payload: &Value) -> Option<(String, String)> {
+    if agy_stop_suppresses_notification(payload) {
+        return None;
+    }
+    if let Some(error) = hook_str(payload, &["error"]) {
+        return Some(("Antigravity failed".to_string(), error.to_owned()));
+    }
+    let reason = hook_str(payload, &["terminationReason"]);
+    let body = match reason {
+        Some("ERROR") => "stopped with an error",
+        Some("MAX_INVOCATIONS") => "hit maximum invocations",
+        Some("MAX_FORCED_INVOCATIONS") => "hit maximum forced invocations",
+        Some("MAX_TOKEN_BUDGET_EXCEEDED") => "exceeded token budget",
+        Some("TERMINAL_CUSTOM_HOOK") => "stopped by custom hook",
+        _ => hook_str(payload, &["message", "reason"]).unwrap_or("task complete"),
+    };
+    let title = if reason == Some("ERROR") {
+        "Antigravity failed"
+    } else {
+        "Antigravity finished"
+    };
+    Some((title.to_string(), body.to_owned()))
+}
+
+fn agent_hook_notification(
+    agent: agent_hooks::AgentKind,
+    event: &str,
+    payload: &Value,
+) -> Option<(String, String)> {
+    let agent_label = agent.label();
+    match event {
+        "Notification" | "notification" => Some((
+            format!("{agent_label} needs you"),
+            hook_str(payload, &["message", "notification"])
+                .unwrap_or("waiting for input")
+                .to_owned(),
+        )),
+        "Stop" | "stop" | "finished" => {
+            if agent == agent_hooks::AgentKind::Agy {
+                agy_stop_notification(payload)
+            } else {
+                Some((
+                    format!("{agent_label} finished"),
+                    hook_str(payload, &["message", "reason"])
+                        .unwrap_or("task complete")
+                        .to_owned(),
+                ))
+            }
+        }
+        "SessionStart" | "session-start" | "SessionEnd" | "session-end" | "UserPromptSubmit"
+        | "prompt-submit" | "PreInvocation" | "pre-invocation" | "PostInvocation"
+        | "post-invocation" | "PreToolUse" | "PostToolUse" | "SubagentStop" | "subagent-stop"
+        | "Cleanup" | "cleanup" | "restore-exit" => None,
+        other => Some((
+            format!("{agent_label}: {other}"),
+            hook_str(payload, &["message", "summary"])
+                .unwrap_or("")
+                .to_owned(),
+        )),
+    }
+}
+
 /// Run an agent hook: read JSON from stdin, synthesize a notification.
 ///
 /// Args:
@@ -1098,37 +1160,8 @@ async fn run_agent_hook(
     }
 
     // Build a human-friendly title + body depending on event + agent.
-    let agent_label = agent.label();
     persist_agent_hook_session(agent, args, &payload, &event)?;
-    let notification_title_body = match event.as_str() {
-        "Notification" | "notification" => Some((
-            format!("{agent_label} needs you"),
-            hook_str(&payload, &["message", "notification"])
-                .unwrap_or("waiting for input")
-                .to_owned(),
-        )),
-        "Stop" | "stop" | "finished" => {
-            if agent == agent_hooks::AgentKind::Agy && agy_stop_suppresses_notification(&payload) {
-                None
-            } else {
-                Some((
-                    format!("{agent_label} finished"),
-                    hook_str(&payload, &["message", "reason"])
-                        .unwrap_or("task complete")
-                        .to_owned(),
-                ))
-            }
-        }
-        "SessionStart" | "session-start" | "SessionEnd" | "session-end" | "UserPromptSubmit"
-        | "prompt-submit" | "PreToolUse" | "PostToolUse" | "SubagentStop" | "subagent-stop"
-        | "Cleanup" | "cleanup" | "restore-exit" => None,
-        other => Some((
-            format!("{agent_label}: {other}"),
-            hook_str(&payload, &["message", "summary"])
-                .unwrap_or("")
-                .to_owned(),
-        )),
-    };
+    let notification_title_body = agent_hook_notification(agent, &event, &payload);
 
     if let Some((title, body)) = notification_title_body {
         let subtitle = hook_str(
@@ -1170,7 +1203,7 @@ fn agent_hook_output(agent: agent_hooks::AgentKind, event: &str, payload: &Value
     if agent == agent_hooks::AgentKind::Agy {
         return match canonical_event {
             Some("Stop") => json!({ "decision": "allow" }),
-            Some("SessionStart") => match hook_additional_context(payload) {
+            Some("SessionStart" | "PreInvocation") => match hook_additional_context(payload) {
                 Some(context) => json!({
                     "injectSteps": [{
                         "systemMessage": {
@@ -1210,6 +1243,7 @@ fn agent_hook_output(agent: agent_hooks::AgentKind, event: &str, payload: &Value
 fn canonical_hook_event_name(event: &str) -> Option<&'static str> {
     match event {
         "SessionStart" | "session-start" => Some("SessionStart"),
+        "PreInvocation" | "pre-invocation" => Some("PreInvocation"),
         "UserPromptSubmit" | "prompt-submit" => Some("UserPromptSubmit"),
         "Stop" | "stop" | "Notification" => Some("Stop"),
         "SessionEnd" | "session-end" => None,
@@ -1237,6 +1271,24 @@ fn hook_additional_context(payload: &Value) -> Option<String> {
     hook_str(payload, &["additional_context", "additionalContext"])
         .map(str::to_owned)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn hook_cwd(payload: &Value) -> Option<String> {
+    hook_str(payload, &["cwd", "working_directory", "directory"])
+        .map(str::to_string)
+        .or_else(|| {
+            payload
+                .get("workspacePaths")
+                .and_then(Value::as_array)
+                .and_then(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .find(|path| !path.is_empty())
+                        .map(str::to_string)
+                })
+        })
 }
 
 fn persist_agent_hook_session(
@@ -1322,8 +1374,7 @@ fn persist_agent_hook_session(
     let proc_env = ancestor_pid.and_then(proc_allowed_environment);
 
     let result = store.update(&session_id, |existing| {
-        let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
-            .map(str::to_string)
+        let cwd = hook_cwd(payload)
             .or_else(|| proc_cwd.clone())
             .or_else(|| existing.and_then(|record| record.cwd.clone()));
         let pid = hook_str(payload, &["pid"])
@@ -1830,6 +1881,16 @@ fn install_agy_hooks(path: &Path, osc: bool) -> Result<()> {
                 "command": hook_command_with_fallback(
                     agent_hooks::AgentKind::Agy,
                     "session-start",
+                    osc,
+                    "{}",
+                )?,
+                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
+            }],
+            "PreInvocation": [{
+                "type": "command",
+                "command": hook_command_with_fallback(
+                    agent_hooks::AgentKind::Agy,
+                    "pre-invocation",
                     osc,
                     "{}",
                 )?,
@@ -5139,6 +5200,14 @@ mod cli_arg_tests {
         assert_eq!(
             agent_hook_output(
                 agent_hooks::AgentKind::Agy,
+                "pre-invocation",
+                &json!({ "conversationId": "conv-1", "invocationNum": 2 }),
+            ),
+            json!({})
+        );
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
                 "session-start",
                 &json!({
                     "conversationId": "conv-1",
@@ -5153,6 +5222,23 @@ mod cli_arg_tests {
                 }]
             })
         );
+        assert_eq!(
+            agent_hook_output(
+                agent_hooks::AgentKind::Agy,
+                "PreInvocation",
+                &json!({
+                    "conversationId": "conv-1",
+                    "additionalContext": "Turn context"
+                }),
+            ),
+            json!({
+                "injectSteps": [{
+                    "systemMessage": {
+                        "systemMessage": "Turn context"
+                    }
+                }]
+            })
+        );
         assert!(agy_stop_suppresses_notification(
             &json!({ "terminationReason": "USER_CANCELED" })
         ));
@@ -5162,6 +5248,63 @@ mod cli_arg_tests {
         assert!(!agy_stop_suppresses_notification(
             &json!({ "terminationReason": "NO_TOOL_CALL", "fullyIdle": true })
         ));
+        assert_eq!(
+            agent_hook_notification(
+                agent_hooks::AgentKind::Agy,
+                "PreInvocation",
+                &json!({ "conversationId": "conv-1" }),
+            ),
+            None
+        );
+        assert_eq!(
+            agent_hook_notification(
+                agent_hooks::AgentKind::Agy,
+                "PostInvocation",
+                &json!({ "conversationId": "conv-1" }),
+            ),
+            None
+        );
+        assert_eq!(
+            agent_hook_notification(
+                agent_hooks::AgentKind::Agy,
+                "stop",
+                &json!({ "terminationReason": "ERROR", "error": "rate limit exceeded", "fullyIdle": true }),
+            ),
+            Some((
+                "Antigravity failed".to_string(),
+                "rate limit exceeded".to_string(),
+            ))
+        );
+        assert_eq!(
+            agent_hook_notification(
+                agent_hooks::AgentKind::Agy,
+                "stop",
+                &json!({ "terminationReason": "MAX_TOKEN_BUDGET_EXCEEDED", "fullyIdle": true }),
+            ),
+            Some((
+                "Antigravity finished".to_string(),
+                "exceeded token budget".to_string(),
+            ))
+        );
+        assert_eq!(
+            agent_hook_notification(
+                agent_hooks::AgentKind::Agy,
+                "stop",
+                &json!({ "terminationReason": "NO_TOOL_CALL", "fullyIdle": true }),
+            ),
+            Some((
+                "Antigravity finished".to_string(),
+                "task complete".to_string(),
+            ))
+        );
+        assert_eq!(
+            hook_cwd(&json!({ "workspacePaths": ["", "/tmp/agy-ws", "/tmp/other"] })),
+            Some("/tmp/agy-ws".to_string())
+        );
+        assert_eq!(
+            hook_cwd(&json!({ "cwd": "/tmp/explicit", "workspacePaths": ["/tmp/agy-ws"] })),
+            Some("/tmp/explicit".to_string())
+        );
     }
 
     #[test]
@@ -5191,6 +5334,15 @@ mod cli_arg_tests {
             .as_str()
             .unwrap()
             .contains("hooks agy session-start"));
+        assert_eq!(installed["limux"]["PreInvocation"][0]["timeout"], 5);
+        assert!(installed["limux"]["PreInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hooks agy pre-invocation"));
+        assert!(installed["limux"]["PreInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("echo '{}'"));
         assert!(installed["limux"]["Stop"][0]["command"]
             .as_str()
             .unwrap()

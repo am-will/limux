@@ -229,8 +229,8 @@ not.
 ## Remote agent notifications and helper installation
 
 Open **Connect via SSH**, enter the destination and optional port, then choose
-**Install remote agent helper…**. Select Codex, Claude Code, or Gemini CLI and a
-**trusted Linux `limux-cli` executable**. Review the destination and description,
+**Install remote agent helper…**. Select Codex, Claude Code, Gemini CLI, or
+Antigravity (`agy`) and a **trusted Linux `limux-cli` executable**. Review the destination and description,
 then click **Install helper and configure hooks**. Merely opening either dialog
 or selecting a file makes no SSH connection. Installation does not require
 creating another workspace, and it is never repeated automatically on reconnect.
@@ -285,7 +285,8 @@ to the selected agent's settings while installing.
 
 Codex uses `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json`; Claude uses
 `$CLAUDE_CONFIG_DIR/settings.json` or `~/.claude/settings.json`; Gemini uses
-`~/.gemini/settings.json`. These are the remote process's environment values,
+`~/.gemini/settings.json`; Antigravity (`agy`) uses
+`~/.gemini/config/hooks.json`. These are the remote process's environment values,
 not the local desktop's. **Restart the agent and approve its new hooks if it
 asks.** The installer does not bypass the agent's hook trust checks. OpenCode's
 plugin-based setup is not offered by this installer.
@@ -325,7 +326,7 @@ To test after installation, run the printed helper path on the remote host:
 ```
 
 To remove this agent's Limux hooks, run that same helper with
-`hooks uninstall codex` (or `claude` / `gemini`), then restart the agent. This
+`hooks uninstall codex` (or `claude` / `gemini` / `agy`), then restart the agent. This
 preserves unrelated hooks. Restore the recorded configuration backup instead
 if you want the exact previous Limux hooks, taking care not to discard later
 edits. Delete unused helper-version directories only after no installed hooks
