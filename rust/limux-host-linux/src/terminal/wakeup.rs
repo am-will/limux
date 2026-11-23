@@ -120,6 +120,7 @@ fn dispatch_tick(context: &glib::MainContext, shared: &Arc<Shared>) {
             return;
         };
         shared.phase.store(PHASE_RUNNING, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
         pending
     };
     pending.idle.destroy();
@@ -254,7 +255,7 @@ mod tests {
                 }
                 // A refill arrives before a tick exceeding the timer interval
                 // completes, as it can under sustained terminal output.
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(FALLBACK_DELAY + Duration::from_millis(1));
             }
         });
         run_until(&context, || ticks.load(Ordering::Relaxed) == 10);
@@ -302,6 +303,9 @@ mod tests {
             std::thread::yield_now();
         }
         producer.join().unwrap();
+        // Drain any trailing wakeup queued by the final iteration after
+        // `observed` already caught up to `total`.
+        run_until(&context, || !context.pending());
         assert!(!context.pending());
     }
 }

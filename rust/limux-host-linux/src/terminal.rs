@@ -819,10 +819,6 @@ fn load_ghostty_config_with_font(
         ghostty_config_load_default_files(config);
         ghostty_config_load_recursive_files(config);
         let base_contents = serialized_config(config);
-        CURRENT_AUTOSTART_SHELL_KIND.store(
-            autostart_shell_kind_from_contents(base_contents.as_deref()),
-            Ordering::Relaxed,
-        );
         if let Some(contents) = base_contents.as_deref() {
             let defaults =
                 crate::ghostty_config::GhosttyFontDefaults::from_config_contents(contents);
@@ -865,6 +861,13 @@ fn load_ghostty_config_with_font(
             }
         }
         ghostty_config_finalize(config);
+        // Resolve the autostart shell kind AFTER finalize() so Ghostty's
+        // default shell resolution ($SHELL / passwd.shell) and themes are included.
+        let finalized_contents = serialized_config(config);
+        CURRENT_AUTOSTART_SHELL_KIND.store(
+            autostart_shell_kind_from_contents(finalized_contents.as_deref()),
+            Ordering::Relaxed,
+        );
         config
     }
 }
@@ -889,7 +892,8 @@ fn decode_autostart_shell_kind(raw: u8) -> Option<crate::ghostty_config::Autosta
 
 fn autostart_shell_kind_from_contents(contents: Option<&str>) -> u8 {
     let command = contents
-        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "command"));
+        .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "command"))
+        .filter(|command| !command.trim().is_empty());
     let initial_command = contents
         .and_then(|contents| crate::ghostty_config::read_ghostty_value(contents, "initial-command"))
         .filter(|command| !command.trim().is_empty());
@@ -2098,8 +2102,16 @@ pub fn create_terminal(
                 return;
             }
 
+            let surface = *surface_cell.borrow();
+            if let Some(surface) = surface {
+                SURFACE_MAP.with(|map| {
+                    if let Some(entry) = map.borrow().get(&(surface as usize)) {
+                        entry.scrollbar_state.set(None);
+                    }
+                });
+            }
             let row = adj.value().round() as usize;
-            surface_action(*surface_cell.borrow(), &format!("scroll_to_row:{row}"));
+            surface_action(surface, &format!("scroll_to_row:{row}"));
         });
         track_signal(&signal_handlers, &scrollbar_adjustment, handler);
     }
@@ -3843,5 +3855,30 @@ mod tests {
     #[test]
     fn shell_escape_joined_bytes_rejects_empty_input() {
         assert!(shell_escape_joined_bytes(std::iter::empty::<&[u8]>()).is_none());
+    }
+
+    #[test]
+    fn autostart_shell_kind_handles_empty_serialized_command_and_explicit_shells() {
+        // An empty serialized `command = ` (before or without explicit command)
+        // must fall back to the default shell rather than disabling autostart.
+        let empty_cmd = decode_autostart_shell_kind(autostart_shell_kind_from_contents(Some(
+            "command = \ninitial-command = \n",
+        )));
+        assert!(
+            empty_cmd.is_some(),
+            "empty serialized command must not disable workspace autostart"
+        );
+        assert_eq!(
+            decode_autostart_shell_kind(autostart_shell_kind_from_contents(Some(
+                "command = /usr/bin/fish\n"
+            ))),
+            Some(crate::ghostty_config::AutostartShellKind::Fish)
+        );
+        assert_eq!(
+            decode_autostart_shell_kind(autostart_shell_kind_from_contents(Some(
+                "command = /usr/bin/top\n"
+            ))),
+            None
+        );
     }
 }

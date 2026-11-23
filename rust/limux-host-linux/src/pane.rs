@@ -1684,7 +1684,7 @@ fn make_terminal_callbacks(
             if is_ssh {
                 return;
             }
-            let changed = {
+            let tab_changed = {
                 let mut current = term_cwd_for_pwd.borrow_mut();
                 if current.as_deref() == Some(pwd) {
                     false
@@ -1693,8 +1693,11 @@ fn make_terminal_callbacks(
                     true
                 }
             };
-            if changed {
-                (callbacks_for_pwd.on_pwd_changed)(pwd);
+            // Always let the workspace check whether workspace.cwd diverged
+            // (for example after another tab changed directory); it skips
+            // work and saves when workspace.cwd already matches.
+            (callbacks_for_pwd.on_pwd_changed)(pwd);
+            if tab_changed {
                 (callbacks_for_pwd.on_state_changed)();
             }
         }),

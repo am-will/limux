@@ -23,6 +23,7 @@ pub(super) struct FontCatalog {
 
 #[derive(Clone, Debug)]
 struct CachedSystemFonts {
+    font_map: gtk::glib::WeakRef<gtk::pango::FontMap>,
     serial: u32,
     catalog: FontCatalog,
 }
@@ -88,7 +89,9 @@ impl FontCatalog {
             let serial = font_map.serial();
             SYSTEM_FONT_CATALOG_CACHE.with(|cache| {
                 let mut cache = cache.borrow_mut();
-                if let Some(cached) = cache.as_ref().filter(|cached| cached.serial == serial) {
+                if let Some(cached) = cache.as_ref().filter(|cached| {
+                    cached.serial == serial && cached.font_map.upgrade().as_ref() == Some(&font_map)
+                }) {
                     return cached.catalog.clone();
                 }
 
@@ -110,6 +113,7 @@ impl FontCatalog {
                 }
                 let catalog = Self::from_by_lower(discovered);
                 *cache = Some(CachedSystemFonts {
+                    font_map: font_map.downgrade(),
                     serial,
                     catalog: catalog.clone(),
                 });

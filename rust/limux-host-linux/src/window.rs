@@ -7723,18 +7723,46 @@ pub(crate) fn create_pane_for_workspace(
             Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
         },
         on_pwd_changed: Box::new(move |pwd: &str| {
-            let state = state_for_pwd.clone();
-            let ws_id = ws_id_pwd.clone();
-            let pwd = pwd.to_string();
-            glib::idle_add_local_once(move || {
-                let s = state.borrow();
-                if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
+            let ws_changed = if let Ok(s) = state_for_pwd.try_borrow() {
+                if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id_pwd) {
                     let mut current = ws.cwd.borrow_mut();
-                    if current.as_deref() != Some(pwd.as_str()) {
-                        *current = Some(pwd);
+                    if current.as_deref() == Some(pwd) {
+                        false
+                    } else {
+                        *current = Some(pwd.to_string());
+                        true
                     }
+                } else {
+                    false
                 }
-            });
+            } else {
+                let state = state_for_pwd.clone();
+                let ws_id = ws_id_pwd.clone();
+                let pwd = pwd.to_string();
+                glib::idle_add_local_once(move || {
+                    let changed = {
+                        let s = state.borrow();
+                        if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
+                            let mut current = ws.cwd.borrow_mut();
+                            if current.as_deref() != Some(pwd.as_str()) {
+                                *current = Some(pwd);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        request_session_save(&state);
+                    }
+                });
+                false
+            };
+            if ws_changed {
+                request_session_save(&state_for_pwd);
+            }
         }),
         on_empty: Box::new(move |pane_widget, reason| {
             if should_keep_workspace_open_for_empty_pane(&state_for_empty, &ws_id_empty, reason) {
