@@ -521,6 +521,9 @@ fn option_is_safe_flag_or_assignment(kind: AgentKind, arg: &str) -> bool {
     if arg == "--sandbox" && matches!(kind, AgentKind::Agy | AgentKind::Gemini) {
         return true;
     }
+    if arg == "--remote-control" && kind == AgentKind::Agy {
+        return true;
+    }
     if arg == "-s" && kind == AgentKind::Gemini {
         return true;
     }
@@ -687,7 +690,15 @@ mod tests {
     fn build_resume_command_supports_agy_conversation_flag() {
         let launch = AgentLaunchCommand {
             executable: "/opt/bin/agy".to_string(),
-            arguments: vec_str(&["/opt/bin/agy", "--model", "gemini-2.5-pro"]),
+            arguments: vec_str(&[
+                "/opt/bin/agy",
+                "--model",
+                "gemini-2.5-pro",
+                "--remote-control",
+                "--new-project",
+                "-i",
+                "initial prompt",
+            ]),
             cwd: Some("/tmp/repo".to_string()),
             environment: BTreeMap::new(),
             captured_at: None,
@@ -696,7 +707,7 @@ mod tests {
             .expect("agy resume command");
         assert_eq!(
             command,
-            "cd '/tmp/repo' && '/opt/bin/agy' '--conversation' 'conv-abc' '--model' 'gemini-2.5-pro'"
+            "cd '/tmp/repo' && '/opt/bin/agy' '--conversation' 'conv-abc' '--model' 'gemini-2.5-pro' '--remote-control'"
         );
     }
 

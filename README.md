@@ -219,8 +219,8 @@ notification is read. In **Settings > General**, turn off **Tab activity indicat
 or adjust **Tab activity timeout** from 1 to 60 seconds. Cursor blinking and
 scrolling alone do not count as output.
 
-Limux ships first-class hooks for coding agents (Codex, Claude Code, and
-Gemini CLI). Every terminal limux spawns auto-exports
+Limux ships first-class hooks for coding agents (Codex, Claude Code,
+Gemini CLI, and Antigravity (`agy`)). Every terminal limux spawns auto-exports
 `LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /
 `LIMUX_TAB_ID` / `LIMUX_SOCKET`, so the CLI auto-targets the right place
 with no flags needed from inside the agent's own terminal.
@@ -229,16 +229,19 @@ with no flags needed from inside the agent's own terminal.
 # Fire a libadwaita toast + tab/workspace unread badges from any agent
 limux notify --subtitle "needs review" --body "blocked on auth choice" "Input needed"
 
-# Install Limux session-restore hooks for supported agents
+# Install Limux session-restore and notification hooks for supported agents
 limux hooks setup
+# Or configure a single agent (codex, claude, gemini, agy, opencode):
+limux hooks setup agy
 
 # Drop-in hook handlers translate hook JSON on stdin into notify/session state
 echo '{"event":"stop"}' | limux claude-hook --event stop
 echo '{"event":"finished"}' | limux gemini-hook --event finished
+echo '{"conversationId":"conv-1","terminationReason":"NO_TOOL_CALL","fullyIdle":true}' | limux agy-hook --event stop
 
-# Spin up a multi-agent collaboration team — one workspace per agent,
-# launches each agent's CLI, and writes AGENTS.md describing the
-# <agent-msg> XML protocol so peers can talk to each other:
+# Spin up a multi-agent collaboration team (supports codex, claude, opencode,
+# gemini, agy) that launches each agent's CLI and writes AGENTS.md describing
+# the <agent-msg> XML protocol so peers can talk to each other:
 limux agent-team --agents codex,claude --cwd "$PWD"
 # → Codex and Claude can now do:
 #   limux send --workspace claude $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
@@ -269,9 +272,9 @@ before running it again, then merge any project policies you want to keep.
 without writing files or contacting the host.
 
 Checked-in hook templates live in [`hooks/`](hooks/). They mirror
-`limux hooks setup` for Codex, Claude Code, and Gemini CLI; OpenCode is
-omitted from default `limux hooks setup` and can be installed explicitly with
-`limux hooks setup opencode`.
+`limux hooks setup` for Codex, Claude Code, Gemini CLI, and Antigravity
+(`agy`); OpenCode is omitted from default `limux hooks setup` and can be
+installed explicitly with `limux hooks setup opencode`.
 
 Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
 and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build

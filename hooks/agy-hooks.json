@@ -1,0 +1,25 @@
+{
+  "limux": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "[ \"${LIMUX_AGY_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks agy session-start || echo '{}'",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "[ \"${LIMUX_AGY_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks agy pre-invocation || echo '{}'",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "[ \"${LIMUX_AGY_HOOKS_DISABLED:-}\" != \"1\" ] && limux --json hooks agy stop || echo '{\"decision\":\"allow\"}'",
+        "timeout": 5
+      }
+    ]
+  }
+}

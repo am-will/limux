@@ -78,13 +78,14 @@ dispatcher parity.
 `mark_workspace_unread_with_message` + libadwaita toast.
 CLI: `limux notify [--workspace <id|name>] [--subtitle <…>] [--body <…>] <title>`.
 
-### Phase 4 — `limux claude-hook` / `opencode-hook` / `gemini-hook` ✅
+### Phase 4 — `limux claude-hook` / `opencode-hook` / `gemini-hook` / `agy-hook` ✅
 Reads hook JSON from stdin, translates the agent-specific event vocabulary
 into a `notify` (and, where useful, an inline `send`). Drop-in for
-`~/.claude/settings.json` hooks blocks.
+`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.gemini/settings.json`,
+and `~/.gemini/config/hooks.json` hooks blocks.
 
 ### Phase 5 — `limux agent-team` + `AGENTS.md` template ✅
-`limux agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>]
+`limux agent-team [--agents codex,claude[,opencode,gemini,agy]] [--cwd <path>]
 [--no-launch] [--dry-run]`:
 
 - Splits the active workspace into peer terminal panes via `pane.create` and
