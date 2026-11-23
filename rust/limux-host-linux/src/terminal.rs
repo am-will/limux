@@ -230,8 +230,10 @@ impl SurfaceIdentityRegistry {
 
 thread_local! {
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
-    static CURSOR_CACHE: RefCell<HashMap<&'static str, Option<gtk::gdk::Cursor>>> =
-        RefCell::new(HashMap::new());
+    // Bounded to the static set of Ghostty cursor names; ManuallyDrop avoids
+    // running g_object_unref on GdkCursor during TLS exit after GTK/Wayland teardown.
+    static CURSOR_CACHE: RefCell<std::mem::ManuallyDrop<HashMap<&'static str, Option<gtk::gdk::Cursor>>>> =
+        RefCell::new(std::mem::ManuallyDrop::new(HashMap::new()));
     static LAYOUT_ANIMATIONS_ACTIVE: Cell<usize> = const { Cell::new(0) };
 }
 
