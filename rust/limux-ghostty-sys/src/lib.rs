@@ -518,6 +518,15 @@ pub type ghostty_runtime_tmux_control_cb =
     unsafe extern "C" fn(*mut c_void, c_int, u32, *const u8, usize);
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ghostty_surface_scrollbar_s {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+    pub row_space_revision: u64,
+}
+
+#[repr(C)]
 pub struct ghostty_runtime_config_s {
     pub userdata: *mut c_void,
     pub supports_selection_clipboard: bool,
@@ -668,6 +677,17 @@ extern "C" {
         selection: ghostty_selection_s,
         text: *mut ghostty_text_s,
     ) -> bool;
+    pub fn ghostty_surface_scrollbar(
+        surface: ghostty_surface_t,
+        scrollbar: *mut ghostty_surface_scrollbar_s,
+    ) -> bool;
+    pub fn ghostty_surface_read_screen_clipboard_text(
+        surface: ghostty_surface_t,
+        top_y: u32,
+        bottom_y: u32,
+        max_bytes: usize,
+        text: *mut ghostty_text_s,
+    ) -> bool;
     pub fn ghostty_surface_free_text(surface: ghostty_surface_t, text: *mut ghostty_text_s);
 
     // Clipboard
@@ -703,6 +723,13 @@ mod tests {
         assert_eq!(align_of::<ghostty_runtime_config_s>(), 8);
         assert_eq!(offset_of!(ghostty_runtime_config_s, read_clipboard_cb), 32);
         assert_eq!(offset_of!(ghostty_runtime_config_s, tmux_control_cb), 64);
+
+        assert_eq!(size_of::<ghostty_surface_scrollbar_s>(), 32);
+        assert_eq!(align_of::<ghostty_surface_scrollbar_s>(), 8);
+        assert_eq!(
+            offset_of!(ghostty_surface_scrollbar_s, row_space_revision),
+            24
+        );
 
         assert_eq!(size_of::<ghostty_action_u>(), 24);
         assert_eq!(size_of::<ghostty_action_s>(), 32);

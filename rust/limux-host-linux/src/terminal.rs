@@ -106,7 +106,9 @@ struct SurfaceEntry {
     scrollbar_adjustment: gtk::Adjustment,
     scrollbar_syncing: Rc<Cell<bool>>,
     scrollbar_state: Cell<Option<ScrollbarMetrics>>,
+    scrollbar_applied: Cell<Option<ScrollbarMetrics>>,
     scrollbar_dirty: Cell<bool>,
+    scrollbar_flush_timer: RefCell<Option<glib::SourceId>>,
     on_title_changed: Option<Box<TitleChangedCallback>>,
     on_pwd_changed: Option<Box<PwdChangedCallback>>,
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
@@ -136,12 +138,20 @@ struct ClipboardContext {
     url_probe_active: Cell<bool>,
 }
 
+const SCROLLBAR_STREAM_COALESCE_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScrollbarMetrics {
     total: u64,
     offset: u64,
     len: u64,
     visible: bool,
+}
+
+impl ScrollbarMetrics {
+    fn is_at_bottom(self) -> bool {
+        self.offset.saturating_add(self.len) >= self.total
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -628,10 +638,26 @@ impl TerminalHandle {
         self.read_text(false)
     }
 
+    #[cfg(test)]
     pub fn read_text(&self, scrollback: bool) -> Option<String> {
+        self.read_text_tail(scrollback, None)
+    }
+
+    pub fn read_text_tail(&self, scrollback: bool, max_lines: Option<usize>) -> Option<String> {
+        if max_lines == Some(0) {
+            return Some(String::new());
+        }
         let Some(surface) = *self.surface_cell.borrow() else {
             return Some(String::new());
         };
+
+        if scrollback {
+            if let Some(limit) = max_lines {
+                if let Some(bounded) = read_bounded_scrollback_tail(surface, limit) {
+                    return Some(bounded);
+                }
+            }
+        }
 
         let tag = if scrollback {
             GHOSTTY_POINT_SCREEN
@@ -661,7 +687,11 @@ impl TerminalHandle {
         }
 
         let bytes = unsafe { std::slice::from_raw_parts(text.text.cast::<u8>(), text.text_len) };
-        let output = String::from_utf8_lossy(bytes).into_owned();
+        let slice = match max_lines {
+            Some(limit) => tail_lines_bytes(bytes, limit),
+            None => bytes,
+        };
+        let output = String::from_utf8_lossy(slice).into_owned();
         unsafe { ghostty_surface_free_text(surface, &mut text) };
         Some(output)
     }
@@ -1091,6 +1121,7 @@ pub fn apply_terminal_font_config(
     let surfaces: Vec<(ghostty_surface_t, gtk::GLArea)> = SURFACE_MAP.with(|map| {
         map.borrow()
             .iter()
+            .filter(|(_, entry)| entry.gl_area.is_mapped())
             .map(|(&key, entry)| (key as ghostty_surface_t, entry.gl_area.clone()))
             .collect()
     });
@@ -1303,7 +1334,98 @@ unsafe extern "C" fn ghostty_wakeup_cb(_userdata: *mut c_void) {
     });
 }
 
+fn tail_lines_bytes(bytes: &[u8], max_lines: usize) -> &[u8] {
+    if max_lines == 0 || bytes.is_empty() {
+        return &[];
+    }
+    let trimmed = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let mut seen_newlines = 0usize;
+    for (idx, &byte) in trimmed.iter().enumerate().rev() {
+        if byte == b'\n' {
+            seen_newlines += 1;
+            if seen_newlines == max_lines {
+                return &bytes[idx + 1..];
+            }
+        }
+    }
+    bytes
+}
+
+fn bounded_scrollback_tail_bytes(bytes: &[u8], top_y: u32, max_lines: usize) -> Option<&[u8]> {
+    if max_lines == 0 {
+        return Some(&[]);
+    }
+    if top_y == 0 {
+        return Some(tail_lines_bytes(bytes, max_lines));
+    }
+    // When `top_y > 0`, row `top_y` may land in the middle of a soft-wrapped
+    // logical line. Everything strictly after the first newline begins on a
+    // true logical line boundary, so the tail is complete iff that suffix
+    // contains at least `max_lines` logical lines.
+    let first_nl = bytes.iter().position(|&b| b == b'\n')?;
+    let after_first = &bytes[first_nl + 1..];
+    if after_first.is_empty() {
+        return None;
+    }
+    let trimmed = after_first.strip_suffix(b"\n").unwrap_or(after_first);
+    let logical_lines = trimmed.iter().filter(|&&b| b == b'\n').count() + 1;
+    (logical_lines >= max_lines).then(|| tail_lines_bytes(after_first, max_lines))
+}
+
+fn read_bounded_scrollback_tail(surface: ghostty_surface_t, max_lines: usize) -> Option<String> {
+    let mut scrollbar = ghostty_surface_scrollbar_s::default();
+    if !unsafe { ghostty_surface_scrollbar(surface, &mut scrollbar) } {
+        return None;
+    }
+    if scrollbar.total == 0 {
+        return Some(String::new());
+    }
+    let total = usize::try_from(scrollbar.total).ok()?;
+    let bottom_y = u32::try_from(scrollbar.total - 1).ok()?;
+    let cols = usize::from(unsafe { ghostty_surface_size(surface) }.columns).max(80);
+    // Start with a 2x physical-row margin to cover typical wrapped lines in a
+    // single FFI call, then double if heavily wrapped lines need more rows.
+    let mut window_rows = max_lines.saturating_mul(2).max(64).min(total);
+    loop {
+        let top_y = u32::try_from(total.saturating_sub(window_rows)).ok()?;
+        let max_bytes = window_rows
+            .saturating_mul(cols)
+            .saturating_mul(4)
+            .clamp(64 * 1024, 16 * 1024 * 1024);
+        let mut text = empty_ghostty_text();
+        let ok = unsafe {
+            ghostty_surface_read_screen_clipboard_text(
+                surface, top_y, bottom_y, max_bytes, &mut text,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        if text.text.is_null() {
+            return Some(String::new());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(text.text.cast::<u8>(), text.text_len) };
+        let resolved = bounded_scrollback_tail_bytes(bytes, top_y, max_lines)
+            .map(|slice| String::from_utf8_lossy(slice).into_owned());
+        unsafe { ghostty_surface_free_text(surface, &mut text) };
+        if let Some(output) = resolved {
+            return Some(output);
+        }
+        if top_y == 0 || window_rows >= total {
+            return None;
+        }
+        window_rows = window_rows.saturating_mul(2).min(total);
+    }
+}
+
+fn cancel_scrollbar_flush_timer(entry: &SurfaceEntry) {
+    if let Some(source_id) = entry.scrollbar_flush_timer.borrow_mut().take() {
+        source_id.remove();
+    }
+}
+
 fn apply_scrollbar_metrics(entry: &SurfaceEntry, metrics: ScrollbarMetrics) {
+    cancel_scrollbar_flush_timer(entry);
     entry.scrollbar_syncing.set(true);
     entry.scrollbar_adjustment.configure(
         metrics.offset as f64,
@@ -1314,6 +1436,8 @@ fn apply_scrollbar_metrics(entry: &SurfaceEntry, metrics: ScrollbarMetrics) {
         metrics.len as f64,
     );
     entry.scrollbar_syncing.set(false);
+    entry.scrollbar_applied.set(Some(metrics));
+    entry.scrollbar_dirty.set(false);
     if entry.scrollbar.get_visible() != metrics.visible {
         entry.scrollbar.set_visible(metrics.visible);
     }
@@ -1328,6 +1452,32 @@ fn should_update_scrollbar_metrics(
     }
     cache.set(Some(next));
     true
+}
+
+fn should_coalesce_scrollbar_update(
+    applied: Option<ScrollbarMetrics>,
+    next: ScrollbarMetrics,
+) -> bool {
+    let Some(prev) = applied else {
+        return false;
+    };
+    prev.visible == next.visible
+        && prev.len == next.len
+        && prev.is_at_bottom()
+        && next.is_at_bottom()
+}
+
+fn flush_pending_scrollbar(surface_key: usize) {
+    SURFACE_MAP.with(|map| {
+        if let Some(entry) = map.borrow().get(&surface_key) {
+            entry.scrollbar_flush_timer.borrow_mut().take();
+            if entry.gl_area.is_mapped() && entry.scrollbar_dirty.replace(false) {
+                if let Some(metrics) = entry.scrollbar_state.get() {
+                    apply_scrollbar_metrics(entry, metrics);
+                }
+            }
+        }
+    });
 }
 
 fn link_popover_anchor_point(x: f64, y: f64) -> (i32, i32) {
@@ -1433,6 +1583,17 @@ unsafe extern "C" fn ghostty_action_cb(
                         }
                         if !entry.gl_area.is_mapped() {
                             entry.scrollbar_dirty.set(true);
+                            return;
+                        }
+                        if should_coalesce_scrollbar_update(entry.scrollbar_applied.get(), next) {
+                            entry.scrollbar_dirty.set(true);
+                            if entry.scrollbar_flush_timer.borrow().is_none() {
+                                let source_id = glib::timeout_add_local_once(
+                                    SCROLLBAR_STREAM_COALESCE_INTERVAL,
+                                    move || flush_pending_scrollbar(surface_key),
+                                );
+                                *entry.scrollbar_flush_timer.borrow_mut() = Some(source_id);
+                            }
                             return;
                         }
                         apply_scrollbar_metrics(entry, next);
@@ -1887,6 +2048,14 @@ pub struct TerminalOptions {
 /// Resolve effective base font defaults from Ghostty's default files and
 /// recursive `config-file` includes (before Limux's terminal-font overlay).
 pub(crate) fn base_ghostty_font_defaults() -> crate::ghostty_config::GhosttyFontDefaults {
+    if let Some(cached) = BASE_GHOSTTY_FONT_DEFAULTS
+        .lock()
+        .expect("base ghostty font defaults lock poisoned")
+        .as_ref()
+    {
+        return cached.clone();
+    }
+
     if GHOSTTY.get().is_some() {
         let parsed = unsafe {
             let config = ghostty_config_new();
@@ -1907,14 +2076,6 @@ pub(crate) fn base_ghostty_font_defaults() -> crate::ghostty_config::GhosttyFont
                 .expect("base ghostty font defaults lock poisoned") = Some(defaults.clone());
             return defaults;
         }
-    }
-
-    if let Some(cached) = BASE_GHOSTTY_FONT_DEFAULTS
-        .lock()
-        .expect("base ghostty font defaults lock poisoned")
-        .as_ref()
-    {
-        return cached.clone();
     }
 
     crate::ghostty_config::read_font_defaults()
@@ -1949,6 +2110,7 @@ fn free_terminal_surface(
 
     clipboard_context_cell.set(ptr::null_mut());
     if let Some(entry) = entry.as_ref() {
+        cancel_scrollbar_flush_timer(entry);
         entry.link_popover.popdown();
         unregister_surface_identity(entry.identity);
     }
@@ -2287,6 +2449,7 @@ pub fn create_terminal(
             if let Some(surface) = *surface_cell.borrow() {
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&(surface as usize)) {
+                        cancel_scrollbar_flush_timer(entry);
                         entry.output_activity.set_mapped(false);
                     }
                 });
@@ -2340,7 +2503,9 @@ pub fn create_terminal(
             if let Some(surface) = surface {
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&(surface as usize)) {
+                        cancel_scrollbar_flush_timer(entry);
                         entry.scrollbar_state.set(None);
+                        entry.scrollbar_applied.set(None);
                     }
                 });
             }
@@ -2557,7 +2722,9 @@ pub fn create_terminal(
                         scrollbar_adjustment: scrollbar_adjustment_for_map.clone(),
                         scrollbar_syncing: scrollbar_syncing.clone(),
                         scrollbar_state: Cell::new(None),
+                        scrollbar_applied: Cell::new(None),
                         scrollbar_dirty: Cell::new(false),
+                        scrollbar_flush_timer: RefCell::new(None),
                         on_title_changed: Some(Box::new({
                             let cb = callbacks.clone();
                             move |title| {
@@ -4375,6 +4542,90 @@ mod tests {
     #[test]
     fn shell_escape_joined_bytes_rejects_empty_input() {
         assert!(shell_escape_joined_bytes(std::iter::empty::<&[u8]>()).is_none());
+    }
+
+    #[test]
+    fn tail_lines_bytes_and_bounded_scrollback_tail_handle_boundaries() {
+        assert_eq!(tail_lines_bytes(b"", 5), b"");
+        assert_eq!(tail_lines_bytes(b"alpha\nbeta\ngamma\n", 0), b"");
+        assert_eq!(
+            tail_lines_bytes(b"alpha\nbeta\ngamma\n", 2),
+            b"beta\ngamma\n"
+        );
+        assert_eq!(tail_lines_bytes(b"alpha\nbeta\ngamma", 2), b"beta\ngamma");
+        assert_eq!(tail_lines_bytes(b"alpha\nbeta", 10), b"alpha\nbeta");
+        assert_eq!(tail_lines_bytes(b"\n", 1), b"\n");
+        assert_eq!(tail_lines_bytes(b"a\n\n", 1), b"\n");
+
+        // At top_y == 0, any line count is complete.
+        assert_eq!(
+            bounded_scrollback_tail_bytes(b"only-one-line", 0, 5),
+            Some(b"only-one-line".as_slice())
+        );
+        // At top_y > 0, the first line may be a wrapped tail fragment and must
+        // not count toward the requested logical line count.
+        assert_eq!(
+            bounded_scrollback_tail_bytes(b"wrapped-tail\nline1\n", 10, 2),
+            None
+        );
+        assert_eq!(
+            bounded_scrollback_tail_bytes(b"wrapped-tail\nline1\nline2\n", 10, 2),
+            Some(b"line1\nline2\n".as_slice())
+        );
+        assert_eq!(
+            bounded_scrollback_tail_bytes(b"giant-wrapped-line-without-newline", 10, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn should_coalesce_scrollbar_update_only_for_bottom_pinned_stream_growth() {
+        let bottom_100 = ScrollbarMetrics {
+            total: 100,
+            offset: 60,
+            len: 40,
+            visible: true,
+        };
+        let bottom_105 = ScrollbarMetrics {
+            total: 105,
+            offset: 65,
+            len: 40,
+            visible: true,
+        };
+        let scrolled_up = ScrollbarMetrics {
+            total: 105,
+            offset: 50,
+            len: 40,
+            visible: true,
+        };
+        let resized = ScrollbarMetrics {
+            total: 105,
+            offset: 55,
+            len: 50,
+            visible: true,
+        };
+        let hidden = ScrollbarMetrics {
+            total: 40,
+            offset: 0,
+            len: 40,
+            visible: false,
+        };
+
+        assert!(!should_coalesce_scrollbar_update(None, bottom_100));
+        assert!(should_coalesce_scrollbar_update(
+            Some(bottom_100),
+            bottom_105
+        ));
+        assert!(!should_coalesce_scrollbar_update(
+            Some(bottom_100),
+            scrolled_up
+        ));
+        assert!(!should_coalesce_scrollbar_update(
+            Some(scrolled_up),
+            bottom_105
+        ));
+        assert!(!should_coalesce_scrollbar_update(Some(bottom_100), resized));
+        assert!(!should_coalesce_scrollbar_update(Some(hidden), bottom_100));
     }
 
     #[test]

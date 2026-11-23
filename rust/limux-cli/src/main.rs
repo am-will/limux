@@ -12,6 +12,7 @@ use limux_control::socket_path::{resolve_socket_path, SocketMode};
 use limux_protocol::{V2Request, V2Response};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
 mod agent_hooks;
@@ -56,14 +57,24 @@ enum CommandOutput {
     Json(Value),
 }
 
+struct ClientConnection {
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+}
+
 struct Client {
     socket: PathBuf,
     seq: u64,
+    conn: Option<ClientConnection>,
 }
 
 impl Client {
     fn new(socket: PathBuf) -> Self {
-        Self { socket, seq: 0 }
+        Self {
+            socket,
+            seq: 0,
+            conn: None,
+        }
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -76,7 +87,7 @@ impl Client {
         self.send_request(request).await
     }
 
-    async fn send_request(&self, request: V2Request) -> Result<Value> {
+    async fn connect(&self) -> Result<ClientConnection> {
         let stream = UnixStream::connect(&self.socket)
             .await
             .with_context(|| format!("failed to connect to socket {}", self.socket.display()))?;
@@ -85,26 +96,59 @@ impl Client {
             limux_control::auth::SocketControlMode::from_env(),
         )
         .with_context(|| format!("untrusted server on socket {}", self.socket.display()))?;
-        let (reader_half, mut writer_half) = stream.into_split();
+        let (reader_half, writer) = stream.into_split();
+        Ok(ClientConnection {
+            reader: BufReader::new(reader_half),
+            writer,
+        })
+    }
 
+    async fn send_request(&mut self, request: V2Request) -> Result<Value> {
         let mut payload = serde_json::to_string(&request).context("failed to encode request")?;
         payload.push('\n');
 
-        writer_half
-            .write_all(payload.as_bytes())
-            .await
-            .context("failed to write request")?;
-        writer_half
-            .flush()
-            .await
-            .context("failed to flush request")?;
+        let mut reused = self.conn.is_some();
+        let line = loop {
+            if self.conn.is_none() {
+                self.conn = Some(self.connect().await?);
+                reused = false;
+            }
+            let conn = self.conn.as_mut().expect("client connection present");
+            let write_result = async {
+                conn.writer.write_all(payload.as_bytes()).await?;
+                conn.writer.flush().await
+            }
+            .await;
+            if let Err(err) = write_result {
+                self.conn = None;
+                if reused {
+                    reused = false;
+                    continue;
+                }
+                return Err(err).context("failed to write request");
+            }
 
-        let mut reader = BufReader::new(reader_half);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .context("failed to read response")?;
+            let mut line = String::new();
+            match conn.reader.read_line(&mut line).await {
+                Ok(0) => {
+                    self.conn = None;
+                    if reused {
+                        reused = false;
+                        continue;
+                    }
+                    bail!("server returned an empty response");
+                }
+                Ok(_) => break line,
+                Err(err) => {
+                    self.conn = None;
+                    if reused {
+                        reused = false;
+                        continue;
+                    }
+                    return Err(err).context("failed to read response");
+                }
+            }
+        };
 
         if line.trim().is_empty() {
             bail!("server returned an empty response");
@@ -1246,16 +1290,13 @@ fn persist_agent_hook_session(
     event: &str,
 ) -> Result<()> {
     let Some(session_id) = hook_session_id(agent, payload) else {
-        write_agent_hook_debug(
-            agent,
-            event,
-            "skip_missing_session_id",
-            &json!({
+        write_agent_hook_debug(agent, event, "skip_missing_session_id", || {
+            json!({
                 "payload_keys": payload_keys(payload),
                 "has_claude_code_session_env": limux_env_value("CLAUDE_CODE_SESSION_ID").is_some(),
                 "has_claude_session_env": limux_env_value("CLAUDE_SESSION_ID").is_some(),
-            }),
-        );
+            })
+        });
         return Ok(());
     };
 
@@ -1266,58 +1307,58 @@ fn persist_agent_hook_session(
                 agent_hook_cleanup_scope(args, payload, limux_env_value);
             let result = store.remove(&session_id, workspace_id.as_deref(), surface_id.as_deref());
             if result.is_ok() {
-                write_agent_hook_debug(
-                    agent,
-                    event,
-                    "removed",
-                    &json!({
+                write_agent_hook_debug(agent, event, "removed", || {
+                    json!({
                         "session_id": session_id,
                         "payload_keys": payload_keys(payload),
-                    }),
-                );
+                    })
+                });
             }
             return result;
         }
         AgentHookPersistenceAction::Preserve => {
-            write_agent_hook_debug(
-                agent,
-                event,
-                "preserved",
-                &json!({
+            write_agent_hook_debug(agent, event, "preserved", || {
+                json!({
                     "session_id": session_id,
                     "payload_keys": payload_keys(payload),
-                }),
-            );
+                })
+            });
             return Ok(());
         }
         AgentHookPersistenceAction::Upsert => {}
     }
 
-    let workspace_id = parse_opt(args, "--workspace")
+    let workspace_arg = parse_opt(args, "--workspace");
+    let surface_arg = parse_opt(args, "--surface");
+    let workspace_id = workspace_arg
+        .clone()
         .or_else(|| limux_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|value| !value.trim().is_empty());
-    let surface_id = parse_opt(args, "--surface")
-        .or_else(|| limux_env_value("LIMUX_SURFACE_ID"))
-        .filter(|value| !value.trim().is_empty());
+    let surface_id = if workspace_id.is_some() {
+        surface_arg
+            .clone()
+            .or_else(|| limux_env_value("LIMUX_SURFACE_ID"))
+            .filter(|value| !value.trim().is_empty())
+    } else {
+        None
+    };
     let (Some(workspace_id), Some(surface_id)) = (workspace_id, surface_id) else {
-        write_agent_hook_debug(
-            agent,
-            event,
-            "skip_missing_limux_target",
-            &json!({
+        write_agent_hook_debug(agent, event, "skip_missing_limux_target", || {
+            json!({
                 "session_id": session_id,
-                "has_workspace_arg": parse_opt(args, "--workspace").is_some(),
-                "has_surface_arg": parse_opt(args, "--surface").is_some(),
+                "has_workspace_arg": workspace_arg.is_some(),
+                "has_surface_arg": surface_arg.is_some(),
                 "has_workspace_env": limux_env_value("LIMUX_WORKSPACE_ID").is_some(),
                 "has_surface_env": limux_env_value("LIMUX_SURFACE_ID").is_some(),
                 "payload_keys": payload_keys(payload),
-            }),
-        );
+            })
+        });
         return Ok(());
     };
 
-    let ancestor_pid = agent_ancestor_pid(agent);
-    let proc_args = ancestor_pid.and_then(proc_cmdline_args);
+    let ancestor = agent_ancestor_process(agent);
+    let ancestor_pid = ancestor.as_ref().map(|(pid, _)| *pid);
+    let proc_args = ancestor.and_then(|(_, args)| (!args.is_empty()).then_some(args));
     let proc_cwd = ancestor_pid.and_then(proc_cwd_path);
     let proc_env = ancestor_pid.and_then(proc_allowed_environment);
 
@@ -1350,14 +1391,11 @@ fn persist_agent_hook_session(
         }
     });
     if result.is_ok() {
-        write_agent_hook_debug(
-            agent,
-            event,
-            "upserted",
-            &json!({
+        write_agent_hook_debug(agent, event, "upserted", || {
+            json!({
                 "payload_keys": payload_keys(payload),
-            }),
-        );
+            })
+        });
     }
     result
 }
@@ -1439,11 +1477,12 @@ fn write_agent_hook_debug(
     agent: agent_hooks::AgentKind,
     event: &str,
     outcome: &str,
-    details: &Value,
+    details: impl FnOnce() -> Value,
 ) {
     if !agent_hook_debug_enabled() {
         return;
     }
+    let details = details();
     let Some(dir) = agent_hook_debug_dir() else {
         return;
     };
@@ -1510,15 +1549,20 @@ fn limux_env_value(name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn agent_ancestor_pid(agent: agent_hooks::AgentKind) -> Option<u32> {
+fn agent_ancestor_process(agent: agent_hooks::AgentKind) -> Option<(u32, Vec<String>)> {
     let mut pid = std::process::id();
     for _ in 0..8 {
         let parent = proc_parent_pid(pid)?;
         if parent <= 1 || parent == pid {
             return None;
         }
-        if proc_matches_pid(parent, agent) {
-            return Some(parent);
+        let args = proc_cmdline_args(parent).unwrap_or_default();
+        if limux_control::agent_sessions::proc_matches_agent(&args, None, agent) {
+            return Some((parent, args));
+        }
+        let comm = fs::read_to_string(format!("/proc/{parent}/comm")).ok();
+        if limux_control::agent_sessions::proc_matches_agent(&args, comm.as_deref(), agent) {
+            return Some((parent, args));
         }
         pid = parent;
     }
@@ -1526,15 +1570,8 @@ fn agent_ancestor_pid(agent: agent_hooks::AgentKind) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn agent_ancestor_pid(_agent: agent_hooks::AgentKind) -> Option<u32> {
+fn agent_ancestor_process(_agent: agent_hooks::AgentKind) -> Option<(u32, Vec<String>)> {
     None
-}
-
-#[cfg(target_os = "linux")]
-fn proc_matches_pid(pid: u32, agent: agent_hooks::AgentKind) -> bool {
-    let args = proc_cmdline_args(pid).unwrap_or_default();
-    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok();
-    limux_control::agent_sessions::proc_matches_agent(&args, comm.as_deref(), agent)
 }
 
 #[cfg(target_os = "linux")]
@@ -6368,6 +6405,7 @@ mod new_pane_tests {
         let mut client = super::Client {
             socket: socket_path,
             seq: 1,
+            conn: None,
         };
         let cli_args = vec![
             "--surface".to_string(),

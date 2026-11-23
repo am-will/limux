@@ -692,7 +692,7 @@ pub fn create_pane(
     if let Some(saved_state) = initial_state {
         restore_tabs_from_state(&internals, working_directory, saved_state);
     } else if !skip_default_tab {
-        add_terminal_tab_inner(&internals, working_directory, None);
+        add_terminal_tab_inner(&internals, working_directory, None, true);
     }
 
     {
@@ -1550,7 +1550,7 @@ fn restore_tabs_from_state(
     saved_state: &PaneState,
 ) {
     if saved_state.tabs.is_empty() {
-        add_terminal_tab_inner(internals, working_directory, None);
+        add_terminal_tab_inner(internals, working_directory, None, true);
         return;
     }
 
@@ -1567,6 +1567,7 @@ fn restore_tabs_from_state(
                     agent: agent.clone(),
                     ssh: ssh.as_deref().cloned(),
                 }),
+                false,
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
                 internals,
@@ -1576,6 +1577,7 @@ fn restore_tabs_from_state(
                     pinned: saved_tab.pinned,
                     uri: uri.as_deref(),
                 }),
+                false,
             ),
             TabContentState::Keybinds {} => add_keybind_editor_tab_inner(
                 internals,
@@ -1588,6 +1590,7 @@ fn restore_tabs_from_state(
                         pinned: saved_tab.pinned,
                     }),
                 },
+                false,
             ),
             // Settings now open in a transient dialog rather than a persisted tab.
             TabContentState::Settings {} => {}
@@ -1595,7 +1598,7 @@ fn restore_tabs_from_state(
     }
 
     if internals.tab_state.borrow().tabs.is_empty() {
-        add_terminal_tab_inner(internals, working_directory, None);
+        add_terminal_tab_inner(internals, working_directory, None, false);
     }
 
     let active_tab_id = saved_state
@@ -1620,11 +1623,12 @@ fn restore_tabs_from_state(
         });
 
     if let Some(active_tab_id) = active_tab_id {
-        activate_tab(
+        activate_tab_with_focus(
             &internals.tab_strip,
             &internals.content_stack,
             &internals.tab_state,
             &active_tab_id,
+            false,
         );
     }
 }
@@ -2188,6 +2192,7 @@ fn add_terminal_tab_inner(
     internals: &Rc<PaneInternals>,
     working_directory: Option<&str>,
     options: Option<TerminalTabOptions<'_>>,
+    activate: bool,
 ) {
     let tab_id = options
         .as_ref()
@@ -2318,13 +2323,15 @@ fn add_terminal_tab_inner(
         }
     }
 
-    activate_tab(
-        &internals.tab_strip,
-        &internals.content_stack,
-        &internals.tab_state,
-        &tab_id,
-    );
-    term.handle.focus_surface();
+    if activate {
+        activate_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &tab_id,
+        );
+        term.handle.focus_surface();
+    }
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
@@ -2372,7 +2379,7 @@ fn is_usable_autostart_runtime_dir(
     flatpak_id: Option<&std::ffi::OsStr>,
     xdg_runtime_dir: Option<&std::ffi::OsStr>,
 ) -> bool {
-    if !flatpak_id.is_some_and(|id| id == crate::APP_ID) {
+    if flatpak_id.is_none_or(|id| id != crate::APP_ID) {
         return true;
     }
     xdg_runtime_dir
@@ -2528,7 +2535,11 @@ fn nushell_quote(value: &str) -> String {
     }
 }
 
-fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
+fn add_browser_tab_inner(
+    internals: &Rc<PaneInternals>,
+    options: Option<BrowserTabOptions<'_>>,
+    activate: bool,
+) {
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
@@ -2610,18 +2621,24 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
         }
     }
 
-    activate_tab(
-        &internals.tab_strip,
-        &internals.content_stack,
-        &internals.tab_state,
-        &tab_id,
-    );
+    if activate {
+        activate_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &tab_id,
+        );
+    }
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
 }
 
-fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTabInput<'_>) {
+fn add_keybind_editor_tab_inner(
+    internals: &Rc<PaneInternals>,
+    input: KeybindsTabInput<'_>,
+    activate: bool,
+) {
     let tab_id = input
         .options
         .as_ref()
@@ -2689,12 +2706,14 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
         }
     }
 
-    activate_tab(
-        &internals.tab_strip,
-        &internals.content_stack,
-        &internals.tab_state,
-        &tab_id,
-    );
+    if activate {
+        activate_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &tab_id,
+        );
+    }
     if input.options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
@@ -2706,13 +2725,13 @@ pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
     if let Some(internals) = find_pane_internals(pane_widget) {
         let dir = active_tab_working_directory(pane_widget)
             .or_else(|| internals.working_directory.borrow().clone());
-        add_terminal_tab_inner(&internals, dir.as_deref(), None);
+        add_terminal_tab_inner(&internals, dir.as_deref(), None, true);
     }
 }
 
 pub fn add_terminal_tab_to_pane_in_directory(pane_widget: &gtk::Widget, directory: Option<&str>) {
     if let Some(internals) = find_pane_internals(pane_widget) {
-        add_terminal_tab_inner(&internals, directory, None);
+        add_terminal_tab_inner(&internals, directory, None, true);
     }
 }
 
@@ -2730,7 +2749,7 @@ pub fn add_browser_tab_to_pane_with_uri(pane_widget: &gtk::Widget, uri: Option<&
             pinned: false,
             uri: Some(uri),
         });
-        add_browser_tab_inner(&internals, options);
+        add_browser_tab_inner(&internals, options, true);
         if uri.is_some() {
             (internals.callbacks.on_state_changed)();
         }
@@ -2768,6 +2787,7 @@ pub fn add_keybind_editor_tab_to_pane(
                 on_capture,
                 options: None,
             },
+            true,
         );
     }
 }
@@ -3447,6 +3467,16 @@ fn activate_tab(
     tab_state: &Rc<RefCell<TabState>>,
     tab_id: &str,
 ) {
+    activate_tab_with_focus(tab_strip, content_stack, tab_state, tab_id, true);
+}
+
+fn activate_tab_with_focus(
+    tab_strip: &gtk::Box,
+    content_stack: &gtk::Stack,
+    tab_state: &Rc<RefCell<TabState>>,
+    tab_id: &str,
+    focus: bool,
+) {
     let (focus_target, has_content_child, needs_stack_switch) = {
         let mut ts = tab_state.borrow_mut();
         let was_active = ts.active_tab.as_deref() == Some(tab_id);
@@ -3473,11 +3503,14 @@ fn activate_tab(
             }
         }
 
-        let focus_target = ts
-            .tabs
-            .iter()
-            .find(|entry| entry.id == tab_id)
-            .map(TabFocusTarget::from_entry);
+        let focus_target = if focus {
+            ts.tabs
+                .iter()
+                .find(|entry| entry.id == tab_id)
+                .map(TabFocusTarget::from_entry)
+        } else {
+            None
+        };
 
         let has_content_child = content_stack.child_by_name(tab_id).is_some();
         let needs_stack_switch =
