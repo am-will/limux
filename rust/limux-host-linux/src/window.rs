@@ -1156,7 +1156,6 @@ pub(crate) type State = Rc<RefCell<AppState>>;
 thread_local! {
     static CONTROL_STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
-const SPLIT_RATIO_STATE_KEY: &str = "limux-split-ratio-state";
 const PORTAL_DESKTOP_SERVICE: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
@@ -1241,25 +1240,6 @@ fn begin_window_move_from_widget(
     toplevel.begin_move(device, button, surface_x, surface_y, timestamp);
 }
 
-fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
-    unsafe {
-        paned
-            .data::<Rc<RefCell<f64>>>(SPLIT_RATIO_STATE_KEY)
-            .map(|ptr| ptr.as_ref().clone())
-    }
-}
-
-pub(crate) fn update_split_ratio_state(paned: &gtk::Paned, ratio: f64) {
-    let ratio = layout_state::clamp_split_ratio(ratio);
-    if let Some(stored_ratio) = split_ratio_state(paned) {
-        *stored_ratio.borrow_mut() = ratio;
-    } else {
-        unsafe {
-            paned.set_data(SPLIT_RATIO_STATE_KEY, Rc::new(RefCell::new(ratio)));
-        }
-    }
-}
-
 fn build_workspace_root(
     state: &State,
     shortcuts: &Rc<ResolvedShortcutConfig>,
@@ -1288,12 +1268,7 @@ pub(crate) fn apply_ratio_value(
     applying: &Rc<Cell<bool>>,
 ) -> bool {
     let ratio = layout_state::clamp_split_ratio(ratio);
-    let allocation = paned.allocation();
-    let size = if orientation == gtk::Orientation::Horizontal {
-        allocation.width()
-    } else {
-        allocation.height()
-    };
+    let size = crate::split_tree::paned_extent(paned, orientation);
     if size <= 0 {
         return false;
     }
@@ -1305,7 +1280,6 @@ pub(crate) fn apply_ratio_value(
     if paned.position() != clamped {
         paned.set_position(clamped);
     }
-    update_split_ratio_state(paned, ratio);
     applying.set(false);
     true
 }
@@ -1317,43 +1291,21 @@ pub(crate) fn apply_split_ratio_after_layout(
     applying: Rc<Cell<bool>>,
     last_size: Rc<Cell<i32>>,
 ) {
-    // Capture the ratio by value for the initial retry loop so that early
-    // position_notify events (which may corrupt the cell) don't affect it.
-    let initial_ratio = *ratio_cell.borrow();
-
-    // Poll via a one-shot tick callback until the paned actually has a non-zero
-    // extent, apply the initial ratio once, then return Break so GdkFrameClock
-    // can sleep when idle. Subsequent resizes are handled via notify::max-position.
-    let applying_tick = applying.clone();
-    let last_size_tick = last_size.clone();
-    paned.add_tick_callback(move |paned, _clock| {
-        let size = if orientation == gtk::Orientation::Horizontal {
-            paned.width()
-        } else {
-            paned.height()
-        };
-        if size <= 0 {
-            return glib::ControlFlow::Continue;
-        }
-        let ok = apply_ratio_value(paned, orientation, initial_ratio, &applying_tick);
-        if ok {
-            last_size_tick.set(size);
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
-    });
+    // If the Paned already has a non-zero allocation at install time, apply
+    // the live ratio immediately. Otherwise GTK4's first size_allocate updates
+    // `max-position` from `G_MAXINT` and triggers the coalesced resize handler
+    // without needing a tick callback.
+    let initial_size = crate::split_tree::paned_extent(paned, orientation);
+    if initial_size > 0 && apply_ratio_value(paned, orientation, *ratio_cell.borrow(), &applying) {
+        last_size.set(initial_size);
+    }
 
     // Re-apply the current data model ratio on every map event (workspace switches).
     // Reads from the cell so drag-adjusted ratios are restored correctly.
     paned.connect_map(move |paned| {
         let ratio = *ratio_cell.borrow();
         if apply_ratio_value(paned, orientation, ratio, &applying) {
-            let size = if orientation == gtk::Orientation::Horizontal {
-                paned.width()
-            } else {
-                paned.height()
-            };
+            let size = crate::split_tree::paned_extent(paned, orientation);
             if size > 0 {
                 last_size.set(size);
             }
