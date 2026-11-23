@@ -988,3 +988,51 @@ fn clean_canonical_read_reports_no_minted_ids_while_empty_pane_does() {
     let (_, minted_empty) = read_session_with_minted_ids(dir.path()).unwrap();
     assert!(minted_empty);
 }
+
+#[test]
+fn merge_groups_preserves_first_duplicate_and_independent_edits() {
+    let make_group = |id: &str, name: &str| layout_state::WorkspaceGroupState {
+        id: id.into(),
+        name: name.into(),
+        color: Some(crate::workspace_color::WorkspaceColor::Blue),
+        collapsed: false,
+        position: 0,
+    };
+    let state_with = |groups: Vec<layout_state::WorkspaceGroupState>| AppSessionState {
+        groups,
+        ..AppSessionState::default()
+    };
+
+    let previous = state_with(vec![
+        make_group("g-edit", "Old"),
+        make_group("g-delete", "Drop"),
+        make_group("g-keep", "Keep"),
+    ]);
+    let local = state_with(vec![
+        make_group("g-edit", "Renamed"),
+        make_group("g-edit", "DuplicateIgnored"),
+        make_group("g-keep", "Keep"),
+        make_group("g-local-new", "LocalNew"),
+    ]);
+    let disk = state_with(vec![
+        make_group("g-edit", "Old"),
+        make_group("g-delete", "Drop"),
+        make_group("g-keep", "DiskEdited"),
+        make_group("g-disk-new", "DiskNew"),
+    ]);
+
+    let merged = merge_groups(&previous, &local, &disk);
+    let names: Vec<(&str, &str)> = merged
+        .iter()
+        .map(|g| (g.id.as_str(), g.name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("g-edit", "Renamed"),
+            ("g-keep", "DiskEdited"),
+            ("g-local-new", "LocalNew"),
+            ("g-disk-new", "DiskNew"),
+        ]
+    );
+}

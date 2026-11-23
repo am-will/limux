@@ -3834,6 +3834,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
 
 fn collapsed_dock_layout_matches(leading: &gtk::Box, widgets: &TopBarWidgets) -> bool {
     widgets.dock.parent().as_ref() == Some(leading.upcast_ref())
+        && widgets.sidebar_header.first_child().is_none()
         && widgets.settings.parent().is_none()
         && widgets.new_ws.parent().is_none()
         && widgets.open_folder.parent().is_none()
@@ -8096,9 +8097,19 @@ fn run_startup_eager_restore(state: &State) {
                 eprintln!("limux: startup eager restore requested ({total} tabs)");
                 return glib::ControlFlow::Break;
             };
-            // A queued tab can move or close before its turn. Resolve its
-            // current terminal handle directly without holding a state borrow.
-            if let Some(terminal) = pane::terminal_handle_by_tab_id(&tab_id) {
+            // A queued tab can move or close before its turn. Resolve its current
+            // owner directly from the pane registry, then release the state borrow
+            // before GTK emits callbacks.
+            let terminal = {
+                let app_state = state.borrow();
+                pane::terminal_handle_by_tab_id_in_workspaces(&tab_id, |ws_id| {
+                    app_state
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == ws_id)
+                })
+            };
+            if let Some(terminal) = terminal {
                 terminal.realize_in_background();
             }
             glib::ControlFlow::Continue

@@ -2956,17 +2956,33 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
     panes
 }
 
-fn pane_internals_for_workspace(workspace_id: &str) -> Vec<Rc<PaneInternals>> {
-    let mut panes = PANE_REGISTRY.with(|registry| {
-        registry
-            .borrow()
-            .values()
-            .filter_map(|weak| weak.upgrade())
-            .filter(|internals| internals.callbacks.workspace_id == workspace_id)
-            .collect::<Vec<_>>()
-    });
-    panes.sort_by_key(|internals| internals.pane_id);
-    panes
+/// Direct lookup of a live terminal handle by tab id across panes belonging to
+/// matching workspaces via the pane registry, avoiding full workspace tree
+/// walks and vector clones.
+pub fn terminal_handle_by_tab_id_in_workspaces(
+    tab_id: &str,
+    matches_workspace: impl Fn(&str) -> bool,
+) -> Option<terminal::TerminalHandle> {
+    PANE_REGISTRY.with(|registry| {
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            if !matches_workspace(&internals.callbacks.workspace_id) {
+                continue;
+            }
+            let tab_state = internals.tab_state.borrow();
+            if let Some(TabKind::Terminal { state }) = tab_state
+                .tabs
+                .iter()
+                .find(|entry| entry.id == tab_id)
+                .map(|entry| &entry.kind)
+            {
+                return Some(state.handle.clone());
+            }
+        }
+        None
+    })
 }
 
 /// Every tab of the workspace `surface_hint` names, ranked by how it names it;
@@ -2977,17 +2993,25 @@ pub fn tab_candidates_for_workspace(
     terminals_only: bool,
 ) -> Vec<(SurfaceHintMatch, u32, String)> {
     let mut candidates = Vec::new();
-    for internals in pane_internals_for_workspace(workspace_id) {
-        let pane_id = internals.pane_id;
-        for entry in &internals.tab_state.borrow().tabs {
-            if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+    PANE_REGISTRY.with(|registry| {
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            if internals.callbacks.workspace_id != workspace_id {
                 continue;
             }
-            if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
-                candidates.push((rank, pane_id, entry.id.clone()));
+            let pane_id = internals.pane_id;
+            for entry in &internals.tab_state.borrow().tabs {
+                if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+                    continue;
+                }
+                if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
+                    candidates.push((rank, pane_id, entry.id.clone()));
+                }
             }
         }
-    }
+    });
     candidates
 }
 
@@ -3112,16 +3136,19 @@ pub fn mark_active_tab_manual_unread_in_root(root: &gtk::Widget) -> bool {
 }
 
 pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
-    pane_internals_for_workspace(workspace_id)
-        .into_iter()
-        .any(|internals| {
-            internals
-                .tab_state
-                .borrow()
-                .tabs
-                .iter()
-                .any(|entry| entry.unread)
+    PANE_REGISTRY.with(|registry| {
+        registry.borrow().values().any(|weak| {
+            weak.upgrade().is_some_and(|internals| {
+                internals.callbacks.workspace_id == workspace_id
+                    && internals
+                        .tab_state
+                        .borrow()
+                        .tabs
+                        .iter()
+                        .any(|entry| entry.unread)
+            })
         })
+    })
 }
 
 fn pane_summary_from_internals(internals: &PaneInternals) -> PaneSummary {
@@ -3249,24 +3276,6 @@ pub fn active_pane_and_tab_id(pane_widget: &gtk::Widget) -> Option<(u32, String)
         .clone()
         .or_else(|| tab_state.tabs.first().map(|entry| entry.id.clone()))?;
     Some((internals.pane_id, tab_id))
-}
-
-/// Direct lookup of a terminal handle by tab id across live panes.
-pub fn terminal_handle_by_tab_id(tab_id: &str) -> Option<terminal::TerminalHandle> {
-    PANE_REGISTRY.with(|registry| {
-        for weak in registry.borrow().values() {
-            let Some(internals) = weak.upgrade() else {
-                continue;
-            };
-            let tab_state = internals.tab_state.borrow();
-            if let Some(entry) = tab_state.tabs.iter().find(|entry| entry.id == tab_id) {
-                if let TabKind::Terminal { state } = &entry.kind {
-                    return Some(state.handle.clone());
-                }
-            }
-        }
-        None
-    })
 }
 
 pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummary> {

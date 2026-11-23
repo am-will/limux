@@ -659,6 +659,9 @@ impl RestorableAgentIndex {
     }
 
     fn session_ended(&self, kind: RestorableAgentKind, session_id: &str, tab_id: &str) -> bool {
+        if self.ended_sessions.is_empty() {
+            return false;
+        }
         self.ended_sessions
             .contains(&(kind, session_id.trim().to_string(), tab_id.to_string()))
     }

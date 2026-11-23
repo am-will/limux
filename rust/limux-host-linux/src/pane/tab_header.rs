@@ -94,8 +94,34 @@ pub(super) fn build_tab_button_from_label(
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
-            let was_active = tab_state.borrow().active_tab.as_deref() == Some(tab_id.as_str());
-            activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
+            let already_active = tab_state.borrow().active_tab.as_deref() == Some(tab_id.as_str());
+            if !already_active {
+                activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
+            } else if n_press == 1 {
+                if tab_strip
+                    .ancestor(gtk::ScrolledWindow::static_type())
+                    .and_downcast::<gtk::ScrolledWindow>()
+                    .is_some_and(|scroller| {
+                        let adjustment = scroller.hadjustment();
+                        adjustment.upper() > adjustment.page_size() + 0.5
+                    })
+                {
+                    queue_active_tab_reveal(&tab_strip, &tab_state);
+                }
+                let focus_target = tab_state
+                    .borrow()
+                    .tabs
+                    .iter()
+                    .find(|entry| entry.id == tab_id)
+                    .map(TabFocusTarget::from_entry);
+                if let Some(target) =
+                    focus_target.filter(|_| content_stack.child_by_name(&tab_id).is_some())
+                {
+                    glib::idle_add_local_once(move || {
+                        target.focus();
+                    });
+                }
+            }
             if let Some(pane_widget) = pane_widget.upgrade() {
                 clear_tab_unread_if_visible(
                     &tab_state,
@@ -104,7 +130,7 @@ pub(super) fn build_tab_button_from_label(
                     &callbacks,
                 );
             }
-            if !was_active {
+            if !already_active {
                 (callbacks.on_state_changed)();
             }
             if n_press == 2 {
