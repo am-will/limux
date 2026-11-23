@@ -825,8 +825,23 @@ fn tab_unread_changes_preserve_independent_workspace_notifications() {
     let surface = pane::active_surface_summary(&pane).unwrap();
     let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
     pump_until(wait, || handle.health().realized);
+    // Only a watched exit closes on its own; Weston headless has no active
+    // window, so there nobody is watching and the exit is held until closed.
+    let watched = state.borrow().window.is_active();
     assert!(handle.send_text("exit"));
     assert!(handle.send_key("enter"));
+    pump_until(wait, || {
+        handle.health().process_exited || pane::tab_count_in_pane(&pane) == 1
+    });
+    if !watched {
+        pump_for(std::time::Duration::from_millis(300));
+        assert_eq!(
+            pane::tab_count_in_pane(&pane),
+            2,
+            "an unwatched exit keeps its tab"
+        );
+        assert!(pane::close_tab_in_pane(&pane, &surface.tab_id));
+    }
     pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
     assert_eq!(pane::tab_count_in_pane(&pane), 1);
     assert!(

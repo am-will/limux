@@ -309,8 +309,24 @@ os.execv('/bin/sh', ['/bin/sh'])
         pane::tab_working_directory(&source, &clean_tab).as_deref(),
         Some("/nonexistent-remote-directory")
     );
+    // Only a watched exit closes on its own; Weston headless has no active
+    // window, so there nobody is watching and the exit is held until closed.
+    let watched = state.borrow().window.is_active();
     assert!(handle.send_text("exit 0"));
     assert!(handle.send_key("enter"));
+    // A watched exit closes the tab, and with it the handle.
+    pump_until("clean exit must end the process", || {
+        handle.health().process_exited || pane::tab_count_in_pane(&source) == 0
+    });
+    if !watched {
+        pump_for(std::time::Duration::from_millis(300));
+        assert_eq!(
+            pane::tab_count_in_pane(&source),
+            1,
+            "an unwatched clean exit is held"
+        );
+        assert!(pane::close_tab_in_pane(&source, &clean_tab));
+    }
     pump_until("clean exit must remove the tab", || {
         pane::tab_count_in_pane(&source) == 0
     });
