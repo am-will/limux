@@ -89,6 +89,7 @@ impl Fixture {
                 agent: None,
                 ssh: Some(connection),
             }),
+            true,
         );
         let id = self.panes[pane]
             .tab_state
@@ -118,6 +119,7 @@ impl Fixture {
                 agent: None,
                 ssh: None,
             }),
+            true,
         );
         let id = self.panes[pane]
             .tab_state
@@ -705,6 +707,7 @@ fn restart_replays_workspace_autostart() {
             agent: None,
             ssh: None,
         }),
+        true,
     );
     let id = fixture.panes[2]
         .tab_state

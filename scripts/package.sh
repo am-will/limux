@@ -6,11 +6,8 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # Read version from workspace Cargo.toml (single source of truth)
 VERSION="${1:-$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 "$ROOT_DIR/scripts/validate-release-version.sh" "$VERSION" >/dev/null
-ARCH="$(uname -m)"
-DEB_ARCH="amd64"
-[ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
-RPM_ARCH="x86_64"
-[ "$ARCH" = "aarch64" ] && RPM_ARCH="aarch64"
+. "${ROOT_DIR}/scripts/release-arch.sh"
+resolve_release_arch
 
 PKG_BASE="limux-${VERSION}-linux-${ARCH}"
 STAGE="/tmp/limux-staging"
@@ -222,8 +219,8 @@ if [ ! -f "${ROOT_DIR}/ghostty/build.zig" ]; then
 fi
 
 # Always build libghostty with ReleaseFast to guarantee optimized output.
-# Pinning cpu=baseline keeps the shipped library portable across x86_64 CPUs
-# that do not expose the builder's ISA extensions, such as AVX-512.
+# Pinning cpu=baseline keeps the shipped library portable across CPUs that
+# lack the builder's ISA extensions, such as AVX-512 or SVE.
 echo "Building libghostty (ReleaseFast, cpu=baseline)..."
 "$ROOT_DIR/scripts/build-ghostty.sh"
 build_ghostty_resources

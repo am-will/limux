@@ -4,7 +4,7 @@ pkgname=limux-bin
 pkgver=@@VERSION@@
 pkgrel=1
 pkgdesc="GPU-accelerated terminal workspace manager for Linux, powered by Ghostty's rendering engine (cmux port)"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://github.com/am-will/limux"
 license=('MIT')
 depends=('fontconfig' 'glib2' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'pango' 'webkitgtk-6.0')
@@ -12,11 +12,14 @@ optdepends=('wl-clipboard: Ctrl+V paste in shells & CLI tools on Wayland')
 provides=('limux')
 conflicts=('limux' 'limux-debug')
 options=(!debug !strip)
-source=("limux-${pkgver}.tar.gz::https://github.com/am-will/limux/releases/download/v${pkgver}/limux-${pkgver}-linux-x86_64.tar.gz")
-sha256sums=('@@SHA256@@')
+_release_url="https://github.com/am-will/limux/releases/download/v${pkgver}"
+source_x86_64=("limux-${pkgver}-x86_64.tar.gz::${_release_url}/limux-${pkgver}-linux-x86_64.tar.gz")
+source_aarch64=("limux-${pkgver}-aarch64.tar.gz::${_release_url}/limux-${pkgver}-linux-aarch64.tar.gz")
+sha256sums_x86_64=('@@SHA256_X86_64@@')
+sha256sums_aarch64=('@@SHA256_AARCH64@@')
 
 package() {
-    cd "limux-${pkgver}-linux-x86_64"
+    cd "limux-${pkgver}-linux-${CARCH}"
 
     install -Dm755 limux "${pkgdir}/usr/bin/limux"
     install -Dm755 libexec/limux/limux-host "${pkgdir}/usr/libexec/limux/limux-host"

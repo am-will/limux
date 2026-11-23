@@ -30,8 +30,9 @@ GitHub release triggers Linux package, RPM, and AUR automation.
 4. Wait for `Build Linux Release Packages` and `Build RPM Package`. A
    successful tagged Linux build triggers `Publish to AUR`.
 
-5. Verify release contains tarball, Debian package, AppImage, and RPM. Confirm
-   AUR `limux-bin` reports matching version.
+5. Verify release contains tarball, Debian package, AppImage, and RPM for both
+   x86_64 and aarch64 (Debian `amd64` and `arm64`). Confirm AUR `limux-bin`
+   reports matching version for both architectures.
 
 ## Verify packaged runtime
 

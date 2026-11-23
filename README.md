@@ -21,16 +21,18 @@ https://github.com/user-attachments/assets/6f3047c2-e2b6-49f2-b536-570a1570d0f8
 ## Install
 
 Download the latest release from [GitHub Releases](https://github.com/am-will/limux/releases).
+Each release includes x86_64 and ARM64 builds. ARM64 files are named `aarch64`, except the `.deb`, which uses `arm64`.
 
 **Debian/Ubuntu (.deb)** — recommended:
 ```bash
-sudo dpkg -i ./limux_*_amd64.deb
+sudo dpkg -i ./limux_*_amd64.deb   # x86_64
+sudo dpkg -i ./limux_*_arm64.deb   # aarch64
 ```
 
 **AppImage** — portable across Ubuntu 24.04-era desktops and newer, with no
 Limux installation needed:
 ```bash
-chmod +x Limux-*-x86_64.AppImage
+chmod +x Limux-*-x86_64.AppImage   # or Limux-*-aarch64.AppImage
 ./Limux-*-x86_64.AppImage
 ```
 
@@ -62,7 +64,7 @@ host tools such as Flatpak do not load AppImage-private libraries first.
 
 **Tarball** — manual install:
 ```bash
-tar xzf limux-*-linux-x86_64.tar.gz
+tar xzf limux-*-linux-x86_64.tar.gz   # or limux-*-linux-aarch64.tar.gz
 cd limux-*-linux-x86_64
 sudo ./install.sh
 ```
@@ -83,7 +85,7 @@ yay -S limux-bin
 yay -S limux
 ```
 
-Both [`limux-bin`](https://aur.archlinux.org/packages/limux-bin) and the source-built [`limux`](https://aur.archlinux.org/packages/limux) package are published from this repository. Thanks to [Anton Barchukov](https://github.com/antonbarchukov) for creating the original Arch packaging in [PR #50](https://github.com/am-will/limux/pull/50).
+Both [`limux-bin`](https://aur.archlinux.org/packages/limux-bin) and the source-built [`limux`](https://aur.archlinux.org/packages/limux) package are published from this repository for `x86_64` and `aarch64` (Arch Linux ARM). Thanks to [Anton Barchukov](https://github.com/antonbarchukov) for creating the original Arch packaging in [PR #50](https://github.com/am-will/limux/pull/50).
 
 To uninstall:
 ```bash
@@ -217,8 +219,8 @@ notification is read. In **Settings > General**, turn off **Tab activity indicat
 or adjust **Tab activity timeout** from 1 to 60 seconds. Cursor blinking and
 scrolling alone do not count as output.
 
-Limux ships first-class hooks for coding agents (Codex, Claude Code, and
-Gemini CLI). Every terminal limux spawns auto-exports
+Limux ships first-class hooks for coding agents (Codex, Claude Code,
+Gemini CLI, and Antigravity (`agy`)). Every terminal limux spawns auto-exports
 `LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /
 `LIMUX_TAB_ID` / `LIMUX_SOCKET`, so the CLI auto-targets the right place
 with no flags needed from inside the agent's own terminal.
@@ -227,16 +229,19 @@ with no flags needed from inside the agent's own terminal.
 # Fire a libadwaita toast + tab/workspace unread badges from any agent
 limux notify --subtitle "needs review" --body "blocked on auth choice" "Input needed"
 
-# Install Limux session-restore hooks for supported agents
+# Install Limux session-restore and notification hooks for supported agents
 limux hooks setup
+# Or configure a single agent (codex, claude, gemini, agy, opencode):
+limux hooks setup agy
 
 # Drop-in hook handlers translate hook JSON on stdin into notify/session state
 echo '{"event":"stop"}' | limux claude-hook --event stop
 echo '{"event":"finished"}' | limux gemini-hook --event finished
+echo '{"conversationId":"conv-1","terminationReason":"NO_TOOL_CALL","fullyIdle":true}' | limux agy-hook --event stop
 
-# Spin up a multi-agent collaboration team — one workspace per agent,
-# launches each agent's CLI, and writes AGENTS.md describing the
-# <agent-msg> XML protocol so peers can talk to each other:
+# Spin up a multi-agent collaboration team (supports codex, claude, opencode,
+# gemini, agy) that launches each agent's CLI and writes AGENTS.md describing
+# the <agent-msg> XML protocol so peers can talk to each other:
 limux agent-team --agents codex,claude --cwd "$PWD"
 # → Codex and Claude can now do:
 #   limux send --workspace claude $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
@@ -267,9 +272,9 @@ before running it again, then merge any project policies you want to keep.
 without writing files or contacting the host.
 
 Checked-in hook templates live in [`hooks/`](hooks/). They mirror
-`limux hooks setup` for Codex, Claude Code, and Gemini CLI; OpenCode is
-omitted from default `limux hooks setup` and can be installed explicitly with
-`limux hooks setup opencode`.
+`limux hooks setup` for Codex, Claude Code, Gemini CLI, and Antigravity
+(`agy`); OpenCode is omitted from default `limux hooks setup` and can be
+installed explicitly with `limux hooks setup opencode`.
 
 Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
 and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build

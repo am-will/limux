@@ -220,6 +220,7 @@ fn pane_create_response_payload(
     })
 }
 
+#[cfg(test)]
 fn tail_lines(text: &str, max_lines: usize) -> String {
     if max_lines == 0 || text.is_empty() {
         return String::new();
@@ -6515,15 +6516,11 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let Some(raw_text) = handle.read_text(scrollback) else {
+            let Some(text) = handle.read_text_tail(scrollback, lines) else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
                     "surface.read_text failed",
                 )));
                 return;
-            };
-            let text = match lines {
-                Some(limit) => tail_lines(&raw_text, limit),
-                None => raw_text,
             };
             if let Some(map) = payload.as_object_mut() {
                 map.insert("text".to_string(), serde_json::Value::String(text));
@@ -7555,13 +7552,26 @@ fn connect_ssh_target(
 }
 
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
-    add_workspace_with_initial_command(state, workspace, None);
+    add_workspace_with_initial_command_mode(state, workspace, None, true);
+}
+
+fn add_restored_workspace_from_state(state: &State, workspace: &WorkspaceState) {
+    add_workspace_with_initial_command_mode(state, workspace, None, false);
 }
 
 fn add_workspace_with_initial_command(
     state: &State,
     workspace: &WorkspaceState,
     initial_command: Option<String>,
+) {
+    add_workspace_with_initial_command_mode(state, workspace, initial_command, true);
+}
+
+fn add_workspace_with_initial_command_mode(
+    state: &State,
+    workspace: &WorkspaceState,
+    initial_command: Option<String>,
+    activate: bool,
 ) {
     let shortcuts = {
         let s = state.borrow();
@@ -7695,28 +7705,34 @@ fn add_workspace_with_initial_command(
 
     {
         let mut s = state.borrow_mut();
-        if let Some(prev_id) = s
-            .workspaces
-            .get(s.active_idx)
-            .map(|existing| existing.id.clone())
-            .filter(|prev| prev != &ws.id)
-        {
-            s.last_workspace_id = Some(prev_id);
+        if activate {
+            if let Some(prev_id) = s
+                .workspaces
+                .get(s.active_idx)
+                .map(|existing| existing.id.clone())
+                .filter(|prev| prev != &ws.id)
+            {
+                s.last_workspace_id = Some(prev_id);
+            }
         }
         s.sidebar.push_workspace(ws.id.clone(), workspace.favorite);
         s.workspaces.push(ws);
-        s.active_idx = s.workspaces.len() - 1;
-        sync_indicator_active_state(&s);
+        if activate {
+            s.active_idx = s.workspaces.len() - 1;
+            sync_indicator_active_state(&s);
+        }
     }
 
-    stack.set_visible_child_name(&stack_name);
-    select_sidebar_row_silently(state, &sidebar_list, &row);
-    // The new workspace is already active, so the selection does not switch
-    // and a collapsed group still shows the one left behind.
-    sidebar_groups::sync_row_visibility(state);
-    // Ensure the new pill's visibility honors the show_workspace_indicators
-    // preference, and that pane/sidebar placement is up to date.
-    apply_top_bar_mode(state);
+    if activate {
+        stack.set_visible_child_name(&stack_name);
+        select_sidebar_row_silently(state, &sidebar_list, &row);
+        // The new workspace is already active, so the selection does not switch
+        // and a collapsed group still shows the one left behind.
+        sidebar_groups::sync_row_visibility(state);
+        // Ensure the new pill's visibility honors the show_workspace_indicators
+        // preference, and that pane/sidebar placement is up to date.
+        apply_top_bar_mode(state);
+    }
 }
 
 /// Create a PaneWidget wired up with callbacks for a specific workspace.

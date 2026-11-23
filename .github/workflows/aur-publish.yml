@@ -12,7 +12,9 @@ on:
       - PKGBUILD.template
       - ghostty
       - rust/**
+      - scripts/render-aur-bin-pkgbuild.sh
       - scripts/render-aur-source-pkgbuild.sh
+      - scripts/tests/test-aur-bin-package.sh
       - scripts/tests/test-aur-source-package.sh
   workflow_run:
     workflows: ["Build Linux Release Packages"]
@@ -116,17 +118,23 @@ jobs:
             "$ghostty_commit"
 
           if [ "$publish" = true ]; then
-            tarball_url="https://github.com/am-will/limux/releases/download/v${version}/limux-${version}-linux-x86_64.tar.gz"
-            curl --fail --location --retry 5 --retry-delay 10 \
-              "$tarball_url" -o /tmp/limux.tar.gz
-            tar -tzf /tmp/limux.tar.gz > /tmp/limux-tarball-files.txt
-            grep -Fxq "limux-${version}-linux-x86_64/limux" /tmp/limux-tarball-files.txt
-            grep -Fxq "limux-${version}-linux-x86_64/libexec/limux/limux-host" /tmp/limux-tarball-files.txt
-            sha256=$(sha256sum /tmp/limux.tar.gz | awk '{print $1}')
-            sed \
-              -e "s/@@VERSION@@/$version/g" \
-              -e "s/@@SHA256@@/$sha256/g" \
-              PKGBUILD.template > /tmp/aur-pkgbuilds/PKGBUILD-bin
+            declare -A tarball_sha256
+            for arch in x86_64 aarch64; do
+              tarball="/tmp/limux-${arch}.tar.gz"
+              tarball_url="https://github.com/am-will/limux/releases/download/v${version}/limux-${version}-linux-${arch}.tar.gz"
+              curl --fail --location --retry 5 --retry-delay 10 \
+                "$tarball_url" -o "$tarball"
+              tar -tzf "$tarball" > "/tmp/limux-${arch}-tarball-files.txt"
+              grep -Fxq "limux-${version}-linux-${arch}/limux" "/tmp/limux-${arch}-tarball-files.txt"
+              grep -Fxq "limux-${version}-linux-${arch}/libexec/limux/limux-host" "/tmp/limux-${arch}-tarball-files.txt"
+              tarball_sha256[$arch]=$(sha256sum "$tarball" | awk '{print $1}')
+            done
+            ./scripts/render-aur-bin-pkgbuild.sh \
+              PKGBUILD.template \
+              /tmp/aur-pkgbuilds/PKGBUILD-bin \
+              "$version" \
+              "${tarball_sha256[x86_64]}" \
+              "${tarball_sha256[aarch64]}"
           fi
 
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
