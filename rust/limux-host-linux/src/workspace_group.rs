@@ -5,7 +5,7 @@
 //! sidebar, and a group's favorites come first among its members. This module owns that order and its rules; the GTK rows only
 //! mirror it, and `AppState::workspaces` follows `workspace_order`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::layout_state::WorkspaceGroupState;
 use crate::workspace_color::WorkspaceColor;
@@ -305,6 +305,38 @@ impl SidebarLayout {
             Item::Workspace { id, favorite } => *favorite && id == workspace_id,
             Item::Group(group) => group.is_pinned(workspace_id),
         })
+    }
+
+    pub fn favorite_ids(&self) -> HashSet<&str> {
+        let mut favorites = HashSet::new();
+        for item in &self.items {
+            match item {
+                Item::Workspace { id, favorite: true } => {
+                    favorites.insert(id.as_str());
+                }
+                Item::Workspace {
+                    favorite: false, ..
+                } => {}
+                Item::Group(group) => {
+                    for id in &group.members[..group.pinned] {
+                        favorites.insert(id.as_str());
+                    }
+                }
+            }
+        }
+        favorites
+    }
+
+    pub fn workspace_group_ids(&self) -> HashMap<&str, &str> {
+        let mut groups = HashMap::new();
+        for item in &self.items {
+            if let Item::Group(group) = item {
+                for member in &group.members {
+                    groups.insert(member.as_str(), group.id.as_str());
+                }
+            }
+        }
+        groups
     }
 
     /// Pin or unpin a workspace. It stays in its group, if any, and lands at
@@ -1044,5 +1076,28 @@ mod tests {
             layout.create_group(None, None, &[]).unwrap();
         }
         assert_eq!(layout.next_group_color(), WorkspaceColor::ALL[0]);
+    }
+
+    #[test]
+    fn bulk_favorite_and_group_maps_match_point_queries() {
+        let groups = [saved_group("g1", 0), saved_group("empty", 1)];
+        let layout = SidebarLayout::from_saved(
+            [
+                ("top_fav".to_string(), true, None),
+                ("top_plain".to_string(), false, None),
+                ("grp_fav".to_string(), true, Some("g1")),
+                ("grp_plain".to_string(), false, Some("g1")),
+            ],
+            &groups,
+        );
+        let favorites = layout.favorite_ids();
+        let group_ids = layout.workspace_group_ids();
+        for id in ["top_fav", "top_plain", "grp_fav", "grp_plain", "unknown"] {
+            assert_eq!(favorites.contains(id), layout.is_favorite(id));
+            assert_eq!(
+                group_ids.get(id).copied(),
+                layout.group_of(id).map(|g| g.id.as_str())
+            );
+        }
     }
 }

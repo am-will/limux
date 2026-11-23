@@ -22,8 +22,17 @@ pub(super) struct GroupHeader {
     count_label: gtk::Label,
 }
 
-fn group_color_class(color: WorkspaceColor) -> String {
-    format!("limux-ws-group-{}", color.as_str())
+fn group_color_class(color: WorkspaceColor) -> &'static str {
+    match color {
+        WorkspaceColor::Red => "limux-ws-group-red",
+        WorkspaceColor::Orange => "limux-ws-group-orange",
+        WorkspaceColor::Amber => "limux-ws-group-amber",
+        WorkspaceColor::Green => "limux-ws-group-green",
+        WorkspaceColor::Teal => "limux-ws-group-teal",
+        WorkspaceColor::Blue => "limux-ws-group-blue",
+        WorkspaceColor::Purple => "limux-ws-group-purple",
+        WorkspaceColor::Pink => "limux-ws-group-pink",
+    }
 }
 
 /// CSS for group headers and the stripe on their members, from the palette.
@@ -127,21 +136,37 @@ fn build_group_header(state: &State, group_id: &str) -> GroupHeader {
 }
 
 fn update_group_header(header: &GroupHeader, group: &WorkspaceGroup) {
-    header.chevron.set_label(if group.collapsed {
+    let chevron = if group.collapsed {
         "\u{25B8}"
     } else {
         "\u{25BE}"
-    });
-    header.name_label.set_label(&group.name);
-    for color in WorkspaceColor::ALL {
-        header.pill.remove_css_class(&group_color_class(color));
+    };
+    if header.chevron.label().as_str() != chevron {
+        header.chevron.set_label(chevron);
     }
-    header.pill.add_css_class(&group_color_class(group.color));
+    if header.name_label.label().as_str() != group.name {
+        header.name_label.set_label(&group.name);
+    }
+    let active_class = group_color_class(group.color);
+    for color in WorkspaceColor::ALL {
+        let class = group_color_class(color);
+        if class == active_class {
+            if !header.pill.has_css_class(class) {
+                header.pill.add_css_class(class);
+            }
+        } else if header.pill.has_css_class(class) {
+            header.pill.remove_css_class(class);
+        }
+    }
     let count = group.members().len();
-    header.count_label.set_label(&count.to_string());
-    header
-        .count_label
-        .set_visible(group.collapsed || count == 0);
+    let count_text = count.to_string();
+    if header.count_label.label().as_str() != count_text {
+        header.count_label.set_label(&count_text);
+    }
+    let show_count = group.collapsed || count == 0;
+    if header.count_label.get_visible() != show_count {
+        header.count_label.set_visible(show_count);
+    }
     let state = if group.collapsed {
         "collapsed"
     } else {
@@ -152,22 +177,31 @@ fn update_group_header(header: &GroupHeader, group: &WorkspaceGroup) {
         group.name,
         if count == 1 { "" } else { "s" }
     );
-    header.row.set_tooltip_text(Some(&summary));
-    header
-        .row
-        .update_property(&[gtk::accessible::Property::Label(&summary)]);
+    if header.row.tooltip_text().as_deref() != Some(summary.as_str()) {
+        header.row.set_tooltip_text(Some(&summary));
+        header
+            .row
+            .update_property(&[gtk::accessible::Property::Label(&summary)]);
+    }
 }
 
 fn set_member_style(row: &gtk::ListBoxRow, color: Option<WorkspaceColor>) {
+    let active_class = color.map(group_color_class);
     for candidate in WorkspaceColor::ALL {
-        row.remove_css_class(&group_color_class(candidate));
-    }
-    match color {
-        Some(color) => {
-            row.add_css_class(MEMBER_CSS_CLASS);
-            row.add_css_class(&group_color_class(color));
+        let class = group_color_class(candidate);
+        if active_class == Some(class) {
+            if !row.has_css_class(class) {
+                row.add_css_class(class);
+            }
+        } else if row.has_css_class(class) {
+            row.remove_css_class(class);
         }
-        None => row.remove_css_class(MEMBER_CSS_CLASS),
+    }
+    let has_member = row.has_css_class(MEMBER_CSS_CLASS);
+    match color {
+        Some(_) if !has_member => row.add_css_class(MEMBER_CSS_CLASS),
+        None if has_member => row.remove_css_class(MEMBER_CSS_CLASS),
+        _ => {}
     }
 }
 
@@ -178,12 +212,18 @@ pub(super) fn sync_sidebar(state: &State) {
     let (sidebar_list, indicator_box, rows, indicators, row_to_select) = {
         let mut guard = state.borrow_mut();
         let s = &mut *guard;
-        let order = s.sidebar.workspace_order();
+        let order_index: HashMap<String, usize> = s
+            .sidebar
+            .workspace_order()
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
         let active_id = s.active_workspace().map(|workspace| workspace.id.clone());
         s.workspaces.sort_by_key(|workspace| {
-            order
-                .iter()
-                .position(|id| *id == workspace.id)
+            order_index
+                .get(&workspace.id)
+                .copied()
                 .unwrap_or(usize::MAX)
         });
         if let Some(index) = active_id.as_ref().and_then(|id| {
@@ -205,16 +245,24 @@ pub(super) fn sync_sidebar(state: &State) {
             update_group_header(header, group);
         }
 
+        let ws_by_id: HashMap<&str, usize> = s
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| (workspace.id.as_str(), index))
+            .collect();
+        let favorites = sidebar.favorite_ids();
         let mut rows = Vec::new();
         for row in sidebar.rows() {
             let widget = match row {
                 SidebarRow::GroupHeader(group) => s.group_headers[&group.id].row.clone(),
                 SidebarRow::Workspace { id, group } => {
-                    let Some(workspace) = s.workspaces.iter().find(|w| w.id == id) else {
+                    let Some(&index) = ws_by_id.get(id) else {
                         continue;
                     };
+                    let workspace = &s.workspaces[index];
                     set_member_style(&workspace.sidebar_row, group.map(|group| group.color));
-                    set_workspace_favorite_visual(workspace, sidebar.is_favorite(id));
+                    set_workspace_favorite_visual(workspace, favorites.contains(id));
                     workspace.sidebar_row.clone()
                 }
             };
@@ -257,7 +305,7 @@ pub(super) fn sync_sidebar(state: &State) {
     );
 
     if let Some(row) = row_to_select {
-        sidebar_list.select_row(Some(&row));
+        select_sidebar_row_silently(state, &sidebar_list, &row);
     }
 }
 
@@ -295,15 +343,23 @@ pub(super) fn sync_row_visibility(state: &State) {
     let rows: Vec<(gtk::ListBoxRow, bool)> = {
         let s = state.borrow();
         let active = s.active_workspace().map(|workspace| workspace.id.as_str());
+        let ws_by_id: HashMap<&str, usize> = s
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| (workspace.id.as_str(), index))
+            .collect();
         s.sidebar
             .rows()
             .into_iter()
             .filter_map(|row| match row {
-                SidebarRow::Workspace { id, .. } => s
-                    .workspaces
-                    .iter()
-                    .find(|w| w.id == id)
-                    .map(|workspace| (workspace.sidebar_row.clone(), row.visible(active))),
+                SidebarRow::Workspace { id, .. } => {
+                    let &index = ws_by_id.get(id)?;
+                    let workspace = &s.workspaces[index];
+                    let visible = row.visible(active);
+                    (workspace.sidebar_row.get_visible() != visible)
+                        .then(|| (workspace.sidebar_row.clone(), visible))
+                }
                 SidebarRow::GroupHeader(_) => None,
             })
             .collect()
@@ -315,7 +371,9 @@ pub(super) fn sync_row_visibility(state: &State) {
 /// focus-leave handlers synchronously.
 fn set_rows_visible(rows: &[(gtk::ListBoxRow, bool)]) {
     for (row, visible) in rows {
-        row.set_visible(*visible);
+        if row.get_visible() != *visible {
+            row.set_visible(*visible);
+        }
     }
 }
 
