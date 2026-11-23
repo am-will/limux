@@ -458,20 +458,31 @@ pub(super) fn install_tab_strip_drop_target(
     tab_overlay.add_controller(drop_target);
 }
 
+pub(super) fn set_browser_widget_targeting_enabled(widget: &gtk::Widget, enabled: bool) {
+    let browser_box = if widget.has_css_class("limux-browser") {
+        Some(widget.clone())
+    } else {
+        widget
+            .first_child()
+            .filter(|child| child.has_css_class("limux-browser"))
+    };
+    let Some(browser_box) = browser_box else {
+        return;
+    };
+    let webview = browser_box
+        .first_child()
+        .and_then(|child| child.next_sibling())
+        .and_then(|child| child.next_sibling());
+    if let Some(webview) = webview {
+        webview.set_can_target(enabled);
+    }
+}
+
 pub(super) fn set_browser_targeting_enabled(content_stack: &gtk::Stack, enabled: bool) {
     let mut child = content_stack.first_child();
     while let Some(widget) = child {
         child = widget.next_sibling();
-        if !widget.has_css_class("limux-browser") {
-            continue;
-        }
-        let webview = widget
-            .first_child()
-            .and_then(|child| child.next_sibling())
-            .and_then(|child| child.next_sibling());
-        if let Some(webview) = webview {
-            webview.set_can_target(enabled);
-        }
+        set_browser_widget_targeting_enabled(&widget, enabled);
     }
 }
 
