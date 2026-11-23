@@ -291,14 +291,14 @@ pub(super) fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     if restored_any {
         layout_state::attach_restorable_agents_to_session(&mut loaded.state, &restorable_agents);
         for workspace in &loaded.state.workspaces {
-            add_workspace_from_state(state, workspace);
+            add_restored_workspace_from_state(state, workspace);
         }
     } else {
         let workspace = initial_workspace_state(
             dirs::home_dir().as_deref(),
             std::env::current_dir().ok().as_deref(),
         );
-        add_workspace_from_state(state, &workspace);
+        add_restored_workspace_from_state(state, &workspace);
     }
     // Empty groups survive even when startup has to create a fallback workspace.
     // Restoring them can repair the order, so track the active workspace by id.
@@ -332,23 +332,33 @@ pub(super) fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
 }
 
 pub(super) fn restore_active_workspace(state: &State, index: usize) {
-    let maybe_row = {
-        let s = state.borrow();
+    let target = {
+        let mut s = state.borrow_mut();
         if s.workspaces.is_empty() {
             None
         } else {
             let clamped = index.min(s.workspaces.len() - 1);
+            s.active_idx = clamped;
+            sync_indicator_active_state(&s);
+            let stack_name = format!("ws-{}", s.workspaces[clamped].id);
             Some((
-                clamped,
+                s.stack.clone(),
+                stack_name,
+                s.workspaces[clamped].root.clone(),
                 s.workspaces[clamped].sidebar_row.clone(),
                 s.sidebar_list.clone(),
             ))
         }
     };
 
-    if let Some((index, row, sidebar_list)) = maybe_row {
-        switch_workspace(state, index);
+    if let Some((stack, stack_name, focus_root, row, sidebar_list)) = target {
+        stack.set_visible_child_name(&stack_name);
         select_sidebar_row_silently(state, &sidebar_list, &row);
+        sidebar_groups::sync_row_visibility(state);
+        glib::idle_add_local_once(move || {
+            focus_workspace_entrypoint(&focus_root);
+        });
+        apply_top_bar_mode(state);
     }
 }
 

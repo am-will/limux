@@ -88,6 +88,7 @@ impl Fixture {
                 agent: None,
                 ssh: Some(connection),
             }),
+            true,
         );
         let id = self.panes[pane]
             .tab_state
@@ -117,6 +118,7 @@ impl Fixture {
                 agent: None,
                 ssh: None,
             }),
+            true,
         );
         let id = self.panes[pane]
             .tab_state

@@ -88,18 +88,34 @@ pub(super) fn effective_drop_target_dimensions(
 }
 
 pub(super) fn clear_content_drop_zone(overlay: &gtk::Box) {
-    overlay.remove_css_class("limux-drop-preview");
-    overlay.remove_css_class("limux-drop-preview-center");
-    overlay.set_size_request(-1, -1);
-    overlay.set_margin_start(0);
-    overlay.set_margin_top(0);
+    if overlay.has_css_class("limux-drop-preview") {
+        overlay.remove_css_class("limux-drop-preview");
+    }
+    if overlay.has_css_class("limux-drop-preview-center") {
+        overlay.remove_css_class("limux-drop-preview-center");
+    }
+    if overlay.size_request() != (-1, -1) {
+        overlay.set_size_request(-1, -1);
+    }
+    if overlay.margin_start() != 0 {
+        overlay.set_margin_start(0);
+    }
+    if overlay.margin_top() != 0 {
+        overlay.set_margin_top(0);
+    }
 }
 
 pub(super) fn highlight_content_drop_zone(overlay: &gtk::Box, zone: ContentDropZone) {
-    clear_content_drop_zone(overlay);
-    overlay.add_css_class("limux-drop-preview");
-    if zone == ContentDropZone::Center {
-        overlay.add_css_class("limux-drop-preview-center");
+    if !overlay.has_css_class("limux-drop-preview") {
+        overlay.add_css_class("limux-drop-preview");
+    }
+    let is_center = zone == ContentDropZone::Center;
+    if is_center {
+        if !overlay.has_css_class("limux-drop-preview-center") {
+            overlay.add_css_class("limux-drop-preview-center");
+        }
+    } else if overlay.has_css_class("limux-drop-preview-center") {
+        overlay.remove_css_class("limux-drop-preview-center");
     }
     let (x_frac, y_frac, width_frac, height_frac) = content_drop_preview_rect(zone);
     let total_width = overlay
@@ -112,12 +128,19 @@ pub(super) fn highlight_content_drop_zone(overlay: &gtk::Box, zone: ContentDropZ
         .map(|parent| parent.allocation().height())
         .unwrap_or_else(|| overlay.height())
         .max(1);
-    overlay.set_margin_start((total_width as f64 * x_frac).round() as i32);
-    overlay.set_margin_top((total_height as f64 * y_frac).round() as i32);
-    overlay.set_size_request(
-        (total_width as f64 * width_frac).round() as i32,
-        (total_height as f64 * height_frac).round() as i32,
-    );
+    let margin_start = (total_width as f64 * x_frac).round() as i32;
+    let margin_top = (total_height as f64 * y_frac).round() as i32;
+    let req_width = (total_width as f64 * width_frac).round() as i32;
+    let req_height = (total_height as f64 * height_frac).round() as i32;
+    if overlay.margin_start() != margin_start {
+        overlay.set_margin_start(margin_start);
+    }
+    if overlay.margin_top() != margin_top {
+        overlay.set_margin_top(margin_top);
+    }
+    if overlay.size_request() != (req_width, req_height) {
+        overlay.set_size_request(req_width, req_height);
+    }
 }
 
 pub(super) fn position_indicator(tab_state: &Rc<RefCell<TabState>>, indicator: &gtk::Box, x: f64) {
@@ -126,7 +149,9 @@ pub(super) fn position_indicator(tab_state: &Rc<RefCell<TabState>>, indicator: &
     };
     let tab_state = tab_state.borrow();
     if tab_state.tabs.is_empty() {
-        indicator.set_visible(false);
+        if indicator.get_visible() {
+            indicator.set_visible(false);
+        }
         return;
     }
 
@@ -144,8 +169,13 @@ pub(super) fn position_indicator(tab_state: &Rc<RefCell<TabState>>, indicator: &
         }
         position = right;
     }
-    indicator.set_margin_start(position.clamp(0.0, viewport.width().max(0) as f64) as i32);
-    indicator.set_visible(true);
+    let margin = position.clamp(0.0, viewport.width().max(0) as f64) as i32;
+    if indicator.margin_start() != margin {
+        indicator.set_margin_start(margin);
+    }
+    if !indicator.get_visible() {
+        indicator.set_visible(true);
+    }
 }
 
 pub(super) fn insert_index_for_drop(

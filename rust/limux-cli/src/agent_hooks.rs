@@ -107,6 +107,7 @@ impl AgentHookSessionStore {
         let _lock = self.lock()?;
         let mut file = self.load()?;
         let record = update(file.sessions.get(&session_id));
+        let ended_before = file.ended_sessions.len();
         file.ended_sessions.retain(|ended| {
             ended.session_id != session_id
                 || tab_identity(&ended.surface_id) != tab_identity(&record.surface_id)
@@ -114,6 +115,13 @@ impl AgentHookSessionStore {
         prune_ended_sessions(&mut file.ended_sessions, now_seconds(), || {
             SessionReferences::load(&self.session_dir)
         });
+        let ended_changed = file.ended_sessions.len() != ended_before;
+        if !ended_changed
+            && file.version == 1
+            && record_unchanged_and_newest(&file.sessions, &session_id, &record)
+        {
+            return Ok(());
+        }
         file.version = 1;
         file.sessions.insert(session_id, record);
         self.save(&file)
@@ -500,6 +508,42 @@ fn safe_store_name(agent: &str) -> String {
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
         .collect::<String>()
+}
+
+fn record_unchanged_and_newest(
+    sessions: &BTreeMap<String, AgentHookSessionRecord>,
+    session_id: &str,
+    next: &AgentHookSessionRecord,
+) -> bool {
+    let Some(existing) = sessions.get(session_id) else {
+        return false;
+    };
+    let same_launch_command = match (&existing.launch_command, &next.launch_command) {
+        (Some(a), Some(b)) => {
+            a.executable == b.executable
+                && a.arguments == b.arguments
+                && a.cwd == b.cwd
+                && a.environment == b.environment
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if existing.session_id != next.session_id
+        || existing.workspace_id != next.workspace_id
+        || existing.surface_id != next.surface_id
+        || existing.cwd != next.cwd
+        || existing.pid != next.pid
+        || !same_launch_command
+    {
+        return false;
+    }
+    let target_tab = tab_identity(&existing.surface_id);
+    !sessions.iter().any(|(other_id, other)| {
+        other_id != session_id
+            && (other.surface_id == existing.surface_id
+                || tab_identity(&other.surface_id) == target_tab)
+            && other.updated_at >= existing.updated_at
+    })
 }
 
 fn normalized(value: &str) -> Option<String> {
@@ -1102,5 +1146,43 @@ mod tests {
             command,
             "cd '/tmp/project one' && 'codex' 'resume' '--model' 'gpt-5.5' '--config' 'profile=work' 'sess-123'"
         );
+    }
+
+    #[test]
+    fn update_skips_rewriting_unchanged_newest_record_and_rewrites_when_superseded() {
+        let dir = tempdir().expect("tempdir");
+        let store = AgentHookSessionStore::new_for_dir("claude", dir.path());
+
+        let mut initial = test_record("sess-a");
+        initial.surface_id = "1:tab-shared".to_string();
+        initial.updated_at = 100.0;
+        store
+            .update("sess-a", |_| initial.clone())
+            .expect("initial save");
+        let first_bytes = fs::read(&store.path).expect("read initial state");
+
+        // Same binding with a newer timestamp does not rewrite the file on disk.
+        let mut repeat = initial.clone();
+        repeat.updated_at = 200.0;
+        store.update("sess-a", |_| repeat).expect("noop update");
+        let after_noop = fs::read(&store.path).expect("read after noop");
+        assert_eq!(after_noop, first_bytes);
+
+        // Once another session on the same surface is newer, updating sess-a
+        // again must persist its newer updated_at so restore picks sess-a.
+        let mut competing = test_record("sess-b");
+        competing.surface_id = "1:tab-shared".to_string();
+        competing.updated_at = 150.0;
+        store
+            .update("sess-b", |_| competing)
+            .expect("competing save");
+
+        let mut promoted = initial.clone();
+        promoted.updated_at = 300.0;
+        store
+            .update("sess-a", |_| promoted)
+            .expect("promote sess-a");
+        let persisted = store.lookup("sess-a").expect("lookup").expect("record");
+        assert_eq!(persisted.updated_at, 300.0);
     }
 }
