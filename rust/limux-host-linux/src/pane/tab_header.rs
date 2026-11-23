@@ -94,6 +94,7 @@ pub(super) fn build_tab_button_from_label(
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
+            let was_active = tab_state.borrow().active_tab.as_deref() == Some(tab_id.as_str());
             activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
             if let Some(pane_widget) = pane_widget.upgrade() {
                 clear_tab_unread_if_visible(
@@ -103,7 +104,9 @@ pub(super) fn build_tab_button_from_label(
                     &callbacks,
                 );
             }
-            (callbacks.on_state_changed)();
+            if !was_active {
+                (callbacks.on_state_changed)();
+            }
             if n_press == 2 {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 let tab_strip = tab_strip.clone();
@@ -561,6 +564,7 @@ pub(super) fn show_rename_dialog(
     label.set_visible(false);
     // Insert entry before the close button
     parent.insert_child_after(&entry, Some(label));
+    crate::window::register_active_inline_rename(&entry);
     tab_state.borrow_mut().active_rename_tab = Some(tab_id.to_string());
     focus_tab_rename_entry(&entry);
 

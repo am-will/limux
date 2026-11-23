@@ -21,51 +21,109 @@ pub(super) struct FontCatalog {
     styles_by_family: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Clone, Debug)]
+struct CachedSystemFonts {
+    font_map: gtk::glib::WeakRef<gtk::pango::FontMap>,
+    serial: u32,
+    catalog: FontCatalog,
+}
+
+thread_local! {
+    static SYSTEM_FONT_CATALOG_CACHE: RefCell<Option<CachedSystemFonts>> =
+        const { RefCell::new(None) };
+}
+
 impl FontCatalog {
-    fn discover(host_widget: &impl IsA<gtk::Widget>, initial: &TerminalFontConfig) -> Self {
-        let mut by_lower: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
-        if let Some(font_map) = host_widget.pango_context().font_map() {
-            for family in font_map.list_families() {
-                let Some(name) = sanitize_font_token(family.name().as_str()) else {
-                    continue;
-                };
-                let face_names: Vec<String> = family
-                    .list_faces()
-                    .into_iter()
-                    .map(|face| face.face_name().to_string())
-                    .collect();
-                let styles = sort_face_styles(face_names);
-                let entry = by_lower
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| (name, Vec::new()));
-                entry.1 = sort_face_styles(entry.1.iter().cloned().chain(styles));
-            }
-        }
-
-        if let Some(configured_family) = initial.family.as_deref().and_then(sanitize_font_token) {
-            let extra_style: Vec<String> = initial
-                .style
-                .as_deref()
-                .and_then(sanitize_font_token)
-                .into_iter()
-                .collect();
-            let entry = by_lower
-                .entry(configured_family.to_ascii_lowercase())
-                .or_insert_with(|| (configured_family, Vec::new()));
-            entry.1 = sort_face_styles(entry.1.iter().cloned().chain(extra_style));
-        }
-
+    fn from_by_lower(by_lower: BTreeMap<String, (String, Vec<String>)>) -> Self {
         let mut families = Vec::with_capacity(by_lower.len());
         let mut styles_by_family = BTreeMap::new();
         for (_, (family, styles)) in by_lower {
             styles_by_family.insert(family.clone(), styles);
             families.push(family);
         }
-
         Self {
             families,
             styles_by_family,
         }
+    }
+
+    fn with_configured_font(mut self, initial: &TerminalFontConfig) -> Self {
+        let Some(configured_family) = initial.family.as_deref().and_then(sanitize_font_token)
+        else {
+            return self;
+        };
+        let extra_style = initial.style.as_deref().and_then(sanitize_font_token);
+
+        if let Some(existing_family) = self
+            .families
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(&configured_family))
+            .cloned()
+        {
+            if let Some(style) = extra_style {
+                let styles = self.styles_by_family.entry(existing_family).or_default();
+                if !styles.iter().any(|s| s.eq_ignore_ascii_case(&style)) {
+                    *styles =
+                        sort_face_styles(styles.iter().cloned().chain(std::iter::once(style)));
+                }
+            }
+            return self;
+        }
+
+        let styles = sort_face_styles(extra_style);
+        self.styles_by_family
+            .insert(configured_family.clone(), styles);
+        let insert_idx = self
+            .families
+            .iter()
+            .position(|existing| {
+                existing.to_ascii_lowercase() > configured_family.to_ascii_lowercase()
+            })
+            .unwrap_or(self.families.len());
+        self.families.insert(insert_idx, configured_family);
+        self
+    }
+
+    fn discover(host_widget: &impl IsA<gtk::Widget>, initial: &TerminalFontConfig) -> Self {
+        let catalog = if let Some(font_map) = host_widget.pango_context().font_map() {
+            let serial = font_map.serial();
+            SYSTEM_FONT_CATALOG_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if let Some(cached) = cache.as_ref().filter(|cached| {
+                    cached.serial == serial && cached.font_map.upgrade().as_ref() == Some(&font_map)
+                }) {
+                    return cached.catalog.clone();
+                }
+
+                let mut discovered: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+                for family in font_map.list_families() {
+                    let Some(name) = sanitize_font_token(family.name().as_str()) else {
+                        continue;
+                    };
+                    let face_names: Vec<String> = family
+                        .list_faces()
+                        .into_iter()
+                        .map(|face| face.face_name().to_string())
+                        .collect();
+                    let styles = sort_face_styles(face_names);
+                    let entry = discovered
+                        .entry(name.to_ascii_lowercase())
+                        .or_insert_with(|| (name, Vec::new()));
+                    entry.1 = sort_face_styles(entry.1.iter().cloned().chain(styles));
+                }
+                let catalog = Self::from_by_lower(discovered);
+                *cache = Some(CachedSystemFonts {
+                    font_map: font_map.downgrade(),
+                    serial,
+                    catalog: catalog.clone(),
+                });
+                catalog
+            })
+        } else {
+            Self::default()
+        };
+
+        catalog.with_configured_font(initial)
     }
 
     #[cfg(test)]
@@ -1058,5 +1116,37 @@ mod tests {
             assert!((comma_size_spin.value() - 14.0).abs() < 0.05);
             assert_eq!(comma_config.borrow().terminal_font.size, Some(14.0));
         }
+    }
+
+    #[test]
+    fn font_catalog_with_configured_font_merges_missing_family_and_style_in_order() {
+        let base = FontCatalog::from_entries(&[
+            ("Fira Code", &["Regular", "Bold"]),
+            ("Monospace", &["Regular"]),
+        ]);
+        let configured = base.clone().with_configured_font(&TerminalFontConfig {
+            family: Some("JetBrains Mono".to_string()),
+            style: Some("Medium".to_string()),
+            ..TerminalFontConfig::default()
+        });
+        assert_eq!(
+            configured.families,
+            vec!["Fira Code", "JetBrains Mono", "Monospace"]
+        );
+        assert_eq!(
+            configured.styles_for("JetBrains Mono"),
+            vec!["Medium".to_string()]
+        );
+
+        let with_extra_style = configured.with_configured_font(&TerminalFontConfig {
+            family: Some("fira code".to_string()),
+            style: Some("Light".to_string()),
+            ..TerminalFontConfig::default()
+        });
+        assert_eq!(with_extra_style.families.len(), 3);
+        assert!(with_extra_style
+            .styles_for("Fira Code")
+            .iter()
+            .any(|style| style == "Light"));
     }
 }

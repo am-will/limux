@@ -291,6 +291,10 @@ fn closed_tabs_panes_and_workspaces_free_their_widgets() {
         pane::find_tab_rename_entry(&closed).is_some(),
         "a rename is open"
     );
+    assert!(
+        active_inline_rename_entry_in(&closed).is_some(),
+        "tab rename entry should be indexed for O(1) lookup"
+    );
 
     let mut refs = weak_refs(&widget_tree(&closed));
     refs.push(toast);
@@ -301,6 +305,10 @@ fn closed_tabs_panes_and_workspaces_free_their_widgets() {
     remove_pane(&state, &ws_id, &closed);
     drop(closed);
     assert_freed("closed pane", &refs);
+    assert!(
+        active_inline_rename_entry_in(&state.borrow().window).is_none(),
+        "closing a pane with an open tab rename must clear the rename index"
+    );
     assert_focus_within("closed pane", &state, &first);
 
     // Two panes closed in one tick, as two shells exiting together: the
@@ -577,6 +585,10 @@ fn inline_rename_commit_returns_the_focus_to_the_workspace() {
     begin_workspace_inline_rename(&state, &ws_id);
     let sidebar_list = state.borrow().sidebar_list.clone();
     let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_eq!(
+        active_inline_rename_entry_in(&sidebar_list).as_ref(),
+        Some(&entry)
+    );
     assert_focus_within("rename started", &state, entry.upcast_ref());
 
     entry.set_text("renamed");
@@ -588,6 +600,7 @@ fn inline_rename_commit_returns_the_focus_to_the_workspace() {
         assert_eq!(ws.name, "renamed");
     }
     assert!(find_active_rename_entry(&sidebar_list).is_none());
+    assert!(active_inline_rename_entry_in(&sidebar_list).is_none());
 
     // A click on a terminal commits the rename on press (the window's
     // capture-phase `click_anywhere`), then the terminal takes the focus. The
@@ -831,6 +844,70 @@ fn tab_unread_changes_preserve_independent_workspace_notifications() {
         !notify_dot.get_visible(),
         "closing a tab-only notice clears it"
     );
+
+    let window = state.borrow().window.clone();
+    window.close();
+    pump_until(wait, || !window.is_visible());
+}
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn closing_inactive_workspace_preserves_active_manual_unread() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.InactiveCloseUnreadTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+
+    let _ = show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    pump_for(std::time::Duration::from_millis(200));
+    assert!(state.borrow().workspaces.len() >= 2);
+
+    let (inactive_id, active_id) = {
+        let s = state.borrow();
+        let active_idx = s.active_idx;
+        let inactive_idx = if active_idx == 0 { 1 } else { 0 };
+        (
+            s.workspaces[inactive_idx].id.clone(),
+            s.workspaces[active_idx].id.clone(),
+        )
+    };
+
+    // Mark the active workspace as manually unread.
+    {
+        let mut s = state.borrow_mut();
+        let ws = s.workspaces.iter_mut().find(|w| w.id == active_id).unwrap();
+        ws.manual_unread = true;
+    }
+    sync_workspace_unread(&state, &active_id);
+
+    // Closing an inactive workspace must NOT clear manual_unread on the active workspace.
+    close_workspace_by_id_internal(&state, &inactive_id, false, None);
+    pump_for(std::time::Duration::from_millis(100));
+    {
+        let s = state.borrow();
+        let ws = s.workspaces.iter().find(|w| w.id == active_id).unwrap();
+        assert!(
+            ws.manual_unread,
+            "closing an inactive workspace must preserve active manual_unread"
+        );
+        assert!(
+            ws.notify_dot.get_visible(),
+            "closing an inactive workspace must preserve the active unread indicator"
+        );
+    }
 
     let window = state.borrow().window.clone();
     window.close();
