@@ -429,6 +429,7 @@ for regression in \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
   window::pane_create_tests::terminal_commands_retry_until_ready_then_reply_without_a_timer \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
+  window::pane_close_tests::localized_split_and_remove_keep_sibling_gl_areas_realized \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
   window::pane_close_tests::closing_inactive_workspace_preserves_active_manual_unread \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \

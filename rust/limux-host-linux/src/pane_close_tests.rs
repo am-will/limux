@@ -913,3 +913,160 @@ fn closing_inactive_workspace_preserves_active_manual_unread() {
     window.close();
     pump_until(wait, || !window.is_visible());
 }
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn localized_split_and_remove_keep_sibling_gl_areas_realized() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.LocalizedSplitSurgeryTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+    state.borrow().window.set_default_size(1400, 900);
+
+    // Build a 4-pane workspace: ((A / B) | (C / D)).
+    let layout = LayoutNodeState::Split(SplitState {
+        orientation: SplitOrientation::Horizontal,
+        ratio: 0.5,
+        start: Box::new(LayoutNodeState::Split(SplitState {
+            orientation: SplitOrientation::Vertical,
+            ratio: 0.5,
+            start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+            end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        })),
+        end: Box::new(LayoutNodeState::Split(SplitState {
+            orientation: SplitOrientation::Vertical,
+            ratio: 0.5,
+            start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+            end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        })),
+    });
+    let (ws_id, _root) = show_focused_workspace(&state, layout);
+    let container = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|w| w.id == ws_id)
+            .unwrap()
+            .split_container
+            .clone()
+    };
+    let [pane_a, pane_b, pane_c, pane_d]: [gtk::Widget; 4] = container
+        .panes()
+        .try_into()
+        .expect("four panes in 2x2 split");
+    pump_until(wait, || {
+        [&pane_a, &pane_b, &pane_c, &pane_d]
+            .iter()
+            .all(|pane| shown(pane) && find_gl_area(pane).is_some_and(|gl| gl.is_realized()))
+    });
+    pump_for(std::time::Duration::from_millis(150));
+
+    let track_unrealize = |pane: &gtk::Widget| -> Rc<Cell<u32>> {
+        let count = Rc::new(Cell::new(0u32));
+        let count_cb = count.clone();
+        let gl = find_gl_area(pane).expect("terminal GLArea");
+        gl.connect_unrealize(move |_| {
+            count_cb.set(count_cb.get() + 1);
+        });
+        count
+    };
+    let track_map = |pane: &gtk::Widget| -> Rc<Cell<u32>> {
+        let count = Rc::new(Cell::new(0u32));
+        let count_cb = count.clone();
+        let gl = find_gl_area(pane).expect("terminal GLArea");
+        gl.connect_map(move |_| {
+            count_cb.set(count_cb.get() + 1);
+        });
+        count
+    };
+    let unrealize_a = track_unrealize(&pane_a);
+    let map_a = track_map(&pane_a);
+    let unrealize_b = track_unrealize(&pane_b);
+    let unrealize_c = track_unrealize(&pane_c);
+    let unrealize_d = track_unrealize(&pane_d);
+
+    // 1. Splitting A horizontally only reparents A; B, C, and D stay realized.
+    // A must map only once (on tick N+1 remount), never spuriously before detach.
+    let pane_e = split_pane(
+        &state,
+        &ws_id,
+        &pane_a,
+        gtk::Orientation::Horizontal,
+        split_options(),
+    )
+    .expect("localized split of A");
+    pump_until(wait, || shown(&pane_e) && shown(&pane_a));
+    pump_for(std::time::Duration::from_millis(120));
+    assert_eq!(unrealize_a.get(), 1, "split target A reparents once");
+    assert_eq!(map_a.get(), 1, "split target A must not map before detach");
+    assert_eq!(unrealize_b.get(), 0, "sibling B must not unrealize");
+    assert_eq!(unrealize_c.get(), 0, "outer sibling C must not unrealize");
+    assert_eq!(unrealize_d.get(), 0, "outer sibling D must not unrealize");
+    assert_focus_within("localized split focuses new pane E", &state, &pane_e);
+
+    // 2. Closing B promotes nested Paned (A | E) into OuterPaned.start without
+    // touching C or D, and preserves focus in E.
+    let refs_b = weak_refs(&widget_tree(&pane_b));
+    remove_pane(&state, &ws_id, &pane_b);
+    drop(pane_b);
+    assert_freed("localized removed pane B", &refs_b);
+    pump_until(wait, || shown(&pane_a) && shown(&pane_e));
+    assert_eq!(map_a.get(), 2, "promoted nested A maps once on remount");
+    assert_eq!(unrealize_c.get(), 0, "closing B must not unrealize C");
+    assert_eq!(unrealize_d.get(), 0, "closing B must not unrealize D");
+    assert_focus_within("closing unfocused B keeps focus in E", &state, &pane_e);
+
+    // 3. Focus unaffected pane D, then close E: single-leaf A is promoted into
+    // OuterPaned.start while D keeps focus and C & D stay realized.
+    assert!(pane::focus_active_tab_in_pane(&pane_d));
+    pump_for(std::time::Duration::from_millis(80));
+    assert_focus_within("focus moved to unaffected pane D", &state, &pane_d);
+    let refs_e = weak_refs(&widget_tree(&pane_e));
+    remove_pane(&state, &ws_id, &pane_e);
+    drop(pane_e);
+    assert_freed("localized removed pane E", &refs_e);
+    pump_until(wait, || shown(&pane_a));
+    assert_eq!(
+        map_a.get(),
+        3,
+        "promoted single-leaf A maps once on remount"
+    );
+    assert_eq!(unrealize_c.get(), 0, "closing E must not unrealize C");
+    assert_eq!(unrealize_d.get(), 0, "closing E must not unrealize D");
+    assert_focus_within("closing unfocused E preserves focus in D", &state, &pane_d);
+
+    // 4. Same-frame compound mutation (split A + close C in one tick) falls back
+    // cleanly to a full rebuild without leaking C or stranding hidden children.
+    let refs_c = weak_refs(&widget_tree(&pane_c));
+    let pane_f = split_pane(
+        &state,
+        &ws_id,
+        &pane_a,
+        gtk::Orientation::Horizontal,
+        split_options(),
+    )
+    .expect("split A before same-frame close");
+    remove_pane(&state, &ws_id, &pane_c);
+    drop(pane_c);
+    assert_freed("same-frame closed pane C", &refs_c);
+    pump_until(wait, || shown(&pane_a) && shown(&pane_f) && shown(&pane_d));
+    assert_eq!(container.panes().len(), 3);
+    assert!(container.panes().iter().all(shown));
+
+    let window = state.borrow().window.clone();
+    window.close();
+    pump_until(wait, || !window.is_visible());
+}

@@ -2946,7 +2946,9 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
             .values()
             .filter_map(|weak| weak.upgrade())
             .filter(|internals| {
-                crate::split_tree::is_visible_within_root(internals.pane_outer.upcast_ref(), root)
+                let pane_widget: &gtk::Widget = internals.pane_outer.upcast_ref();
+                (pane_widget == root && pane_widget.get_visible())
+                    || crate::split_tree::is_visible_within_root(pane_widget, root)
             })
             .collect::<Vec<_>>()
     });

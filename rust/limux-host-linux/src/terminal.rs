@@ -1975,23 +1975,26 @@ fn free_terminal_surface(
     drop(entry);
 }
 
-/// Hide `widget`, then run `detach` once its window has painted a frame
-/// without it.
+/// Wait for one compositor frame after running `hide`, then run `detach`.
 ///
 /// Unrealizing a GLArea whose last frame the renderer still holds makes GTK
 /// copy that frame back to the CPU (`gdk_gl_texture_release`). On NVIDIA the
 /// copy can segfault inside the driver, and when GTK shares the frame as a
 /// dmabuf it also leaks the copy. After one frame without the widget,
 /// unrealize just deletes the textures. An unrealized widget is in no frame
-/// and is detached at once. An unmapped one still waits: the last frame may
-/// show it from before an ancestor was hidden or its workspace switched away.
-pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() + 'static) {
-    let Some(clock) = widget.frame_clock() else {
+/// and is detached at once without calling `hide`. An unmapped one still waits:
+/// the last frame may show it from before an ancestor was hidden or its
+/// workspace switched away.
+pub(crate) fn run_after_repaint(
+    anchor: &gtk::Widget,
+    hide: impl FnOnce(),
+    detach: impl FnOnce() + 'static,
+) {
+    let Some(clock) = anchor.frame_clock() else {
         detach();
         return;
     };
-    unset_focus_within(widget);
-    widget.set_visible(false);
+    hide();
 
     let detach = Rc::new(RefCell::new(Some(detach)));
     let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
@@ -2048,6 +2051,20 @@ pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() +
             }
         });
     *timeout.borrow_mut() = Some(source);
+}
+
+/// Hide `widget`, then run `detach` once its window has painted a frame
+/// without it (see [`run_after_repaint`]).
+pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() + 'static) {
+    let widget_for_hide = widget.clone();
+    run_after_repaint(
+        widget,
+        move || {
+            unset_focus_within(&widget_for_hide);
+            widget_for_hide.set_visible(false);
+        },
+        detach,
+    );
 }
 
 /// Unset the window's focus when it is inside `widget`, before `widget` is

@@ -248,15 +248,76 @@ fn expected_resized_child_extent(
     }
 }
 
-/// Manages the workspace's split layout following Ghostty's atomic rebuild
-/// pattern. Holds a SplitNode data model (source of truth) and a gtk::Box
-/// container for the built widget tree. On structural changes, tears down the
-/// old widget tree and rebuilds from the data model on the next idle tick.
+#[derive(Clone)]
+enum ParentSlot {
+    Bin(gtk::Box),
+    PanedStart(gtk::Paned),
+    PanedEnd(gtk::Paned),
+}
+
+impl ParentSlot {
+    fn of_child(bin: &gtk::Box, child: &gtk::Widget) -> Option<Self> {
+        let parent = child.parent()?;
+        if parent == *bin.upcast_ref::<gtk::Widget>() {
+            return Some(Self::Bin(bin.clone()));
+        }
+        let paned = parent.downcast::<gtk::Paned>().ok()?;
+        if !paned.is_ancestor(bin) {
+            return None;
+        }
+        if paned.start_child().as_ref() == Some(child) {
+            Some(Self::PanedStart(paned))
+        } else if paned.end_child().as_ref() == Some(child) {
+            Some(Self::PanedEnd(paned))
+        } else {
+            None
+        }
+    }
+
+    fn current_child(&self) -> Option<gtk::Widget> {
+        match self {
+            Self::Bin(bin) => bin.first_child(),
+            Self::PanedStart(paned) => paned.start_child(),
+            Self::PanedEnd(paned) => paned.end_child(),
+        }
+    }
+
+    fn replace(&self, old: &gtk::Widget, replacement: Option<&gtk::Widget>) {
+        match self {
+            Self::Bin(bin) => {
+                if old.parent().as_ref() == Some(bin.upcast_ref::<gtk::Widget>()) {
+                    bin.remove(old);
+                }
+                if let Some(replacement) = replacement {
+                    bin.append(replacement);
+                }
+            }
+            Self::PanedStart(paned) => {
+                paned.set_start_child(replacement);
+            }
+            Self::PanedEnd(paned) => {
+                paned.set_end_child(replacement);
+            }
+        }
+    }
+}
+
+/// Manages the workspace's split layout. Holds a SplitNode data model (source
+/// of truth) and a gtk::Box container for the built widget tree. Simple split
+/// and remove operations surgically replace only the affected parent slot so
+/// unaffected sibling panes stay mounted and realized without GL context
+/// teardown; compound same-frame mutations and swap/zoom fall back to an atomic
+/// full-tree rebuild.
 pub(crate) struct SplitTreeContainer {
     tree: RefCell<SplitNode>,
     bin: gtk::Box,
     rebuild_source: RefCell<Option<glib::SourceId>>,
     teardown_pending: Cell<bool>,
+    /// Set while a localized split/remove surgery is waiting for its repaint
+    /// frame. Another structural mutation arriving in the same frame flips
+    /// `local_surgery_fallback` so the surgery hands off to a full rebuild.
+    local_surgery_teardown: Cell<bool>,
+    local_surgery_fallback: Cell<bool>,
     after_rebuild: RefCell<Vec<Box<dyn FnOnce()>>>,
     /// Weak: `remove` saves the focus before a pane closes, and that focus is
     /// usually inside the closing pane.
@@ -280,6 +341,8 @@ impl SplitTreeContainer {
             bin,
             rebuild_source: RefCell::new(None),
             teardown_pending: Cell::new(false),
+            local_surgery_teardown: Cell::new(false),
+            local_surgery_fallback: Cell::new(false),
             after_rebuild: RefCell::default(),
             last_focused: RefCell::new(None),
             zoomed_pane: RefCell::new(None),
@@ -302,6 +365,8 @@ impl SplitTreeContainer {
             bin,
             rebuild_source: RefCell::new(None),
             teardown_pending: Cell::new(false),
+            local_surgery_teardown: Cell::new(false),
+            local_surgery_fallback: Cell::new(false),
             after_rebuild: RefCell::default(),
             last_focused: RefCell::new(None),
             zoomed_pane: RefCell::new(None),
@@ -467,10 +532,12 @@ impl SplitTreeContainer {
         }
 
         self.save_focus();
-        self.zoomed_pane.borrow_mut().take();
+        let was_zoomed = self.zoomed_pane.borrow_mut().take().is_some();
         *self.last_focused.borrow_mut() = Some(new_pane.downgrade());
 
         let shared_ratio = Rc::new(RefCell::new(layout_state::clamp_split_ratio(ratio)));
+        let shared_ratio_for_surgery = shared_ratio.clone();
+        let new_pane_for_surgery = new_pane.clone();
         let new_node = if new_pane_first {
             SplitNode::Split {
                 orientation,
@@ -500,13 +567,23 @@ impl SplitTreeContainer {
             tree.replace(target, new_node)
         };
 
-        if replaced {
+        if replaced
+            && (was_zoomed
+                || !self.try_localized_split(
+                    target,
+                    new_pane_for_surgery,
+                    orientation,
+                    new_pane_first,
+                    shared_ratio_for_surgery,
+                ))
+        {
             self.trigger_rebuild();
         }
         replaced
     }
 
-    /// Remove a pane. Mutates the data model, then triggers async rebuild.
+    /// Remove a pane. Mutates the data model, then applies localized surgery
+    /// when settled or falls back to an async full rebuild.
     pub(crate) fn remove(self: &Rc<Self>, target: &gtk::Widget) -> bool {
         self.save_focus();
 
@@ -517,7 +594,7 @@ impl SplitTreeContainer {
         };
 
         if removed {
-            self.zoomed_pane.borrow_mut().take();
+            let was_zoomed = self.zoomed_pane.borrow_mut().take().is_some();
             // The focus was in the closed pane: the pane that takes its place
             // gets it after the rebuild.
             let focus = self
@@ -528,7 +605,9 @@ impl SplitTreeContainer {
             if focus.is_some_and(|focus| &focus == target || focus.is_ancestor(target)) {
                 *self.last_focused.borrow_mut() = successor.map(|pane| pane.downgrade());
             }
-            self.trigger_rebuild();
+            if was_zoomed || !self.try_localized_remove(target) {
+                self.trigger_rebuild();
+            }
         }
         removed
     }
@@ -638,14 +717,277 @@ impl SplitTreeContainer {
         }
     }
 
+    fn can_start_local_surgery(&self) -> bool {
+        !self.teardown_pending.get()
+            && !self.local_surgery_teardown.get()
+            && self.rebuild_source.borrow().is_none()
+    }
+
+    /// Surgically split `target` in its direct parent slot without unparenting
+    /// or unrealizing unaffected sibling panes.
+    fn try_localized_split(
+        self: &Rc<Self>,
+        target: &gtk::Widget,
+        new_pane: gtk::Widget,
+        orientation: gtk::Orientation,
+        new_pane_first: bool,
+        ratio: Rc<RefCell<f64>>,
+    ) -> bool {
+        if !self.can_start_local_surgery() {
+            return false;
+        }
+        let Some(parent_slot) = ParentSlot::of_child(&self.bin, target) else {
+            return false;
+        };
+
+        self.teardown_pending.set(true);
+        self.local_surgery_teardown.set(true);
+        self.local_surgery_fallback.set(false);
+
+        let target_widget = target.clone();
+        let target_for_hide = target.clone();
+        let hidden = Rc::new(RefCell::new(Vec::<gtk::Widget>::new()));
+        let hidden_for_hide = hidden.clone();
+        let container = Rc::downgrade(self);
+
+        crate::terminal::run_after_repaint(
+            target,
+            move || {
+                crate::terminal::unset_focus_within(&target_for_hide);
+                hide_subtree_contents_for_repaint(
+                    &target_for_hide,
+                    &mut hidden_for_hide.borrow_mut(),
+                );
+            },
+            move || {
+                let Some(container) = container.upgrade() else {
+                    return;
+                };
+                let fallback = container.local_surgery_fallback.replace(false);
+                container.local_surgery_teardown.set(false);
+                container.teardown_pending.set(false);
+
+                if fallback || parent_slot.current_child().as_ref() != Some(&target_widget) {
+                    // Trigger the full rebuild first so `old` is hidden/detached
+                    // before restoring inner child visibility (avoids a spurious
+                    // map -> refresh -> unmap cycle while still mounted).
+                    container.trigger_rebuild();
+                    for widget in hidden.borrow_mut().drain(..) {
+                        widget.set_visible(true);
+                    }
+                    return;
+                }
+
+                // Defensively clear focus before detaching (handles unrealized
+                // no-clock paths and focus re-entry during the repaint frame).
+                crate::terminal::unset_focus_within(&target_widget);
+
+                // Replace `target` in its parent slot with a temporary
+                // placeholder for one idle tick: `target` unrealizes now while
+                // the parent Paned keeps its exact slot allocation (so sibling
+                // panes never resize or flicker), and the new split mounts on
+                // tick N+1. Restore inner visibility only after unparenting.
+                let placeholder = make_surgery_placeholder();
+                parent_slot.replace(&target_widget, Some(placeholder.upcast_ref()));
+                for widget in hidden.borrow_mut().drain(..) {
+                    widget.set_visible(true);
+                }
+
+                container.schedule_localized_mount(
+                    parent_slot,
+                    placeholder,
+                    move |container, slot, placeholder| {
+                        let paned = create_split_paned(orientation, &ratio, &container.state);
+                        if new_pane_first {
+                            paned.set_start_child(Some(&new_pane));
+                            paned.set_end_child(Some(&target_widget));
+                        } else {
+                            paned.set_start_child(Some(&target_widget));
+                            paned.set_end_child(Some(&new_pane));
+                        }
+                        let mounted: gtk::Widget = paned.upcast();
+                        slot.replace(placeholder, Some(&mounted));
+                        mounted
+                    },
+                );
+            },
+        );
+        true
+    }
+
+    /// Surgically remove `target` by promoting its direct sibling subtree into
+    /// its parent `Paned`'s slot, leaving all outer branches mounted and realized.
+    fn try_localized_remove(self: &Rc<Self>, target: &gtk::Widget) -> bool {
+        if !self.can_start_local_surgery() {
+            return false;
+        }
+        let Some(parent_paned) = target
+            .parent()
+            .and_then(|parent| parent.downcast::<gtk::Paned>().ok())
+        else {
+            return false;
+        };
+        if !parent_paned.is_ancestor(&self.bin) {
+            return false;
+        }
+        let sibling = if parent_paned.start_child().as_ref() == Some(target) {
+            parent_paned.end_child()
+        } else if parent_paned.end_child().as_ref() == Some(target) {
+            parent_paned.start_child()
+        } else {
+            None
+        };
+        let Some(sibling) = sibling else {
+            return false;
+        };
+        let Some(grandparent_slot) = ParentSlot::of_child(&self.bin, parent_paned.upcast_ref())
+        else {
+            return false;
+        };
+
+        self.teardown_pending.set(true);
+        self.local_surgery_teardown.set(true);
+        self.local_surgery_fallback.set(false);
+
+        let target_for_hide = target.clone();
+        let sibling_for_hide = sibling.clone();
+        let parent_for_hide = parent_paned.clone();
+        let sibling_hidden = Rc::new(RefCell::new(Vec::<gtk::Widget>::new()));
+        let sibling_hidden_for_hide = sibling_hidden.clone();
+        let container = Rc::downgrade(self);
+
+        let parent_anchor: gtk::Widget = parent_paned.clone().upcast();
+        crate::terminal::run_after_repaint(
+            &parent_anchor,
+            move || {
+                crate::terminal::unset_focus_within(parent_for_hide.upcast_ref());
+                let mut discarded_hidden = Vec::new();
+                hide_subtree_contents_for_repaint(&target_for_hide, &mut discarded_hidden);
+                hide_subtree_contents_for_repaint(
+                    &sibling_for_hide,
+                    &mut sibling_hidden_for_hide.borrow_mut(),
+                );
+            },
+            move || {
+                let Some(container) = container.upgrade() else {
+                    return;
+                };
+                let fallback = container.local_surgery_fallback.replace(false);
+                container.local_surgery_teardown.set(false);
+                container.teardown_pending.set(false);
+
+                if fallback
+                    || grandparent_slot.current_child().as_ref()
+                        != Some(parent_paned.upcast_ref::<gtk::Widget>())
+                {
+                    // Trigger the full rebuild first so `old` is hidden/detached
+                    // before restoring inner visibility on surviving children.
+                    container.trigger_rebuild();
+                    for widget in sibling_hidden.borrow_mut().drain(..) {
+                        widget.set_visible(true);
+                    }
+                    return;
+                }
+
+                // Defensively clear focus inside `parent_paned` (including the
+                // GtkPaned divider itself) before unparenting.
+                crate::terminal::unset_focus_within(parent_paned.upcast_ref());
+
+                // Detach `parent_paned` (replacing it with a placeholder in the
+                // grandparent slot so outer splits keep their allocation) and
+                // release both children immediately so the removed pane and old
+                // Paned drop cleanly while `sibling` unrealizes on tick N.
+                // Restore `sibling` inner visibility only after unparenting so
+                // nothing maps spuriously before unrealize.
+                let placeholder = make_surgery_placeholder();
+                grandparent_slot.replace(parent_paned.upcast_ref(), Some(placeholder.upcast_ref()));
+                parent_paned.set_start_child(gtk::Widget::NONE);
+                parent_paned.set_end_child(gtk::Widget::NONE);
+                for widget in sibling_hidden.borrow_mut().drain(..) {
+                    widget.set_visible(true);
+                }
+
+                container.schedule_localized_mount(
+                    grandparent_slot,
+                    placeholder,
+                    move |_container, slot, placeholder| {
+                        slot.replace(placeholder, Some(&sibling));
+                        sibling
+                    },
+                );
+            },
+        );
+        true
+    }
+
+    fn schedule_localized_mount(
+        self: &Rc<Self>,
+        slot: ParentSlot,
+        placeholder: gtk::Box,
+        mount: impl FnOnce(&Rc<Self>, &ParentSlot, &gtk::Widget) -> gtk::Widget + 'static,
+    ) {
+        if let Some(source) = self.rebuild_source.take() {
+            source.remove();
+        }
+        let container = Rc::downgrade(self);
+        let mut mount = Some(mount);
+        let source = glib::idle_add_local_full(glib::Priority::HIGH, move || {
+            let Some(container) = container.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            container.rebuild_source.replace(None);
+            if slot.current_child().as_ref() != Some(placeholder.upcast_ref::<gtk::Widget>()) {
+                container.trigger_rebuild();
+                return glib::ControlFlow::Break;
+            }
+            if let Some(mount) = mount.take() {
+                let mounted = mount(&container, &slot, placeholder.upcast_ref());
+                container.finish_post_mount(&mounted);
+            }
+            if container.rebuild_source.borrow().is_none() && !container.teardown_pending.get() {
+                let waiting = container.after_rebuild.take();
+                for f in waiting {
+                    f();
+                }
+            }
+            glib::ControlFlow::Break
+        });
+        self.rebuild_source.replace(Some(source));
+    }
+
+    fn finish_post_mount(&self, refresh_root: &gtk::Widget) {
+        refresh_terminal_displays_after_rebuild(refresh_root);
+
+        // Newly created panes are tracked as pane containers rather than the
+        // inner terminal/browser widget, so restore through the pane helper
+        // when possible and fall back to plain widget focus otherwise.
+        let focused = self
+            .last_focused
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        if let Some(focused) = focused {
+            if !focused.has_focus() && !pane::focus_active_tab_in_pane(&focused) {
+                focused.grab_focus();
+            }
+        }
+        crate::window::apply_top_bar_mode(&self.state);
+    }
+
     /// Tear down the old widget tree and schedule a rebuild on the next idle
     /// tick. The one-tick separation between unrealize (teardown) and realize
     /// (rebuild) is what prevents GLArea breakage. The teardown itself waits
     /// for a frame without the old tree (see `terminal::detach_after_repaint`).
     fn trigger_rebuild(self: &Rc<Self>) {
-        // Cancel any pending rebuild
+        // Cancel any pending rebuild or localized tick-N+1 mount
         if let Some(source) = self.rebuild_source.take() {
             source.remove();
+        }
+        // A localized surgery still waiting for its repaint frame will restore
+        // hidden children and hand off to a full rebuild once that frame paints.
+        if self.local_surgery_teardown.get() {
+            self.local_surgery_fallback.set(true);
+            return;
         }
         // A teardown still waiting for its frame rebuilds from the latest tree.
         if self.teardown_pending.get() {
@@ -720,22 +1062,7 @@ impl SplitTreeContainer {
                 apply_zoom_visibility(&self.bin, &pane);
             }
         }
-        refresh_terminal_displays_after_rebuild(self.bin.upcast_ref());
-
-        // Newly created panes are tracked as pane containers rather than the
-        // inner terminal/browser widget, so restore through the pane helper
-        // when possible and fall back to plain widget focus otherwise.
-        let focused = self
-            .last_focused
-            .borrow()
-            .as_ref()
-            .and_then(|w| w.upgrade());
-        if let Some(focused) = focused {
-            if !pane::focus_active_tab_in_pane(&focused) {
-                focused.grab_focus();
-            }
-        }
-        crate::window::apply_top_bar_mode(&self.state);
+        self.finish_post_mount(self.bin.upcast_ref());
     }
 
     fn save_focus(&self) {
@@ -979,6 +1306,75 @@ fn tree_has_pane_parents(node: &SplitNode) -> bool {
     }
 }
 
+fn make_surgery_placeholder() -> gtk::Box {
+    let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    placeholder.set_hexpand(true);
+    placeholder.set_vexpand(true);
+    placeholder
+}
+
+/// Hide visual contents inside `widget` before a localized one-frame repaint
+/// wait without hiding the outer pane or `Paned` slot itself, so unaffected
+/// sibling panes keep their exact allocation and never resize or flicker.
+fn hide_subtree_contents_for_repaint(widget: &gtk::Widget, hidden: &mut Vec<gtk::Widget>) {
+    if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+        if let Some(start) = paned.start_child() {
+            hide_subtree_contents_for_repaint(&start, hidden);
+        }
+        if let Some(end) = paned.end_child() {
+            hide_subtree_contents_for_repaint(&end, hidden);
+        }
+        return;
+    }
+
+    let mut hid_child = false;
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        let next = current.next_sibling();
+        if current.is_visible() {
+            current.set_visible(false);
+            hidden.push(current);
+            hid_child = true;
+        }
+        child = next;
+    }
+    if !hid_child && widget.is_visible() {
+        widget.set_visible(false);
+        hidden.push(widget.clone());
+    }
+}
+
+fn create_split_paned(
+    orientation: gtk::Orientation,
+    ratio: &Rc<RefCell<f64>>,
+    state: &State,
+) -> gtk::Paned {
+    let paned = gtk::Paned::builder()
+        .orientation(orientation)
+        .hexpand(true)
+        .vexpand(true)
+        // Allow either child to be shrunk below its minimum size so
+        // the saved split ratio (e.g. 50/50) is honored even when one
+        // pane has wider tabs than the other. Without this, gtk::Paned
+        // clamps the position to respect the larger pane's minimum
+        // width, producing visibly uneven splits.
+        .shrink_start_child(true)
+        .shrink_end_child(true)
+        .build();
+    paned.set_resize_start_child(true);
+    paned.set_resize_end_child(true);
+
+    let state_for_drag = state.clone();
+    install_split_ratio_tracking(
+        &paned,
+        ratio,
+        Some(Box::new(move || {
+            request_session_save(&state_for_drag);
+        })),
+    );
+    paned
+}
+
 /// Build a GTK widget tree from the SplitNode data model.
 fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
     match node {
@@ -994,30 +1390,7 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
             left,
             right,
         } => {
-            let paned = gtk::Paned::builder()
-                .orientation(*orientation)
-                .hexpand(true)
-                .vexpand(true)
-                // Allow either child to be shrunk below its minimum size so
-                // the saved split ratio (e.g. 50/50) is honored even when one
-                // pane has wider tabs than the other. Without this, gtk::Paned
-                // clamps the position to respect the larger pane's minimum
-                // width, producing visibly uneven splits.
-                .shrink_start_child(true)
-                .shrink_end_child(true)
-                .build();
-            paned.set_resize_start_child(true);
-            paned.set_resize_end_child(true);
-
-            let state_for_drag = state.clone();
-            install_split_ratio_tracking(
-                &paned,
-                ratio,
-                Some(Box::new(move || {
-                    request_session_save(&state_for_drag);
-                })),
-            );
-
+            let paned = create_split_paned(*orientation, ratio, state);
             let left_widget = build_widget_tree(left, state);
             let right_widget = build_widget_tree(right, state);
             paned.set_start_child(Some(&left_widget));
