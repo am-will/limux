@@ -143,6 +143,7 @@ pub(crate) struct AppState {
     close_after_recovery: bool,
     workspace_dragging: Option<String>,
     group_dragging: Option<String>,
+    suppress_sidebar_row_selected: bool,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
@@ -363,6 +364,19 @@ fn control_request_target(
 }
 
 fn workspace_row(state: &AppState, index: usize, workspace: &Workspace) -> serde_json::Value {
+    let group_id = state
+        .sidebar
+        .group_of(&workspace.id)
+        .map(|group| group.id.as_str());
+    workspace_row_with_group(state, index, workspace, group_id)
+}
+
+fn workspace_row_with_group(
+    state: &AppState,
+    index: usize,
+    workspace: &Workspace,
+    group_id: Option<&str>,
+) -> serde_json::Value {
     let selected_idx = state.active_idx;
     let cwd = workspace.cwd.borrow().clone().unwrap_or_default();
     serde_json::json!({
@@ -377,11 +391,8 @@ fn workspace_row(state: &AppState, index: usize, workspace: &Workspace) -> serde
         "focused": index == selected_idx,
         "cwd": cwd,
         "color": workspace.color.map(WorkspaceColor::as_str),
-        "group_id": state.sidebar.group_of(&workspace.id).map(|group| group.id.as_str()),
-        "group_ref": state
-            .sidebar
-            .group_of(&workspace.id)
-            .map(|group| sidebar_groups::group_ref(&group.id)),
+        "group_id": group_id,
+        "group_ref": group_id.map(sidebar_groups::group_ref),
     })
 }
 
@@ -472,10 +483,10 @@ fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>,
     let Some((_focused_workspace_id, pane_widget)) = find_focused_pane(state) else {
         return (None, None);
     };
-    let Some(surface) = pane::active_surface_summary(&pane_widget) else {
+    let Some((pane_id, tab_id)) = pane::active_pane_and_tab_id(&pane_widget) else {
         return (None, None);
     };
-    (Some(surface.pane_id), Some(surface.surface_id))
+    (Some(pane_id), Some(format!("{pane_id}:{tab_id}")))
 }
 
 fn visible_workspace_pane_widgets(workspace: &Workspace) -> Vec<gtk::Widget> {
@@ -483,7 +494,7 @@ fn visible_workspace_pane_widgets(workspace: &Workspace) -> Vec<gtk::Widget> {
         .split_container
         .panes()
         .into_iter()
-        .filter(|widget| widget.is_ancestor(&workspace.root))
+        .filter(|widget| split_tree::is_visible_within_root(widget, &workspace.root))
         .collect()
 }
 
@@ -633,11 +644,11 @@ fn focus_control_surface(state: &State, index: usize, pane: &gtk::Widget, tab_id
                 app_state.workspaces[index].id.clone(),
             )
         };
-        if let Some(summary) = pane::active_surface_summary(pane) {
+        if let Some((pane_id, _)) = pane::active_pane_and_tab_id(pane) {
             note_workspace_pane_focus_with_seed(
                 &mut state.borrow_mut(),
                 &workspace_id,
-                summary.pane_id,
+                pane_id,
                 existing_focused,
             );
         }
@@ -1013,12 +1024,11 @@ fn surface_list_payload(
 }
 
 fn surface_health_row(
-    state: &State,
     workspace: &Workspace,
+    focused_surface_id: Option<&str>,
     index: usize,
     surface: pane::SurfaceSummary,
 ) -> serde_json::Value {
-    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
     let mut row = serde_json::Map::new();
     row.insert("index".to_string(), serde_json::json!(index));
     row.insert(
@@ -1049,7 +1059,7 @@ fn surface_health_row(
         "type".to_string(),
         serde_json::Value::String(surface.kind.clone()),
     );
-    let focused = focused_surface_id.as_deref() == Some(surface.surface_id.as_str());
+    let focused = focused_surface_id == Some(surface.surface_id.as_str());
     row.insert("focused".to_string(), serde_json::Value::Bool(focused));
     row.insert(
         "selected".to_string(),
@@ -1120,6 +1130,7 @@ fn surface_health_payload(
     workspace: &Workspace,
     surface: Option<(u32, String)>,
 ) -> Result<serde_json::Value, BridgeError> {
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
         .filter(|summary| {
@@ -1128,10 +1139,12 @@ fn surface_health_payload(
             })
         })
         .enumerate()
-        .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
+        .map(|(index, surface)| {
+            surface_health_row(workspace, focused_surface_id.as_deref(), index, surface)
+        })
         .collect::<Vec<_>>();
 
-    // A pane detached by a zoom is out of the root.
+    // A pane hidden by a zoom is excluded from root visibility queries.
     if surface.is_some() && surfaces.is_empty() {
         return Err(BridgeError::not_found("surface not found"));
     }
@@ -1321,6 +1334,9 @@ pub(crate) fn apply_split_ratio_after_layout(
     // width, then apply the ratio once and stop.
     let applying_tick = applying.clone();
     paned.add_tick_callback(move |paned, _clock| {
+        if !crate::split_tree::paned_both_children_visible(paned) {
+            return glib::ControlFlow::Break;
+        }
         let size = if orientation == gtk::Orientation::Horizontal {
             paned.width()
         } else {
@@ -1340,6 +1356,9 @@ pub(crate) fn apply_split_ratio_after_layout(
     // Re-apply the current data model ratio on every map event (workspace switches).
     // Reads from the cell so drag-adjusted ratios are restored correctly.
     paned.connect_map(move |paned| {
+        if !crate::split_tree::paned_both_children_visible(paned) {
+            return;
+        }
         let ratio = *ratio_cell.borrow();
         apply_ratio_value(paned, orientation, ratio, &applying);
     });
@@ -1352,6 +1371,11 @@ pub(crate) fn attach_split_position_persistence(state: &State, paned: &gtk::Pane
     update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
     let state = state.clone();
     paned.connect_position_notify(move |paned| {
+        if crate::split_tree::is_applying_split_ratio(paned)
+            || !crate::split_tree::paned_both_children_visible(paned)
+        {
+            return;
+        }
         let allocation = paned.allocation();
         let size = if paned.orientation() == gtk::Orientation::Horizontal {
             allocation.width()
@@ -1965,6 +1989,8 @@ pub fn build_window(app: &adw::Application) {
 
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::None);
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
     stack.set_hexpand(true);
     stack.set_vexpand(true);
     stack.add_css_class("limux-content");
@@ -2109,6 +2135,7 @@ pub fn build_window(app: &adw::Application) {
         close_after_recovery: false,
         workspace_dragging: None,
         group_dragging: None,
+        suppress_sidebar_row_selected: false,
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
@@ -2253,6 +2280,9 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         sidebar_list.connect_row_selected(move |_, row| {
+            if state.borrow().suppress_sidebar_row_selected {
+                return;
+            }
             // Group headers sit between workspace rows, so a row's index is
             // not a workspace index.
             let idx = row.and_then(|row| {
@@ -3534,7 +3564,7 @@ fn activate_desktop_notification_target(
 
     present_existing_window(&window, activation_token);
     switch_workspace(state, workspace_idx);
-    sidebar_list.select_row(Some(&row));
+    select_sidebar_row_silently(state, &sidebar_list, &row);
 
     let state_for_focus = state.clone();
     let target_for_focus = target.clone();
@@ -3563,7 +3593,7 @@ fn focus_desktop_notification_target(state: &State, target: &DesktopNotification
     if let Some(pane_id) = target.pane_id {
         if let Some(pane_widget) = pane::find_pane_widget_by_id(pane_id) {
             if let Some((root, container)) = workspace.as_ref() {
-                if !pane_widget.is_ancestor(root) {
+                if !split_tree::is_visible_within_root(&pane_widget, root) {
                     if let Some(tab_id) = target.tab_id.as_deref() {
                         pane::activate_tab_in_pane(&pane_widget, tab_id);
                     }
@@ -3761,17 +3791,25 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     {
         let s = state.borrow();
         for ws in &s.workspaces {
-            ws.indicator_button.set_visible(show_workspace_indicators);
+            if ws.indicator_button.get_visible() != show_workspace_indicators {
+                ws.indicator_button.set_visible(show_workspace_indicators);
+            }
         }
     }
 
-    widgets.handle.set_visible(show_top_bar);
-    widgets
-        .sidebar_header_handle
-        .set_visible(!show_top_bar && sidebar_visible_now);
-    widgets
-        .sidebar_drag_area
-        .set_visible(!show_top_bar && !sidebar_visible_now);
+    if widgets.handle.get_visible() != show_top_bar {
+        widgets.handle.set_visible(show_top_bar);
+    }
+    let show_sidebar_header = !show_top_bar && sidebar_visible_now;
+    if widgets.sidebar_header_handle.get_visible() != show_sidebar_header {
+        widgets
+            .sidebar_header_handle
+            .set_visible(show_sidebar_header);
+    }
+    let show_sidebar_drag = !show_top_bar && !sidebar_visible_now;
+    if widgets.sidebar_drag_area.get_visible() != show_sidebar_drag {
+        widgets.sidebar_drag_area.set_visible(show_sidebar_drag);
+    }
 
     // Reparenting unmaps buttons and interrupts an in-flight pointer gesture.
     // Sidebar animation updates must leave an unchanged toolbar in place.
@@ -3784,6 +3822,15 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     };
     if toolbar.is_some_and(|toolbar| toolbar_layout_matches(toolbar, &widgets, controls_side)) {
         return;
+    }
+    if !show_top_bar && !sidebar_visible_now {
+        let leading_box =
+            active_workspace_leading_pane(state).and_then(|pane| pane::pane_leading_box(&pane));
+        if let Some(leading) = leading_box {
+            if collapsed_dock_layout_matches(&leading, &widgets) {
+                return;
+            }
+        }
     }
 
     // Detach the mobile widgets from wherever they're parented now — this
@@ -3817,6 +3864,17 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     } else {
         layout_collapsed_dock(state, &widgets, allow_retry);
     }
+}
+
+fn collapsed_dock_layout_matches(leading: &gtk::Box, widgets: &TopBarWidgets) -> bool {
+    widgets.dock.parent().as_ref() == Some(leading.upcast_ref())
+        && widgets.settings.parent().is_none()
+        && widgets.new_ws.parent().is_none()
+        && widgets.open_folder.parent().is_none()
+        && widgets.minimize.parent().is_none()
+        && widgets.maximize.parent().is_none()
+        && widgets.close.parent().is_none()
+        && widgets.indicator_scroll.parent().is_none()
 }
 
 fn toolbar_layout_matches(
@@ -3966,7 +4024,7 @@ fn activate_workspace_shortcut(state: &State, idx: usize) {
 
     if let Some((idx, row, list)) = row_and_list {
         switch_workspace(state, idx);
-        list.select_row(Some(&row));
+        select_sidebar_row_silently(state, &list, &row);
     }
 }
 
@@ -4019,10 +4077,14 @@ fn build_workspace_indicator(name: &str) -> (gtk::Button, gtk::Label) {
 
 fn sync_indicator_active_state(state: &AppState) {
     for (idx, ws) in state.workspaces.iter().enumerate() {
-        if idx == state.active_idx {
+        let should_be_active = idx == state.active_idx;
+        let is_active = ws
+            .indicator_button
+            .has_css_class("limux-indicator-pill-active");
+        if should_be_active && !is_active {
             ws.indicator_button
                 .add_css_class("limux-indicator-pill-active");
-        } else {
+        } else if !should_be_active && is_active {
             ws.indicator_button
                 .remove_css_class("limux-indicator-pill-active");
         }
@@ -4272,7 +4334,7 @@ fn build_color_swatches(
             swatch.add_css_class(workspace_color::SWATCH_BUTTON_CSS_CLASS);
             match color {
                 Some(color) => {
-                    dot.add_css_class(&color.css_class());
+                    dot.add_css_class(color.css_class());
                     swatch.set_tooltip_text(Some(color.label()));
                 }
                 None => {
@@ -4514,7 +4576,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
                 )
             };
             switch_workspace(&state, index);
-            sidebar_list.select_row(Some(&row));
+            select_sidebar_row_silently(&state, &sidebar_list, &row);
             pane::add_terminal_tab_to_pane_in_directory(&target_pane, directory.as_deref());
         });
     }
@@ -4681,12 +4743,17 @@ fn workspace_autostart_dialog_dismisses(keyval: gtk::gdk::Key) -> bool {
 
 fn set_workspace_favorite_visual(workspace: &Workspace, favorite: bool) {
     let symbol = if favorite { "\u{2605}" } else { "\u{2606}" };
-    workspace.favorite_button.set_label(symbol);
-    if favorite {
+    if workspace.favorite_button.label().as_deref() != Some(symbol) {
+        workspace.favorite_button.set_label(symbol);
+    }
+    let is_active = workspace
+        .favorite_button
+        .has_css_class("limux-ws-star-btn-active");
+    if favorite && !is_active {
         workspace
             .favorite_button
             .add_css_class("limux-ws-star-btn-active");
-    } else {
+    } else if !favorite && is_active {
         workspace
             .favorite_button
             .remove_css_class("limux-ws-star-btn-active");
@@ -4697,15 +4764,22 @@ fn set_workspace_color_visual(workspace: &Workspace) {
     let Some(row_box) = workspace.sidebar_row.child() else {
         return;
     };
+    let active_class = workspace.color.map(WorkspaceColor::css_class);
     for color in WorkspaceColor::ALL {
-        row_box.remove_css_class(&color.css_class());
-    }
-    match workspace.color {
-        Some(color) => {
-            row_box.add_css_class(workspace_color::COLORED_ROW_CSS_CLASS);
-            row_box.add_css_class(&color.css_class());
+        let class = color.css_class();
+        if active_class == Some(class) {
+            if !row_box.has_css_class(class) {
+                row_box.add_css_class(class);
+            }
+        } else if row_box.has_css_class(class) {
+            row_box.remove_css_class(class);
         }
-        None => row_box.remove_css_class(workspace_color::COLORED_ROW_CSS_CLASS),
+    }
+    let has_colored = row_box.has_css_class(workspace_color::COLORED_ROW_CSS_CLASS);
+    match workspace.color {
+        Some(_) if !has_colored => row_box.add_css_class(workspace_color::COLORED_ROW_CSS_CLASS),
+        None if has_colored => row_box.remove_css_class(workspace_color::COLORED_ROW_CSS_CLASS),
+        _ => {}
     }
 }
 
@@ -5093,7 +5167,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
                 )
             };
             switch_workspace(&state, idx);
-            sidebar_list.select_row(Some(&row));
+            select_sidebar_row_silently(&state, &sidebar_list, &row);
         });
     }
     let row_clone = row.clone();
@@ -5142,7 +5216,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
 
     {
         let sidebar_list = state.borrow().sidebar_list.clone();
-        sidebar_list.select_row(Some(&row_clone));
+        select_sidebar_row_silently(state, &sidebar_list, &row_clone);
     }
     // The row selection does not switch workspaces here (the new one is
     // already active), so a collapsed group still shows the one left behind.
@@ -5310,7 +5384,7 @@ fn install_workspace_row_interactions(
                             switch_workspace(&state, target_idx);
                         }
                         if let Some(sidebar_row) = sidebar_row {
-                            sidebar_list.select_row(Some(&sidebar_row));
+                            select_sidebar_row_silently(&state, &sidebar_list, &sidebar_row);
                         }
                     },
                 );
@@ -5800,7 +5874,7 @@ fn break_tabs_into_new_workspace(
                 )
             };
             switch_workspace(&state, idx);
-            sidebar_list.select_row(Some(&row));
+            select_sidebar_row_silently(&state, &sidebar_list, &row);
         });
     }
     let row_clone = row.clone();
@@ -5849,7 +5923,7 @@ fn break_tabs_into_new_workspace(
 
     {
         let sidebar_list = state.borrow().sidebar_list.clone();
-        sidebar_list.select_row(Some(&row_clone));
+        select_sidebar_row_silently(state, &sidebar_list, &row_clone);
     }
     sidebar_groups::sync_row_visibility(state);
 
@@ -5924,11 +5998,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         ControlCommand::ListWorkspaces { reply } => {
             let workspaces = {
                 let app_state = state.borrow();
+                let group_ids = app_state.sidebar.workspace_group_ids();
                 app_state
                     .workspaces
                     .iter()
                     .enumerate()
-                    .map(|(index, workspace)| workspace_row(&app_state, index, workspace))
+                    .map(|(index, workspace)| {
+                        let group_id = group_ids.get(workspace.id.as_str()).copied();
+                        workspace_row_with_group(&app_state, index, workspace, group_id)
+                    })
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
@@ -6204,7 +6282,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
             let sidebar_list = state.borrow().sidebar_list.clone();
             switch_workspace(state, index);
-            sidebar_list.select_row(Some(&row));
+            select_sidebar_row_silently(state, &sidebar_list, &row);
 
             let result = {
                 let app_state = state.borrow();
@@ -6733,7 +6811,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
             switch_workspace(state, index);
-            sidebar_list.select_row(Some(&row));
+            select_sidebar_row_silently(state, &sidebar_list, &row);
             let result = {
                 let app_state = state.borrow();
                 workspace_payload(&app_state, index)
@@ -6763,7 +6841,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
             switch_workspace(state, index);
-            sidebar_list.select_row(Some(&row));
+            select_sidebar_row_silently(state, &sidebar_list, &row);
             let result = {
                 let app_state = state.borrow();
                 workspace_payload(&app_state, index)
@@ -7528,7 +7606,7 @@ fn add_workspace_with_initial_command(
                 )
             };
             switch_workspace(&state, idx);
-            sidebar_list.select_row(Some(&row));
+            select_sidebar_row_silently(&state, &sidebar_list, &row);
         });
     }
 
@@ -7576,7 +7654,7 @@ fn add_workspace_with_initial_command(
     }
 
     stack.set_visible_child_name(&stack_name);
-    sidebar_list.select_row(Some(&row));
+    select_sidebar_row_silently(state, &sidebar_list, &row);
     // The new workspace is already active, so the selection does not switch
     // and a collapsed group still shows the one left behind.
     sidebar_groups::sync_row_visibility(state);
@@ -7743,7 +7821,8 @@ pub(crate) fn create_pane_for_workspace(
             let s = state_for_visibility.borrow();
             s.window.is_active()
                 && s.active_workspace().is_some_and(|workspace| {
-                    workspace.id == ws_id_visibility && pane_widget.is_ancestor(&workspace.root)
+                    workspace.id == ws_id_visibility
+                        && split_tree::is_visible_within_root(pane_widget, &workspace.root)
                 })
         }),
         on_split_with_tab: Box::new(
@@ -7866,7 +7945,8 @@ fn close_workspace_by_id_internal(
     sync_indicator_active_state(&s);
 
     let stack = s.stack.clone();
-    let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
+    let new_workspace_id = s.workspaces[new_idx].id.clone();
+    let stack_name = format!("ws-{new_workspace_id}");
     let row = s.workspaces[new_idx].sidebar_row.clone();
     drop(s);
 
@@ -7885,7 +7965,8 @@ fn close_workspace_by_id_internal(
     // it (see `terminal::unset_focus_within`).
     split_container.retire_panes();
     crate::terminal::remove_from_stack_after_repaint(&ws.root);
-    sidebar_list.select_row(Some(&row));
+    clear_visible_tab_unread(state, &new_workspace_id);
+    select_sidebar_row_silently(state, &sidebar_list, &row);
     // Refresh group counts, and show the new active row if it is collapsed.
     sidebar_groups::sync_sidebar(state);
     apply_top_bar_mode(state);
@@ -7943,23 +8024,29 @@ fn run_startup_eager_restore(state: &State) {
                 eprintln!("limux: startup eager restore requested ({total} tabs)");
                 return glib::ControlFlow::Break;
             };
-            // A queued tab can move or close before its turn. Resolve its current
-            // owner, then release the state borrow before GTK emits callbacks.
-            let terminal = {
-                let app_state = state.borrow();
-                app_state
-                    .workspaces
-                    .iter()
-                    .flat_map(|workspace| workspace.split_container.panes())
-                    .flat_map(|pane| pane::terminal_tabs_in_pane(&pane))
-                    .find_map(|(id, handle)| (id == tab_id).then_some(handle))
-            };
-            if let Some(terminal) = terminal {
+            // A queued tab can move or close before its turn. Resolve its
+            // current terminal handle directly without holding a state borrow.
+            if let Some(terminal) = pane::terminal_handle_by_tab_id(&tab_id) {
                 terminal.realize_in_background();
             }
             glib::ControlFlow::Continue
         },
     );
+}
+
+/// Sync the sidebar list selection without re-entering `connect_row_selected`
+/// when the caller has already updated the active workspace.
+pub(super) fn select_sidebar_row_silently(
+    state: &State,
+    sidebar_list: &gtk::ListBox,
+    row: &gtk::ListBoxRow,
+) {
+    if sidebar_list.selected_row().as_ref() == Some(row) {
+        return;
+    }
+    state.borrow_mut().suppress_sidebar_row_selected = true;
+    sidebar_list.select_row(Some(row));
+    state.borrow_mut().suppress_sidebar_row_selected = false;
 }
 
 /// Select a workspace by index and sync the sidebar selection.
@@ -7978,7 +8065,7 @@ fn select_workspace_by_index(state: &State, index: usize) {
         )
     };
     switch_workspace_with_focus(state, index, false);
-    sidebar_list.select_row(Some(&row));
+    select_sidebar_row_silently(state, &sidebar_list, &row);
 }
 
 fn switch_workspace(state: &State, idx: usize) {
@@ -8049,7 +8136,7 @@ fn cycle_workspace(state: &State, direction: i32) {
         )
     };
     switch_workspace(state, new_idx);
-    sidebar_list.select_row(Some(&row));
+    select_sidebar_row_silently(state, &sidebar_list, &row);
 }
 
 fn focus_workspace_entrypoint(root: &gtk::Widget) {
@@ -8087,8 +8174,8 @@ fn schedule_focus_restore_if_idle(
                 // Selecting another tab while Limux was inactive is a
                 // deliberate focus target even before its terminal receives
                 // the first click. Do not switch back to the old tab.
-                if pane::active_surface_summary(&pane_widget)
-                    .is_some_and(|active| active.tab_id != target.tab_id)
+                if pane::active_pane_and_tab_id(&pane_widget)
+                    .is_some_and(|(_, tab_id)| tab_id != target.tab_id)
                 {
                     return;
                 }
@@ -8168,11 +8255,11 @@ fn focus_restore_target_for_pane(
     if !pane::is_live_pane(pane_widget) || !split_container.contains(pane_widget) {
         return None;
     }
-    let surface = pane::active_surface_summary(pane_widget)?;
+    let (pane_id, tab_id) = pane::active_pane_and_tab_id(pane_widget)?;
     Some(FocusRestoreTarget {
         workspace_id: workspace_id.to_string(),
-        pane_id: surface.pane_id,
-        tab_id: surface.tab_id,
+        pane_id,
+        tab_id,
         pane_widget: pane_widget.downgrade(),
     })
 }
@@ -8240,6 +8327,10 @@ fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
 
     let mut child = widget.first_child();
     while let Some(current) = child {
+        if !current.get_visible() {
+            child = current.next_sibling();
+            continue;
+        }
         let candidate = first_leaf_pane(&current);
         if pane::is_live_pane(&candidate) {
             return candidate;
@@ -8648,7 +8739,7 @@ fn find_leaf_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
     // live panes inside the active workspace.
     let mut widget: Option<gtk::Widget> = Some(focus);
     while let Some(w) = widget {
-        if pane::is_live_pane(&w) && w.is_ancestor(&ws_root) {
+        if pane::is_live_pane(&w) && split_tree::is_visible_within_root(&w, &ws_root) {
             return Some((ws_id, w));
         }
         widget = w.parent();

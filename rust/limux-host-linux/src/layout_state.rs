@@ -527,7 +527,7 @@ pub struct RestorableAgentIndex {
     by_surface: HashMap<(String, String), (RestorableAgentState, f64)>,
     by_any_workspace_surface: HashMap<String, Option<(RestorableAgentState, f64)>>,
     by_tab_id: HashMap<String, Option<(RestorableAgentState, f64)>>,
-    ended_sessions: Vec<(RestorableAgentKind, EndedHookSession)>,
+    ended_sessions: HashSet<EndedAgentBindingKey>,
 }
 
 impl RestorableAgentIndex {
@@ -547,9 +547,13 @@ impl RestorableAgentIndex {
             let Ok(file) = serde_json::from_str::<HookSessionFile>(&raw) else {
                 continue;
             };
-            index
-                .ended_sessions
-                .extend(file.ended_sessions.into_iter().map(|record| (kind, record)));
+            for record in file.ended_sessions {
+                let session_id = record.session_id.trim();
+                let tab_id = surface_tab_id(record.surface_id.trim());
+                index
+                    .ended_sessions
+                    .insert((kind, session_id.to_string(), tab_id.to_string()));
+            }
             for record in file.sessions.values() {
                 let Some(session_id) = normalized_str(&record.session_id) else {
                     continue;
@@ -655,11 +659,8 @@ impl RestorableAgentIndex {
     }
 
     fn session_ended(&self, kind: RestorableAgentKind, session_id: &str, tab_id: &str) -> bool {
-        self.ended_sessions.iter().any(|(ended_kind, ended)| {
-            *ended_kind == kind
-                && ended.session_id.trim() == session_id.trim()
-                && surface_tab_id(ended.surface_id.trim()) == tab_id
-        })
+        self.ended_sessions
+            .contains(&(kind, session_id.trim().to_string(), tab_id.to_string()))
     }
 }
 
@@ -679,11 +680,9 @@ pub(crate) fn sync_cached_ended_agent_bindings(index: &RestorableAgentIndex) {
         return;
     };
     guard.clear();
-    for (kind, ended) in &index.ended_sessions {
-        let session_id = ended.session_id.trim();
-        let tab_id = surface_tab_id(ended.surface_id.trim());
-        if !session_id.is_empty() && !tab_id.is_empty() {
-            guard.insert((*kind, session_id.to_string(), tab_id.to_string()));
+    for key in &index.ended_sessions {
+        if !key.1.is_empty() && !key.2.is_empty() {
+            guard.insert(key.clone());
         }
     }
     for ((_, surface_id), (active, _)) in &index.by_surface {

@@ -64,23 +64,25 @@ pub(super) fn pane_in_direction(
             if paned.orientation() == target_orientation {
                 let is_start = paned.start_child().map(|c| c == current).unwrap_or(false);
                 if is_start == must_be_start {
-                    // Found the split point. Navigate to the sibling subtree.
+                    // Found the split point. Navigate to the sibling subtree,
+                    // skipping branches hidden in-place by zoom.
                     let sibling = if must_be_start {
                         paned.end_child()
                     } else {
                         paned.start_child()
-                    };
-                    // A closed pane stays in the old tree until its teardown
-                    // frame and must not be returned.
-                    return sibling
-                        .map(|sibling| {
+                    }
+                    .filter(|sibling| sibling.get_visible());
+                    if let Some(sibling) = sibling {
+                        // A closed pane stays in the old tree until its teardown
+                        // frame and must not be returned.
+                        let leaf =
                             best_directional_leaf_pane(pane_widget, &sibling, &root, direction)
                                 .unwrap_or_else(|| {
                                     let prefer_start = !must_be_start;
                                     find_leaf_pane(&sibling, target_orientation, prefer_start)
-                                })
-                        })
-                        .filter(pane::is_live_pane);
+                                });
+                        return pane::is_live_pane(&leaf).then_some(leaf);
+                    }
                 }
             }
         }
@@ -171,6 +173,9 @@ pub(super) fn neighbor_score_better(candidate: NeighborScore, best: NeighborScor
 }
 
 pub(super) fn collect_leaf_panes(widget: &gtk::Widget, panes: &mut Vec<gtk::Widget>) {
+    if !widget.get_visible() {
+        return;
+    }
     if pane::is_pane_widget(widget) {
         if pane::is_live_pane(widget) {
             panes.push(widget.clone());
@@ -266,15 +271,17 @@ pub(super) fn find_leaf_pane(
     prefer_start: bool,
 ) -> gtk::Widget {
     if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+        let start = paned.start_child().filter(|child| child.get_visible());
+        let end = paned.end_child().filter(|child| child.get_visible());
         let pick_start = if paned.orientation() == axis {
             prefer_start
         } else {
             true // arbitrary default for orthogonal splits
         };
         let child = if pick_start {
-            paned.start_child()
+            start.or(end)
         } else {
-            paned.end_child()
+            end.or(start)
         };
         match child {
             Some(c) => find_leaf_pane(&c, axis, prefer_start),
@@ -284,8 +291,12 @@ pub(super) fn find_leaf_pane(
         // A gtk::Box may be a pane widget (leaf) or a SplitTreeContainer bin
         // wrapping a single pane or paned. Descend into non-pane boxes.
         if !pane::is_pane_widget(widget) {
-            if let Some(first_child) = box_widget.first_child() {
-                return find_leaf_pane(&first_child, axis, prefer_start);
+            let mut child = box_widget.first_child();
+            while let Some(current) = child {
+                if current.get_visible() {
+                    return find_leaf_pane(&current, axis, prefer_start);
+                }
+                child = current.next_sibling();
             }
         }
         widget.clone()
@@ -313,23 +324,30 @@ pub(super) fn surface_tab_target(
     surface_hint: &str,
     terminals_only: bool,
 ) -> pane::HintResolution<(usize, u32, String)> {
-    let workspace_ids = state
-        .borrow()
+    let app_state = state.borrow();
+    if scoped {
+        let Some(workspace) = app_state.workspaces.get(preferred_index) else {
+            return pane::HintResolution::NotFound;
+        };
+        let candidates =
+            pane::tab_candidates_for_workspace(&workspace.id, surface_hint, terminals_only)
+                .into_iter()
+                .map(|(rank, pane_id, tab_id)| ((rank, true), (preferred_index, pane_id, tab_id)));
+        return pane::resolve_surface_hint(candidates);
+    }
+
+    let workspace_indices: HashMap<&str, usize> = app_state
         .workspaces
         .iter()
-        .map(|workspace| workspace.id.clone())
-        .collect::<Vec<_>>();
-    let candidates = workspace_ids
-        .iter()
         .enumerate()
-        .filter(|(index, _)| !scoped || *index == preferred_index)
-        .flat_map(|(index, workspace_id)| {
-            pane::tab_candidates_for_workspace(workspace_id, surface_hint, terminals_only)
-                .into_iter()
-                .map(move |(rank, pane_id, tab_id)| {
-                    ((rank, index == preferred_index), (index, pane_id, tab_id))
-                })
-        });
+        .map(|(index, workspace)| (workspace.id.as_str(), index))
+        .collect();
+    let candidates =
+        pane::tab_candidates_across_workspaces(&workspace_indices, surface_hint, terminals_only)
+            .into_iter()
+            .map(|(rank, index, pane_id, tab_id)| {
+                ((rank, index == preferred_index), (index, pane_id, tab_id))
+            });
     pane::resolve_surface_hint(candidates)
 }
 
@@ -406,7 +424,7 @@ pub(super) fn sync_workspace_unread(state: &State, ws_id: &str) {
 }
 
 pub(super) fn clear_visible_tab_unread(state: &State, ws_id: &str) {
-    let root = {
+    let (root, had_workspace_unread) = {
         let mut s = state.borrow_mut();
         if !s.window.is_active() {
             return;
@@ -418,16 +436,19 @@ pub(super) fn clear_visible_tab_unread(state: &State, ws_id: &str) {
         else {
             return;
         };
+        let had = workspace.unread || workspace.manual_unread;
         workspace.unread = false;
         workspace.manual_unread = false;
-        workspace.root.clone()
+        (workspace.root.clone(), had)
     };
-    pane::clear_active_tab_unread_in_root(&root);
-    sync_workspace_unread(state, ws_id);
+    let cleared_tab = pane::clear_active_tab_unread_in_root(&root);
+    if had_workspace_unread || cleared_tab {
+        sync_workspace_unread(state, ws_id);
+    }
 }
 
 pub(super) fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &str) {
-    let root = {
+    let (root, had_workspace_unread) = {
         let mut s = state.borrow_mut();
         if !s.window.is_active() {
             return;
@@ -439,11 +460,14 @@ pub(super) fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &st
         else {
             return;
         };
+        let had = workspace.unread;
         workspace.unread = false;
-        workspace.root.clone()
+        (workspace.root.clone(), had)
     };
-    pane::clear_active_tab_unread_in_root_if_not_manual(&root);
-    sync_workspace_unread(state, ws_id);
+    let cleared_tab = pane::clear_active_tab_unread_in_root_if_not_manual(&root);
+    if had_workspace_unread || cleared_tab {
+        sync_workspace_unread(state, ws_id);
+    }
 }
 
 pub(super) fn mark_workspace_unread(

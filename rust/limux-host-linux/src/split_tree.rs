@@ -383,21 +383,73 @@ impl SplitTreeContainer {
         }
         self.zoomed_pane.borrow_mut().take();
         *self.last_focused.borrow_mut() = Some(target.downgrade());
-        self.trigger_rebuild();
+        if self.can_toggle_zoom_in_place(target) {
+            self.restore_zoom_in_place(Some(target));
+        } else {
+            self.trigger_rebuild();
+        }
         true
+    }
+
+    fn can_toggle_zoom_in_place(&self, target: &gtk::Widget) -> bool {
+        !self.teardown_pending.get()
+            && self.rebuild_source.borrow().is_none()
+            && target.is_ancestor(&self.bin)
     }
 
     fn zoom_pane(self: &Rc<Self>, target: &gtk::Widget) {
         self.save_focus();
         *self.zoomed_pane.borrow_mut() = Some(target.clone());
         *self.last_focused.borrow_mut() = Some(target.downgrade());
-        self.trigger_rebuild();
+        if self.can_toggle_zoom_in_place(target) {
+            apply_zoom_visibility(&self.bin, target);
+            if !pane::focus_active_tab_in_pane(target) {
+                target.grab_focus();
+            }
+            crate::window::apply_top_bar_mode(&self.state);
+        } else {
+            self.trigger_rebuild();
+        }
     }
 
     fn restore_zoom(self: &Rc<Self>) {
         self.save_focus();
-        self.zoomed_pane.borrow_mut().take();
-        self.trigger_rebuild();
+        let previously_zoomed = self.zoomed_pane.borrow_mut().take();
+        let can_restore_in_place = !self.teardown_pending.get()
+            && self.rebuild_source.borrow().is_none()
+            && self.bin.first_child().is_some()
+            && previously_zoomed
+                .as_ref()
+                .is_none_or(|pane| pane.is_ancestor(&self.bin));
+        if can_restore_in_place {
+            self.restore_zoom_in_place(None);
+        } else {
+            self.trigger_rebuild();
+        }
+    }
+
+    fn restore_zoom_in_place(&self, focus_override: Option<&gtk::Widget>) {
+        if let Some(root_child) = self.bin.first_child() {
+            let tree = self.tree.borrow();
+            restore_zoom_visibility_and_ratios(&root_child, &tree);
+        }
+        if let Some(target) = focus_override {
+            if !pane::focus_active_tab_in_pane(target) {
+                target.grab_focus();
+            }
+        } else {
+            let focused = self
+                .last_focused
+                .borrow()
+                .as_ref()
+                .and_then(|w| w.upgrade());
+            if let Some(focused) = focused {
+                if !pane::focus_active_tab_in_pane(&focused) {
+                    focused.grab_focus();
+                }
+            }
+        }
+        crate::window::apply_top_bar_mode(&self.state);
     }
 
     /// Split a pane. Mutates the data model, then triggers async rebuild.
@@ -549,22 +601,26 @@ impl SplitTreeContainer {
         *ratio_cell.borrow_mut() = updated;
 
         if let Some(paned) = matched_paned {
-            let applying = Rc::new(Cell::new(false));
-            let applied = crate::window::apply_ratio_value(&paned, axis, updated, &applying);
-            update_split_ratio_state(&paned, updated);
-            if applied && paned_extent > 0 {
-                let handle_size = paned.measure(axis, -1).0;
-                let resized_extent = expected_resized_child_extent(
-                    paned_extent,
-                    paned.max_position(),
-                    handle_size,
-                    paned.position(),
-                    side,
-                );
-                if axis == gtk::Orientation::Horizontal {
-                    width = resized_extent;
-                } else {
-                    height = resized_extent;
+            if paned_both_children_visible(&paned) {
+                let applying = split_ratio_control(&paned)
+                    .map(|control| control.applying)
+                    .unwrap_or_else(|| Rc::new(Cell::new(false)));
+                let applied = crate::window::apply_ratio_value(&paned, axis, updated, &applying);
+                update_split_ratio_state(&paned, updated);
+                if applied && paned_extent > 0 {
+                    let handle_size = paned.measure(axis, -1).0;
+                    let resized_extent = expected_resized_child_extent(
+                        paned_extent,
+                        paned.max_position(),
+                        handle_size,
+                        paned.position(),
+                        side,
+                    );
+                    if axis == gtk::Orientation::Horizontal {
+                        width = resized_extent;
+                    } else {
+                        height = resized_extent;
+                    }
                 }
             }
         }
@@ -652,21 +708,17 @@ impl SplitTreeContainer {
         // until they're unparented. Detach them all first.
         let tree = self.tree.borrow();
         let zoomed = self.zoomed_pane.borrow().clone();
+        if tree_has_pane_parents(&tree) {
+            detach_panes_from_old_tree(&tree);
+            self.schedule_rebuild();
+            return;
+        }
+        let widget = build_widget_tree(&tree, &self.state);
+        self.bin.append(&widget);
         if let Some(pane) = zoomed {
-            if pane.parent().is_some() {
-                detach_pane_from_old_parent(&pane);
-                self.schedule_rebuild();
-                return;
+            if pane.is_ancestor(&self.bin) {
+                apply_zoom_visibility(&self.bin, &pane);
             }
-            self.bin.append(&pane);
-        } else {
-            if tree_has_pane_parents(&tree) {
-                detach_panes_from_old_tree(&tree);
-                self.schedule_rebuild();
-                return;
-            }
-            let widget = build_widget_tree(&tree, &self.state);
-            self.bin.append(&widget);
         }
         refresh_terminal_displays_after_rebuild(self.bin.upcast_ref());
 
@@ -742,6 +794,156 @@ fn detach_panes_from_old_tree(node: &SplitNode) {
     }
 }
 
+const SPLIT_RATIO_CONTROL_KEY: &str = "limux-split-ratio-control";
+
+#[derive(Clone)]
+struct SplitRatioControl {
+    applying: Rc<Cell<bool>>,
+    last_size: Rc<Cell<i32>>,
+}
+
+fn split_ratio_control(paned: &gtk::Paned) -> Option<SplitRatioControl> {
+    unsafe {
+        paned
+            .data::<SplitRatioControl>(SPLIT_RATIO_CONTROL_KEY)
+            .map(|ptr| ptr.as_ref().clone())
+    }
+}
+
+pub(crate) fn is_applying_split_ratio(paned: &gtk::Paned) -> bool {
+    unsafe {
+        paned
+            .data::<SplitRatioControl>(SPLIT_RATIO_CONTROL_KEY)
+            .is_some_and(|ptr| ptr.as_ref().applying.get())
+    }
+}
+
+pub(crate) fn paned_both_children_visible(paned: &gtk::Paned) -> bool {
+    paned.start_child().is_some_and(|child| child.get_visible())
+        && paned.end_child().is_some_and(|child| child.get_visible())
+}
+
+/// Returns true when `widget` is a descendant of `root` and no widget along
+/// the path from `widget` up to `root` has `visible == false`.
+///
+/// Unlike `gtk::Widget::is_visible()`, this works for inactive `gtk::Stack`
+/// workspace pages (which hide pages via `child_visible`, not `visible`) and
+/// distinguishes panes hidden in-place by zoom from visible panes.
+pub(crate) fn is_visible_within_root(widget: &gtk::Widget, root: &gtk::Widget) -> bool {
+    if !widget.is_ancestor(root) {
+        return false;
+    }
+    let mut current = Some(widget.clone());
+    while let Some(node) = current {
+        if node == *root {
+            return true;
+        }
+        if !node.get_visible() {
+            return false;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+/// Hide every sibling branch along the path from `target` up to `bin`, keeping
+/// the `gtk::Paned` widget tree and hidden `GLArea` contexts realized in place.
+fn apply_zoom_visibility(bin: &gtk::Box, target: &gtk::Widget) {
+    let mut current = target.clone();
+    if !current.get_visible() {
+        current.set_visible(true);
+    }
+    while let Some(parent) = current.parent() {
+        if parent == *bin {
+            break;
+        }
+        if !parent.get_visible() {
+            parent.set_visible(true);
+        }
+        if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
+            let sibling = if paned.start_child().as_ref() == Some(&current) {
+                paned.end_child()
+            } else {
+                paned.start_child()
+            };
+            if let Some(sibling) = sibling {
+                if sibling.get_visible() {
+                    crate::terminal::unset_focus_within(&sibling);
+                    sibling.set_visible(false);
+                }
+            }
+        }
+        current = parent;
+    }
+}
+
+/// Unhide every branch hidden by zoom and restore stored `SplitNode` ratios
+/// without rebuilding the widget tree.
+fn restore_zoom_visibility_and_ratios(widget: &gtk::Widget, node: &SplitNode) {
+    if !widget.get_visible() {
+        widget.set_visible(true);
+    }
+    if let (
+        Some(paned),
+        SplitNode::Split {
+            orientation,
+            ratio,
+            left,
+            right,
+        },
+    ) = (widget.downcast_ref::<gtk::Paned>(), node)
+    {
+        if let Some(start) = paned.start_child() {
+            restore_zoom_visibility_and_ratios(&start, left);
+        }
+        if let Some(end) = paned.end_child() {
+            restore_zoom_visibility_and_ratios(&end, right);
+        }
+
+        let control = split_ratio_control(paned);
+        let applying = control
+            .as_ref()
+            .map(|control| control.applying.clone())
+            .unwrap_or_else(|| Rc::new(Cell::new(false)));
+        if let Some(control) = control.as_ref() {
+            control.last_size.set(0);
+        }
+        let ratio_val = *ratio.borrow();
+        let _ = crate::window::apply_ratio_value(paned, *orientation, ratio_val, &applying);
+
+        // Also re-apply on the next layout tick so nested splits that were
+        // unmapped while the window resized receive their exact saved ratio
+        // once GTK reallocates them.
+        let ratio_cell = ratio.clone();
+        let orientation = *orientation;
+        let last_size = control.map(|control| control.last_size);
+        paned.add_tick_callback(move |paned, _| {
+            if !paned_both_children_visible(paned) {
+                return glib::ControlFlow::Break;
+            }
+            let size = if orientation == gtk::Orientation::Horizontal {
+                paned.width()
+            } else {
+                paned.height()
+            };
+            if size <= 0 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(last_size) = last_size.as_ref() {
+                last_size.set(size);
+            }
+            let ratio_val = *ratio_cell.borrow();
+            let applied =
+                crate::window::apply_ratio_value(paned, orientation, ratio_val, &applying);
+            if applied {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+}
+
 fn tree_has_pane_parents(node: &SplitNode) -> bool {
     match node {
         SplitNode::Leaf { pane_widget } => pane_widget.parent().is_some(),
@@ -751,28 +953,15 @@ fn tree_has_pane_parents(node: &SplitNode) -> bool {
     }
 }
 
-fn detach_pane_from_old_parent(pane_widget: &gtk::Widget) {
-    if let Some(parent) = pane_widget.parent() {
-        if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
-            if paned
-                .start_child()
-                .map(|child| child == *pane_widget)
-                .unwrap_or(false)
-            {
-                paned.set_start_child(gtk::Widget::NONE);
-            } else {
-                paned.set_end_child(gtk::Widget::NONE);
-            }
-        } else if let Some(container) = parent.downcast_ref::<gtk::Box>() {
-            container.remove(pane_widget);
-        }
-    }
-}
-
 /// Build a GTK widget tree from the SplitNode data model.
 fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
     match node {
-        SplitNode::Leaf { pane_widget } => pane_widget.clone(),
+        SplitNode::Leaf { pane_widget } => {
+            if !pane_widget.get_visible() {
+                pane_widget.set_visible(true);
+            }
+            pane_widget.clone()
+        }
         SplitNode::Split {
             orientation,
             ratio,
@@ -824,11 +1013,20 @@ fn install_split_ratio_tracking(paned: &gtk::Paned, ratio: &Rc<RefCell<f64>>) {
     // sidebar (which shrinks the inner paned's width) silently skews
     // the saved ratio because GtkPaned's position is absolute pixels.
     let last_size = Rc::new(Cell::new(0i32));
+    unsafe {
+        paned.set_data(
+            SPLIT_RATIO_CONTROL_KEY,
+            SplitRatioControl {
+                applying: applying.clone(),
+                last_size: last_size.clone(),
+            },
+        );
+    }
     let shared_ratio = ratio.clone();
     let applying_for_notify = applying.clone();
     let last_size_for_notify = last_size.clone();
     paned.connect_position_notify(move |paned| {
-        if applying_for_notify.get() {
+        if applying_for_notify.get() || !paned_both_children_visible(paned) {
             return;
         }
         let size = if paned.orientation() == gtk::Orientation::Horizontal {
@@ -873,6 +1071,9 @@ fn install_split_ratio_tracking(paned: &gtk::Paned, ratio: &Rc<RefCell<f64>>) {
     let last_size_for_resize = last_size.clone();
     let resize_orientation = paned.orientation();
     paned.add_tick_callback(move |paned, _| {
+        if !paned_both_children_visible(paned) {
+            return glib::ControlFlow::Continue;
+        }
         let size = if resize_orientation == gtk::Orientation::Horizontal {
             paned.width()
         } else {
@@ -945,7 +1146,7 @@ pub(crate) fn clamp_paned_position(paned: &gtk::Paned, position: i32) -> i32 {
 /// the pane minimum, nested splits sum them (same orientation) or take the
 /// larger (cross orientation).
 fn subtree_min_extent(widget: &gtk::Widget, orientation: gtk::Orientation) -> i32 {
-    if !widget.is_visible() {
+    if !widget.get_visible() {
         return 0;
     }
     let Some(paned) = widget.downcast_ref::<gtk::Paned>() else {
@@ -1318,5 +1519,160 @@ mod tests {
             .expect("horizontal ancestor split for swapped start leaf");
         assert!(Rc::ptr_eq(&found_horizontal_start, &outer_ratio));
         assert_eq!(horizontal_start_side, SplitChildSide::Start);
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn in_place_zoom_preserves_widget_realization_and_split_ratios() {
+        fn wait_for(condition: impl Fn() -> bool, failure: &str) {
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "{failure}");
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        gtk::init().expect("initialize GTK");
+
+        let make_leaf = || {
+            let leaf = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            leaf.set_hexpand(true);
+            leaf.set_vexpand(true);
+            leaf.upcast::<gtk::Widget>()
+        };
+        let leaf_a = make_leaf();
+        let leaf_b = make_leaf();
+        let leaf_c = make_leaf();
+
+        let unrealize_count = Rc::new(Cell::new(0usize));
+        for leaf in [&leaf_a, &leaf_b, &leaf_c] {
+            let count = unrealize_count.clone();
+            leaf.connect_unrealize(move |_| {
+                count.set(count.get() + 1);
+            });
+        }
+
+        let outer_ratio = Rc::new(RefCell::new(0.35));
+        let inner_ratio = Rc::new(RefCell::new(0.65));
+
+        let inner_paned = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .vexpand(true)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        inner_paned.set_resize_start_child(true);
+        inner_paned.set_resize_end_child(true);
+        install_split_ratio_tracking(&inner_paned, &inner_ratio);
+        inner_paned.set_start_child(Some(&leaf_b));
+        inner_paned.set_end_child(Some(&leaf_c));
+
+        let outer_paned = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .hexpand(true)
+            .vexpand(true)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        outer_paned.set_resize_start_child(true);
+        outer_paned.set_resize_end_child(true);
+        install_split_ratio_tracking(&outer_paned, &outer_ratio);
+        outer_paned.set_start_child(Some(&leaf_a));
+        outer_paned.set_end_child(Some(&inner_paned));
+
+        let bin = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        bin.set_hexpand(true);
+        bin.set_vexpand(true);
+        bin.append(&outer_paned);
+
+        let tree = SplitNode::Split {
+            orientation: gtk::Orientation::Horizontal,
+            ratio: outer_ratio.clone(),
+            left: Box::new(SplitNode::Leaf {
+                pane_widget: leaf_a.clone(),
+            }),
+            right: Box::new(SplitNode::Split {
+                orientation: gtk::Orientation::Vertical,
+                ratio: inner_ratio.clone(),
+                left: Box::new(SplitNode::Leaf {
+                    pane_widget: leaf_b.clone(),
+                }),
+                right: Box::new(SplitNode::Leaf {
+                    pane_widget: leaf_c.clone(),
+                }),
+            }),
+        };
+
+        let window = gtk::Window::new();
+        window.set_default_size(1000, 600);
+        window.set_child(Some(&bin));
+        window.present();
+
+        wait_for(
+            || {
+                leaf_a.is_realized()
+                    && leaf_b.is_realized()
+                    && leaf_c.is_realized()
+                    && outer_paned.width() >= 900
+                    && (outer_paned.position() - (outer_paned.width() as f64 * 0.35).round() as i32)
+                        .abs()
+                        <= 4
+                    && (inner_paned.position()
+                        - (inner_paned.height() as f64 * 0.65).round() as i32)
+                        .abs()
+                        <= 4
+            },
+            "initial split fixture did not settle at saved ratios",
+        );
+
+        let root_widget: gtk::Widget = bin.clone().upcast();
+        assert!(is_visible_within_root(&leaf_a, &root_widget));
+        assert!(is_visible_within_root(&leaf_b, &root_widget));
+        assert!(is_visible_within_root(&leaf_c, &root_widget));
+
+        // Zoom leaf_b: hides leaf_a and leaf_c in place without unrealizing any leaf.
+        apply_zoom_visibility(&bin, &leaf_b);
+        wait_for(
+            || leaf_b.width() == bin.width() && leaf_b.height() == bin.height(),
+            "zoomed leaf did not expand to fill the workspace bin",
+        );
+        assert_eq!(unrealize_count.get(), 0, "zoom unrealized a leaf widget");
+        assert!(leaf_a.is_realized() && leaf_b.is_realized() && leaf_c.is_realized());
+        assert!(!is_visible_within_root(&leaf_a, &root_widget));
+        assert!(is_visible_within_root(&leaf_b, &root_widget));
+        assert!(!is_visible_within_root(&leaf_c, &root_widget));
+        assert!((*outer_ratio.borrow() - 0.35).abs() < 1e-6);
+        assert!((*inner_ratio.borrow() - 0.65).abs() < 1e-6);
+
+        // Unzoom in place: unhides siblings and restores both saved split ratios.
+        restore_zoom_visibility_and_ratios(outer_paned.upcast_ref(), &tree);
+        wait_for(
+            || {
+                leaf_a.is_mapped()
+                    && leaf_b.is_mapped()
+                    && leaf_c.is_mapped()
+                    && (outer_paned.position() - (outer_paned.width() as f64 * 0.35).round() as i32)
+                        .abs()
+                        <= 4
+                    && (inner_paned.position()
+                        - (inner_paned.height() as f64 * 0.65).round() as i32)
+                        .abs()
+                        <= 4
+            },
+            "unzoom did not restore saved split ratios",
+        );
+        assert_eq!(unrealize_count.get(), 0, "unzoom unrealized a leaf widget");
+        assert!(is_visible_within_root(&leaf_a, &root_widget));
+        assert!(is_visible_within_root(&leaf_b, &root_widget));
+        assert!(is_visible_within_root(&leaf_c, &root_widget));
+        assert!((*outer_ratio.borrow() - 0.35).abs() < 1e-6);
+        assert!((*inner_ratio.borrow() - 0.65).abs() < 1e-6);
+
+        window.close();
     }
 }

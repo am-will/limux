@@ -409,6 +409,7 @@ for regression in \
   pane::tests::moved_terminal_hover_focus_reads_its_new_pane_and_spares_renames \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
   split_tree::tests::restoring_split_respects_nested_pane_minimums \
+  split_tree::tests::in_place_zoom_preserves_widget_realization_and_split_ratios \
   settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
   settings_editor::tests::hook_controls_restore_effective_values_after_save_failure \
   settings_editor::tests::hook_rows_show_socket_changes_without_saving_them_again \

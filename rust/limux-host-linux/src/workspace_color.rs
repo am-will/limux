@@ -86,8 +86,17 @@ impl WorkspaceColor {
         }
     }
 
-    pub fn css_class(self) -> String {
-        format!("limux-ws-color-{}", self.as_str())
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Self::Red => "limux-ws-color-red",
+            Self::Orange => "limux-ws-color-orange",
+            Self::Amber => "limux-ws-color-amber",
+            Self::Green => "limux-ws-color-green",
+            Self::Teal => "limux-ws-color-teal",
+            Self::Blue => "limux-ws-color-blue",
+            Self::Purple => "limux-ws-color-purple",
+            Self::Pink => "limux-ws-color-pink",
+        }
     }
 
     /// The colour as a CSS hex value, for styles generated elsewhere.
