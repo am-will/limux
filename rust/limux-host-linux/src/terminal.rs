@@ -255,8 +255,11 @@ fn flush_deferred_surface_resizes() {
     let pending: Vec<(ghostty_surface_t, gtk::GLArea)> = SURFACE_MAP.with(|map| {
         map.borrow()
             .iter()
-            .filter(|(_, entry)| entry.resize_deferred.replace(false))
-            .map(|(&key, entry)| (key as ghostty_surface_t, entry.gl_area.clone()))
+            .filter_map(|(&key, entry)| {
+                let was_deferred = entry.resize_deferred.replace(false);
+                (was_deferred && entry.gl_area.is_mapped())
+                    .then(|| (key as ghostty_surface_t, entry.gl_area.clone()))
+            })
             .collect()
     });
     for (surface, gl_area) in pending {
@@ -317,6 +320,7 @@ pub struct TerminalHandle {
     search_entry: gtk::SearchEntry,
     callbacks: Rc<RefCell<TerminalCallbacks>>,
     pane_ime: Rc<crate::ime::PaneIme>,
+    motion_coalescer: Rc<MotionCoalescer>,
     signal_handlers: Rc<RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>>,
     controllers: Rc<RefCell<Vec<gtk::EventController>>>,
 }
@@ -441,6 +445,7 @@ impl TerminalHandle {
         for controller in self.controllers.borrow_mut().drain(..) {
             self.gl_area.remove_controller(&controller);
         }
+        self.motion_coalescer.cancel_and_clear();
         self.pane_ime.detach();
 
         if let Some(surface) = self.surface_cell.borrow_mut().take() {
@@ -776,22 +781,24 @@ fn physical_size_for_allocation(
     Some((physical_width, physical_height, scale_factor))
 }
 
+fn display_size_change(prev: Option<(u32, u32, u32)>, next: (u32, u32, u32)) -> (bool, bool) {
+    let scale_changed = prev.is_none_or(|(_, _, s)| s != next.2);
+    let size_changed = prev.is_none_or(|(w, h, _)| w != next.0 || h != next.1);
+    (scale_changed, size_changed)
+}
+
 fn sync_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea, force_refresh: bool) {
     let surface_key = surface as usize;
     let alloc = gl_area.allocation();
     let target =
         physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor());
 
-    let (scale_changed, size_changed) = if let Some((width, height, scale_factor)) = target {
+    let (scale_changed, size_changed) = if let Some(next) = target {
         SURFACE_MAP.with(|map| {
             if let Some(entry) = map.borrow().get(&surface_key) {
-                let prev = entry.last_display_size.get();
-                let sc = prev.is_none_or(|(_, _, s)| s != scale_factor);
-                let sz = prev.is_none_or(|(w, h, _)| w != width || h != height);
+                let (sc, sz) = display_size_change(entry.last_display_size.get(), next);
                 if sc || sz {
-                    entry
-                        .last_display_size
-                        .set(Some((width, height, scale_factor)));
+                    entry.last_display_size.set(Some(next));
                 }
                 (sc, sz)
             } else {
@@ -1185,17 +1192,27 @@ fn set_gtk_mouse_cursor(widget: &impl IsA<gtk::Widget>, state: MouseCursorState)
     widget.set_cursor(cursor.as_ref());
 }
 
-fn apply_mouse_cursor_state(entry: &SurfaceEntry, update: MouseCursorUpdate) -> bool {
-    let prev = entry.mouse_cursor.get();
+fn mouse_cursor_transition(
+    prev: MouseCursorState,
+    update: MouseCursorUpdate,
+) -> Option<(MouseCursorState, bool)> {
     let next = match update {
         MouseCursorUpdate::Shape(shape) => prev.update_shape(shape),
         MouseCursorUpdate::Visibility(visibility) => prev.update_visibility(visibility),
     };
     if prev == next {
-        return false;
+        return None;
     }
+    Some((next, prev.gtk_cursor_name() != next.gtk_cursor_name()))
+}
+
+fn apply_mouse_cursor_state(entry: &SurfaceEntry, update: MouseCursorUpdate) -> bool {
+    let Some((next, gtk_changed)) = mouse_cursor_transition(entry.mouse_cursor.get(), update)
+    else {
+        return false;
+    };
     entry.mouse_cursor.set(next);
-    if prev.gtk_cursor_name() != next.gtk_cursor_name() {
+    if gtk_changed {
         set_gtk_mouse_cursor(&entry.gl_area, next);
         return true;
     }
@@ -1286,22 +1303,30 @@ fn update_link_popover_anchor(
     true
 }
 
+fn should_send_pointer_leave(state: gtk::gdk::ModifierType) -> bool {
+    !state.intersects(
+        gtk::gdk::ModifierType::BUTTON1_MASK
+            | gtk::gdk::ModifierType::BUTTON2_MASK
+            | gtk::gdk::ModifierType::BUTTON3_MASK,
+    )
+}
+
 #[derive(Default)]
 struct MotionCoalescer {
     pending: Cell<Option<(f64, f64, c_int)>>,
-    last_sent: Cell<Option<(i32, i32, c_int)>>,
-    tick_scheduled: Cell<bool>,
+    last_sent: Cell<Option<(f64, f64, c_int)>>,
+    tick_id: RefCell<Option<gtk::TickCallbackId>>,
 }
 
 impl MotionCoalescer {
-    fn quantize(x: f64, y: f64, mods: c_int) -> (i32, i32, c_int) {
-        (x.round() as i32, y.round() as i32, mods)
-    }
-
-    fn queue(&self, x: f64, y: f64, mods: c_int) -> bool {
-        let q = Self::quantize(x, y, mods);
-        if self.pending.get().is_none() && self.last_sent.get() == Some(q) {
-            return false;
+    fn queue(&self, x: f64, y: f64, mods: c_int, scale_factor: f64) -> bool {
+        let scale = scale_factor.max(1.0);
+        if self.pending.get().is_none() {
+            if let Some((lx, ly, lmods)) = self.last_sent.get() {
+                if mods == lmods && (x - lx).abs() * scale < 1.0 && (y - ly).abs() * scale < 1.0 {
+                    return false;
+                }
+            }
         }
         self.pending.set(Some((x, y, mods)));
         true
@@ -1318,12 +1343,19 @@ impl MotionCoalescer {
 
     fn record_sent(&self, x: f64, y: f64, mods: c_int) {
         self.pending.set(None);
-        self.last_sent.set(Some(Self::quantize(x, y, mods)));
+        self.last_sent.set(Some((x, y, mods)));
     }
 
     fn clear(&self) {
         self.pending.set(None);
         self.last_sent.set(None);
+    }
+
+    fn cancel_and_clear(&self) {
+        if let Some(tick_id) = self.tick_id.borrow_mut().take() {
+            tick_id.remove();
+        }
+        self.clear();
     }
 }
 
@@ -2127,6 +2159,7 @@ pub fn create_terminal(
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),
         pane_ime: pane_ime.clone(),
+        motion_coalescer: motion_coalescer.clone(),
         signal_handlers: signal_handlers.clone(),
         controllers: controllers.clone(),
     };
@@ -2171,7 +2204,9 @@ pub fn create_terminal(
 
     {
         let surface_cell = surface_cell.clone();
+        let motion_for_unmap = motion_coalescer.clone();
         let handler = gl_area.connect_unmap(move |gl_area| {
+            motion_for_unmap.cancel_and_clear();
             gl_area.set_auto_render(false);
             if let Some(surface) = *surface_cell.borrow() {
                 unsafe {
@@ -2559,9 +2594,15 @@ pub fn create_terminal(
         let sc_release = surface_cell.clone();
         let pane_ime_press = pane_ime.clone();
         let pane_ime_release = pane_ime.clone();
+        let motion_for_key_press = motion_coalescer.clone();
+        let motion_for_key_release = motion_coalescer.clone();
         let key_controller = gtk::EventControllerKey::new();
         key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_press.borrow() {
+                // Flush queued pointer motion before key handling so Ctrl+link
+                // modifiers and mouse-hide-while-typing cannot be clobbered by
+                // a pre-keypress tick callback.
+                motion_for_key_press.flush_to_surface(surface);
                 let current_event = ctrl
                     .current_event()
                     .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
@@ -2611,6 +2652,7 @@ pub fn create_terminal(
 
         key_controller.connect_key_released(move |ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_release.borrow() {
+                motion_for_key_release.flush_to_surface(surface);
                 let current_event = ctrl
                     .current_event()
                     .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
@@ -2767,38 +2809,47 @@ pub fn create_terminal(
             if surface_cell_for_motion.borrow().is_none() {
                 return;
             }
+            let Some(gl_area) = gl_for_motion.upgrade() else {
+                return;
+            };
             let mods = translate_mouse_mods(ctrl.current_event_state());
-            if !motion_for_move.queue(x, y, mods) {
+            let scale = gl_area.scale_factor().max(1) as f64;
+            if !motion_for_move.queue(x, y, mods, scale) {
                 return;
             }
-            if let Some(gl_area) = gl_for_motion.upgrade() {
-                if !gl_area.is_mapped() {
-                    if let Some(surface) = *surface_cell_for_motion.borrow() {
-                        motion_for_move.flush_to_surface(surface);
+            if !gl_area.is_mapped() {
+                if let Some(surface) = *surface_cell_for_motion.borrow() {
+                    motion_for_move.flush_to_surface(surface);
+                }
+                return;
+            }
+            if motion_for_move.tick_id.borrow().is_none() {
+                let surface_cell = surface_cell_for_motion.clone();
+                let coalescer = motion_for_move.clone();
+                let tick_id = gl_area.add_tick_callback(move |_, _| {
+                    coalescer.tick_id.borrow_mut().take();
+                    if let Some(surface) = *surface_cell.borrow() {
+                        coalescer.flush_to_surface(surface);
                     }
-                    return;
-                }
-                if !motion_for_move.tick_scheduled.replace(true) {
-                    let surface_cell = surface_cell_for_motion.clone();
-                    let coalescer = motion_for_move.clone();
-                    gl_area.add_tick_callback(move |_, _| {
-                        coalescer.tick_scheduled.set(false);
-                        if let Some(surface) = *surface_cell.borrow() {
-                            coalescer.flush_to_surface(surface);
-                        }
-                        glib::ControlFlow::Break
-                    });
-                }
+                    glib::ControlFlow::Break
+                });
+                *motion_for_move.tick_id.borrow_mut() = Some(tick_id);
             }
         });
         motion.connect_leave(move |ctrl| {
-            motion_for_leave.clear();
             last_popover_point_leave.set(None);
             if link_popover_leave.get_visible() {
                 link_popover_leave.popdown();
             }
+            let event_state = ctrl.current_event_state();
+            if !should_send_pointer_leave(event_state) {
+                // Keep drag-selection and TUI mouse drag intact when the
+                // pointer crosses out of the GLArea while a button is held.
+                return;
+            }
+            motion_for_leave.cancel_and_clear();
             if let Some(surface) = *surface_cell_for_leave.borrow() {
-                let mods = translate_mouse_mods(ctrl.current_event_state());
+                let mods = translate_mouse_mods(event_state);
                 unsafe { ghostty_surface_mouse_pos(surface, -1.0, -1.0, mods) };
             }
         });
@@ -2894,7 +2945,9 @@ pub fn create_terminal(
         let link_popover = link_popover.clone();
         let display_realized = display_realized.clone();
         let pane_ime = pane_ime.clone();
+        let motion_for_unrealize = motion_coalescer.clone();
         let handler = gl_area.connect_unrealize(move |gl_area| {
+            motion_for_unrealize.cancel_and_clear();
             pane_ime.detach();
             link_popover.popdown();
             let Some(surface) = *surface_cell.borrow() else {
@@ -3859,10 +3912,10 @@ mod tests {
     }
 
     #[test]
-    fn motion_coalescer_deduplicates_unchanged_positions_and_overwrites_pending() {
+    fn motion_coalescer_uses_physical_pixel_threshold_and_overwrites_pending() {
         let coalescer = MotionCoalescer::default();
-        assert!(coalescer.queue(10.1, 20.2, GHOSTTY_MODS_NONE));
-        assert!(coalescer.queue(15.4, 25.6, GHOSTTY_MODS_CTRL));
+        assert!(coalescer.queue(10.1, 20.2, GHOSTTY_MODS_NONE, 1.0));
+        assert!(coalescer.queue(15.4, 25.6, GHOSTTY_MODS_CTRL, 1.0));
         assert_eq!(
             coalescer.pending.get(),
             Some((15.4, 25.6, GHOSTTY_MODS_CTRL))
@@ -3870,13 +3923,100 @@ mod tests {
 
         coalescer.record_sent(15.4, 25.6, GHOSTTY_MODS_CTRL);
         assert_eq!(coalescer.pending.get(), None);
-        // Same rounded pixel and modifiers should be skipped.
-        assert!(!coalescer.queue(15.2, 25.8, GHOSTTY_MODS_CTRL));
-        // Different modifier or pixel re-queues.
-        assert!(coalescer.queue(15.2, 25.8, GHOSTTY_MODS_NONE));
+        // Sub-physical-pixel move with unchanged modifiers is deduplicated at 1x.
+        assert!(!coalescer.queue(15.8, 25.9, GHOSTTY_MODS_CTRL, 1.0));
+        // At 2x HiDPI, 0.5 logical px is 1.0 physical px and must be queued.
+        assert!(coalescer.queue(15.9, 25.6, GHOSTTY_MODS_CTRL, 2.0));
+        coalescer.record_sent(9.6, 20.0, GHOSTTY_MODS_NONE);
+        // Crossing 1.0 physical px at 1x must be queued even near a cell boundary.
+        assert!(coalescer.queue(10.6, 20.0, GHOSTTY_MODS_NONE, 1.0));
+        coalescer.record_sent(15.4, 25.6, GHOSTTY_MODS_CTRL);
+        // Different modifier re-queues even at identical coordinates.
+        assert!(coalescer.queue(15.4, 25.6, GHOSTTY_MODS_NONE, 1.0));
         coalescer.clear();
         assert_eq!(coalescer.pending.get(), None);
         assert_eq!(coalescer.last_sent.get(), None);
+    }
+
+    #[test]
+    fn pointer_leave_is_suppressed_while_mouse_button_is_held() {
+        assert!(should_send_pointer_leave(gtk::gdk::ModifierType::empty()));
+        assert!(should_send_pointer_leave(
+            gtk::gdk::ModifierType::CONTROL_MASK
+        ));
+        assert!(!should_send_pointer_leave(
+            gtk::gdk::ModifierType::BUTTON1_MASK
+        ));
+        assert!(!should_send_pointer_leave(
+            gtk::gdk::ModifierType::BUTTON2_MASK | gtk::gdk::ModifierType::SHIFT_MASK
+        ));
+        assert!(!should_send_pointer_leave(
+            gtk::gdk::ModifierType::BUTTON3_MASK
+        ));
+    }
+
+    #[test]
+    fn display_size_change_detects_initial_size_and_scale_only_transitions() {
+        assert_eq!(display_size_change(None, (800, 600, 1)), (true, true));
+        assert_eq!(
+            display_size_change(Some((800, 600, 1)), (800, 600, 1)),
+            (false, false)
+        );
+        assert_eq!(
+            display_size_change(Some((800, 600, 1)), (900, 600, 1)),
+            (false, true)
+        );
+        assert_eq!(
+            display_size_change(Some((1600, 1200, 1)), (1600, 1200, 2)),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn mouse_cursor_transition_deduplicates_and_restores_shape_after_hide() {
+        let initial = MouseCursorState::default();
+        // Same shape is a complete no-op.
+        assert_eq!(
+            mouse_cursor_transition(initial, MouseCursorUpdate::Shape(GHOSTTY_MOUSE_SHAPE_TEXT)),
+            None
+        );
+        // Hide transitions GTK cursor to "none".
+        let (hidden, gtk_changed) =
+            mouse_cursor_transition(initial, MouseCursorUpdate::Visibility(GHOSTTY_MOUSE_HIDDEN))
+                .expect("hide should change state");
+        assert!(gtk_changed);
+        assert_eq!(hidden.gtk_cursor_name(), "none");
+
+        // Changing shape while hidden records the new shape without touching GTK.
+        let (hidden_pointer, gtk_changed) = mouse_cursor_transition(
+            hidden,
+            MouseCursorUpdate::Shape(GHOSTTY_MOUSE_SHAPE_POINTER),
+        )
+        .expect("shape while hidden should update stored state");
+        assert!(!gtk_changed);
+        assert_eq!(hidden_pointer.gtk_cursor_name(), "none");
+
+        // Unhiding restores the updated pointer shape.
+        let (visible_pointer, gtk_changed) = mouse_cursor_transition(
+            hidden_pointer,
+            MouseCursorUpdate::Visibility(GHOSTTY_MOUSE_VISIBLE),
+        )
+        .expect("unhide should change state");
+        assert!(gtk_changed);
+        assert_eq!(visible_pointer.gtk_cursor_name(), "pointer");
+
+        // Distinct Ghostty shapes mapping to the same GTK cursor name skip GTK update.
+        let (default_state, gtk_changed) = mouse_cursor_transition(
+            visible_pointer,
+            MouseCursorUpdate::Shape(GHOSTTY_MOUSE_SHAPE_DEFAULT),
+        )
+        .expect("switch to default");
+        assert!(gtk_changed);
+        let (unknown_state, gtk_changed) =
+            mouse_cursor_transition(default_state, MouseCursorUpdate::Shape(9999))
+                .expect("distinct raw shape updates stored state");
+        assert!(!gtk_changed);
+        assert_eq!(unknown_state.gtk_cursor_name(), "default");
     }
 
     #[test]
@@ -3899,8 +4039,8 @@ mod tests {
             (42, 50 - LINK_PREVIEW_CURSOR_Y_GAP)
         );
         assert_eq!(
-            link_popover_anchor_point(0.0, 2.0),
-            (0, 2 - LINK_PREVIEW_CURSOR_Y_GAP)
+            link_popover_anchor_point(0.0, f64::from(i32::MIN)),
+            (0, i32::MIN)
         );
     }
 
