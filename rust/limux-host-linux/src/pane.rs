@@ -38,6 +38,7 @@ mod tab_header;
 #[cfg(test)]
 mod tab_overflow_tests;
 use drag_drop::*;
+#[cfg(test)]
 pub(crate) use tab_header::find_tab_rename_entry;
 use tab_header::*;
 
