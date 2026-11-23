@@ -1801,9 +1801,11 @@ fn make_terminal_callbacks(
                         return None;
                     };
                     let active = tabs.active_tab.as_deref() == Some(tab_id.as_str());
-                    (state.generation.clone(), active)
+                    let driven = state.handle.driven_within(exit_hold::DRIVEN_EXIT_WINDOW);
+                    (state.generation.clone(), active, driven)
                 };
-                Some((generation.0, generation.1 && pane_is_visible(&pane)))
+                let (generation, active, driven) = generation;
+                Some((generation, driven || (active && pane_is_visible(&pane))))
             });
             if let Some((generation, attended)) = exit {
                 glib::idle_add_local_once(move || {

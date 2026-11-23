@@ -1,7 +1,8 @@
 //! What happens to a terminal tab when its process ends on its own.
 //!
 //! A terminal closes when the user ends it in front of them, as in every
-//! terminal. A process that ends while nobody is watching (a hidden project,
+//! terminal, or when a script or agent driving it through the control
+//! socket ends it (`limux send-key ... '<Ctrl>d'`). A process that ends while nobody is watching (a hidden project,
 //! a background tab, an inactive window) keeps its tab, its output and its
 //! project, with a banner to restart or close it. A process that fails right
 //! after starting is held even in front of the user, so a mistyped command
@@ -12,6 +13,10 @@ use std::time::Duration;
 
 /// Matches Ghostty's `abnormal-command-exit-runtime` default.
 pub(super) const ABNORMAL_EXIT_RUNTIME: Duration = Duration::from_millis(250);
+
+/// An exit this soon after control-socket input was caused by it: whoever
+/// sent it is driving the terminal, so it closes as if watched.
+pub(super) const DRIVEN_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
 pub(super) const EXITED_TAB_CSS_CLASS: &str = "limux-tab-exited";
 const EXIT_BANNER_CSS_CLASS: &str = "limux-exit-banner";

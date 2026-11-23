@@ -878,6 +878,91 @@ fn tab_unread_changes_preserve_independent_workspace_notifications() {
 
 #[test]
 #[ignore = "requires a graphical display and Ghostty resources"]
+fn an_exit_driven_through_the_control_socket_closes_its_tab_unwatched() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.DrivenExitTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    pane::add_terminal_tab_to_pane(&pane);
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    let wait = std::time::Duration::from_secs(5);
+    pump_until(wait, || handle.health().realized);
+    assert_eq!(pane::tab_count_in_pane(&pane), 2);
+
+    // Nobody is watching: another window has the focus (on Weston headless
+    // no window ever has it).
+    let peer = adw::ApplicationWindow::builder()
+        .application(&app)
+        .title("Focus peer")
+        .build();
+    peer.present();
+    let window = state.borrow().window.clone();
+    pump_until(wait, || !window.is_active());
+    assert!(!window.is_active());
+
+    // A script ends the shell through the socket, as `limux send` and
+    // `limux send-key` do: the tab closes as if watched.
+    let target = || WorkspaceTarget::Handle(ws_id.clone());
+    let (reply, rx) = std::sync::mpsc::channel();
+    handle_control_command(
+        &state,
+        ControlCommand::SendText {
+            target: target(),
+            surface_hint: Some(surface.surface_id.clone()),
+            text: "exit".to_string(),
+            reply,
+        },
+    );
+    rx.recv_timeout(wait).unwrap().expect("surface.send_text");
+    let (reply, rx) = std::sync::mpsc::channel();
+    handle_control_command(
+        &state,
+        ControlCommand::SendKey {
+            target: target(),
+            surface_hint: Some(surface.surface_id.clone()),
+            key: "enter".to_string(),
+            reply,
+        },
+    );
+    rx.recv_timeout(wait).unwrap().expect("surface.send_key");
+    pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
+    assert_eq!(
+        pane::tab_count_in_pane(&pane),
+        1,
+        "an exit a script caused closes its tab"
+    );
+    peer.close();
+    window.close();
+}
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
 fn closing_inactive_workspace_preserves_active_manual_unread() {
     let temp = tempfile::tempdir().unwrap();
     for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {

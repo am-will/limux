@@ -343,6 +343,9 @@ pub struct TerminalHandle {
     motion_coalescer: Rc<MotionCoalescer>,
     signal_handlers: Rc<RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>>,
     controllers: Rc<RefCell<Vec<gtk::EventController>>>,
+    /// When input last came through the control socket (`limux send`,
+    /// `send-key`): a script or agent driving this terminal.
+    driven_at: Rc<Cell<Option<std::time::Instant>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -398,6 +401,18 @@ impl TerminalHandle {
     pub(crate) fn realize_in_background(&self) {
         self.background_realize
             .realize(&self.gl_area, &self.shutting_down);
+    }
+
+    /// Note input sent through the control socket.
+    pub fn note_driven_input(&self) {
+        self.driven_at.set(Some(std::time::Instant::now()));
+    }
+
+    /// Whether the control socket sent input within `window`.
+    pub fn driven_within(&self, window: std::time::Duration) -> bool {
+        self.driven_at
+            .get()
+            .is_some_and(|at| at.elapsed() <= window)
     }
 
     pub fn set_output_activity_enabled(&self, enabled: bool) {
@@ -2404,6 +2419,7 @@ pub fn create_terminal(
         motion_coalescer: motion_coalescer.clone(),
         signal_handlers: signal_handlers.clone(),
         controllers: controllers.clone(),
+        driven_at: Rc::default(),
     };
 
     {
