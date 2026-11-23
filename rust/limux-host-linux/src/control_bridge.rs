@@ -1782,11 +1782,29 @@ impl Drop for ConnectionSlot {
     }
 }
 
+fn command_needs_browser_sandbox(command: &ControlCommand) -> bool {
+    matches!(
+        command,
+        ControlCommand::CreateSurface { browser: true, .. }
+            | ControlCommand::CreatePane {
+                request: CreatePaneRequest {
+                    pane_type: PaneCreateType::Browser,
+                    ..
+                },
+                ..
+            }
+            | ControlCommand::BrowserOpenSplit { .. }
+    )
+}
+
 /// Start the control socket server in a background thread and dispatch each
 /// command onto the GTK main context.
 pub fn start(dispatch: fn(ControlCommand)) {
     let context = glib::MainContext::default();
     let dispatch = std::sync::Arc::new(move |command: ControlCommand| {
+        if command_needs_browser_sandbox(&command) {
+            let _ = crate::browser_sandbox::wait_for_availability_blocking();
+        }
         context.invoke(move || dispatch(command));
     });
 

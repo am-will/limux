@@ -2534,11 +2534,15 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             kind: TabKind::Browser {
                 state: BrowserTabState {
                     uri: saved_uri.clone(),
-                    handles,
-                    callbacks,
+                    handles: handles.clone(),
+                    callbacks: callbacks.clone(),
                 },
             },
         });
+    }
+    #[cfg(feature = "webkit")]
+    if let BrowserHandles::Pending(pending) = handles {
+        register_pending_browser_upgrade(&tab_id, pending, saved_uri, callbacks);
     }
     internals.tab_strip.append(
         &internals
@@ -3557,9 +3561,19 @@ struct LiveBrowserHandles {
 }
 
 #[cfg(feature = "webkit")]
+struct PendingBrowserHandles {
+    container: gtk::Box,
+    initial_uri: Option<String>,
+    explicit_uri: Option<String>,
+    removed: bool,
+    resolved: Option<Box<BrowserHandles>>,
+}
+
+#[cfg(feature = "webkit")]
 #[derive(Clone)]
 enum BrowserHandles {
     Ready(Rc<LiveBrowserHandles>),
+    Pending(Rc<RefCell<PendingBrowserHandles>>),
     Unavailable(gtk::Widget),
 }
 
@@ -3799,21 +3813,55 @@ impl LiveBrowserHandles {
 
 #[cfg(feature = "webkit")]
 impl BrowserHandles {
+    fn resolved_from_pending(pending: &Rc<RefCell<PendingBrowserHandles>>) -> Option<Self> {
+        pending.borrow().resolved.as_deref().cloned()
+    }
+
     fn prepare_for_removal(&self) {
-        if let Self::Ready(handles) = self {
-            handles.prepare_for_removal();
+        match self {
+            Self::Ready(handles) => handles.prepare_for_removal(),
+            Self::Pending(pending) => {
+                let resolved = {
+                    let mut slot = pending.borrow_mut();
+                    slot.removed = true;
+                    slot.resolved.as_deref().cloned()
+                };
+                if let Some(handles) = resolved {
+                    handles.prepare_for_removal();
+                }
+            }
+            Self::Unavailable(_) => {}
         }
     }
 
     fn navigate(&self, url: &str) {
-        if let Self::Ready(handles) = self {
-            handles.navigate(url);
+        match self {
+            Self::Ready(handles) => handles.navigate(url),
+            Self::Pending(pending) => {
+                let resolved = {
+                    let mut slot = pending.borrow_mut();
+                    if let Some(handles) = slot.resolved.as_deref() {
+                        Some(handles.clone())
+                    } else {
+                        slot.explicit_uri = Some(url.to_string());
+                        None
+                    }
+                };
+                if let Some(handles) = resolved {
+                    handles.navigate(url);
+                }
+            }
+            Self::Unavailable(_) => {}
         }
     }
 
     fn focus_content(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.focus_content(),
+            Self::Pending(pending) => match Self::resolved_from_pending(pending) {
+                Some(handles) => handles.focus_content(),
+                None => pending.borrow().container.grab_focus(),
+            },
             Self::Unavailable(widget) => widget.grab_focus(),
         }
     }
@@ -3821,6 +3869,9 @@ impl BrowserHandles {
     fn is_find_active(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.is_find_active(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.is_find_active())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3828,6 +3879,9 @@ impl BrowserHandles {
     fn is_page_editable(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.is_page_editable(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.is_page_editable())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3835,6 +3889,9 @@ impl BrowserHandles {
     fn focus_location(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.focus_location(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.focus_location())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3846,6 +3903,8 @@ impl BrowserHandles {
     ) -> bool {
         match self {
             Self::Ready(handles) => handles.go_back(saved_uri, callbacks),
+            Self::Pending(pending) => Self::resolved_from_pending(pending)
+                .is_some_and(|h| h.go_back(saved_uri, callbacks)),
             Self::Unavailable(_) => false,
         }
     }
@@ -3857,6 +3916,8 @@ impl BrowserHandles {
     ) -> bool {
         match self {
             Self::Ready(handles) => handles.go_forward(saved_uri, callbacks),
+            Self::Pending(pending) => Self::resolved_from_pending(pending)
+                .is_some_and(|h| h.go_forward(saved_uri, callbacks)),
             Self::Unavailable(_) => false,
         }
     }
@@ -3864,6 +3925,9 @@ impl BrowserHandles {
     fn reload(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.reload(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.reload())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3871,6 +3935,9 @@ impl BrowserHandles {
     fn show_inspector(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.show_inspector(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.show_inspector())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3878,6 +3945,9 @@ impl BrowserHandles {
     fn show_console(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.show_console(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.show_console())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3885,6 +3955,9 @@ impl BrowserHandles {
     fn show_find(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.show_find(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.show_find())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3892,6 +3965,9 @@ impl BrowserHandles {
     fn find_next(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.find_next(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.find_next())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3899,6 +3975,9 @@ impl BrowserHandles {
     fn find_previous(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.find_previous(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.find_previous())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3906,6 +3985,9 @@ impl BrowserHandles {
     fn hide_find(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.hide_find(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.hide_find())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3913,6 +3995,9 @@ impl BrowserHandles {
     fn use_selection_for_find(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.use_selection_for_find(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.use_selection_for_find())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4155,16 +4240,126 @@ const LIMUX_BROWSER_EDITABLE_STATE_SCRIPT: &str = r#"
 "#;
 
 #[cfg(feature = "webkit")]
+fn pending_browser_widget(initial_uri: Option<&str>) -> (gtk::Widget, String, BrowserHandles) {
+    let container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .focusable(true)
+        .build();
+    let inner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .vexpand(true)
+        .spacing(12)
+        .build();
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    let label = gtk::Label::new(Some("Checking browser sandbox..."));
+    label.add_css_class("dim-label");
+    inner.append(&spinner);
+    inner.append(&label);
+    container.append(&inner);
+
+    let pending = Rc::new(RefCell::new(PendingBrowserHandles {
+        container: container.clone(),
+        initial_uri: initial_uri.map(str::to_string),
+        explicit_uri: None,
+        removed: false,
+        resolved: None,
+    }));
+    (
+        container.upcast(),
+        "Browser".to_string(),
+        BrowserHandles::Pending(pending),
+    )
+}
+
+#[cfg(feature = "webkit")]
+fn register_pending_browser_upgrade(
+    tab_id: &str,
+    pending: Rc<RefCell<PendingBrowserHandles>>,
+    saved_uri: Rc<RefCell<Option<String>>>,
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
+) {
+    let tab_id = tab_id.to_string();
+    crate::browser_sandbox::register_main_thread_waiter(move |availability| {
+        let (container, initial_uri, explicit_uri) = {
+            let slot = pending.borrow();
+            if slot.removed || slot.resolved.is_some() {
+                return;
+            }
+            (
+                slot.container.clone(),
+                slot.initial_uri.clone(),
+                slot.explicit_uri.clone(),
+            )
+        };
+
+        let had_focus = crate::terminal::focus_is_within(container.upcast_ref());
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+
+        let (child_widget, resolved_handles) = match availability {
+            Ok(_) => {
+                let effective_uri = explicit_uri.as_deref().or(initial_uri.as_deref());
+                let (widget, _, handles) =
+                    build_live_browser_widget(effective_uri, saved_uri.clone(), callbacks.clone());
+                if let Some(uri) = explicit_uri.as_deref() {
+                    handles.navigate(uri);
+                }
+                container.append(&widget);
+                (widget, handles)
+            }
+            Err(error) => {
+                let (widget, _, handles) = unavailable_browser_widget(error);
+                container.append(&widget);
+                (widget, handles)
+            }
+        };
+        let _ = child_widget;
+
+        pending.borrow_mut().resolved = Some(Box::new(resolved_handles.clone()));
+        if let Some(owner) = terminal_tab_owner(&tab_id) {
+            let mut tabs = owner.tab_state.borrow_mut();
+            if let Some(entry) = tabs.find_tab_mut(&tab_id) {
+                if let TabKind::Browser { state } = &mut entry.kind {
+                    state.handles = resolved_handles.clone();
+                }
+            }
+        }
+        if had_focus {
+            resolved_handles.focus_content();
+        }
+    });
+}
+
+#[cfg(feature = "webkit")]
 fn create_browser_widget(
+    initial_uri: Option<&str>,
+    saved_uri: Rc<RefCell<Option<String>>>,
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
+) -> (gtk::Widget, String, BrowserHandles) {
+    match crate::browser_sandbox::status_nonblocking_or_start() {
+        crate::browser_sandbox::ProbeState::Pending => pending_browser_widget(initial_uri),
+        crate::browser_sandbox::ProbeState::Ready(Err(error)) => unavailable_browser_widget(&error),
+        crate::browser_sandbox::ProbeState::Ready(Ok(_)) => {
+            build_live_browser_widget(initial_uri, saved_uri, callbacks)
+        }
+    }
+}
+
+#[cfg(feature = "webkit")]
+fn build_live_browser_widget(
     initial_uri: Option<&str>,
     saved_uri: Rc<RefCell<Option<String>>>,
     callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
 ) -> (gtk::Widget, String, BrowserHandles) {
     use webkit6::prelude::*;
 
-    if let Some(error) = crate::browser_sandbox::unavailable_reason() {
-        return unavailable_browser_widget(error);
-    }
     let user_content_manager = webkit6::UserContentManager::new();
     let dom_editable = Rc::new(Cell::new(false));
     let _ = user_content_manager
@@ -5924,9 +6119,17 @@ mod tests {
 
         let internals = find_pane_internals(pane.upcast_ref()).unwrap();
         let content = internals.tab_state.borrow().tabs[0].content.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !content.is_mapped() {
-            assert!(std::time::Instant::now() < deadline, "browser never mapped");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !content.is_mapped()
+            || !matches!(
+                &internals.tab_state.borrow().tabs[0].kind,
+                TabKind::Browser { state } if matches!(state.handles, super::BrowserHandles::Ready(_))
+            )
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "browser never mapped and resolved"
+            );
             context.iteration(true);
         }
         while context.iteration(false) {}
@@ -6010,6 +6213,19 @@ mod tests {
         window.present();
 
         let internals = find_pane_internals(pane.upcast_ref()).unwrap();
+        let wait_until = |pred: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !pred() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                context.iteration(true);
+            }
+        };
+        wait_until(&|| {
+            matches!(
+                &internals.tab_state.borrow().tabs[0].kind,
+                TabKind::Browser { state } if matches!(state.handles, super::BrowserHandles::Ready(_))
+            )
+        });
         let webview = {
             let tab_state = internals.tab_state.borrow();
             let TabKind::Browser { state } = &tab_state.tabs[0].kind else {
@@ -6019,14 +6235,6 @@ mod tests {
                 panic!("expected available browser");
             };
             handles.webview.clone()
-        };
-
-        let wait_until = |pred: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !pred() {
-                assert!(std::time::Instant::now() < deadline, "timed out");
-                context.iteration(true);
-            }
         };
 
         wait_until(&|| {

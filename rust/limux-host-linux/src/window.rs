@@ -1086,25 +1086,34 @@ fn surface_health_row(
             row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
         }
     } else if surface.kind == "browser" {
-        let availability = crate::browser_sandbox::availability();
-        row.insert(
-            "healthy".to_string(),
-            serde_json::Value::Bool(availability.is_ok()),
-        );
-        row.insert(
-            "realized".to_string(),
-            serde_json::Value::Bool(availability.is_ok()),
-        );
-        row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
-        row.insert(
-            "sandboxed".to_string(),
-            serde_json::Value::Bool(availability.as_ref().is_ok_and(|status| status.sandboxed)),
-        );
-        if let Err(error) = availability {
-            row.insert(
-                "error".to_string(),
-                serde_json::Value::String(error.clone()),
-            );
+        match crate::browser_sandbox::status_nonblocking_or_start() {
+            #[cfg(feature = "webkit")]
+            crate::browser_sandbox::ProbeState::Pending => {
+                row.insert("healthy".to_string(), serde_json::Value::Bool(false));
+                row.insert("realized".to_string(), serde_json::Value::Bool(false));
+                row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
+                row.insert("sandboxed".to_string(), serde_json::Value::Bool(false));
+            }
+            crate::browser_sandbox::ProbeState::Ready(availability) => {
+                row.insert(
+                    "healthy".to_string(),
+                    serde_json::Value::Bool(availability.is_ok()),
+                );
+                row.insert(
+                    "realized".to_string(),
+                    serde_json::Value::Bool(availability.is_ok()),
+                );
+                row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
+                row.insert(
+                    "sandboxed".to_string(),
+                    serde_json::Value::Bool(
+                        availability.as_ref().is_ok_and(|status| status.sandboxed),
+                    ),
+                );
+                if let Err(error) = availability {
+                    row.insert("error".to_string(), serde_json::Value::String(error));
+                }
+            }
         }
     } else {
         row.insert("healthy".to_string(), serde_json::Value::Bool(true));
@@ -6403,7 +6412,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             if browser {
-                if let Some(error) = crate::browser_sandbox::unavailable_reason() {
+                if let crate::browser_sandbox::ProbeState::Ready(Err(error)) =
+                    crate::browser_sandbox::status_nonblocking_or_start()
+                {
                     let _ = reply.send(Err(BridgeError::internal(error)));
                     return;
                 }
