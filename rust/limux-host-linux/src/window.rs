@@ -1277,7 +1277,7 @@ pub(crate) fn apply_ratio_value(
         layout_state::split_position_from_ratio(ratio, size),
     );
     applying.set(true);
-    if paned.position() != clamped {
+    if !paned.is_position_set() || paned.position() != clamped {
         paned.set_position(clamped);
     }
     applying.set(false);

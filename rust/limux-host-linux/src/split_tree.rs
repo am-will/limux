@@ -1433,6 +1433,75 @@ mod tests {
 
         nested_window.close();
         pump_for(std::time::Duration::from_millis(30));
+
+        // 3. Default 50/50 split on an even width (800px -> pos 400 matches GTK4's
+        // initial default position before `position-set` is true): `apply_ratio_value`
+        // must still mark `position-set` so later child minimum-width growth cannot
+        // skew the split or trigger a false user-drag save.
+        let half_paned = make_paned();
+        let half_start = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let half_end = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        half_start.set_size_request(pane::MIN_PANE_WIDTH, -1);
+        half_end.set_size_request(pane::MIN_PANE_WIDTH, -1);
+        half_paned.set_start_child(Some(&half_start));
+        half_paned.set_end_child(Some(&half_end));
+
+        let half_ratio = Rc::new(RefCell::new(0.5));
+        let half_saves = Rc::new(Cell::new(0u32));
+        let half_saves_cb = half_saves.clone();
+        install_split_ratio_tracking(
+            &half_paned,
+            &half_ratio,
+            Some(Box::new(move || {
+                half_saves_cb.set(half_saves_cb.get() + 1);
+            })),
+        );
+
+        let half_window = gtk::Window::new();
+        half_window.set_default_size(800, 500);
+        half_window.set_child(Some(&half_paned));
+        half_window.present();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(half_paned.is_mapped()
+            && half_paned.width() == 800
+            && half_paned.is_position_set()
+            && (half_paned.position() - 400).abs() <= 2)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "50/50 split did not lock position-set (width={}, pos={}, set={})",
+                half_paned.width(),
+                half_paned.position(),
+                half_paned.is_position_set()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert_eq!(half_saves.get(), 0);
+
+        // Growing one child's minimum width at the same 800px width must keep the
+        // 50/50 split locked at 400px with no ratio drift or user-drag save.
+        half_start.set_size_request(450, -1);
+        pump_for(std::time::Duration::from_millis(120));
+        assert!(half_paned.is_position_set());
+        assert!(
+            (half_paned.position() - 400).abs() <= 2,
+            "child minimum growth skewed 50/50 split position to {}",
+            half_paned.position()
+        );
+        assert!(
+            (*half_ratio.borrow() - 0.5).abs() < 1e-9,
+            "child minimum growth corrupted 50/50 stored ratio: {}",
+            *half_ratio.borrow()
+        );
+        assert_eq!(
+            half_saves.get(),
+            0,
+            "child minimum growth must not trigger a user-drag save"
+        );
+
+        half_window.close();
+        pump_for(std::time::Duration::from_millis(30));
     }
 
     #[test]
