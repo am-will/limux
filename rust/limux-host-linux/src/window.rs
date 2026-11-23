@@ -903,7 +903,7 @@ pub(crate) fn resolve_pane_create_target(
         target_workspace_is_active,
         &pane_ids,
     )?;
-    // A pane detached by a zoom is out of the root.
+    // A pane hidden by a zoom is excluded from root visibility queries.
     let pane_widget =
         pane::pane_widget_for_root(&workspace_root, pane_id).ok_or_else(|| match surface_id {
             Some(surface_id) => PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()),
@@ -7898,11 +7898,12 @@ fn close_workspace_by_id_internal(
     let Some(idx) = s.workspaces.iter().position(|workspace| workspace.id == id) else {
         return;
     };
+    let previous_active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
     // Closing the active workspace activates its sidebar neighbour, skipping
     // rows hidden in collapsed groups.
     let desired_active_workspace_id = preferred_active_workspace_id
         .map(ToOwned::to_owned)
-        .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()))
+        .or_else(|| previous_active_workspace_id.clone())
         .filter(|desired| desired != id)
         .or_else(|| s.sidebar.workspace_to_activate_after(id));
 
@@ -7965,7 +7966,9 @@ fn close_workspace_by_id_internal(
     // it (see `terminal::unset_focus_within`).
     split_container.retire_panes();
     crate::terminal::remove_from_stack_after_repaint(&ws.root);
-    clear_visible_tab_unread(state, &new_workspace_id);
+    if previous_active_workspace_id.as_deref() != Some(new_workspace_id.as_str()) {
+        clear_visible_tab_unread(state, &new_workspace_id);
+    }
     select_sidebar_row_silently(state, &sidebar_list, &row);
     // Refresh group counts, and show the new active row if it is collapsed.
     sidebar_groups::sync_sidebar(state);
@@ -8044,9 +8047,23 @@ pub(super) fn select_sidebar_row_silently(
     if sidebar_list.selected_row().as_ref() == Some(row) {
         return;
     }
-    state.borrow_mut().suppress_sidebar_row_selected = true;
+    struct RestoreSuppress<'a> {
+        state: &'a State,
+        previous: bool,
+    }
+    impl Drop for RestoreSuppress<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut app_state) = self.state.try_borrow_mut() {
+                app_state.suppress_sidebar_row_selected = self.previous;
+            }
+        }
+    }
+    let previous = {
+        let mut app_state = state.borrow_mut();
+        std::mem::replace(&mut app_state.suppress_sidebar_row_selected, true)
+    };
+    let _guard = RestoreSuppress { state, previous };
     sidebar_list.select_row(Some(row));
-    state.borrow_mut().suppress_sidebar_row_selected = false;
 }
 
 /// Select a workspace by index and sync the sidebar selection.

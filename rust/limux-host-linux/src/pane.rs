@@ -3126,7 +3126,7 @@ pub(crate) fn pane_widget_for_root(root: &gtk::Widget, pane_id: u32) -> Option<g
         .then(|| internals.pane_outer.clone().upcast())
 }
 
-/// Includes panes temporarily detached from the visible tree by zoom.
+/// Includes panes temporarily hidden in-place by zoom.
 pub(crate) fn pane_widget_for_workspace(workspace_id: &str, pane_id: u32) -> Option<gtk::Widget> {
     let internals = lookup_pane_internals(pane_id)?;
     (internals.callbacks.workspace_id == workspace_id)
