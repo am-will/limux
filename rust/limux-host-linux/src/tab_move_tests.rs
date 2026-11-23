@@ -362,8 +362,13 @@ fn a_surface_hidden_by_a_zoom_is_reported_not_found() {
         (workspace.root.clone(), workspace.split_container.clone())
     };
     let left = find_leaf_pane(&root, gtk::Orientation::Horizontal, true);
+    let right = find_leaf_pane(&root, gtk::Orientation::Horizontal, false);
     assert!(container.toggle_zoom(&left));
     pump_until(std::time::Duration::from_millis(300), || false);
+    assert!(
+        pane_in_direction(&state, &left, Direction::Right).is_none(),
+        "directional navigation must not target a sibling hidden by zoom"
+    );
 
     let target = WorkspaceTarget::Index(index);
     let (_, surface) = control_request_target(&state, &target, Some("right"), false).unwrap();
@@ -384,6 +389,12 @@ fn a_surface_hidden_by_a_zoom_is_reported_not_found() {
         created,
         Some(PaneCreateTargetError::InvalidSurfaceId("right".to_string()))
     );
+
+    // Revealing the hidden sibling unzooms in-place and makes it visible again.
+    assert!(container.reveal_pane(&right));
+    pump_until(std::time::Duration::from_millis(300), || false);
+    assert!(split_tree::is_visible_within_root(&right, &root));
+    assert!(pane_in_direction(&state, &left, Direction::Right).is_some());
 
     let window = state.borrow().window.clone();
     window.close();

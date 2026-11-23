@@ -36,8 +36,7 @@ impl SessionStore {
 
     pub(crate) fn load_from_dir(directory: &Path) -> io::Result<(Self, LoadedSession)> {
         let _lock = lock_directory(directory)?;
-        let mut loaded = read_session(directory)?;
-        let mut changed = false;
+        let (mut loaded, mut changed) = read_session_with_minted_ids(directory)?;
         let mut ids = BTreeSet::new();
         for workspace in &mut loaded.state.workspaces {
             if workspace
@@ -52,11 +51,6 @@ impl SessionStore {
             }
         }
         changed |= layout_state::dedup_tab_ids(&mut loaded.state);
-        // Normalization mints a fresh tab id for an empty pane, so two reads of such a
-        // file differ. Persist it too, or every save would see a remote edit.
-        if !changed {
-            changed = read_session(directory)?.state != loaded.state;
-        }
         // Migrate identity once, under the writer lock, before another window loads.
         if changed {
             layout_state::save_session_atomic_in(directory, &loaded.state)?;
@@ -180,30 +174,61 @@ fn lock_directory(directory: &Path) -> io::Result<File> {
     }
 }
 
+fn layout_has_empty_pane(layout: &layout_state::LayoutNodeState) -> bool {
+    match layout {
+        layout_state::LayoutNodeState::Pane(pane) => pane.tabs.is_empty(),
+        layout_state::LayoutNodeState::Split(split) => {
+            layout_has_empty_pane(&split.start) || layout_has_empty_pane(&split.end)
+        }
+    }
+}
+
 fn read_session(directory: &Path) -> io::Result<LoadedSession> {
+    read_session_with_minted_ids(directory).map(|(loaded, _)| loaded)
+}
+
+fn read_session_with_minted_ids(directory: &Path) -> io::Result<(LoadedSession, bool)> {
     let canonical = layout_state::canonical_session_path_in(directory);
     match fs::read(&canonical) {
         Ok(bytes) => {
-            let state = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-            Ok(LoadedSession {
-                state: layout_state::normalize_session(state),
-                source: layout_state::SessionLoadSource::Canonical,
-            })
+            let state: AppSessionState =
+                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            // Normalization mints a fresh tab id only for empty panes; detect
+            // that before normalizing so clean startups avoid a second disk read.
+            let minted_ids = state
+                .workspaces
+                .iter()
+                .any(|workspace| layout_has_empty_pane(&workspace.layout));
+            Ok((
+                LoadedSession {
+                    state: layout_state::normalize_session(state),
+                    source: layout_state::SessionLoadSource::Canonical,
+                },
+                minted_ids,
+            ))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let legacy = layout_state::legacy_workspaces_path_in(directory);
             match fs::read(legacy) {
                 Ok(bytes) => {
-                    let workspaces = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-                    Ok(LoadedSession {
-                        state: AppSessionState::from_legacy(workspaces),
-                        source: layout_state::SessionLoadSource::Legacy,
-                    })
+                    let workspaces: Vec<layout_state::LegacySavedWorkspace> =
+                        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                    let minted_ids = !workspaces.is_empty();
+                    Ok((
+                        LoadedSession {
+                            state: AppSessionState::from_legacy(workspaces),
+                            source: layout_state::SessionLoadSource::Legacy,
+                        },
+                        minted_ids,
+                    ))
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(LoadedSession {
-                    state: AppSessionState::default(),
-                    source: layout_state::SessionLoadSource::Empty,
-                }),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((
+                    LoadedSession {
+                        state: AppSessionState::default(),
+                        source: layout_state::SessionLoadSource::Empty,
+                    },
+                    false,
+                )),
                 Err(error) => Err(error),
             }
         }

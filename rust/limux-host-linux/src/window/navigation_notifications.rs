@@ -64,23 +64,25 @@ pub(super) fn pane_in_direction(
             if paned.orientation() == target_orientation {
                 let is_start = paned.start_child().map(|c| c == current).unwrap_or(false);
                 if is_start == must_be_start {
-                    // Found the split point. Navigate to the sibling subtree.
+                    // Found the split point. Navigate to the sibling subtree,
+                    // skipping branches hidden in-place by zoom.
                     let sibling = if must_be_start {
                         paned.end_child()
                     } else {
                         paned.start_child()
-                    };
-                    // A closed pane stays in the old tree until its teardown
-                    // frame and must not be returned.
-                    return sibling
-                        .map(|sibling| {
+                    }
+                    .filter(|sibling| sibling.get_visible());
+                    if let Some(sibling) = sibling {
+                        // A closed pane stays in the old tree until its teardown
+                        // frame and must not be returned.
+                        let leaf =
                             best_directional_leaf_pane(pane_widget, &sibling, &root, direction)
                                 .unwrap_or_else(|| {
                                     let prefer_start = !must_be_start;
                                     find_leaf_pane(&sibling, target_orientation, prefer_start)
-                                })
-                        })
-                        .filter(pane::is_live_pane);
+                                });
+                        return pane::is_live_pane(&leaf).then_some(leaf);
+                    }
                 }
             }
         }
@@ -171,6 +173,9 @@ pub(super) fn neighbor_score_better(candidate: NeighborScore, best: NeighborScor
 }
 
 pub(super) fn collect_leaf_panes(widget: &gtk::Widget, panes: &mut Vec<gtk::Widget>) {
+    if !widget.get_visible() {
+        return;
+    }
     if pane::is_pane_widget(widget) {
         if pane::is_live_pane(widget) {
             panes.push(widget.clone());
@@ -266,15 +271,17 @@ pub(super) fn find_leaf_pane(
     prefer_start: bool,
 ) -> gtk::Widget {
     if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+        let start = paned.start_child().filter(|child| child.get_visible());
+        let end = paned.end_child().filter(|child| child.get_visible());
         let pick_start = if paned.orientation() == axis {
             prefer_start
         } else {
             true // arbitrary default for orthogonal splits
         };
         let child = if pick_start {
-            paned.start_child()
+            start.or(end)
         } else {
-            paned.end_child()
+            end.or(start)
         };
         match child {
             Some(c) => find_leaf_pane(&c, axis, prefer_start),
@@ -284,8 +291,12 @@ pub(super) fn find_leaf_pane(
         // A gtk::Box may be a pane widget (leaf) or a SplitTreeContainer bin
         // wrapping a single pane or paned. Descend into non-pane boxes.
         if !pane::is_pane_widget(widget) {
-            if let Some(first_child) = box_widget.first_child() {
-                return find_leaf_pane(&first_child, axis, prefer_start);
+            let mut child = box_widget.first_child();
+            while let Some(current) = child {
+                if current.get_visible() {
+                    return find_leaf_pane(&current, axis, prefer_start);
+                }
+                child = current.next_sibling();
             }
         }
         widget.clone()
@@ -313,9 +324,9 @@ pub(super) fn surface_tab_target(
     surface_hint: &str,
     terminals_only: bool,
 ) -> pane::HintResolution<(usize, u32, String)> {
-    let s = state.borrow();
+    let app_state = state.borrow();
     if scoped {
-        let Some(workspace) = s.workspaces.get(preferred_index) else {
+        let Some(workspace) = app_state.workspaces.get(preferred_index) else {
             return pane::HintResolution::NotFound;
         };
         let candidates =
@@ -325,18 +336,19 @@ pub(super) fn surface_tab_target(
         return pane::resolve_surface_hint(candidates);
     }
 
-    let workspace_index_by_id: std::collections::HashMap<&str, usize> = s
+    let workspace_indices: HashMap<&str, usize> = app_state
         .workspaces
         .iter()
         .enumerate()
         .map(|(index, workspace)| (workspace.id.as_str(), index))
         .collect();
-    pane::resolve_surface_hint_for_workspaces(
-        &workspace_index_by_id,
-        preferred_index,
-        surface_hint,
-        terminals_only,
-    )
+    let candidates =
+        pane::tab_candidates_across_workspaces(&workspace_indices, surface_hint, terminals_only)
+            .into_iter()
+            .map(|(rank, index, pane_id, tab_id)| {
+                ((rank, index == preferred_index), (index, pane_id, tab_id))
+            });
+    pane::resolve_surface_hint(candidates)
 }
 
 pub(super) fn has_unread(workspace_unread: bool, tab_unread: bool) -> bool {
@@ -344,6 +356,13 @@ pub(super) fn has_unread(workspace_unread: bool, tab_unread: bool) -> bool {
 }
 
 pub(super) fn set_workspace_unread_visual(workspace: &Workspace, unread: bool) {
+    let show_notify_label = unread && !workspace.notify_label.label().is_empty();
+    let visual_state = (unread, show_notify_label);
+    if workspace.unread_visual.get() == Some(visual_state) {
+        return;
+    }
+    workspace.unread_visual.set(Some(visual_state));
+
     if unread {
         workspace
             .notify_dot
@@ -353,9 +372,7 @@ pub(super) fn set_workspace_unread_visual(workspace: &Workspace, unread: bool) {
         workspace
             .notify_label
             .add_css_class("limux-notify-msg-unread");
-        workspace
-            .notify_label
-            .set_visible(!workspace.notify_label.label().is_empty());
+        workspace.notify_label.set_visible(show_notify_label);
         if let Some(row_box) = workspace.sidebar_row.child() {
             row_box.add_css_class("limux-sidebar-row-unread");
         }
@@ -412,7 +429,7 @@ pub(super) fn sync_workspace_unread(state: &State, ws_id: &str) {
 }
 
 pub(super) fn clear_visible_tab_unread(state: &State, ws_id: &str) {
-    let root = {
+    let (root, had_workspace_unread) = {
         let mut s = state.borrow_mut();
         if !s.window.is_active() {
             return;
@@ -424,16 +441,19 @@ pub(super) fn clear_visible_tab_unread(state: &State, ws_id: &str) {
         else {
             return;
         };
+        let had = workspace.unread || workspace.manual_unread;
         workspace.unread = false;
         workspace.manual_unread = false;
-        workspace.root.clone()
+        (workspace.root.clone(), had)
     };
-    pane::clear_active_tab_unread_in_root(&root);
-    sync_workspace_unread(state, ws_id);
+    let cleared_tab = pane::clear_active_tab_unread_in_root(&root);
+    if had_workspace_unread || cleared_tab {
+        sync_workspace_unread(state, ws_id);
+    }
 }
 
 pub(super) fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &str) {
-    let root = {
+    let (root, had_workspace_unread) = {
         let mut s = state.borrow_mut();
         if !s.window.is_active() {
             return;
@@ -445,11 +465,14 @@ pub(super) fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &st
         else {
             return;
         };
+        let had = workspace.unread;
         workspace.unread = false;
-        workspace.root.clone()
+        (workspace.root.clone(), had)
     };
-    pane::clear_active_tab_unread_in_root_if_not_manual(&root);
-    sync_workspace_unread(state, ws_id);
+    let cleared_tab = pane::clear_active_tab_unread_in_root_if_not_manual(&root);
+    if had_workspace_unread || cleared_tab {
+        sync_workspace_unread(state, ws_id);
+    }
 }
 
 pub(super) fn mark_workspace_unread(
@@ -569,7 +592,84 @@ pub(super) fn desktop_notification_actions() -> Vec<String> {
     vec!["default".to_string(), "Open".to_string()]
 }
 
+const MAX_DESKTOP_NOTIFICATION_ROUTES: usize = 256;
+
+pub(super) fn record_desktop_notification_route(
+    routes: &mut HashMap<u32, DesktopNotificationRoute>,
+    order: &mut VecDeque<u32>,
+    notification_id: u32,
+    route: DesktopNotificationRoute,
+) {
+    if routes.insert(notification_id, route).is_some() {
+        order.retain(|id| *id != notification_id);
+    }
+    order.push_back(notification_id);
+    while routes.len() > MAX_DESKTOP_NOTIFICATION_ROUTES {
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
+        routes.remove(&oldest);
+    }
+}
+
+fn send_desktop_notification_with_proxy(
+    state: State,
+    proxy: &gio::DBusProxy,
+    request: &DesktopNotificationRequest,
+) {
+    let route = DesktopNotificationRoute {
+        target: request.target.clone(),
+        activation_token: None,
+    };
+
+    let params = (
+        "Limux",
+        0u32,
+        crate::APP_ID,
+        request.summary.as_str(),
+        request.body.as_str(),
+        desktop_notification_actions(),
+        desktop_notification_hints(request.sound),
+        DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
+    )
+        .to_variant();
+
+    proxy.call(
+        "Notify",
+        Some(&params),
+        gio::DBusCallFlags::NONE,
+        DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS,
+        None::<&gio::Cancellable>,
+        move |result| {
+            let Ok(response) = result else {
+                return;
+            };
+            let Some(notification_id) = desktop_notification_id_from_response(&response) else {
+                return;
+            };
+
+            let mut s = state.borrow_mut();
+            let AppState {
+                desktop_notification_routes,
+                desktop_notification_route_order,
+                ..
+            } = &mut *s;
+            record_desktop_notification_route(
+                desktop_notification_routes,
+                desktop_notification_route_order,
+                notification_id,
+                route.clone(),
+            );
+        },
+    );
+}
+
 pub(super) fn show_desktop_notification(state: &State, request: DesktopNotificationRequest) {
+    if let Some(proxy) = state.borrow().desktop_notification_proxy.clone() {
+        send_desktop_notification_with_proxy(state.clone(), &proxy, &request);
+        return;
+    }
+
     let state = state.clone();
     gio::DBusProxy::for_bus(
         gio::BusType::Session,
@@ -583,44 +683,13 @@ pub(super) fn show_desktop_notification(state: &State, request: DesktopNotificat
             let Ok(proxy) = result else {
                 return;
             };
-            let route = DesktopNotificationRoute {
-                target: request.target.clone(),
-                activation_token: None,
-            };
-
-            let params = (
-                "Limux",
-                0u32,
-                crate::APP_ID,
-                request.summary.as_str(),
-                request.body.as_str(),
-                desktop_notification_actions(),
-                desktop_notification_hints(request.sound),
-                DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
-            )
-                .to_variant();
-
-            proxy.call(
-                "Notify",
-                Some(&params),
-                gio::DBusCallFlags::NONE,
-                DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS,
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let Ok(response) = result else {
-                        return;
-                    };
-                    let Some(notification_id) = desktop_notification_id_from_response(&response)
-                    else {
-                        return;
-                    };
-
-                    state
-                        .borrow_mut()
-                        .desktop_notification_routes
-                        .insert(notification_id, route.clone());
-                },
-            );
+            {
+                let mut s = state.borrow_mut();
+                if s.desktop_notification_proxy.is_none() {
+                    s.desktop_notification_proxy = Some(proxy.clone());
+                }
+            }
+            send_desktop_notification_with_proxy(state.clone(), &proxy, &request);
         },
     );
 }

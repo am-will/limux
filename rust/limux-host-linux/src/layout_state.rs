@@ -547,15 +547,13 @@ impl RestorableAgentIndex {
             let Ok(file) = serde_json::from_str::<HookSessionFile>(&raw) else {
                 continue;
             };
-            index
-                .ended_sessions
-                .extend(file.ended_sessions.into_iter().map(|record| {
-                    (
-                        kind,
-                        record.session_id.trim().to_string(),
-                        surface_tab_id(record.surface_id.trim()).to_string(),
-                    )
-                }));
+            for record in file.ended_sessions {
+                let session_id = record.session_id.trim();
+                let tab_id = surface_tab_id(record.surface_id.trim());
+                index
+                    .ended_sessions
+                    .insert((kind, session_id.to_string(), tab_id.to_string()));
+            }
             for record in file.sessions.values() {
                 let Some(session_id) = normalized_str(&record.session_id) else {
                     continue;
@@ -685,9 +683,9 @@ pub(crate) fn sync_cached_ended_agent_bindings(index: &RestorableAgentIndex) {
         return;
     };
     guard.clear();
-    for (kind, session_id, tab_id) in &index.ended_sessions {
-        if !session_id.is_empty() && !tab_id.is_empty() {
-            guard.insert((*kind, session_id.clone(), tab_id.clone()));
+    for key in &index.ended_sessions {
+        if !key.1.is_empty() && !key.2.is_empty() {
+            guard.insert(key.clone());
         }
     }
     for ((_, surface_id), (active, _)) in &index.by_surface {
