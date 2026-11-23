@@ -7,8 +7,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::{fs::MetadataExt, process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use webkit6::prelude::*;
 
@@ -205,22 +205,53 @@ fn drain_stderr(stderr: &mut Option<ChildStderr>, output: &mut Vec<u8>) {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LaunchEnv {
+    appimage_webkit_unavailable: bool,
+    bypass_requested: bool,
+}
+
+static LAUNCH_ENV: OnceLock<LaunchEnv> = OnceLock::new();
+
+pub(super) fn capture_launch_env() {
+    let _ = LAUNCH_ENV.set(LaunchEnv {
+        appimage_webkit_unavailable: std::env::var_os("LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE")
+            .as_deref()
+            == Some(std::ffi::OsStr::new("1")),
+        bypass_requested: std::env::var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").as_deref()
+            == Ok("1"),
+    });
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn check() -> Result<BrowserSandbox, String> {
+    check_with_cancel(None)
+}
+
+pub(super) fn check_with_cancel(cancel: Option<&AtomicBool>) -> Result<BrowserSandbox, String> {
     require_prepared_runtime()?;
-    let signal_lock = HOST_SIGNAL_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    HOST_TERMINATION_SIGNAL.store(0, Ordering::SeqCst);
-    let signal_guard = HostSignalGuard::install()?;
-    let early_signal = HOST_TERMINATION_SIGNAL.load(Ordering::Relaxed);
-    if early_signal != 0 {
-        drop(signal_guard);
-        drop(signal_lock);
-        reraise_host_signal(early_signal);
-        return Err(format!(
-            "Browser startup check interrupted by signal {early_signal}."
-        ));
-    }
+    let (signal_lock, signal_guard) = if cancel.is_none() {
+        let lock = HOST_SIGNAL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        HOST_TERMINATION_SIGNAL.store(0, Ordering::SeqCst);
+        let guard = HostSignalGuard::install()?;
+        let early_signal = HOST_TERMINATION_SIGNAL.load(Ordering::Relaxed);
+        if early_signal != 0 {
+            drop(guard);
+            drop(lock);
+            reraise_host_signal(early_signal);
+            return Err(format!(
+                "Browser startup check interrupted by signal {early_signal}."
+            ));
+        }
+        (Some(lock), Some(guard))
+    } else {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("Browser startup check cancelled during shutdown.".to_string());
+        }
+        (None, None)
+    };
 
     let expected_ppid = unsafe { libc::getpid() };
     let mut command = own_command(false, None)?;
@@ -282,7 +313,11 @@ pub(super) fn check() -> Result<BrowserSandbox, String> {
             drain_stderr(&mut stderr, &mut stderr_bytes);
             break status;
         }
-        if HOST_TERMINATION_SIGNAL.load(Ordering::Relaxed) != 0 {
+        let cancelled = match cancel {
+            Some(flag) => flag.load(Ordering::Acquire),
+            None => HOST_TERMINATION_SIGNAL.load(Ordering::Relaxed) != 0,
+        };
+        if cancelled {
             match forwarded_at {
                 None => {
                     unsafe {
@@ -315,14 +350,18 @@ pub(super) fn check() -> Result<BrowserSandbox, String> {
         }
     };
 
-    let caught_signal = HOST_TERMINATION_SIGNAL.load(Ordering::Relaxed);
-    drop(signal_guard);
-    drop(signal_lock);
-    if caught_signal != 0 {
-        reraise_host_signal(caught_signal);
-        return Err(format!(
-            "Browser startup check interrupted by signal {caught_signal}."
-        ));
+    if signal_guard.is_some() {
+        let caught_signal = HOST_TERMINATION_SIGNAL.load(Ordering::Relaxed);
+        drop(signal_guard);
+        drop(signal_lock);
+        if caught_signal != 0 {
+            reraise_host_signal(caught_signal);
+            return Err(format!(
+                "Browser startup check interrupted by signal {caught_signal}."
+            ));
+        }
+    } else if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err("Browser startup check cancelled during shutdown.".to_string());
     }
     if !status.success() {
         let diagnostic = String::from_utf8_lossy(&stderr_bytes);
@@ -355,13 +394,21 @@ fn finish(result: Result<(), String>) -> i32 {
 }
 
 fn bypass_requested() -> bool {
-    std::env::var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").as_deref() == Ok("1")
+    LAUNCH_ENV.get().map_or_else(
+        || std::env::var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").as_deref() == Ok("1"),
+        |env| env.bypass_requested,
+    )
 }
 
 fn require_prepared_runtime() -> Result<(), String> {
-    if std::env::var_os("LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
+    let unavailable = LAUNCH_ENV.get().map_or_else(
+        || {
+            std::env::var_os("LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+        },
+        |env| env.appimage_webkit_unavailable,
+    );
+    if unavailable {
         return Err(APPIMAGE_RUNTIME_ERROR.to_string());
     }
     Ok(())
@@ -1123,9 +1170,11 @@ mod tests {
     #[test]
     #[ignore = "isolated AppImage browser runtime preparation regression fixture"]
     fn unprepared_runtime_fixture_child() {
+        super::super::capture_launch_env();
+        std::env::remove_var("LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE");
         assert_eq!(
-            super::super::availability(),
-            &Err(APPIMAGE_RUNTIME_ERROR.to_string())
+            super::super::wait_for_availability_blocking(),
+            Err(APPIMAGE_RUNTIME_ERROR.to_string())
         );
         assert_eq!(supervise(), Err(APPIMAGE_RUNTIME_ERROR.to_string()));
         assert_eq!(webview_probe(), Err(APPIMAGE_RUNTIME_ERROR.to_string()));

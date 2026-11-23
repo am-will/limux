@@ -408,11 +408,17 @@ for regression in \
   pane::tests::closing_the_active_tab_maps_only_its_replacement \
   pane::tests::moved_terminal_hover_focus_reads_its_new_pane_and_spares_renames \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
+  split_tree::tests::split_ratio_tracks_resizes_without_idle_frame_clock_or_spurious_saves \
+  split_tree::tests::split_ratio_survives_bounce_unmapped_updates_and_nested_resizes \
   split_tree::tests::restoring_split_respects_nested_pane_minimums \
+  split_tree::tests::in_place_zoom_preserves_widget_realization_and_split_ratios \
+  split_tree::tests::in_place_unzoom_after_window_resize_preserves_ratios_and_clamping \
   settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
   settings_editor::tests::hook_controls_restore_effective_values_after_save_failure \
   settings_editor::tests::hook_rows_show_socket_changes_without_saving_them_again \
   settings_editor::tests::hooks_is_the_second_settings_tab \
+  settings_editor::terminal_font_group::tests::terminal_font_controls_update_auto_style_rollback_and_reset \
+  window::terminal_font_tests::terminal_font_config_updates_live_and_new_ghostty_surfaces \
   window::tests::hidden_workspace_path_does_not_reserve_sidebar_row_height \
   terminal::tests::submenu_popovers_never_grab \
   terminal::tests::clipboard_toast_never_retains_its_terminal \
@@ -423,7 +429,9 @@ for regression in \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
   window::pane_create_tests::terminal_commands_retry_until_ready_then_reply_without_a_timer \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
+  window::pane_close_tests::localized_split_and_remove_keep_sibling_gl_areas_realized \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
+  window::pane_close_tests::closing_inactive_workspace_preserves_active_manual_unread \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
   window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \

@@ -966,3 +966,73 @@ fn noop_repeat_save_does_not_rewrite_unchanged_canonical_file() {
         "repeated no-op save must not replace canonical session.json inode"
     );
 }
+
+#[test]
+fn clean_canonical_read_reports_no_minted_ids_while_empty_pane_does() {
+    let dir = tempdir().unwrap();
+    let _base = initial(dir.path());
+    let (_, minted_clean) = read_session_with_minted_ids(dir.path()).unwrap();
+    assert!(!minted_clean);
+
+    let mut empty_pane_state = initial(dir.path());
+    if let layout_state::LayoutNodeState::Pane(pane) = &mut empty_pane_state.workspaces[0].layout {
+        pane.tabs.clear();
+        pane.active_tab_id = None;
+    }
+    let canonical = layout_state::canonical_session_path_in(dir.path());
+    fs::write(
+        &canonical,
+        serde_json::to_vec_pretty(&empty_pane_state).unwrap(),
+    )
+    .unwrap();
+    let (_, minted_empty) = read_session_with_minted_ids(dir.path()).unwrap();
+    assert!(minted_empty);
+}
+
+#[test]
+fn merge_groups_preserves_first_duplicate_and_independent_edits() {
+    let make_group = |id: &str, name: &str| layout_state::WorkspaceGroupState {
+        id: id.into(),
+        name: name.into(),
+        color: Some(crate::workspace_color::WorkspaceColor::Blue),
+        collapsed: false,
+        position: 0,
+    };
+    let state_with = |groups: Vec<layout_state::WorkspaceGroupState>| AppSessionState {
+        groups,
+        ..AppSessionState::default()
+    };
+
+    let previous = state_with(vec![
+        make_group("g-edit", "Old"),
+        make_group("g-delete", "Drop"),
+        make_group("g-keep", "Keep"),
+    ]);
+    let local = state_with(vec![
+        make_group("g-edit", "Renamed"),
+        make_group("g-edit", "DuplicateIgnored"),
+        make_group("g-keep", "Keep"),
+        make_group("g-local-new", "LocalNew"),
+    ]);
+    let disk = state_with(vec![
+        make_group("g-edit", "Old"),
+        make_group("g-delete", "Drop"),
+        make_group("g-keep", "DiskEdited"),
+        make_group("g-disk-new", "DiskNew"),
+    ]);
+
+    let merged = merge_groups(&previous, &local, &disk);
+    let names: Vec<(&str, &str)> = merged
+        .iter()
+        .map(|g| (g.id.as_str(), g.name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("g-edit", "Renamed"),
+            ("g-keep", "DiskEdited"),
+            ("g-local-new", "LocalNew"),
+            ("g-disk-new", "DiskNew"),
+        ]
+    );
+}

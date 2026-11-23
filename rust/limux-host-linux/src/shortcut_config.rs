@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gtk4::gdk;
 use gtk4::gdk::prelude::DisplayExtManual;
+use gtk4::glib::translate::IntoGlib;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -166,11 +167,79 @@ pub struct ResolvedShortcut {
     pub binding: Option<NormalizedShortcut>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
+struct ShortcutLookupIndex {
+    by_binding: HashMap<NormalizedShortcut, usize>,
+    unmodified_keyvals: Vec<(u32, usize)>,
+    has_unmodified_fallback: bool,
+    has_shift_only_binding: bool,
+}
+
+impl ShortcutLookupIndex {
+    fn build(shortcuts: &[ResolvedShortcut]) -> Self {
+        let mut index = Self {
+            by_binding: HashMap::with_capacity(shortcuts.len()),
+            unmodified_keyvals: Vec::new(),
+            has_unmodified_fallback: false,
+            has_shift_only_binding: false,
+        };
+        for (idx, shortcut) in shortcuts.iter().enumerate() {
+            let Some(ref binding) = shortcut.binding else {
+                continue;
+            };
+            index.by_binding.insert(binding.clone(), idx);
+            if !binding.ctrl && !binding.alt && !binding.cmd {
+                if binding.shift {
+                    index.has_shift_only_binding = true;
+                } else if let Some(keyval) =
+                    gdk::Key::from_name(runtime_key_to_gtk_key(&binding.key))
+                        .filter(|key| is_direct_unmodified_keyval(*key))
+                {
+                    index
+                        .unmodified_keyvals
+                        .push((keyval.to_lower().into_glib(), idx));
+                } else {
+                    index.has_unmodified_fallback = true;
+                }
+            }
+        }
+        index
+    }
+}
+
+fn is_direct_unmodified_keyval(keyval: gdk::Key) -> bool {
+    let raw = keyval.into_glib();
+    // Standard X11/GDK function keys (F1..F35) and fixed non-shifted navigation/editing keys
+    // that cannot be produced by level-shifting another key via AltGr/CapsLock.
+    (gdk::Key::F1.into_glib()..=gdk::Key::F35.into_glib()).contains(&raw)
+        || matches!(
+            keyval,
+            gdk::Key::Escape
+                | gdk::Key::Return
+                | gdk::Key::Tab
+                | gdk::Key::Page_Up
+                | gdk::Key::Page_Down
+                | gdk::Key::Left
+                | gdk::Key::Right
+                | gdk::Key::Up
+                | gdk::Key::Down
+        )
+}
+
+#[derive(Clone, Debug)]
 pub struct ResolvedShortcutConfig {
     pub shortcuts: Vec<ResolvedShortcut>,
     pub warnings: Vec<String>,
+    index: ShortcutLookupIndex,
 }
+
+impl PartialEq for ResolvedShortcutConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.shortcuts == other.shortcuts && self.warnings == other.warnings
+    }
+}
+
+impl Eq for ResolvedShortcutConfig {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShortcutConfigError {
@@ -1094,6 +1163,7 @@ impl ResolvedShortcut {
             .unwrap_or_default()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn runtime_combo(&self) -> Option<String> {
         self.binding
             .as_ref()
@@ -1112,6 +1182,19 @@ impl ResolvedShortcut {
 }
 
 impl ResolvedShortcutConfig {
+    fn from_parts(shortcuts: Vec<ResolvedShortcut>, warnings: Vec<String>) -> Self {
+        let index = ShortcutLookupIndex::build(&shortcuts);
+        Self {
+            shortcuts,
+            warnings,
+            index,
+        }
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index = ShortcutLookupIndex::build(&self.shortcuts);
+    }
+
     pub fn gtk_accel_entries(&self) -> Vec<(&'static str, Vec<String>)> {
         self.shortcuts
             .iter()
@@ -1125,12 +1208,10 @@ impl ResolvedShortcutConfig {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn command_for_runtime_combo(&self, combo: &str) -> Option<ShortcutCommand> {
-        self.find_by_runtime_combo(combo)
+        self.shortcuts
+            .iter()
+            .find(|shortcut| shortcut.runtime_combo().as_deref() == Some(combo))
             .map(|shortcut| shortcut.definition.command)
-    }
-
-    pub fn shortcut_for_runtime_combo(&self, combo: &str) -> Option<&ResolvedShortcut> {
-        self.find_by_runtime_combo(combo)
     }
 
     pub fn display_label_for_id(&self, id: ShortcutId) -> Option<String> {
@@ -1155,10 +1236,56 @@ impl ResolvedShortcutConfig {
             .find(|shortcut| shortcut.definition.id == id)
     }
 
-    pub fn find_by_runtime_combo(&self, combo: &str) -> Option<&ResolvedShortcut> {
-        self.shortcuts
-            .iter()
-            .find(|shortcut| shortcut.runtime_combo().as_deref() == Some(combo))
+    #[cfg(test)]
+    pub fn find_for_key_press(
+        &self,
+        display: Option<&gdk::Display>,
+        keyval: gdk::Key,
+        keycode: u32,
+        modifier: gdk::ModifierType,
+    ) -> Option<&ResolvedShortcut> {
+        self.find_for_key_press_with_display(|| display.cloned(), keyval, keycode, modifier)
+    }
+
+    pub fn find_for_key_press_with_display(
+        &self,
+        display: impl FnOnce() -> Option<gdk::Display>,
+        keyval: gdk::Key,
+        keycode: u32,
+        modifier: gdk::ModifierType,
+    ) -> Option<&ResolvedShortcut> {
+        let has_base_modifier = modifier.intersects(
+            gdk::ModifierType::CONTROL_MASK
+                | gdk::ModifierType::ALT_MASK
+                | gdk::ModifierType::META_MASK
+                | gdk::ModifierType::SUPER_MASK,
+        );
+        if !has_base_modifier {
+            let has_shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+            if !has_shift && !self.index.has_unmodified_fallback {
+                let raw = keyval.to_lower().into_glib();
+                return self
+                    .index
+                    .unmodified_keyvals
+                    .iter()
+                    .find(|(candidate, _)| *candidate == raw)
+                    .and_then(|(_, idx)| self.shortcuts.get(*idx));
+            }
+            if has_shift && !self.index.has_shift_only_binding {
+                return None;
+            }
+        }
+        let resolved_display = display();
+        let shortcut = NormalizedShortcut::from_gdk_key_event(
+            resolved_display.as_ref(),
+            keyval,
+            keycode,
+            modifier,
+        )?;
+        self.index
+            .by_binding
+            .get(&shortcut)
+            .and_then(|&idx| self.shortcuts.get(idx))
     }
 
     pub fn override_bindings_json(&self) -> Map<String, Value> {
@@ -1192,6 +1319,7 @@ impl ResolvedShortcutConfig {
             shortcut.binding = binding;
         }
         ensure_valid_active_bindings(&updated.shortcuts)?;
+        updated.rebuild_index();
         Ok(updated)
     }
 }
@@ -1245,16 +1373,14 @@ fn legacy_config_path_for(shortcuts_path: &Path) -> Option<PathBuf> {
 }
 
 pub fn default_shortcuts() -> ResolvedShortcutConfig {
-    ResolvedShortcutConfig {
-        shortcuts: definitions()
-            .iter()
-            .map(|definition| ResolvedShortcut {
-                definition,
-                binding: Some(definition.default_binding()),
-            })
-            .collect(),
-        warnings: Vec::new(),
-    }
+    let shortcuts = definitions()
+        .iter()
+        .map(|definition| ResolvedShortcut {
+            definition,
+            binding: Some(definition.default_binding()),
+        })
+        .collect();
+    ResolvedShortcutConfig::from_parts(shortcuts, Vec::new())
 }
 
 #[cfg(test)]
@@ -1468,6 +1594,7 @@ fn resolve_shortcuts_from_file(
     }
 
     ensure_valid_active_bindings(&resolved.shortcuts)?;
+    resolved.rebuild_index();
     Ok(resolved)
 }
 
@@ -2588,5 +2715,113 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["theme"], "nord");
         assert!(written.get("shortcuts").is_none());
+    }
+
+    #[test]
+    fn find_for_key_press_matches_defaults_and_tracks_remaps() {
+        let defaults = default_shortcuts();
+        assert!(!defaults.index.has_unmodified_fallback);
+        assert!(!defaults.index.has_shift_only_binding);
+
+        assert!(defaults
+            .find_for_key_press(None, gdk::Key::a, 38, gdk::ModifierType::empty())
+            .is_none());
+        assert!(defaults
+            .find_for_key_press(None, gdk::Key::A, 38, gdk::ModifierType::SHIFT_MASK)
+            .is_none());
+        assert_eq!(
+            defaults
+                .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::empty())
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
+        assert_eq!(
+            defaults
+                .find_for_key_press(
+                    None,
+                    gdk::Key::T,
+                    28,
+                    gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
+                )
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::NewTerminal)
+        );
+
+        let shift_fullscreen = defaults
+            .with_binding(
+                ShortcutId::ToggleFullscreen,
+                Some(NormalizedShortcut::parse("<Shift>F12").unwrap()),
+            )
+            .unwrap();
+        assert!(shift_fullscreen.index.has_shift_only_binding);
+        assert!(shift_fullscreen
+            .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::empty())
+            .is_none());
+        assert_eq!(
+            shift_fullscreen
+                .find_for_key_press(None, gdk::Key::F12, 96, gdk::ModifierType::SHIFT_MASK)
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
+
+        let letter_fullscreen = defaults
+            .with_binding(
+                ShortcutId::ToggleFullscreen,
+                Some(NormalizedShortcut::parse("a").unwrap()),
+            )
+            .unwrap();
+        assert!(letter_fullscreen.index.has_unmodified_fallback);
+        assert_eq!(
+            letter_fullscreen
+                .find_for_key_press(None, gdk::Key::a, 38, gdk::ModifierType::empty())
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
+
+        let disabled_fullscreen = defaults
+            .with_binding(ShortcutId::ToggleFullscreen, None)
+            .unwrap();
+        assert!(disabled_fullscreen.index.unmodified_keyvals.is_empty());
+        assert!(disabled_fullscreen
+            .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::empty())
+            .is_none());
+
+        // CapsLock (LOCK_MASK) is ignored on unmodified F11; Shift+F11 is not matched.
+        assert_eq!(
+            defaults
+                .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::LOCK_MASK)
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
+        assert!(defaults
+            .find_for_key_press(None, gdk::Key::F11, 95, gdk::ModifierType::SHIFT_MASK)
+            .is_none());
+
+        // Unmodified printable keys skip display resolution entirely.
+        let mut display_called = false;
+        assert!(defaults
+            .find_for_key_press_with_display(
+                || {
+                    display_called = true;
+                    None
+                },
+                gdk::Key::a,
+                38,
+                gdk::ModifierType::empty(),
+            )
+            .is_none());
+        assert!(!display_called);
+
+        // Loading overrides from JSON rebuilds the lookup index too.
+        let loaded =
+            resolve_shortcuts_from_str(r#"{"shortcuts": {"toggle_fullscreen": "<Shift>F12"}}"#)
+                .expect("valid shortcut JSON");
+        assert!(loaded.index.has_shift_only_binding);
+        assert_eq!(
+            loaded
+                .find_for_key_press(None, gdk::Key::F12, 96, gdk::ModifierType::SHIFT_MASK)
+                .map(|shortcut| shortcut.definition.command),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
     }
 }

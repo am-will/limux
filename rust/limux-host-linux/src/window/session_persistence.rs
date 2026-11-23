@@ -48,7 +48,7 @@ pub(super) fn queue_session_save_request<T: SessionSaveAccess>(
     }
 }
 
-pub(super) fn request_session_save(state: &State) {
+pub(crate) fn request_session_save(state: &State) {
     match queue_session_save_request(state) {
         SessionSaveRequest::Ignore => {}
         SessionSaveRequest::RetryOnIdle => {
@@ -348,7 +348,7 @@ pub(super) fn restore_active_workspace(state: &State, index: usize) {
 
     if let Some((index, row, sidebar_list)) = maybe_row {
         switch_workspace(state, index);
-        sidebar_list.select_row(Some(&row));
+        select_sidebar_row_silently(state, &sidebar_list, &row);
     }
 }
 
@@ -393,6 +393,8 @@ pub(super) fn snapshot_session_state(state: &State) -> AppSessionState {
     }
     .max(SIDEBAR_WIDTH);
 
+    let favorites = s.sidebar.favorite_ids();
+    let group_ids = s.sidebar.workspace_group_ids();
     let workspaces = s
         .workspaces
         .iter()
@@ -407,15 +409,14 @@ pub(super) fn snapshot_session_state(state: &State) -> AppSessionState {
             WorkspaceState {
                 id: Some(workspace.id.clone()),
                 name: workspace.name.clone(),
-                favorite: s.sidebar.is_favorite(&workspace.id),
+                favorite: favorites.contains(workspace.id.as_str()),
                 cwd,
                 folder_path,
                 autostart_command: workspace.autostart_command.borrow().clone(),
                 color: workspace.color,
-                group_id: s
-                    .sidebar
-                    .group_of(&workspace.id)
-                    .map(|group| group.id.clone()),
+                group_id: group_ids
+                    .get(workspace.id.as_str())
+                    .map(|id| (*id).to_string()),
                 layout,
             }
         })

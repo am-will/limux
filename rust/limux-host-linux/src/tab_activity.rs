@@ -123,13 +123,21 @@ impl TabActivity {
             Instant::now(),
         );
         let Some(remaining) = remaining else {
-            self.0.spinner.stop();
-            self.0.spinner.set_visible(false);
+            if self.0.spinner.is_spinning() {
+                self.0.spinner.stop();
+            }
+            if self.0.spinner.get_visible() {
+                self.0.spinner.set_visible(false);
+            }
             self.cancel_expiry();
             return;
         };
-        self.0.spinner.set_visible(true);
-        self.0.spinner.start();
+        if !self.0.spinner.get_visible() {
+            self.0.spinner.set_visible(true);
+        }
+        if !self.0.spinner.is_spinning() {
+            self.0.spinner.start();
+        }
         if self.0.expiry.borrow().is_none() {
             let weak = Rc::downgrade(&self.0);
             let source =

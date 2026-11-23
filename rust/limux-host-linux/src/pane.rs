@@ -39,6 +39,7 @@ mod tab_header;
 #[cfg(test)]
 mod tab_overflow_tests;
 use drag_drop::*;
+#[cfg(test)]
 pub(crate) use tab_header::find_tab_rename_entry;
 use tab_header::*;
 
@@ -610,6 +611,8 @@ pub fn create_pane(
 
     let content_stack = gtk::Stack::new();
     content_stack.set_transition_type(gtk::StackTransitionType::None);
+    content_stack.set_hhomogeneous(false);
+    content_stack.set_vhomogeneous(false);
     content_stack.set_hexpand(true);
     content_stack.set_vexpand(true);
 
@@ -920,9 +923,16 @@ pub fn close_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
 
 pub fn refresh_terminal_displays_in_root(root: &gtk::Widget) {
     for internals in pane_internals_for_root(root) {
-        for entry in &internals.tab_state.borrow().tabs {
+        let tab_state = internals.tab_state.borrow();
+        let active_id = tab_state.active_tab.as_deref();
+        for entry in &tab_state.tabs {
+            if active_id.is_some_and(|id| id != entry.id) {
+                continue;
+            }
             if let TabKind::Terminal { state } = &entry.kind {
-                state.handle.refresh_display();
+                if state.handle.is_mapped() {
+                    state.handle.refresh_display();
+                }
             }
         }
     }
@@ -1383,7 +1393,8 @@ mod batch_move_tests {
 
 #[derive(Clone)]
 enum TabKind {
-    Terminal { state: TerminalTabState },
+    // Boxed: the terminal's state is far larger than the other kinds'.
+    Terminal { state: Box<TerminalTabState> },
     Browser { state: BrowserTabState },
     Keybinds,
 }
@@ -1684,6 +1695,7 @@ fn make_terminal_callbacks(
     tab_id: &str,
     title_label: &gtk::Label,
     term_cwd: &Rc<RefCell<Option<String>>>,
+    is_ssh: bool,
 ) -> TerminalCallbacks {
     let tid_for_title = tab_id.to_string();
     let title_label = title_label.clone();
@@ -1697,7 +1709,6 @@ fn make_terminal_callbacks(
     let callbacks_for_keybinds = internals.callbacks.clone();
     let callbacks_for_identity = internals.callbacks.clone();
     let term_cwd_for_pwd = term_cwd.clone();
-    let tid_for_pwd = tab_id.to_string();
     let tid_for_close = tab_id.to_string();
     let tid_for_notification = tab_id.to_string();
     let pane_id = internals.pane_id;
@@ -1730,6 +1741,9 @@ fn make_terminal_callbacks(
             }
             let display = display_terminal_title(title);
             if let Some(entry) = state_for_title.borrow_mut().find_tab_mut(&tid_for_title) {
+                if entry.automatic_title.as_deref() == Some(display.as_str()) {
+                    return;
+                }
                 entry.automatic_title = Some(display.clone());
                 if entry.custom_name.is_some() {
                     return;
@@ -1738,18 +1752,25 @@ fn make_terminal_callbacks(
             title_label.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
-            if terminal_tab_owner(&tid_for_pwd).is_some_and(|pane| {
-                pane.tab_state.borrow().tabs.iter().any(|entry| {
-                    entry.id == tid_for_pwd
-                        && matches!(&entry.kind, TabKind::Terminal { state } if state.ssh.is_some())
-                })
-            }) {
+            if is_ssh {
                 return;
             }
-
-            *term_cwd_for_pwd.borrow_mut() = Some(pwd.to_string());
+            let tab_changed = {
+                let mut current = term_cwd_for_pwd.borrow_mut();
+                if current.as_deref() == Some(pwd) {
+                    false
+                } else {
+                    *current = Some(pwd.to_string());
+                    true
+                }
+            };
+            // Always let the workspace check whether workspace.cwd diverged
+            // (for example after another tab changed directory); it skips
+            // work and saves when workspace.cwd already matches.
             (callbacks_for_pwd.on_pwd_changed)(pwd);
-            (callbacks_for_pwd.on_state_changed)();
+            if tab_changed {
+                (callbacks_for_pwd.on_state_changed)();
+            }
         }),
         on_desktop_notification: Box::new({
             let callbacks = internals.callbacks.clone();
@@ -1850,6 +1871,7 @@ fn make_terminal_callbacks(
                     && !pane_outer
                         .root()
                         .and_then(|root| root.focus())
+                        .filter(|focus| !focus.is::<gtk::GLArea>())
                         .and_then(|focus| focus.ancestor(gtk::Entry::static_type()))
                         .is_some_and(|entry| entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS))
             }
@@ -1897,26 +1919,7 @@ fn resolved_link_destination(
     Some(destination)
 }
 
-fn open_url_in_external_browser(url: &str) {
-    if !link_uri::is_safe_external_url(url) {
-        eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
-        return;
-    }
-
-    // Use the GDK display's launch context so GIO emits an xdg-activation
-    // token. Without it, the target app (e.g. Firefox) receives the URL but
-    // Wayland refuses to let it raise its window — Konsole works because KIO
-    // wires the token in the same way.
-    if let Some(display) = gtk::gdk::Display::default() {
-        let context = display.app_launch_context();
-        match gtk::gio::AppInfo::launch_default_for_uri(url, Some(&context)) {
-            Ok(_) => return,
-            Err(err) => {
-                eprintln!("limux: gio launch failed, falling back to xdg-open: {err}");
-            }
-        }
-    }
-
+fn spawn_xdg_open(url: &str) {
     // Fallback: spawn xdg-open. Loses activation but at least delivers the URL
     // in AppImage / sandboxed contexts where the bundled GIO can't dispatch.
     // Reap the child in a detached thread — xdg-open exits as soon as it
@@ -1938,6 +1941,35 @@ fn open_url_in_external_browser(url: &str) {
             eprintln!("limux: failed to spawn xdg-open for {url}: {err}");
         }
     }
+}
+
+fn open_url_in_external_browser(url: &str) {
+    if !link_uri::is_safe_external_url(url) {
+        eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
+        return;
+    }
+
+    // Use the GDK display's launch context asynchronously so GIO emits an
+    // xdg-activation token without stalling the GTK main thread if a portal or
+    // D-Bus handler is slow.
+    if let Some(display) = gtk::gdk::Display::default() {
+        let context = display.app_launch_context();
+        let fallback_url = url.to_string();
+        gtk::gio::AppInfo::launch_default_for_uri_async(
+            url,
+            Some(&context),
+            gtk::gio::Cancellable::NONE,
+            move |result| {
+                if let Err(err) = result {
+                    eprintln!("limux: gio launch failed, falling back to xdg-open: {err}");
+                    spawn_xdg_open(&fallback_url);
+                }
+            },
+        );
+        return;
+    }
+
+    spawn_xdg_open(url);
 }
 
 fn build_terminal_env(internals: &Rc<PaneInternals>, tab_id: &str) -> Vec<(String, String)> {
@@ -1975,10 +2007,11 @@ fn build_terminal_widget(
     tab_id: &str,
     title_label: &gtk::Label,
     term_cwd: &Rc<RefCell<Option<String>>>,
+    is_ssh: bool,
     working_directory: Option<&str>,
     mut options: terminal::TerminalOptions,
 ) -> terminal::TerminalWidget {
-    let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd);
+    let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd, is_ssh);
     let config = (internals.callbacks.current_config)();
     options.track_output_activity = config.borrow().interface.show_tab_activity;
     options.saved_font_size = config.borrow().font_size;
@@ -2256,6 +2289,7 @@ fn finish_terminal_respawn(
         tab_id,
         &label,
         &cwd,
+        true,
         directory.as_deref(),
         terminal::TerminalOptions {
             startup_command: command,
@@ -2381,6 +2415,7 @@ fn add_terminal_tab_inner(
         &tab_id,
         &title_label,
         &term_cwd,
+        ssh.is_some(),
         working_directory,
         terminal::TerminalOptions {
             startup_command: startup_command.clone(),
@@ -2409,7 +2444,7 @@ fn add_terminal_tab_inner(
             unread: false,
             manual_unread: false,
             kind: TabKind::Terminal {
-                state: TerminalTabState {
+                state: Box::new(TerminalTabState {
                     ssh,
                     retry_attempt: 0,
                     spawned_at: std::time::Instant::now(),
@@ -2421,7 +2456,7 @@ fn add_terminal_tab_inner(
                     agent: Rc::new(RefCell::new(
                         options.as_ref().and_then(|value| value.agent.clone()),
                     )),
-                },
+                }),
             },
         });
     }
@@ -2701,11 +2736,21 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             kind: TabKind::Browser {
                 state: BrowserTabState {
                     uri: saved_uri.clone(),
-                    handles,
-                    callbacks,
+                    handles: handles.clone(),
+                    callbacks: callbacks.clone(),
                 },
             },
         });
+    }
+    #[cfg(feature = "webkit")]
+    if let BrowserHandles::Pending(pending) = handles {
+        register_pending_browser_upgrade(
+            &tab_id,
+            Rc::downgrade(internals),
+            pending,
+            saved_uri,
+            callbacks,
+        );
     }
     internals.tab_strip.append(
         &internals
@@ -3068,24 +3113,44 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
             .borrow()
             .values()
             .filter_map(|weak| weak.upgrade())
-            .filter(|internals| internals.pane_outer.is_ancestor(root))
+            .filter(|internals| {
+                let pane_widget: &gtk::Widget = internals.pane_outer.upcast_ref();
+                (pane_widget == root && pane_widget.get_visible())
+                    || crate::split_tree::is_visible_within_root(pane_widget, root)
+            })
             .collect::<Vec<_>>()
     });
     panes.sort_by_key(|internals| internals.pane_id);
     panes
 }
 
-fn pane_internals_for_workspace(workspace_id: &str) -> Vec<Rc<PaneInternals>> {
-    let mut panes = PANE_REGISTRY.with(|registry| {
-        registry
-            .borrow()
-            .values()
-            .filter_map(|weak| weak.upgrade())
-            .filter(|internals| internals.callbacks.workspace_id == workspace_id)
-            .collect::<Vec<_>>()
-    });
-    panes.sort_by_key(|internals| internals.pane_id);
-    panes
+/// Direct lookup of a live terminal handle by tab id across panes belonging to
+/// matching workspaces via the pane registry, avoiding full workspace tree
+/// walks and vector clones.
+pub fn terminal_handle_by_tab_id_in_workspaces(
+    tab_id: &str,
+    matches_workspace: impl Fn(&str) -> bool,
+) -> Option<terminal::TerminalHandle> {
+    PANE_REGISTRY.with(|registry| {
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            if !matches_workspace(&internals.callbacks.workspace_id) {
+                continue;
+            }
+            let tab_state = internals.tab_state.borrow();
+            if let Some(TabKind::Terminal { state }) = tab_state
+                .tabs
+                .iter()
+                .find(|entry| entry.id == tab_id)
+                .map(|entry| &entry.kind)
+            {
+                return Some(state.handle.clone());
+            }
+        }
+        None
+    })
 }
 
 /// Every tab of the workspace `surface_hint` names, ranked by how it names it;
@@ -3096,18 +3161,58 @@ pub fn tab_candidates_for_workspace(
     terminals_only: bool,
 ) -> Vec<(SurfaceHintMatch, u32, String)> {
     let mut candidates = Vec::new();
-    for internals in pane_internals_for_workspace(workspace_id) {
-        let pane_id = internals.pane_id;
-        for entry in &internals.tab_state.borrow().tabs {
-            if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+    PANE_REGISTRY.with(|registry| {
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            if internals.callbacks.workspace_id != workspace_id {
                 continue;
             }
-            if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
-                candidates.push((rank, pane_id, entry.id.clone()));
+            let pane_id = internals.pane_id;
+            for entry in &internals.tab_state.borrow().tabs {
+                if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+                    continue;
+                }
+                if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
+                    candidates.push((rank, pane_id, entry.id.clone()));
+                }
             }
         }
-    }
+    });
     candidates
+}
+
+/// Single-pass lookup across all workspaces in `workspace_indices`, avoiding
+/// O(W * P_total) scans of `PANE_REGISTRY` when resolving unscoped surface hints.
+pub fn tab_candidates_across_workspaces(
+    workspace_indices: &std::collections::HashMap<&str, usize>,
+    surface_hint: &str,
+    terminals_only: bool,
+) -> Vec<(SurfaceHintMatch, usize, u32, String)> {
+    PANE_REGISTRY.with(|registry| {
+        let mut candidates = Vec::new();
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            let Some(&workspace_index) =
+                workspace_indices.get(internals.callbacks.workspace_id.as_str())
+            else {
+                continue;
+            };
+            let pane_id = internals.pane_id;
+            for entry in &internals.tab_state.borrow().tabs {
+                if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+                    continue;
+                }
+                if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
+                    candidates.push((rank, workspace_index, pane_id, entry.id.clone()));
+                }
+            }
+        }
+        candidates
+    })
 }
 
 pub fn mark_tab_unread_in_workspace(
@@ -3115,9 +3220,10 @@ pub fn mark_tab_unread_in_workspace(
     pane_id: u32,
     tab_id: &str,
 ) -> Option<bool> {
-    let internals = pane_internals_for_workspace(workspace_id)
-        .into_iter()
-        .find(|internals| internals.pane_id == pane_id)?;
+    let internals = lookup_pane_internals(pane_id)?;
+    if internals.callbacks.workspace_id != workspace_id {
+        return None;
+    }
     let mut tab_state = internals.tab_state.borrow_mut();
     let entry = tab_state.find_tab_mut(tab_id)?;
     Some(set_tab_unread(entry, true))
@@ -3129,13 +3235,11 @@ pub fn tab_is_visible_in_workspace(
     pane_id: u32,
     tab_id: &str,
 ) -> bool {
-    pane_internals_for_workspace(workspace_id)
-        .into_iter()
-        .find(|internals| internals.pane_id == pane_id)
-        .is_some_and(|internals| {
-            internals.pane_outer.is_ancestor(root)
-                && internals.tab_state.borrow().active_tab.as_deref() == Some(tab_id)
-        })
+    lookup_pane_internals(pane_id).is_some_and(|internals| {
+        internals.callbacks.workspace_id == workspace_id
+            && crate::split_tree::is_visible_within_root(internals.pane_outer.upcast_ref(), root)
+            && internals.tab_state.borrow().active_tab.as_deref() == Some(tab_id)
+    })
 }
 
 pub fn clear_active_tab_unread_in_root(root: &gtk::Widget) -> bool {
@@ -3200,16 +3304,19 @@ pub fn mark_active_tab_manual_unread_in_root(root: &gtk::Widget) -> bool {
 }
 
 pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
-    pane_internals_for_workspace(workspace_id)
-        .into_iter()
-        .any(|internals| {
-            internals
-                .tab_state
-                .borrow()
-                .tabs
-                .iter()
-                .any(|entry| entry.unread)
+    PANE_REGISTRY.with(|registry| {
+        registry.borrow().values().any(|weak| {
+            weak.upgrade().is_some_and(|internals| {
+                internals.callbacks.workspace_id == workspace_id
+                    && internals
+                        .tab_state
+                        .borrow()
+                        .tabs
+                        .iter()
+                        .any(|entry| entry.unread)
+            })
         })
+    })
 }
 
 fn pane_summary_from_internals(internals: &PaneInternals) -> PaneSummary {
@@ -3253,13 +3360,12 @@ pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
 
 #[allow(dead_code)]
 pub(crate) fn pane_widget_for_root(root: &gtk::Widget, pane_id: u32) -> Option<gtk::Widget> {
-    pane_internals_for_root(root)
-        .into_iter()
-        .find(|internals| internals.pane_id == pane_id)
-        .map(|internals| internals.pane_outer.clone().upcast())
+    let internals = lookup_pane_internals(pane_id)?;
+    crate::split_tree::is_visible_within_root(internals.pane_outer.upcast_ref(), root)
+        .then(|| internals.pane_outer.clone().upcast())
 }
 
-/// Includes panes temporarily detached from the visible tree by zoom.
+/// Includes panes temporarily hidden in-place by zoom.
 pub(crate) fn pane_widget_for_workspace(workspace_id: &str, pane_id: u32) -> Option<gtk::Widget> {
     let internals = lookup_pane_internals(pane_id)?;
     (internals.callbacks.workspace_id == workspace_id)
@@ -3328,6 +3434,16 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
         surfaces.extend(surface_summaries_from_internals(&internals));
     }
     surfaces
+}
+
+pub fn active_pane_and_tab_id(pane_widget: &gtk::Widget) -> Option<(u32, String)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    let tab_id = tab_state
+        .active_tab
+        .clone()
+        .or_else(|| tab_state.tabs.first().map(|entry| entry.id.clone()))?;
+    Some((internals.pane_id, tab_id))
 }
 
 pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummary> {
@@ -3499,16 +3615,29 @@ fn activate_tab(
     tab_state: &Rc<RefCell<TabState>>,
     tab_id: &str,
 ) {
-    let (focus_target, has_content_child) = {
+    let (focus_target, has_content_child, needs_stack_switch) = {
         let mut ts = tab_state.borrow_mut();
-        ts.active_tab = Some(tab_id.to_string());
+        let was_active = ts.active_tab.as_deref() == Some(tab_id);
+        let tab_button_already_active = was_active
+            && ts
+                .tabs
+                .iter()
+                .find(|entry| entry.id == tab_id)
+                .is_some_and(|entry| entry.tab_button.has_css_class("limux-tab-active"));
+        if !was_active {
+            ts.active_tab = Some(tab_id.to_string());
+        }
 
-        // Update visual state on all tabs
-        for entry in &ts.tabs {
-            if entry.id == tab_id {
-                entry.tab_button.add_css_class("limux-tab-active");
-            } else {
-                entry.tab_button.remove_css_class("limux-tab-active");
+        // Update visual state on tabs only when selection or active CSS class changed.
+        if !tab_button_already_active {
+            for entry in &ts.tabs {
+                if entry.id == tab_id {
+                    if !entry.tab_button.has_css_class("limux-tab-active") {
+                        entry.tab_button.add_css_class("limux-tab-active");
+                    }
+                } else if entry.tab_button.has_css_class("limux-tab-active") {
+                    entry.tab_button.remove_css_class("limux-tab-active");
+                }
             }
         }
 
@@ -3518,7 +3647,10 @@ fn activate_tab(
             .find(|entry| entry.id == tab_id)
             .map(TabFocusTarget::from_entry);
 
-        (focus_target, content_stack.child_by_name(tab_id).is_some())
+        let has_content_child = content_stack.child_by_name(tab_id).is_some();
+        let needs_stack_switch =
+            has_content_child && content_stack.visible_child_name().as_deref() != Some(tab_id);
+        (focus_target, has_content_child, needs_stack_switch)
         // `ts` (the RefCell borrow_mut guard) is dropped here, before we touch
         // content_stack. set_visible_child_name() synchronously fires GTK
         // unmap/map signals (hover-out on the old surface, etc.), and those
@@ -3527,7 +3659,7 @@ fn activate_tab(
         // panic on rapid repeated tab switches (Ctrl+Tab x2-4 fast).
     };
 
-    if has_content_child {
+    if needs_stack_switch {
         content_stack.set_visible_child_name(tab_id);
     }
     queue_active_tab_reveal(tab_strip, tab_state);
@@ -3724,9 +3856,19 @@ struct LiveBrowserHandles {
 }
 
 #[cfg(feature = "webkit")]
+struct PendingBrowserHandles {
+    container: gtk::Box,
+    initial_uri: Option<String>,
+    explicit_uri: Option<String>,
+    removed: bool,
+    resolved: Option<Box<BrowserHandles>>,
+}
+
+#[cfg(feature = "webkit")]
 #[derive(Clone)]
 enum BrowserHandles {
     Ready(Rc<LiveBrowserHandles>),
+    Pending(Rc<RefCell<PendingBrowserHandles>>),
     Unavailable(gtk::Widget),
 }
 
@@ -3966,21 +4108,55 @@ impl LiveBrowserHandles {
 
 #[cfg(feature = "webkit")]
 impl BrowserHandles {
+    fn resolved_from_pending(pending: &Rc<RefCell<PendingBrowserHandles>>) -> Option<Self> {
+        pending.borrow().resolved.as_deref().cloned()
+    }
+
     fn prepare_for_removal(&self) {
-        if let Self::Ready(handles) = self {
-            handles.prepare_for_removal();
+        match self {
+            Self::Ready(handles) => handles.prepare_for_removal(),
+            Self::Pending(pending) => {
+                let resolved = {
+                    let mut slot = pending.borrow_mut();
+                    slot.removed = true;
+                    slot.resolved.as_deref().cloned()
+                };
+                if let Some(handles) = resolved {
+                    handles.prepare_for_removal();
+                }
+            }
+            Self::Unavailable(_) => {}
         }
     }
 
     fn navigate(&self, url: &str) {
-        if let Self::Ready(handles) = self {
-            handles.navigate(url);
+        match self {
+            Self::Ready(handles) => handles.navigate(url),
+            Self::Pending(pending) => {
+                let resolved = {
+                    let mut slot = pending.borrow_mut();
+                    if let Some(handles) = slot.resolved.as_deref() {
+                        Some(handles.clone())
+                    } else {
+                        slot.explicit_uri = Some(url.to_string());
+                        None
+                    }
+                };
+                if let Some(handles) = resolved {
+                    handles.navigate(url);
+                }
+            }
+            Self::Unavailable(_) => {}
         }
     }
 
     fn focus_content(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.focus_content(),
+            Self::Pending(pending) => match Self::resolved_from_pending(pending) {
+                Some(handles) => handles.focus_content(),
+                None => pending.borrow().container.grab_focus(),
+            },
             Self::Unavailable(widget) => widget.grab_focus(),
         }
     }
@@ -3988,6 +4164,9 @@ impl BrowserHandles {
     fn is_find_active(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.is_find_active(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.is_find_active())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -3995,6 +4174,9 @@ impl BrowserHandles {
     fn is_page_editable(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.is_page_editable(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.is_page_editable())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4002,6 +4184,9 @@ impl BrowserHandles {
     fn focus_location(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.focus_location(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.focus_location())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4013,6 +4198,8 @@ impl BrowserHandles {
     ) -> bool {
         match self {
             Self::Ready(handles) => handles.go_back(saved_uri, callbacks),
+            Self::Pending(pending) => Self::resolved_from_pending(pending)
+                .is_some_and(|h| h.go_back(saved_uri, callbacks)),
             Self::Unavailable(_) => false,
         }
     }
@@ -4024,6 +4211,8 @@ impl BrowserHandles {
     ) -> bool {
         match self {
             Self::Ready(handles) => handles.go_forward(saved_uri, callbacks),
+            Self::Pending(pending) => Self::resolved_from_pending(pending)
+                .is_some_and(|h| h.go_forward(saved_uri, callbacks)),
             Self::Unavailable(_) => false,
         }
     }
@@ -4031,6 +4220,9 @@ impl BrowserHandles {
     fn reload(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.reload(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.reload())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4038,6 +4230,9 @@ impl BrowserHandles {
     fn show_inspector(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.show_inspector(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.show_inspector())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4045,6 +4240,9 @@ impl BrowserHandles {
     fn show_console(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.show_console(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.show_console())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4052,6 +4250,9 @@ impl BrowserHandles {
     fn show_find(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.show_find(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.show_find())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4059,6 +4260,9 @@ impl BrowserHandles {
     fn find_next(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.find_next(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.find_next())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4066,6 +4270,9 @@ impl BrowserHandles {
     fn find_previous(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.find_previous(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.find_previous())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4073,6 +4280,9 @@ impl BrowserHandles {
     fn hide_find(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.hide_find(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.hide_find())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4080,6 +4290,9 @@ impl BrowserHandles {
     fn use_selection_for_find(&self) -> bool {
         match self {
             Self::Ready(handles) => handles.use_selection_for_find(),
+            Self::Pending(pending) => {
+                Self::resolved_from_pending(pending).is_some_and(|h| h.use_selection_for_find())
+            }
             Self::Unavailable(_) => false,
         }
     }
@@ -4322,16 +4535,135 @@ const LIMUX_BROWSER_EDITABLE_STATE_SCRIPT: &str = r#"
 "#;
 
 #[cfg(feature = "webkit")]
+fn pending_browser_widget(initial_uri: Option<&str>) -> (gtk::Widget, String, BrowserHandles) {
+    let container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .focusable(true)
+        .build();
+    let inner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .vexpand(true)
+        .spacing(12)
+        .build();
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    let label = gtk::Label::new(Some("Checking browser sandbox..."));
+    label.add_css_class("dim-label");
+    inner.append(&spinner);
+    inner.append(&label);
+    container.append(&inner);
+
+    let pending = Rc::new(RefCell::new(PendingBrowserHandles {
+        container: container.clone(),
+        initial_uri: initial_uri.map(str::to_string),
+        explicit_uri: None,
+        removed: false,
+        resolved: None,
+    }));
+    (
+        container.upcast(),
+        "Browser".to_string(),
+        BrowserHandles::Pending(pending),
+    )
+}
+
+#[cfg(feature = "webkit")]
+fn register_pending_browser_upgrade(
+    tab_id: &str,
+    initial_owner: std::rc::Weak<PaneInternals>,
+    pending: Rc<RefCell<PendingBrowserHandles>>,
+    saved_uri: Rc<RefCell<Option<String>>>,
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
+) {
+    let tab_id = tab_id.to_string();
+    crate::browser_sandbox::register_main_thread_waiter(move |availability| {
+        let (container, initial_uri, explicit_uri) = {
+            let slot = pending.borrow();
+            if slot.removed || slot.resolved.is_some() {
+                return;
+            }
+            (
+                slot.container.clone(),
+                slot.initial_uri.clone(),
+                slot.explicit_uri.clone(),
+            )
+        };
+
+        let Some(owner) = terminal_tab_owner(&tab_id).or_else(|| initial_owner.upgrade()) else {
+            return;
+        };
+
+        let had_focus = crate::terminal::focus_is_within(container.upcast_ref());
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+        container.set_focusable(false);
+
+        let (child_widget, resolved_handles) = match availability {
+            Ok(_) => {
+                let effective_uri = explicit_uri.as_deref().or(initial_uri.as_deref());
+                let (widget, _, handles) =
+                    build_live_browser_widget(effective_uri, saved_uri.clone(), callbacks.clone());
+                if let Some(uri) = explicit_uri.as_deref() {
+                    handles.navigate(uri);
+                }
+                if is_tab_dragging() {
+                    set_browser_widget_targeting_enabled(&widget, false);
+                }
+                container.append(&widget);
+                (widget, handles)
+            }
+            Err(error) => {
+                let (widget, _, handles) = unavailable_browser_widget(error);
+                container.append(&widget);
+                (widget, handles)
+            }
+        };
+        let _ = child_widget;
+
+        pending.borrow_mut().resolved = Some(Box::new(resolved_handles.clone()));
+        {
+            let mut tabs = owner.tab_state.borrow_mut();
+            if let Some(entry) = tabs.find_tab_mut(&tab_id) {
+                if let TabKind::Browser { state } = &mut entry.kind {
+                    state.handles = resolved_handles.clone();
+                }
+            }
+        }
+        if had_focus {
+            resolved_handles.focus_content();
+        }
+    });
+}
+
+#[cfg(feature = "webkit")]
 fn create_browser_widget(
+    initial_uri: Option<&str>,
+    saved_uri: Rc<RefCell<Option<String>>>,
+    callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
+) -> (gtk::Widget, String, BrowserHandles) {
+    match crate::browser_sandbox::status_nonblocking_or_start() {
+        crate::browser_sandbox::ProbeState::Pending => pending_browser_widget(initial_uri),
+        crate::browser_sandbox::ProbeState::Ready(Err(error)) => unavailable_browser_widget(&error),
+        crate::browser_sandbox::ProbeState::Ready(Ok(_)) => {
+            build_live_browser_widget(initial_uri, saved_uri, callbacks)
+        }
+    }
+}
+
+#[cfg(feature = "webkit")]
+fn build_live_browser_widget(
     initial_uri: Option<&str>,
     saved_uri: Rc<RefCell<Option<String>>>,
     callbacks: Rc<RefCell<Rc<PaneCallbacks>>>,
 ) -> (gtk::Widget, String, BrowserHandles) {
     use webkit6::prelude::*;
 
-    if let Some(error) = crate::browser_sandbox::unavailable_reason() {
-        return unavailable_browser_widget(error);
-    }
     let user_content_manager = webkit6::UserContentManager::new();
     let dom_editable = Rc::new(Cell::new(false));
     let _ = user_content_manager
@@ -6098,9 +6430,17 @@ mod tests {
 
         let internals = find_pane_internals(pane.upcast_ref()).unwrap();
         let content = internals.tab_state.borrow().tabs[0].content.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !content.is_mapped() {
-            assert!(std::time::Instant::now() < deadline, "browser never mapped");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !content.is_mapped()
+            || !matches!(
+                &internals.tab_state.borrow().tabs[0].kind,
+                TabKind::Browser { state } if matches!(state.handles, super::BrowserHandles::Ready(_))
+            )
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "browser never mapped and resolved"
+            );
             context.iteration(true);
         }
         while context.iteration(false) {}
@@ -6119,6 +6459,13 @@ mod tests {
             webkit6::prelude::WebViewExt::uri(&handles.webview).as_deref(),
             Some(target_url)
         );
+        // Upgraded pending container drops its temporary focus stop and
+        // responds to tab-drag targeting toggles on the nested WebView.
+        assert!(!content.is_focusable());
+        super::set_browser_targeting_enabled(&internals.content_stack, false);
+        assert!(!handles.webview.can_target());
+        super::set_browser_targeting_enabled(&internals.content_stack, true);
+        assert!(handles.webview.can_target());
         drop(tab_state);
         window.close();
     }
@@ -6185,6 +6532,19 @@ mod tests {
         window.present();
 
         let internals = find_pane_internals(pane.upcast_ref()).unwrap();
+        let wait_until = |pred: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !pred() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                context.iteration(true);
+            }
+        };
+        wait_until(&|| {
+            matches!(
+                &internals.tab_state.borrow().tabs[0].kind,
+                TabKind::Browser { state } if matches!(state.handles, super::BrowserHandles::Ready(_))
+            )
+        });
         let webview = {
             let tab_state = internals.tab_state.borrow();
             let TabKind::Browser { state } = &tab_state.tabs[0].kind else {
@@ -6194,14 +6554,6 @@ mod tests {
                 panic!("expected available browser");
             };
             handles.webview.clone()
-        };
-
-        let wait_until = |pred: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !pred() {
-                assert!(std::time::Instant::now() < deadline, "timed out");
-                context.iteration(true);
-            }
         };
 
         wait_until(&|| {
