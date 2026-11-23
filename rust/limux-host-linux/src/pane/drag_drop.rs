@@ -203,6 +203,7 @@ pub(super) fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInter
                 &entry.id,
                 &entry.title_label,
                 &state.cwd,
+                state.ssh.is_some(),
             ));
         }
         TabKind::Browser { state } => {

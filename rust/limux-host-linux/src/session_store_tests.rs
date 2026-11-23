@@ -966,3 +966,25 @@ fn noop_repeat_save_does_not_rewrite_unchanged_canonical_file() {
         "repeated no-op save must not replace canonical session.json inode"
     );
 }
+
+#[test]
+fn clean_canonical_read_reports_no_minted_ids_while_empty_pane_does() {
+    let dir = tempdir().unwrap();
+    let _base = initial(dir.path());
+    let (_, minted_clean) = read_session_with_minted_ids(dir.path()).unwrap();
+    assert!(!minted_clean);
+
+    let mut empty_pane_state = initial(dir.path());
+    if let layout_state::LayoutNodeState::Pane(pane) = &mut empty_pane_state.workspaces[0].layout {
+        pane.tabs.clear();
+        pane.active_tab_id = None;
+    }
+    let canonical = layout_state::canonical_session_path_in(dir.path());
+    fs::write(
+        &canonical,
+        serde_json::to_vec_pretty(&empty_pane_state).unwrap(),
+    )
+    .unwrap();
+    let (_, minted_empty) = read_session_with_minted_ids(dir.path()).unwrap();
+    assert!(minted_empty);
+}
