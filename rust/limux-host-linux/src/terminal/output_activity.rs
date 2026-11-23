@@ -15,6 +15,7 @@ pub(super) struct OutputActivity {
     // Odd generations are enabled. A new generation rejects callbacks that
     // started before the setting was toggled off and back on.
     enabled_generation: AtomicU64,
+    mapped: AtomicBool,
     queued: AtomicBool,
     last_output_nanos: AtomicU64,
     last_output_generation: AtomicU64,
@@ -22,11 +23,12 @@ pub(super) struct OutputActivity {
 }
 
 impl OutputActivity {
-    pub(super) fn new(enabled: bool) -> Arc<Self> {
+    pub(super) fn new(enabled: bool, mapped: bool) -> Arc<Self> {
         EPOCH.get_or_init(Instant::now);
         Arc::new_cyclic(|weak| Self {
             identity: OnceLock::new(),
             enabled_generation: AtomicU64::new(u64::from(enabled)),
+            mapped: AtomicBool::new(mapped),
             queued: AtomicBool::new(false),
             last_output_nanos: AtomicU64::new(0),
             last_output_generation: AtomicU64::new(0),
@@ -47,7 +49,14 @@ impl OutputActivity {
         }
     }
 
+    pub(super) fn set_mapped(&self, mapped: bool) {
+        self.mapped.store(mapped, Ordering::Release);
+    }
+
     fn receive(&self) {
+        if self.mapped.load(Ordering::Acquire) {
+            return;
+        }
         let generation = self.enabled_generation.load(Ordering::Acquire);
         if generation & 1 == 0 {
             return;
@@ -123,7 +132,7 @@ mod tests {
 
     #[test]
     fn output_captured_before_disable_is_not_replayed_after_reenable() {
-        let activity = OutputActivity::new(true);
+        let activity = OutputActivity::new(true, false);
         let previous_generation = activity.enabled_generation.load(Ordering::Acquire);
         activity.set_enabled(false);
         activity.set_enabled(true);
@@ -135,5 +144,18 @@ mod tests {
         assert_eq!(activity.latest_output(), Some(at));
         activity.set_enabled(false);
         assert_eq!(activity.latest_output(), None);
+    }
+
+    #[test]
+    fn mapped_activity_skips_recording_and_delivery_until_unmapped() {
+        let activity = OutputActivity::new(true, true);
+        activity.receive();
+        assert_eq!(activity.latest_output(), None);
+        assert!(!activity.queued.load(Ordering::Acquire));
+
+        activity.set_mapped(false);
+        activity.receive();
+        assert!(activity.latest_output().is_some());
+        assert!(activity.queued.load(Ordering::Acquire));
     }
 }

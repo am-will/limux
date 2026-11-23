@@ -408,6 +408,8 @@ for regression in \
   pane::tests::closing_the_active_tab_maps_only_its_replacement \
   pane::tests::moved_terminal_hover_focus_reads_its_new_pane_and_spares_renames \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
+  split_tree::tests::split_ratio_tracks_resizes_without_idle_frame_clock_or_spurious_saves \
+  split_tree::tests::split_ratio_survives_bounce_unmapped_updates_and_nested_resizes \
   split_tree::tests::restoring_split_respects_nested_pane_minimums \
   split_tree::tests::in_place_zoom_preserves_widget_realization_and_split_ratios \
   split_tree::tests::in_place_unzoom_after_window_resize_preserves_ratios_and_clamping \

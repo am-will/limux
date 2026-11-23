@@ -356,6 +356,13 @@ pub(super) fn has_unread(workspace_unread: bool, tab_unread: bool) -> bool {
 }
 
 pub(super) fn set_workspace_unread_visual(workspace: &Workspace, unread: bool) {
+    let show_notify_label = unread && !workspace.notify_label.label().is_empty();
+    let visual_state = (unread, show_notify_label);
+    if workspace.unread_visual.get() == Some(visual_state) {
+        return;
+    }
+    workspace.unread_visual.set(Some(visual_state));
+
     if unread {
         workspace
             .notify_dot
@@ -365,9 +372,7 @@ pub(super) fn set_workspace_unread_visual(workspace: &Workspace, unread: bool) {
         workspace
             .notify_label
             .add_css_class("limux-notify-msg-unread");
-        workspace
-            .notify_label
-            .set_visible(!workspace.notify_label.label().is_empty());
+        workspace.notify_label.set_visible(show_notify_label);
         if let Some(row_box) = workspace.sidebar_row.child() {
             row_box.add_css_class("limux-sidebar-row-unread");
         }
@@ -587,7 +592,84 @@ pub(super) fn desktop_notification_actions() -> Vec<String> {
     vec!["default".to_string(), "Open".to_string()]
 }
 
+const MAX_DESKTOP_NOTIFICATION_ROUTES: usize = 256;
+
+pub(super) fn record_desktop_notification_route(
+    routes: &mut HashMap<u32, DesktopNotificationRoute>,
+    order: &mut VecDeque<u32>,
+    notification_id: u32,
+    route: DesktopNotificationRoute,
+) {
+    if routes.insert(notification_id, route).is_some() {
+        order.retain(|id| *id != notification_id);
+    }
+    order.push_back(notification_id);
+    while routes.len() > MAX_DESKTOP_NOTIFICATION_ROUTES {
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
+        routes.remove(&oldest);
+    }
+}
+
+fn send_desktop_notification_with_proxy(
+    state: State,
+    proxy: &gio::DBusProxy,
+    request: &DesktopNotificationRequest,
+) {
+    let route = DesktopNotificationRoute {
+        target: request.target.clone(),
+        activation_token: None,
+    };
+
+    let params = (
+        "Limux",
+        0u32,
+        crate::APP_ID,
+        request.summary.as_str(),
+        request.body.as_str(),
+        desktop_notification_actions(),
+        desktop_notification_hints(request.sound),
+        DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
+    )
+        .to_variant();
+
+    proxy.call(
+        "Notify",
+        Some(&params),
+        gio::DBusCallFlags::NONE,
+        DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS,
+        None::<&gio::Cancellable>,
+        move |result| {
+            let Ok(response) = result else {
+                return;
+            };
+            let Some(notification_id) = desktop_notification_id_from_response(&response) else {
+                return;
+            };
+
+            let mut s = state.borrow_mut();
+            let AppState {
+                desktop_notification_routes,
+                desktop_notification_route_order,
+                ..
+            } = &mut *s;
+            record_desktop_notification_route(
+                desktop_notification_routes,
+                desktop_notification_route_order,
+                notification_id,
+                route.clone(),
+            );
+        },
+    );
+}
+
 pub(super) fn show_desktop_notification(state: &State, request: DesktopNotificationRequest) {
+    if let Some(proxy) = state.borrow().desktop_notification_proxy.clone() {
+        send_desktop_notification_with_proxy(state.clone(), &proxy, &request);
+        return;
+    }
+
     let state = state.clone();
     gio::DBusProxy::for_bus(
         gio::BusType::Session,
@@ -601,44 +683,13 @@ pub(super) fn show_desktop_notification(state: &State, request: DesktopNotificat
             let Ok(proxy) = result else {
                 return;
             };
-            let route = DesktopNotificationRoute {
-                target: request.target.clone(),
-                activation_token: None,
-            };
-
-            let params = (
-                "Limux",
-                0u32,
-                crate::APP_ID,
-                request.summary.as_str(),
-                request.body.as_str(),
-                desktop_notification_actions(),
-                desktop_notification_hints(request.sound),
-                DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
-            )
-                .to_variant();
-
-            proxy.call(
-                "Notify",
-                Some(&params),
-                gio::DBusCallFlags::NONE,
-                DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS,
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let Ok(response) = result else {
-                        return;
-                    };
-                    let Some(notification_id) = desktop_notification_id_from_response(&response)
-                    else {
-                        return;
-                    };
-
-                    state
-                        .borrow_mut()
-                        .desktop_notification_routes
-                        .insert(notification_id, route.clone());
-                },
-            );
+            {
+                let mut s = state.borrow_mut();
+                if s.desktop_notification_proxy.is_none() {
+                    s.desktop_notification_proxy = Some(proxy.clone());
+                }
+            }
+            send_desktop_notification_with_proxy(state.clone(), &proxy, &request);
         },
     );
 }

@@ -291,6 +291,10 @@ fn closed_tabs_panes_and_workspaces_free_their_widgets() {
         pane::find_tab_rename_entry(&closed).is_some(),
         "a rename is open"
     );
+    assert!(
+        active_inline_rename_entry_in(&closed).is_some(),
+        "tab rename entry should be indexed for O(1) lookup"
+    );
 
     let mut refs = weak_refs(&widget_tree(&closed));
     refs.push(toast);
@@ -301,6 +305,10 @@ fn closed_tabs_panes_and_workspaces_free_their_widgets() {
     remove_pane(&state, &ws_id, &closed);
     drop(closed);
     assert_freed("closed pane", &refs);
+    assert!(
+        active_inline_rename_entry_in(&state.borrow().window).is_none(),
+        "closing a pane with an open tab rename must clear the rename index"
+    );
     assert_focus_within("closed pane", &state, &first);
 
     // Two panes closed in one tick, as two shells exiting together: the
@@ -577,6 +585,10 @@ fn inline_rename_commit_returns_the_focus_to_the_workspace() {
     begin_workspace_inline_rename(&state, &ws_id);
     let sidebar_list = state.borrow().sidebar_list.clone();
     let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_eq!(
+        active_inline_rename_entry_in(&sidebar_list).as_ref(),
+        Some(&entry)
+    );
     assert_focus_within("rename started", &state, entry.upcast_ref());
 
     entry.set_text("renamed");
@@ -588,6 +600,7 @@ fn inline_rename_commit_returns_the_focus_to_the_workspace() {
         assert_eq!(ws.name, "renamed");
     }
     assert!(find_active_rename_entry(&sidebar_list).is_none());
+    assert!(active_inline_rename_entry_in(&sidebar_list).is_none());
 
     // A click on a terminal commits the rename on press (the window's
     // capture-phase `click_anywhere`), then the terminal takes the focus. The
