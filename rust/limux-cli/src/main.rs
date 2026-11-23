@@ -17,6 +17,7 @@ use tokio::net::UnixStream;
 
 mod agent_hooks;
 mod agent_team_file;
+mod session_snapshot;
 mod terminal_notifications;
 
 const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -305,10 +306,12 @@ Common commands:
   capture-pane (alias of read-screen)
   tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]
   browser [--surface <id|ref>|<surface>] <subcommand> ...
+  save-session
+      Flush the running window's session.json with attached restorable agent sessions.
 
 Agent integrations:
   notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
-  hooks setup [agent] [--osc] | hooks uninstall [agent] | hooks <agent> <event>
+  hooks setup [agent] [--osc] | hooks uninstall [agent] | hooks snapshot [agent] [--dry-run] [--save-session] [--all-sockets] | hooks <agent> <event>
   claude-hook | opencode-hook | gemini-hook | agy-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]
   agent-team [--agents codex,claude[,opencode,gemini,agy]] [--cwd <path>] [--no-launch] [--dry-run]
       Splits the active workspace into one pane per agent (caller's pane stays
@@ -767,6 +770,13 @@ async fn run_activate(client: &mut Client, args: &[String]) -> Result<Value> {
             window_activation_params(activation_token.as_deref(), startup_id.as_deref()),
         )
         .await
+}
+
+async fn run_save_session(client: &mut Client, args: &[String]) -> Result<Value> {
+    if !args.is_empty() {
+        bail!("save-session takes no arguments; use --socket <path> before save-session to target an instance");
+    }
+    client.call("session.save", json!({})).await
 }
 
 async fn run_identify(client: &mut Client, args: &[String]) -> Result<Value> {
@@ -1730,7 +1740,7 @@ async fn run_hooks_command(
 ) -> Result<CommandOutput> {
     let Some(first) = args.first().map(String::as_str) else {
         bail!(
-            "Usage: limux hooks setup [agent]|uninstall [agent]|<agent> install|uninstall|<event>"
+            "Usage: limux hooks setup [agent]|uninstall [agent]|snapshot [agent] [--dry-run] [--save-session] [--all-sockets]|<agent> install|uninstall|<event>"
         );
     };
 
@@ -1744,6 +1754,9 @@ async fn run_hooks_command(
             let target = parse_opt(args, "--agent").or_else(|| positional_arg(args, 1));
             let changed = uninstall_hook_targets(target.as_deref())?;
             return hooks_summary_output("uninstalled", changed, json_output);
+        }
+        "snapshot" => {
+            return run_hooks_snapshot(client, &args[1..], json_output).await;
         }
         _ => {}
     }
@@ -1799,6 +1812,107 @@ fn hooks_summary_output(
             }
         )))
     }
+}
+
+fn snapshot_positional_agent(args: &[String]) -> Option<String> {
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if matches!(arg.as_str(), "--agent" | "--workspace" | "--surface") {
+            skip = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+async fn run_hooks_snapshot(
+    client: &mut Client,
+    args: &[String],
+    json_output: bool,
+) -> Result<CommandOutput> {
+    let agent_name = parse_opt(args, "--agent").or_else(|| snapshot_positional_agent(args));
+    let agent = agent_name
+        .as_deref()
+        .map(|name| {
+            agent_hooks::AgentKind::from_hook_name(name)
+                .ok_or_else(|| anyhow!("unknown hooks target: {name}"))
+        })
+        .transpose()?;
+    let dry_run = parse_flag(args, "--dry-run");
+    let save_session = parse_flag(args, "--save-session");
+    let options = session_snapshot::SnapshotOptions {
+        agent,
+        workspace_id: parse_opt(args, "--workspace"),
+        surface_id: parse_opt(args, "--surface"),
+        target_socket: Some(client.socket.clone()),
+        all_sockets: parse_flag(args, "--all-sockets"),
+        dry_run,
+    };
+
+    let report = session_snapshot::snapshot_running_agents(&options)?;
+    let session_save = if save_session && !dry_run {
+        Some(client.call("session.save", json!({})).await?)
+    } else {
+        None
+    };
+
+    if json_output {
+        let mut payload = serde_json::to_value(&report)?;
+        if let (Some(map), Some(saved)) = (payload.as_object_mut(), session_save) {
+            map.insert("session_save".to_string(), saved);
+        }
+        return Ok(CommandOutput::Json(payload));
+    }
+
+    let mut lines = Vec::new();
+    let verb = if report.dry_run {
+        "would capture"
+    } else {
+        "captured"
+    };
+    lines.push(format!(
+        "OK {verb} {} running agent session(s) ({} skipped)",
+        report.captured.len(),
+        report.skipped.len()
+    ));
+    for item in &report.captured {
+        let cwd = item.cwd.as_deref().unwrap_or("-");
+        lines.push(format!(
+            "  {} {} pid={} surface={} cwd={}",
+            item.agent, item.session_id, item.pid, item.surface_id, cwd
+        ));
+    }
+    for item in &report.skipped {
+        let cwd = item.cwd.as_deref().unwrap_or("-");
+        lines.push(format!(
+            "  skipped {} pid={} surface={} cwd={} ({})",
+            item.agent, item.pid, item.surface_id, cwd, item.reason
+        ));
+    }
+    if let Some(saved) = session_save {
+        if let Some(path) = saved.get("path").and_then(Value::as_str) {
+            let workspaces = saved.get("workspaces").and_then(Value::as_u64).unwrap_or(0);
+            let tabs = saved.get("tabs").and_then(Value::as_u64).unwrap_or(0);
+            let agents = saved
+                .get("restorable_agents")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            lines.push(format!(
+                "OK saved session to {path} ({workspaces} workspaces, {tabs} tabs, {agents} restorable agents)"
+            ));
+        } else {
+            lines.push("OK saved session".to_string());
+        }
+    }
+    Ok(CommandOutput::Text(lines.join("\n")))
 }
 
 fn install_hook_targets(target: Option<&str>, osc: bool) -> Result<Vec<String>> {
@@ -4516,6 +4630,27 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             let payload = run_activate(client, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "save-session" => {
+            let payload = run_save_session(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if let Some(path) = payload.get("path").and_then(Value::as_str) {
+                let workspaces = payload
+                    .get("workspaces")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let tabs = payload.get("tabs").and_then(Value::as_u64).unwrap_or(0);
+                let agents = payload
+                    .get("restorable_agents")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                CommandOutput::Text(format!(
+                    "OK saved {path} ({workspaces} workspaces, {tabs} tabs, {agents} restorable agents)"
+                ))
             } else {
                 CommandOutput::Text("OK".to_string())
             }

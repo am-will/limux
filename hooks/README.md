@@ -37,3 +37,22 @@ LIMUX_CLAUDE_HOOKS_DISABLED=1
 LIMUX_GEMINI_HOOKS_DISABLED=1
 LIMUX_AGY_HOOKS_DISABLED=1
 ```
+
+## Snapshotting already-running agent sessions
+
+Hooks record session IDs as agents start or run turns. If you already have live
+agent tabs open before installing hooks, or want to flush restorable state
+right before restarting or upgrading Limux, snapshot running processes and flush
+`session.json`:
+
+```bash
+# Preview which running Limux-hosted agents can be snapshotted
+limux hooks snapshot --dry-run
+
+# Record live running agent sessions into ~/.local/state/limux/*-hook-sessions.json
+# and flush ~/.local/share/limux/session.json from the running host
+limux hooks snapshot --save-session
+
+# Or flush session.json directly
+limux save-session
+```

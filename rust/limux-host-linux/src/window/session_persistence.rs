@@ -90,10 +90,77 @@ pub(super) fn report_session_save_notice(state: &State, detail: String) {
     show_runtime_error(state, "Session could not be merged", &detail);
 }
 
-pub(super) fn save_session_now(state: &State) {
-    let store = {
+pub(super) fn save_session_for_rpc(
+    state: &State,
+    reply: std::sync::mpsc::Sender<crate::control_bridge::BridgeResult>,
+) {
+    {
         let mut s = state.borrow_mut();
         if s.persistence_suspended {
+            let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                "session persistence is suspended",
+            )));
+            return;
+        }
+        if s.session_close_dialog_open {
+            let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                "session close dialog is open",
+            )));
+            return;
+        }
+        s.session_save_waiters.push(reply);
+    }
+    save_session_now(state);
+}
+
+fn notify_session_save_waiters(
+    waiters: Vec<std::sync::mpsc::Sender<crate::control_bridge::BridgeResult>>,
+    result: &Result<crate::session_store::SaveOutcome, String>,
+    summary: Option<&crate::session_store::SavedSessionSummary>,
+) {
+    if waiters.is_empty() {
+        return;
+    }
+    let response = match result {
+        Ok(crate::session_store::SaveOutcome::Saved) => {
+            let payload = match summary {
+                Some(summary) => serde_json::json!({
+                    "saved": true,
+                    "path": summary.path.to_string_lossy(),
+                    "workspaces": summary.workspaces,
+                    "tabs": summary.tabs,
+                    "restorable_agents": summary.restorable_agents,
+                }),
+                None => serde_json::json!({ "saved": true }),
+            };
+            Ok(payload)
+        }
+        Ok(crate::session_store::SaveOutcome::Conflict {
+            recovery,
+            workspaces,
+        }) => Err(crate::control_bridge::BridgeError::conflict(
+            session_conflict_detail(recovery, workspaces),
+        )),
+        Err(error) => Err(crate::control_bridge::BridgeError::internal(format!(
+            "Failed to save session: {error}"
+        ))),
+    };
+    for waiter in waiters {
+        let _ = waiter.send(response.clone());
+    }
+}
+
+pub(super) fn save_session_now(state: &State) {
+    let (store, waiters) = {
+        let mut s = state.borrow_mut();
+        if s.persistence_suspended {
+            let waiters = std::mem::take(&mut s.session_save_waiters);
+            drop(s);
+            for waiter in waiters {
+                let _ = waiter.send(Err(crate::control_bridge::BridgeError::conflict(
+                    "session persistence is suspended",
+                )));
+            }
             return;
         }
         if let Some(timer) = s.session_save_timer.take() {
@@ -101,25 +168,37 @@ pub(super) fn save_session_now(state: &State) {
         }
         if s.session_close_dialog_open {
             s.save_queued = true;
+            let waiters = std::mem::take(&mut s.session_save_waiters);
+            drop(s);
+            for waiter in waiters {
+                let _ = waiter.send(Err(crate::control_bridge::BridgeError::conflict(
+                    "session close dialog is open",
+                )));
+            }
             return;
         }
         s.save_queued = false;
         match s.session_store.as_mut() {
             Ok(store) => match store.take() {
-                Some(store) => Ok(store),
+                Some(store) => (Ok(store), std::mem::take(&mut s.session_save_waiters)),
                 None => {
                     // The in-flight writer owns the store and its merge ancestry.
-                    // Its completion captures the latest GTK state before saving again.
+                    // Its completion captures the latest GTK state before saving again,
+                    // carrying any queued RPC waiters onto that fresh save.
                     s.save_queued = true;
                     return;
                 }
             },
-            Err(error) => Err(format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")),
+            Err(error) => (
+                Err(format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")),
+                std::mem::take(&mut s.session_save_waiters),
+            ),
         }
     };
     let store = match store {
         Ok(store) => store,
         Err(error) => {
+            notify_session_save_waiters(waiters, &Err(error.clone()), None);
             finish_session_save(state, Err(error));
             return;
         }
@@ -128,24 +207,31 @@ pub(super) fn save_session_now(state: &State) {
     let task = store.save_in_background(session);
     let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
-        let result = match task.await {
-            Ok((store, saved_session, result)) => {
+        let (result, summary) = match task.await {
+            Ok((store, saved_session, result, summary)) => {
                 state.borrow_mut().session_store = Ok(Some(store));
                 // A close request must include changes made while the worker was
                 // saving, including control-socket commands behind a modal dialog.
                 let closing = state.borrow().session_close_pending.is_some();
                 if closing && result.is_ok() && snapshot_session_state(&state) != saved_session {
+                    if !waiters.is_empty() {
+                        let mut s = state.borrow_mut();
+                        let mut requeued = waiters;
+                        requeued.append(&mut s.session_save_waiters);
+                        s.session_save_waiters = requeued;
+                    }
                     save_session_now(&state);
                     return;
                 }
-                result.map_err(|error| error.to_string())
+                (result.map_err(|error| error.to_string()), Some(summary))
             }
             Err(_) => {
                 let error = "Session writer stopped unexpectedly".to_string();
                 state.borrow_mut().session_store = Err(error.clone());
-                Err(error)
+                (Err(error), None)
             }
         };
+        notify_session_save_waiters(waiters, &result, summary.as_ref());
         finish_session_save(&state, result);
         let pending = {
             let s = state.borrow();
@@ -273,11 +359,19 @@ pub(super) fn suspend_persistence(state: &State, suspended: bool) {
 }
 
 pub(super) fn stop_session_saves_for_shutdown(state: &State) {
-    let mut s = state.borrow_mut();
-    s.save_queued = false;
-    s.persistence_suspended = true;
-    if let Some(timer) = s.session_save_timer.take() {
-        timer.remove();
+    let waiters = {
+        let mut s = state.borrow_mut();
+        s.save_queued = false;
+        s.persistence_suspended = true;
+        if let Some(timer) = s.session_save_timer.take() {
+            timer.remove();
+        }
+        std::mem::take(&mut s.session_save_waiters)
+    };
+    for waiter in waiters {
+        let _ = waiter.send(Err(crate::control_bridge::BridgeError::conflict(
+            "window is closing",
+        )));
     }
 }
 

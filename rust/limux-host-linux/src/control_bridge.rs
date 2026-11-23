@@ -27,7 +27,7 @@ const INTERNAL_ERROR_CODE: i64 = -32603;
 const NOT_FOUND_CODE: i64 = -32004;
 const CONFLICT_CODE: i64 = -32009;
 
-type BridgeResult = Result<Value, BridgeError>;
+pub(crate) type BridgeResult = Result<Value, BridgeError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceTarget {
@@ -143,6 +143,9 @@ pub enum ControlCommand {
     },
     ActivateWindow {
         activation_token: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    SaveSession {
         reply: mpsc::Sender<BridgeResult>,
     },
     CurrentWorkspace {
@@ -329,6 +332,7 @@ impl ControlCommand {
         match self {
             Self::Identify { reply, .. }
             | Self::ActivateWindow { reply, .. }
+            | Self::SaveSession { reply }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
             | Self::ListPanes { reply, .. }
@@ -1044,6 +1048,10 @@ fn handle_method(
                 },
                 rx,
             )
+        }
+        "session.save" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::SaveSession { reply }, rx)
         }
         "workspace.current" => {
             let (reply, rx) = mpsc::channel();
@@ -1945,6 +1953,39 @@ mod tests {
                 Some(INVALID_PARAMS_CODE)
             );
         }
+    }
+
+    #[test]
+    fn session_save_dispatches_to_gtk_host() {
+        let response = dispatch_request(
+            &json!({ "id": "save", "method": "session.save", "params": {} }).to_string(),
+            &|command| match command {
+                ControlCommand::SaveSession { reply } => {
+                    reply
+                        .send(Ok(json!({
+                            "saved": true,
+                            "path": "/tmp/session.json",
+                            "workspaces": 2,
+                            "tabs": 5,
+                            "restorable_agents": 3
+                        })))
+                        .unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(response.error, None);
+        assert_eq!(response.id, Some(json!("save")));
+        assert_eq!(
+            response.result,
+            Some(json!({
+                "saved": true,
+                "path": "/tmp/session.json",
+                "workspaces": 2,
+                "tabs": 5,
+                "restorable_agents": 3
+            }))
+        );
     }
 
     #[test]

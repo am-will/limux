@@ -234,6 +234,12 @@ limux hooks setup
 # Or configure a single agent (codex, claude, gemini, agy, opencode):
 limux hooks setup agy
 
+# Snapshot already-running Limux-hosted agent sessions before a restart/upgrade
+# and flush the host's session.json:
+limux hooks snapshot --save-session
+# Or flush session.json directly:
+limux save-session
+
 # Drop-in hook handlers translate hook JSON on stdin into notify/session state
 echo '{"event":"stop"}' | limux claude-hook --event stop
 echo '{"event":"finished"}' | limux gemini-hook --event finished

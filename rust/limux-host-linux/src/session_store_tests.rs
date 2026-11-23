@@ -57,12 +57,19 @@ fn background_save_keeps_the_main_context_responsive_and_preserves_merge_ancestr
                 remote.workspaces[1].name = "independent remote edit".into();
                 layout_state::save_session_atomic_in(dir.path(), &remote).unwrap();
                 drop(lock);
-                let (store, snapshot, result) = task.await.unwrap();
+                let (store, snapshot, result, summary) = task.await.unwrap();
                 assert!(matches!(result.unwrap(), SaveOutcome::Saved));
                 assert_eq!(snapshot, local);
+                assert_eq!(summary.workspaces, 2);
+                assert_eq!(summary.tabs, 2);
+                assert_eq!(
+                    summary.path,
+                    layout_state::canonical_session_path_in(dir.path())
+                );
 
                 local.workspaces[0].name = "latest local edit".into();
-                let (_, snapshot, result) = store.save_in_background(local.clone()).await.unwrap();
+                let (_, snapshot, result, _) =
+                    store.save_in_background(local.clone()).await.unwrap();
                 assert!(matches!(result.unwrap(), SaveOutcome::Saved));
                 assert_eq!(snapshot, local);
                 let saved = disk(dir.path());
@@ -87,10 +94,10 @@ fn background_save_returns_conflicts_and_preserves_the_latest_recovery() {
     context
         .with_thread_default(|| {
             context.block_on(async {
-                let (store, _, result) = store.save_in_background(local.clone()).await.unwrap();
+                let (store, _, result, _) = store.save_in_background(local.clone()).await.unwrap();
                 assert!(matches!(result.unwrap(), SaveOutcome::Conflict { .. }));
                 local.workspaces[0].name = "edit while confirming recovery".into();
-                let (_, _, result) = store.save_in_background(local.clone()).await.unwrap();
+                let (_, _, result, _) = store.save_in_background(local.clone()).await.unwrap();
                 let SaveOutcome::Conflict { recovery, .. } = result.unwrap() else {
                     panic!("stale local edits must still conflict");
                 };
@@ -116,13 +123,13 @@ fn background_save_returns_errors_without_losing_the_store_or_unsaved_changes() 
     context
         .with_thread_default(|| {
             context.block_on(async {
-                let (store, snapshot, result) =
+                let (store, snapshot, result, _) =
                     store.save_in_background(local.clone()).await.unwrap();
                 assert!(result.is_err());
                 assert_eq!(snapshot, local);
                 assert_eq!(fs::read_to_string(&path).unwrap(), "invalid session");
                 layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
-                let (_, _, result) = store.save_in_background(local.clone()).await.unwrap();
+                let (_, _, result, _) = store.save_in_background(local.clone()).await.unwrap();
                 assert!(matches!(result.unwrap(), SaveOutcome::Saved));
                 assert_eq!(disk(dir.path()), local);
             });
@@ -183,7 +190,7 @@ fn measure_session_save_lock_contention() {
                         });
                         let start = Instant::now();
                         if background {
-                            let (_, _, result) =
+                            let (_, _, result, _) =
                                 store.save_in_background(state.clone()).await.unwrap();
                             assert!(matches!(result.unwrap(), SaveOutcome::Saved));
                         } else {

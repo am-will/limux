@@ -17,6 +17,54 @@ pub(crate) enum SaveOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SavedSessionSummary {
+    pub(crate) path: PathBuf,
+    pub(crate) workspaces: usize,
+    pub(crate) tabs: usize,
+    pub(crate) restorable_agents: usize,
+}
+
+fn count_layout_tabs(layout: &layout_state::LayoutNodeState) -> (usize, usize) {
+    match layout {
+        layout_state::LayoutNodeState::Pane(pane) => {
+            let tabs = pane.tabs.len();
+            let agents = pane
+                .tabs
+                .iter()
+                .filter(|tab| match &tab.content {
+                    layout_state::TabContentState::Terminal { agent, .. } => {
+                        agent.as_ref().is_some_and(|agent| agent.restore_on_startup)
+                    }
+                    _ => false,
+                })
+                .count();
+            (tabs, agents)
+        }
+        layout_state::LayoutNodeState::Split(split) => {
+            let (start_tabs, start_agents) = count_layout_tabs(&split.start);
+            let (end_tabs, end_agents) = count_layout_tabs(&split.end);
+            (start_tabs + end_tabs, start_agents + end_agents)
+        }
+    }
+}
+
+fn summarize_saved_session(path: PathBuf, session: &AppSessionState) -> SavedSessionSummary {
+    let mut tabs = 0usize;
+    let mut restorable_agents = 0usize;
+    for workspace in &session.workspaces {
+        let (workspace_tabs, workspace_agents) = count_layout_tabs(&workspace.layout);
+        tabs += workspace_tabs;
+        restorable_agents += workspace_agents;
+    }
+    SavedSessionSummary {
+        path,
+        workspaces: session.workspaces.len(),
+        tabs,
+        restorable_agents,
+    }
+}
+
 pub(crate) struct SessionStore {
     directory: PathBuf,
     recovery: PathBuf,
@@ -101,13 +149,22 @@ impl SessionStore {
     pub(crate) fn save_in_background(
         mut self,
         local: AppSessionState,
-    ) -> gtk4::gio::JoinHandle<(Self, AppSessionState, io::Result<SaveOutcome>)> {
+    ) -> gtk4::gio::JoinHandle<(
+        Self,
+        AppSessionState,
+        io::Result<SaveOutcome>,
+        SavedSessionSummary,
+    )> {
         gtk4::gio::spawn_blocking(move || {
             let mut persisted = local.clone();
             let agents = layout_state::RestorableAgentIndex::load();
             layout_state::attach_restorable_agents_to_session(&mut persisted, &agents);
+            let summary = summarize_saved_session(
+                layout_state::canonical_session_path_in(&self.directory),
+                &persisted,
+            );
             let result = self.save(&persisted);
-            (self, local, result)
+            (self, local, result, summary)
         })
     }
 
