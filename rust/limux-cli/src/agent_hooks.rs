@@ -118,7 +118,10 @@ impl AgentHookSessionStore {
         let ended_changed = file.ended_sessions.len() != ended_before;
         if !ended_changed
             && file.version == 1
-            && record_unchanged_and_newest(&file.sessions, &session_id, &record)
+            && file.sessions.get(&session_id).is_some_and(|existing| {
+                record_unchanged_and_newest(&file.sessions, &session_id, &record)
+                    && !sibling_store_has_newer_surface_session(&self.path, existing)
+            })
         {
             return Ok(());
         }
@@ -544,6 +547,62 @@ fn record_unchanged_and_newest(
                 || tab_identity(&other.surface_id) == target_tab)
             && other.updated_at >= existing.updated_at
     })
+}
+
+fn sibling_store_has_newer_surface_session(
+    store_path: &Path,
+    existing: &AgentHookSessionRecord,
+) -> bool {
+    let Some(parent) = store_path.parent() else {
+        return false;
+    };
+    if !existing.updated_at.is_finite() {
+        return true;
+    }
+    // Allow 2 seconds of slack for coarse filesystem mtime granularity.
+    let threshold = UNIX_EPOCH + Duration::from_secs_f64((existing.updated_at - 2.0).max(0.0));
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let target_tab = tab_identity(&existing.surface_id);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let path = entry.path();
+        if path == store_path {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.ends_with("-hook-sessions.json") {
+            continue;
+        }
+        if let Ok(mtime) = entry.metadata().and_then(|meta| meta.modified()) {
+            if mtime < threshold {
+                continue;
+            }
+        }
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(_) => return true,
+        };
+        let Ok(sibling) = serde_json::from_str::<AgentHookSessionFile>(&raw) else {
+            return true;
+        };
+        if sibling.sessions.values().any(|other| {
+            (other.surface_id == existing.surface_id
+                || tab_identity(&other.surface_id) == target_tab)
+                && other.updated_at >= existing.updated_at
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn normalized(value: &str) -> Option<String> {
@@ -1184,5 +1243,58 @@ mod tests {
             .expect("promote sess-a");
         let persisted = store.lookup("sess-a").expect("lookup").expect("record");
         assert_eq!(persisted.updated_at, 300.0);
+    }
+
+    #[test]
+    fn update_rewrites_when_sibling_agent_store_has_newer_surface_session() {
+        let dir = tempdir().expect("tempdir");
+        let claude = AgentHookSessionStore::new_for_dir("claude", dir.path());
+        let codex = AgentHookSessionStore::new_for_dir("codex", dir.path());
+
+        let mut initial = test_record("sess-claude");
+        initial.surface_id = "1:tab-shared".to_string();
+        initial.updated_at = 100.0;
+        claude
+            .update("sess-claude", |_| initial.clone())
+            .expect("initial claude save");
+        let after_initial = fs::read(&claude.path).expect("read initial claude state");
+
+        // A sibling agent session on a different surface must not force a rewrite.
+        let mut other_surface = test_record("sess-codex-other");
+        other_surface.surface_id = "1:tab-other".to_string();
+        other_surface.updated_at = 150.0;
+        codex
+            .update("sess-codex-other", |_| other_surface)
+            .expect("save sibling on other surface");
+
+        let mut repeat_other = initial.clone();
+        repeat_other.updated_at = 180.0;
+        claude
+            .update("sess-claude", |_| repeat_other)
+            .expect("noop update with unrelated sibling");
+        assert_eq!(
+            fs::read(&claude.path).expect("read after unrelated sibling"),
+            after_initial
+        );
+
+        // Once a sibling agent writes a newer session on the same surface, the next
+        // claude update must persist its newer updated_at so restore picks claude.
+        let mut competing_sibling = test_record("sess-codex-shared");
+        competing_sibling.surface_id = "1:tab-shared".to_string();
+        competing_sibling.updated_at = 150.0;
+        codex
+            .update("sess-codex-shared", |_| competing_sibling)
+            .expect("save sibling on shared surface");
+
+        let mut promoted = initial.clone();
+        promoted.updated_at = 250.0;
+        claude
+            .update("sess-claude", |_| promoted)
+            .expect("promote claude over sibling");
+        let persisted = claude
+            .lookup("sess-claude")
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(persisted.updated_at, 250.0);
     }
 }

@@ -1471,7 +1471,7 @@ fn flush_pending_scrollbar(surface_key: usize) {
     SURFACE_MAP.with(|map| {
         if let Some(entry) = map.borrow().get(&surface_key) {
             entry.scrollbar_flush_timer.borrow_mut().take();
-            if entry.scrollbar_dirty.replace(false) && entry.gl_area.is_mapped() {
+            if entry.gl_area.is_mapped() && entry.scrollbar_dirty.replace(false) {
                 if let Some(metrics) = entry.scrollbar_state.get() {
                     apply_scrollbar_metrics(entry, metrics);
                 }
