@@ -590,6 +590,8 @@ pub fn create_pane(
 
     let content_stack = gtk::Stack::new();
     content_stack.set_transition_type(gtk::StackTransitionType::None);
+    content_stack.set_hhomogeneous(false);
+    content_stack.set_vhomogeneous(false);
     content_stack.set_hexpand(true);
     content_stack.set_vexpand(true);
 
@@ -2908,17 +2910,29 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
     panes
 }
 
-fn pane_internals_for_workspace(workspace_id: &str) -> Vec<Rc<PaneInternals>> {
-    let mut panes = PANE_REGISTRY.with(|registry| {
-        registry
-            .borrow()
-            .values()
-            .filter_map(|weak| weak.upgrade())
-            .filter(|internals| internals.callbacks.workspace_id == workspace_id)
-            .collect::<Vec<_>>()
-    });
-    panes.sort_by_key(|internals| internals.pane_id);
-    panes
+/// Direct lookup of a live terminal handle and its owning workspace id by tab id
+/// via the pane registry, avoiding full workspace tree walks and vector clones.
+pub fn terminal_handle_by_tab_id(tab_id: &str) -> Option<(String, terminal::TerminalHandle)> {
+    PANE_REGISTRY.with(|registry| {
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            let tab_state = internals.tab_state.borrow();
+            if let Some(TabKind::Terminal { state }) = tab_state
+                .tabs
+                .iter()
+                .find(|entry| entry.id == tab_id)
+                .map(|entry| &entry.kind)
+            {
+                return Some((
+                    internals.callbacks.workspace_id.clone(),
+                    state.handle.clone(),
+                ));
+            }
+        }
+        None
+    })
 }
 
 /// Every tab of the workspace `surface_hint` names, ranked by how it names it;
@@ -2929,18 +2943,63 @@ pub fn tab_candidates_for_workspace(
     terminals_only: bool,
 ) -> Vec<(SurfaceHintMatch, u32, String)> {
     let mut candidates = Vec::new();
-    for internals in pane_internals_for_workspace(workspace_id) {
-        let pane_id = internals.pane_id;
-        for entry in &internals.tab_state.borrow().tabs {
-            if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+    PANE_REGISTRY.with(|registry| {
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            if internals.callbacks.workspace_id != workspace_id {
                 continue;
             }
-            if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
-                candidates.push((rank, pane_id, entry.id.clone()));
+            let pane_id = internals.pane_id;
+            for entry in &internals.tab_state.borrow().tabs {
+                if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+                    continue;
+                }
+                if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
+                    candidates.push((rank, pane_id, entry.id.clone()));
+                }
             }
         }
-    }
+    });
     candidates
+}
+
+/// Resolve `surface_hint` across all known workspaces in a single pass over the
+/// pane registry instead of scanning and sorting the registry once per workspace.
+pub(crate) fn resolve_surface_hint_for_workspaces(
+    workspace_index_by_id: &std::collections::HashMap<&str, usize>,
+    preferred_index: usize,
+    surface_hint: &str,
+    terminals_only: bool,
+) -> HintResolution<(usize, u32, String)> {
+    let mut candidates = Vec::new();
+    PANE_REGISTRY.with(|registry| {
+        for weak in registry.borrow().values() {
+            let Some(internals) = weak.upgrade() else {
+                continue;
+            };
+            let Some(&workspace_index) =
+                workspace_index_by_id.get(internals.callbacks.workspace_id.as_str())
+            else {
+                continue;
+            };
+            let pane_id = internals.pane_id;
+            let preferred = workspace_index == preferred_index;
+            for entry in &internals.tab_state.borrow().tabs {
+                if terminals_only && !matches!(entry.kind, TabKind::Terminal { .. }) {
+                    continue;
+                }
+                if let Some(rank) = surface_hint_match(pane_id, &entry.id, surface_hint) {
+                    candidates.push((
+                        (rank, preferred),
+                        (workspace_index, pane_id, entry.id.clone()),
+                    ));
+                }
+            }
+        }
+    });
+    resolve_surface_hint(candidates)
 }
 
 pub fn mark_tab_unread_in_workspace(
@@ -2948,9 +3007,10 @@ pub fn mark_tab_unread_in_workspace(
     pane_id: u32,
     tab_id: &str,
 ) -> Option<bool> {
-    let internals = pane_internals_for_workspace(workspace_id)
-        .into_iter()
-        .find(|internals| internals.pane_id == pane_id)?;
+    let internals = lookup_pane_internals(pane_id)?;
+    if internals.callbacks.workspace_id != workspace_id {
+        return None;
+    }
     let mut tab_state = internals.tab_state.borrow_mut();
     let entry = tab_state.find_tab_mut(tab_id)?;
     Some(set_tab_unread(entry, true))
@@ -2962,13 +3022,12 @@ pub fn tab_is_visible_in_workspace(
     pane_id: u32,
     tab_id: &str,
 ) -> bool {
-    pane_internals_for_workspace(workspace_id)
-        .into_iter()
-        .find(|internals| internals.pane_id == pane_id)
-        .is_some_and(|internals| {
-            internals.pane_outer.is_ancestor(root)
-                && internals.tab_state.borrow().active_tab.as_deref() == Some(tab_id)
-        })
+    let Some(internals) = lookup_pane_internals(pane_id) else {
+        return false;
+    };
+    internals.callbacks.workspace_id == workspace_id
+        && internals.pane_outer.is_ancestor(root)
+        && internals.tab_state.borrow().active_tab.as_deref() == Some(tab_id)
 }
 
 pub fn clear_active_tab_unread_in_root(root: &gtk::Widget) -> bool {
@@ -3033,16 +3092,19 @@ pub fn mark_active_tab_manual_unread_in_root(root: &gtk::Widget) -> bool {
 }
 
 pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
-    pane_internals_for_workspace(workspace_id)
-        .into_iter()
-        .any(|internals| {
-            internals
-                .tab_state
-                .borrow()
-                .tabs
-                .iter()
-                .any(|entry| entry.unread)
+    PANE_REGISTRY.with(|registry| {
+        registry.borrow().values().any(|weak| {
+            weak.upgrade().is_some_and(|internals| {
+                internals.callbacks.workspace_id == workspace_id
+                    && internals
+                        .tab_state
+                        .borrow()
+                        .tabs
+                        .iter()
+                        .any(|entry| entry.unread)
+            })
         })
+    })
 }
 
 fn pane_summary_from_internals(internals: &PaneInternals) -> PaneSummary {
@@ -3086,10 +3148,11 @@ pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
 
 #[allow(dead_code)]
 pub(crate) fn pane_widget_for_root(root: &gtk::Widget, pane_id: u32) -> Option<gtk::Widget> {
-    pane_internals_for_root(root)
-        .into_iter()
-        .find(|internals| internals.pane_id == pane_id)
-        .map(|internals| internals.pane_outer.clone().upcast())
+    let internals = lookup_pane_internals(pane_id)?;
+    internals
+        .pane_outer
+        .is_ancestor(root)
+        .then(|| internals.pane_outer.clone().upcast())
 }
 
 /// Includes panes temporarily detached from the visible tree by zoom.

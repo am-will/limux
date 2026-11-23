@@ -1,5 +1,5 @@
 //! Serialize session writers and apply only changes made by this window.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -235,22 +235,31 @@ fn merge_groups(
     local: &AppSessionState,
     disk: &AppSessionState,
 ) -> Vec<WorkspaceGroupState> {
-    let find = |state: &'_ AppSessionState, id: &str| -> Option<WorkspaceGroupState> {
-        state.groups.iter().find(|group| group.id == id).cloned()
-    };
-    let mut ids: Vec<&str> = Vec::new();
+    fn index_groups(state: &AppSessionState) -> HashMap<&str, &WorkspaceGroupState> {
+        let mut map = HashMap::with_capacity(state.groups.len());
+        for group in &state.groups {
+            map.entry(group.id.as_str()).or_insert(group);
+        }
+        map
+    }
+    let prev_map = index_groups(previous_local);
+    let local_map = index_groups(local);
+    let disk_map = index_groups(disk);
+
+    let mut seen = HashSet::with_capacity(local.groups.len() + disk.groups.len());
+    let mut ids = Vec::with_capacity(local.groups.len() + disk.groups.len());
     for group in local.groups.iter().chain(&disk.groups) {
-        if !ids.contains(&group.id.as_str()) {
-            ids.push(&group.id);
+        if seen.insert(group.id.as_str()) {
+            ids.push(group.id.as_str());
         }
     }
     ids.into_iter()
         .filter_map(|id| {
-            let ours = find(local, id);
-            if ours != find(previous_local, id) {
-                ours
+            let ours = local_map.get(id).copied();
+            if ours != prev_map.get(id).copied() {
+                ours.cloned()
             } else {
-                find(disk, id)
+                disk_map.get(id).copied().cloned()
             }
         })
         .collect()

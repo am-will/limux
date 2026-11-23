@@ -365,6 +365,10 @@ fn control_request_target(
 fn workspace_row(state: &AppState, index: usize, workspace: &Workspace) -> serde_json::Value {
     let selected_idx = state.active_idx;
     let cwd = workspace.cwd.borrow().clone().unwrap_or_default();
+    let group_id = state
+        .sidebar
+        .group_of(&workspace.id)
+        .map(|group| group.id.as_str());
     serde_json::json!({
         "index": index,
         "id": workspace.id.as_str(),
@@ -377,11 +381,8 @@ fn workspace_row(state: &AppState, index: usize, workspace: &Workspace) -> serde
         "focused": index == selected_idx,
         "cwd": cwd,
         "color": workspace.color.map(WorkspaceColor::as_str),
-        "group_id": state.sidebar.group_of(&workspace.id).map(|group| group.id.as_str()),
-        "group_ref": state
-            .sidebar
-            .group_of(&workspace.id)
-            .map(|group| sidebar_groups::group_ref(&group.id)),
+        "group_id": group_id,
+        "group_ref": group_id.map(sidebar_groups::group_ref),
     })
 }
 
@@ -1013,12 +1014,11 @@ fn surface_list_payload(
 }
 
 fn surface_health_row(
-    state: &State,
     workspace: &Workspace,
+    focused_surface_id: Option<&str>,
     index: usize,
     surface: pane::SurfaceSummary,
 ) -> serde_json::Value {
-    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
     let mut row = serde_json::Map::new();
     row.insert("index".to_string(), serde_json::json!(index));
     row.insert(
@@ -1049,7 +1049,7 @@ fn surface_health_row(
         "type".to_string(),
         serde_json::Value::String(surface.kind.clone()),
     );
-    let focused = focused_surface_id.as_deref() == Some(surface.surface_id.as_str());
+    let focused = focused_surface_id == Some(surface.surface_id.as_str());
     row.insert("focused".to_string(), serde_json::Value::Bool(focused));
     row.insert(
         "selected".to_string(),
@@ -1120,6 +1120,7 @@ fn surface_health_payload(
     workspace: &Workspace,
     surface: Option<(u32, String)>,
 ) -> Result<serde_json::Value, BridgeError> {
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
         .filter(|summary| {
@@ -1128,7 +1129,9 @@ fn surface_health_payload(
             })
         })
         .enumerate()
-        .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
+        .map(|(index, surface)| {
+            surface_health_row(workspace, focused_surface_id.as_deref(), index, surface)
+        })
         .collect::<Vec<_>>();
 
     // A pane detached by a zoom is out of the root.
@@ -1965,6 +1968,8 @@ pub fn build_window(app: &adw::Application) {
 
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::None);
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
     stack.set_hexpand(true);
     stack.set_vexpand(true);
     stack.add_css_class("limux-content");
@@ -3782,7 +3787,9 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     } else {
         None
     };
-    if toolbar.is_some_and(|toolbar| toolbar_layout_matches(toolbar, &widgets, controls_side)) {
+    if toolbar.is_some_and(|toolbar| toolbar_layout_matches(toolbar, &widgets, controls_side))
+        || (toolbar.is_none() && collapsed_dock_layout_matches(state, &widgets))
+    {
         return;
     }
 
@@ -3817,6 +3824,28 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     } else {
         layout_collapsed_dock(state, &widgets, allow_retry);
     }
+}
+
+fn collapsed_dock_layout_matches(state: &State, widgets: &TopBarWidgets) -> bool {
+    let Some(leading_box) =
+        active_workspace_leading_pane(state).and_then(|pane| pane::pane_leading_box(&pane))
+    else {
+        return false;
+    };
+    let expected_parent: gtk::Widget = leading_box.upcast();
+    widgets.dock.parent().as_ref() == Some(&expected_parent)
+        && widgets.sidebar_header.first_child().is_none()
+        && [
+            widgets.settings.upcast_ref::<gtk::Widget>(),
+            widgets.new_ws.upcast_ref(),
+            widgets.open_folder.upcast_ref(),
+            widgets.minimize.upcast_ref(),
+            widgets.maximize.upcast_ref(),
+            widgets.close.upcast_ref(),
+            widgets.indicator_scroll.upcast_ref(),
+        ]
+        .iter()
+        .all(|widget| widget.parent().is_none())
 }
 
 fn toolbar_layout_matches(
@@ -7944,15 +7973,17 @@ fn run_startup_eager_restore(state: &State) {
                 return glib::ControlFlow::Break;
             };
             // A queued tab can move or close before its turn. Resolve its current
-            // owner, then release the state borrow before GTK emits callbacks.
+            // owner directly from the pane registry, then release the state borrow
+            // before GTK emits callbacks.
             let terminal = {
                 let app_state = state.borrow();
-                app_state
-                    .workspaces
-                    .iter()
-                    .flat_map(|workspace| workspace.split_container.panes())
-                    .flat_map(|pane| pane::terminal_tabs_in_pane(&pane))
-                    .find_map(|(id, handle)| (id == tab_id).then_some(handle))
+                pane::terminal_handle_by_tab_id(&tab_id).and_then(|(ws_id, handle)| {
+                    app_state
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == ws_id)
+                        .then_some(handle)
+                })
             };
             if let Some(terminal) = terminal {
                 terminal.realize_in_background();

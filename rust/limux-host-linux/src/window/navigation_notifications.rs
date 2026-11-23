@@ -313,24 +313,30 @@ pub(super) fn surface_tab_target(
     surface_hint: &str,
     terminals_only: bool,
 ) -> pane::HintResolution<(usize, u32, String)> {
-    let workspace_ids = state
-        .borrow()
+    let s = state.borrow();
+    if scoped {
+        let Some(workspace) = s.workspaces.get(preferred_index) else {
+            return pane::HintResolution::NotFound;
+        };
+        let candidates =
+            pane::tab_candidates_for_workspace(&workspace.id, surface_hint, terminals_only)
+                .into_iter()
+                .map(|(rank, pane_id, tab_id)| ((rank, true), (preferred_index, pane_id, tab_id)));
+        return pane::resolve_surface_hint(candidates);
+    }
+
+    let workspace_index_by_id: std::collections::HashMap<&str, usize> = s
         .workspaces
         .iter()
-        .map(|workspace| workspace.id.clone())
-        .collect::<Vec<_>>();
-    let candidates = workspace_ids
-        .iter()
         .enumerate()
-        .filter(|(index, _)| !scoped || *index == preferred_index)
-        .flat_map(|(index, workspace_id)| {
-            pane::tab_candidates_for_workspace(workspace_id, surface_hint, terminals_only)
-                .into_iter()
-                .map(move |(rank, pane_id, tab_id)| {
-                    ((rank, index == preferred_index), (index, pane_id, tab_id))
-                })
-        });
-    pane::resolve_surface_hint(candidates)
+        .map(|(index, workspace)| (workspace.id.as_str(), index))
+        .collect();
+    pane::resolve_surface_hint_for_workspaces(
+        &workspace_index_by_id,
+        preferred_index,
+        surface_hint,
+        terminals_only,
+    )
 }
 
 pub(super) fn has_unread(workspace_unread: bool, tab_unread: bool) -> bool {
