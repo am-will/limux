@@ -131,6 +131,7 @@ pub(crate) struct AppState {
     indicator_box: gtk::Box,
     indicator_scroll: gtk::ScrolledWindow,
     sidebar_animation: Option<adw::TimedAnimation>,
+    sidebar_animation_guard: Option<crate::terminal::LayoutAnimationGuard>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
     persistence_suspended: bool,
@@ -2097,6 +2098,7 @@ pub fn build_window(app: &adw::Application) {
         sidebar_handle: sidebar_handle.clone(),
         new_ws_btn: new_ws_btn.clone(),
         sidebar_animation: None,
+        sidebar_animation_guard: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
         persistence_suspended: false,
@@ -5240,43 +5242,52 @@ fn install_workspace_row_interactions(
     drop_target.set_preload(true);
     let hover_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let drop_handled = Rc::new(Cell::new(false));
+    let drop_indicator: Rc<Cell<Option<&'static str>>> = Rc::new(Cell::new(None));
+    let set_drop_indicator =
+        |row: &gtk::ListBoxRow, slot: &Cell<Option<&'static str>>, next: Option<&'static str>| {
+            let prev = slot.replace(next);
+            if prev == next {
+                return;
+            }
+            if let Some(class) = prev {
+                row.remove_css_class(class);
+            }
+            if let Some(class) = next {
+                row.add_css_class(class);
+            }
+        };
     {
         let r = row.clone();
         let state = state.clone();
         let hover_timer = hover_timer.clone();
         let target_workspace_id = workspace_id.to_string();
         let drop_handled = drop_handled.clone();
+        let drop_indicator = drop_indicator.clone();
         drop_target.connect_motion(move |_, _x, y| {
             drop_handled.set(false);
             let h = r.height() as f64;
-            r.remove_css_class("limux-drop-above");
-            r.remove_css_class("limux-drop-below");
-            r.remove_css_class("limux-tab-drop-target");
 
             let (dragged_workspace, dragging_group) = {
                 let s = state.borrow();
                 (s.workspace_dragging.clone(), s.group_dragging.is_some())
             };
-            match dragged_workspace {
+            let next_class = match dragged_workspace {
                 Some(ref dragged_workspace_id) if dragged_workspace_id != &target_workspace_id => {
-                    if y < h / 2.0 {
-                        r.add_css_class("limux-drop-above");
+                    Some(if y < h / 2.0 {
+                        "limux-drop-above"
                     } else {
-                        r.add_css_class("limux-drop-below");
-                    }
+                        "limux-drop-below"
+                    })
                 }
-                None if dragging_group => {
-                    if y < h / 2.0 {
-                        r.add_css_class("limux-drop-above");
-                    } else {
-                        r.add_css_class("limux-drop-below");
-                    }
-                }
-                None => {
-                    r.add_css_class("limux-tab-drop-target");
-                }
-                _ => {}
-            }
+                None if dragging_group => Some(if y < h / 2.0 {
+                    "limux-drop-above"
+                } else {
+                    "limux-drop-below"
+                }),
+                None => Some("limux-tab-drop-target"),
+                _ => None,
+            };
+            set_drop_indicator(&r, &drop_indicator, next_class);
 
             // Hovering a dragged group over a row must not switch workspaces.
             if hover_timer.borrow().is_none() && !dragging_group {
@@ -5322,10 +5333,9 @@ fn install_workspace_row_interactions(
     {
         let r = row.clone();
         let hover_timer = hover_timer.clone();
+        let drop_indicator = drop_indicator.clone();
         drop_target.connect_leave(move |_| {
-            r.remove_css_class("limux-drop-above");
-            r.remove_css_class("limux-drop-below");
-            r.remove_css_class("limux-tab-drop-target");
+            set_drop_indicator(&r, &drop_indicator, None);
             if let Some(source) = hover_timer.borrow_mut().take() {
                 source.remove();
             }
@@ -5339,9 +5349,7 @@ fn install_workspace_row_interactions(
         let drop_handled = drop_handled.clone();
         drop_target.connect_drop(move |_dt, value, _, y| {
             drop_handled.set(true);
-            r.remove_css_class("limux-drop-above");
-            r.remove_css_class("limux-drop-below");
-            r.remove_css_class("limux-tab-drop-target");
+            set_drop_indicator(&r, &drop_indicator, None);
             if let Some(source) = hover_timer.borrow_mut().take() {
                 source.remove();
             }
@@ -8354,13 +8362,13 @@ fn toggle_sidebar(state: &State) {
             .build();
         let state_for_done = state.clone();
         animation.connect_done(move |_| {
-            let is_current = {
+            let (is_current, guard) = {
                 let mut s = state_for_done.borrow_mut();
                 if s.sidebar_animation_epoch != epoch {
-                    false
+                    (false, None)
                 } else {
                     s.sidebar_animation = None;
-                    true
+                    (true, s.sidebar_animation_guard.take())
                 }
             };
             if is_current {
@@ -8368,13 +8376,28 @@ fn toggle_sidebar(state: &State) {
                 apply_top_bar_mode(&state_for_done);
                 sync_sidebar_toggle(&state_for_done);
                 request_session_save(&state_for_done);
+                // Drop the animation guard on the next idle tick so GTK settles the
+                // final hidden handle / top-bar allocation before flushing a single
+                // terminal resize per pane.
+                glib::idle_add_local_once(move || {
+                    drop(guard);
+                });
             }
         });
-        state.borrow_mut().sidebar_animation = Some(animation.clone());
+        {
+            let guard = crate::terminal::begin_layout_animation();
+            let mut s = state.borrow_mut();
+            s.sidebar_animation = Some(animation.clone());
+            s.sidebar_animation_guard = Some(guard);
+        }
         sync_sidebar_toggle(state);
         animation.play();
     } else {
         // Expand from the current position to the remembered width.
+        {
+            let guard = crate::terminal::begin_layout_animation();
+            state.borrow_mut().sidebar_animation_guard = Some(guard);
+        }
         set_sidebar_state_widgets(&sidebar_shell, &sidebar_handle, current, true);
         apply_top_bar_mode(state);
         let target = adw::CallbackAnimationTarget::new({
@@ -8393,18 +8416,21 @@ fn toggle_sidebar(state: &State) {
             .build();
         let state_for_done = state.clone();
         animation.connect_done(move |_| {
-            let is_current = {
+            let (is_current, guard) = {
                 let mut s = state_for_done.borrow_mut();
                 if s.sidebar_animation_epoch != epoch {
-                    false
+                    (false, None)
                 } else {
                     s.sidebar_animation = None;
-                    true
+                    (true, s.sidebar_animation_guard.take())
                 }
             };
             if is_current {
                 sync_sidebar_toggle(&state_for_done);
                 request_session_save(&state_for_done);
+                glib::idle_add_local_once(move || {
+                    drop(guard);
+                });
             }
         });
         state.borrow_mut().sidebar_animation = Some(animation.clone());

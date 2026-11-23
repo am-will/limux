@@ -119,8 +119,12 @@ struct SurfaceEntry {
     // right-click context menu by construction.
     link_popover: gtk::Popover,
     link_label: gtk::Label,
+    last_link_url: RefCell<Option<String>>,
+    last_popover_point: Rc<Cell<Option<(i32, i32)>>>,
     cursor_pos: Rc<Cell<(f64, f64)>>,
     mouse_cursor: Cell<MouseCursorState>,
+    last_display_size: Cell<Option<(u32, u32, u32)>>,
+    resize_deferred: Cell<bool>,
 }
 
 struct ClipboardContext {
@@ -226,6 +230,49 @@ impl SurfaceIdentityRegistry {
 
 thread_local! {
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
+    static CURSOR_CACHE: RefCell<HashMap<&'static str, Option<gtk::gdk::Cursor>>> =
+        RefCell::new(HashMap::new());
+    static LAYOUT_ANIMATIONS_ACTIVE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII guard that defers intermediate terminal grid resizes (`SIGWINCH` /
+/// reflow) while a smooth container animation such as the sidebar slide runs,
+/// flushing each affected terminal once when the animation finishes.
+pub(crate) struct LayoutAnimationGuard;
+
+pub(crate) fn begin_layout_animation() -> LayoutAnimationGuard {
+    LAYOUT_ANIMATIONS_ACTIVE.with(|count| count.set(count.get().saturating_add(1)));
+    LayoutAnimationGuard
+}
+
+fn layout_animation_active() -> bool {
+    LAYOUT_ANIMATIONS_ACTIVE.with(|count| count.get() > 0)
+}
+
+fn flush_deferred_surface_resizes() {
+    let pending: Vec<(ghostty_surface_t, gtk::GLArea)> = SURFACE_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter(|(_, entry)| entry.resize_deferred.replace(false))
+            .map(|(&key, entry)| (key as ghostty_surface_t, entry.gl_area.clone()))
+            .collect()
+    });
+    for (surface, gl_area) in pending {
+        refresh_surface_display(surface, &gl_area);
+    }
+}
+
+impl Drop for LayoutAnimationGuard {
+    fn drop(&mut self) {
+        let finished = LAYOUT_ANIMATIONS_ACTIVE.with(|count| {
+            let next = count.get().saturating_sub(1);
+            count.set(next);
+            next == 0
+        });
+        if finished {
+            flush_deferred_surface_resizes();
+        }
+    }
 }
 
 static SURFACE_IDENTITIES: OnceLock<Mutex<SurfaceIdentityRegistry>> = OnceLock::new();
@@ -727,19 +774,50 @@ fn physical_size_for_allocation(
     Some((physical_width, physical_height, scale_factor))
 }
 
-fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+fn sync_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea, force_refresh: bool) {
+    let surface_key = surface as usize;
     let alloc = gl_area.allocation();
-    if let Some((width, height, scale_factor)) =
-        physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor())
-    {
-        let scale = scale_factor as f64;
-        unsafe {
-            ghostty_surface_set_content_scale(surface, scale, scale);
-            ghostty_surface_set_size(surface, width, height);
+    let target =
+        physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor());
+
+    let (scale_changed, size_changed) = if let Some((width, height, scale_factor)) = target {
+        SURFACE_MAP.with(|map| {
+            if let Some(entry) = map.borrow().get(&surface_key) {
+                let prev = entry.last_display_size.get();
+                let sc = prev.is_none_or(|(_, _, s)| s != scale_factor);
+                let sz = prev.is_none_or(|(w, h, _)| w != width || h != height);
+                if sc || sz {
+                    entry
+                        .last_display_size
+                        .set(Some((width, height, scale_factor)));
+                }
+                (sc, sz)
+            } else {
+                (true, true)
+            }
+        })
+    } else {
+        (false, false)
+    };
+
+    if let Some((width, height, scale_factor)) = target {
+        if scale_changed {
+            let scale = scale_factor as f64;
+            unsafe { ghostty_surface_set_content_scale(surface, scale, scale) };
+        }
+        if size_changed {
+            unsafe { ghostty_surface_set_size(surface, width, height) };
         }
     }
-    unsafe { ghostty_surface_refresh(surface) };
-    gl_area.queue_render();
+
+    if force_refresh || scale_changed || size_changed {
+        unsafe { ghostty_surface_refresh(surface) };
+        gl_area.queue_render();
+    }
+}
+
+fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+    sync_surface_display(surface, gl_area, true);
 }
 
 /// Tracks whether Ghostty's renderer is realized for one surface.
@@ -1094,7 +1172,32 @@ fn gtk_cursor_name_for_ghostty_shape(shape: ghostty_action_mouse_shape_e) -> &'s
 }
 
 fn set_gtk_mouse_cursor(widget: &impl IsA<gtk::Widget>, state: MouseCursorState) {
-    widget.set_cursor_from_name(Some(state.gtk_cursor_name()));
+    let name = state.gtk_cursor_name();
+    let cursor = CURSOR_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(name)
+            .or_insert_with(|| gtk::gdk::Cursor::from_name(name, None))
+            .clone()
+    });
+    widget.set_cursor(cursor.as_ref());
+}
+
+fn apply_mouse_cursor_state(entry: &SurfaceEntry, update: MouseCursorUpdate) -> bool {
+    let prev = entry.mouse_cursor.get();
+    let next = match update {
+        MouseCursorUpdate::Shape(shape) => prev.update_shape(shape),
+        MouseCursorUpdate::Visibility(visibility) => prev.update_visibility(visibility),
+    };
+    if prev == next {
+        return false;
+    }
+    entry.mouse_cursor.set(next);
+    if prev.gtk_cursor_name() != next.gtk_cursor_name() {
+        set_gtk_mouse_cursor(&entry.gl_area, next);
+        return true;
+    }
+    false
 }
 
 fn apply_mouse_cursor_update(identity: SurfaceIdentity, update: MouseCursorUpdate) {
@@ -1106,29 +1209,27 @@ fn apply_mouse_cursor_update(identity: SurfaceIdentity, update: MouseCursorUpdat
         if entry.identity != identity {
             return;
         }
-        let state = match update {
-            MouseCursorUpdate::Shape(shape) => entry.mouse_cursor.get().update_shape(shape),
-            MouseCursorUpdate::Visibility(visibility) => {
-                entry.mouse_cursor.get().update_visibility(visibility)
-            }
-        };
-        entry.mouse_cursor.set(state);
-        set_gtk_mouse_cursor(&entry.gl_area, state);
+        apply_mouse_cursor_state(entry, update);
     });
 }
 
 fn dispatch_mouse_cursor_update(surface_key: usize, update: MouseCursorUpdate) {
+    if glib::MainContext::default().is_owner() {
+        SURFACE_MAP.with(|map| {
+            if let Some(entry) = map.borrow().get(&surface_key) {
+                apply_mouse_cursor_state(entry, update);
+            }
+        });
+        return;
+    }
+
     let Some(identity) = current_surface_identity(surface_key) else {
         return;
     };
 
-    if glib::MainContext::default().is_owner() {
-        apply_mouse_cursor_update(identity, update);
-    } else {
-        // Capture copied payload and surface generation. GTK access happens
-        // later, only if this pointer still identifies the same surface.
-        glib::idle_add_once(move || apply_mouse_cursor_update(identity, update));
-    }
+    // Capture copied payload and surface generation. GTK access happens
+    // later, only if this pointer still identifies the same surface.
+    glib::idle_add_once(move || apply_mouse_cursor_update(identity, update));
 }
 
 pub fn sync_color_scheme(dark: bool) {
@@ -1159,6 +1260,69 @@ unsafe extern "C" fn ghostty_wakeup_cb(_userdata: *mut c_void) {
         let app = ghostty_app();
         unsafe { ghostty_app_tick(app) };
     });
+}
+
+fn link_popover_anchor_point(x: f64, y: f64) -> (i32, i32) {
+    (
+        x as i32,
+        (y as i32).saturating_sub(LINK_PREVIEW_CURSOR_Y_GAP),
+    )
+}
+
+fn update_link_popover_anchor(
+    popover: &gtk::Popover,
+    last_point: &Cell<Option<(i32, i32)>>,
+    x: f64,
+    y: f64,
+) -> bool {
+    let point = link_popover_anchor_point(x, y);
+    if last_point.get() == Some(point) {
+        return false;
+    }
+    last_point.set(Some(point));
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(point.0, point.1, 1, 1)));
+    true
+}
+
+#[derive(Default)]
+struct MotionCoalescer {
+    pending: Cell<Option<(f64, f64, c_int)>>,
+    last_sent: Cell<Option<(i32, i32, c_int)>>,
+    tick_scheduled: Cell<bool>,
+}
+
+impl MotionCoalescer {
+    fn quantize(x: f64, y: f64, mods: c_int) -> (i32, i32, c_int) {
+        (x.round() as i32, y.round() as i32, mods)
+    }
+
+    fn queue(&self, x: f64, y: f64, mods: c_int) -> bool {
+        let q = Self::quantize(x, y, mods);
+        if self.pending.get().is_none() && self.last_sent.get() == Some(q) {
+            return false;
+        }
+        self.pending.set(Some((x, y, mods)));
+        true
+    }
+
+    fn flush_to_surface(&self, surface: ghostty_surface_t) -> bool {
+        let Some((x, y, mods)) = self.pending.take() else {
+            return false;
+        };
+        self.record_sent(x, y, mods);
+        unsafe { ghostty_surface_mouse_pos(surface, x, y, mods) };
+        true
+    }
+
+    fn record_sent(&self, x: f64, y: f64, mods: c_int) {
+        self.pending.set(None);
+        self.last_sent.set(Some(Self::quantize(x, y, mods)));
+    }
+
+    fn clear(&self) {
+        self.pending.set(None);
+        self.last_sent.set(None);
+    }
 }
 
 unsafe extern "C" fn ghostty_action_cb(
@@ -1304,36 +1468,48 @@ unsafe extern "C" fn ghostty_action_cb(
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
                 let payload = unsafe { action.action.mouse_over_link };
-                let url = if payload.url.is_null() || payload.len == 0 {
+                let raw_bytes = if payload.url.is_null() || payload.len == 0 {
                     None
                 } else {
-                    let bytes = unsafe {
+                    Some(unsafe {
                         std::slice::from_raw_parts(payload.url.cast::<u8>(), payload.len)
-                    };
-                    Some(String::from_utf8_lossy(bytes).to_string())
+                    })
                 };
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
-                        match url {
-                            Some(url) if widget_has_native_surface(&entry.gl_area) => {
-                                entry.link_label.set_text(&url);
+                        match raw_bytes {
+                            Some(bytes) if widget_has_native_surface(&entry.gl_area) => {
+                                let url = String::from_utf8_lossy(bytes);
+                                {
+                                    let mut last_url = entry.last_link_url.borrow_mut();
+                                    if last_url.as_deref() != Some(url.as_ref()) {
+                                        entry.link_label.set_text(url.as_ref());
+                                        *last_url = Some(url.into_owned());
+                                    }
+                                }
                                 let (x, y) = entry.cursor_pos.get();
                                 // GTK default: PositionType::Top centers the
                                 // popover horizontally on the rectangle and
                                 // anchors its bottom edge to the rectangle's
                                 // top edge. The Y-gap keeps the popover clear
                                 // of large accessibility cursor skins.
-                                entry.link_popover.set_pointing_to(Some(
-                                    &gtk::gdk::Rectangle::new(
-                                        x as i32,
-                                        (y as i32).saturating_sub(LINK_PREVIEW_CURSOR_Y_GAP),
-                                        1,
-                                        1,
-                                    ),
-                                ));
-                                entry.link_popover.popup();
+                                update_link_popover_anchor(
+                                    &entry.link_popover,
+                                    &entry.last_popover_point,
+                                    x,
+                                    y,
+                                );
+                                if !entry.link_popover.get_visible() {
+                                    entry.link_popover.popup();
+                                }
                             }
-                            Some(_) | None => entry.link_popover.popdown(),
+                            Some(_) | None => {
+                                *entry.last_link_url.borrow_mut() = None;
+                                entry.last_popover_point.set(None);
+                                if entry.link_popover.get_visible() {
+                                    entry.link_popover.popdown();
+                                }
+                            }
                         }
                     }
                 });
@@ -1872,6 +2048,8 @@ pub fn create_terminal(
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
     let cursor_pos: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+    let last_popover_point: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
+    let motion_coalescer = Rc::new(MotionCoalescer::default());
     let signal_handlers = Rc::new(RefCell::new(Vec::new()));
     let controllers = Rc::new(RefCell::new(Vec::new()));
 
@@ -2054,6 +2232,7 @@ pub fn create_terminal(
         let scrollbar_adjustment_for_map = scrollbar_adjustment.clone();
         let link_popover_for_map = link_popover.clone();
         let link_label_for_map = link_label.clone();
+        let last_popover_point_for_map = last_popover_point.clone();
         let cursor_pos_for_map = cursor_pos.clone();
         let surface_cell = surface_cell.clone();
         let callbacks = callbacks.clone();
@@ -2216,9 +2395,9 @@ pub fn create_terminal(
             // Set initial size in physical pixels. GTK allocation is logical
             // CSS pixels; Ghostty's GL renderer expects the backing FBO size.
             let alloc = gl_area.allocation();
-            if physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor())
-                .is_some()
-            {
+            let initial_display_size =
+                physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor());
+            if initial_display_size.is_some() {
                 refresh_surface_display(surface, gl_area);
             }
 
@@ -2282,8 +2461,12 @@ pub fn create_terminal(
                         clipboard_context,
                         link_popover: link_popover_for_map.clone(),
                         link_label: link_label_for_map.clone(),
+                        last_link_url: RefCell::new(None),
+                        last_popover_point: last_popover_point_for_map.clone(),
                         cursor_pos: cursor_pos_for_map.clone(),
                         mouse_cursor: Cell::new(MouseCursorState::default()),
+                        last_display_size: Cell::new(initial_display_size),
+                        resize_deferred: Cell::new(false),
                     },
                 );
             });
@@ -2332,16 +2515,29 @@ pub fn create_terminal(
                 let w = width as u32;
                 let h = height as u32;
                 if w > 0 && h > 0 {
-                    refresh_surface_display(surface, gl_area);
+                    let deferred = layout_animation_active()
+                        && SURFACE_MAP.with(|map| {
+                            map.borrow()
+                                .get(&(surface as usize))
+                                .filter(|entry| entry.last_display_size.get().is_some())
+                                .map(|entry| {
+                                    entry.resize_deferred.set(true);
+                                    true
+                                })
+                                .unwrap_or(false)
+                        });
+                    if !deferred {
+                        sync_surface_display(surface, gl_area, false);
+                    }
                 }
             }
 
-            if had_focus.get() {
+            if had_focus.get() && !gl_area.is_focus() {
                 let gl_for_focus = gl_for_resize.clone();
                 let had_focus = had_focus.clone();
                 glib::idle_add_local_once(move || {
                     // Another pane may have received focus while layout completed.
-                    if had_focus.get() {
+                    if had_focus.get() && !gl_for_focus.is_focus() {
                         gl_for_focus.grab_focus();
                     }
                 });
@@ -2456,6 +2652,7 @@ pub fn create_terminal(
         let sc = surface_cell.clone();
         let gl_for_focus = gl_area.clone();
         let had_focus = had_focus.clone();
+        let motion_for_press = motion_coalescer.clone();
         click.connect_pressed(move |gesture, _n, x, y| {
             let btn = gesture.current_button();
             // Grab keyboard focus on any click
@@ -2471,6 +2668,7 @@ pub fn create_terminal(
                     _ => GHOSTTY_MOUSE_UNKNOWN,
                 };
                 let mods = translate_mouse_mods(gesture.current_event_state());
+                motion_for_press.record_sent(x, y, mods);
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, button, mods);
@@ -2478,6 +2676,7 @@ pub fn create_terminal(
             }
         });
         let sc2 = surface_cell.clone();
+        let motion_for_release = motion_coalescer.clone();
         click.connect_released(move |gesture, _n, x, y| {
             let btn = gesture.current_button();
             if btn == 3 {
@@ -2490,6 +2689,7 @@ pub fn create_terminal(
                     _ => GHOSTTY_MOUSE_UNKNOWN,
                 };
                 let mods = translate_mouse_mods(gesture.current_event_state());
+                motion_for_release.record_sent(x, y, mods);
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, button, mods);
@@ -2506,10 +2706,12 @@ pub fn create_terminal(
         let callbacks = callbacks.clone();
         let gl = gl_area.clone();
         let overlay = overlay.clone();
+        let motion_for_right_click = motion_coalescer.clone();
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
         right_click.connect_pressed(move |gesture, _n, x, y| {
             let surface = *sc.borrow();
+            motion_for_right_click.clear();
             let mods = translate_mouse_mods(gesture.current_event_state());
             show_terminal_context_menu(&gl, &overlay, surface, &callbacks, x, y, mods);
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -2518,19 +2720,27 @@ pub fn create_terminal(
         gl_area.add_controller(right_click);
     }
 
-    // Mouse motion
+    // Mouse motion (frame-coalesced to avoid 1000 Hz renderer_state.mutex contention)
     {
-        let surface_cell = surface_cell.clone();
         let surface_cell_for_enter = surface_cell.clone();
+        let surface_cell_for_motion = surface_cell.clone();
+        let surface_cell_for_leave = surface_cell.clone();
         let gl_for_focus = gl_area.clone();
+        let gl_for_motion = gl_area.downgrade();
         let had_focus = had_focus.clone();
         let callbacks = callbacks.clone();
         let cursor_pos_enter = cursor_pos.clone();
         let cursor_pos_motion = cursor_pos.clone();
         let link_popover_motion = link_popover.clone();
+        let link_popover_leave = link_popover.clone();
+        let last_popover_point_motion = last_popover_point.clone();
+        let last_popover_point_leave = last_popover_point.clone();
+        let motion_for_enter = motion_coalescer.clone();
+        let motion_for_move = motion_coalescer.clone();
+        let motion_for_leave = motion_coalescer.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
-            if (callbacks.borrow().hover_focus)() {
+            if !gl_for_focus.is_focus() && (callbacks.borrow().hover_focus)() {
                 // Match common Hyprland/Omarchy-style focus-follows-mouse behavior:
                 // as soon as the pointer enters a terminal, focus it so typing works
                 // immediately without an extra click.
@@ -2540,26 +2750,54 @@ pub fn create_terminal(
             cursor_pos_enter.set((x, y));
             if let Some(surface) = *surface_cell_for_enter.borrow() {
                 let mods = translate_mouse_mods(ctrl.current_event_state());
+                motion_for_enter.record_sent(x, y, mods);
                 unsafe { ghostty_surface_mouse_pos(surface, x, y, mods) };
             }
         });
-        let surface_cell = surface_cell.clone();
         motion.connect_motion(move |ctrl, x, y| {
             cursor_pos_motion.set((x, y));
             // Keep the URL preview tracking the cursor while it stays inside
             // a clickable link region (Ghostty only emits MOUSE_OVER_LINK
             // on enter/leave, not on every motion).
-            if link_popover_motion.is_visible() {
-                link_popover_motion.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-                    x as i32,
-                    (y as i32).saturating_sub(LINK_PREVIEW_CURSOR_Y_GAP),
-                    1,
-                    1,
-                )));
+            if link_popover_motion.get_visible() {
+                update_link_popover_anchor(&link_popover_motion, &last_popover_point_motion, x, y);
             }
-            if let Some(surface) = *surface_cell.borrow() {
+            if surface_cell_for_motion.borrow().is_none() {
+                return;
+            }
+            let mods = translate_mouse_mods(ctrl.current_event_state());
+            if !motion_for_move.queue(x, y, mods) {
+                return;
+            }
+            if let Some(gl_area) = gl_for_motion.upgrade() {
+                if !gl_area.is_mapped() {
+                    if let Some(surface) = *surface_cell_for_motion.borrow() {
+                        motion_for_move.flush_to_surface(surface);
+                    }
+                    return;
+                }
+                if !motion_for_move.tick_scheduled.replace(true) {
+                    let surface_cell = surface_cell_for_motion.clone();
+                    let coalescer = motion_for_move.clone();
+                    gl_area.add_tick_callback(move |_, _| {
+                        coalescer.tick_scheduled.set(false);
+                        if let Some(surface) = *surface_cell.borrow() {
+                            coalescer.flush_to_surface(surface);
+                        }
+                        glib::ControlFlow::Break
+                    });
+                }
+            }
+        });
+        motion.connect_leave(move |ctrl| {
+            motion_for_leave.clear();
+            last_popover_point_leave.set(None);
+            if link_popover_leave.get_visible() {
+                link_popover_leave.popdown();
+            }
+            if let Some(surface) = *surface_cell_for_leave.borrow() {
                 let mods = translate_mouse_mods(ctrl.current_event_state());
-                unsafe { ghostty_surface_mouse_pos(surface, x, y, mods) };
+                unsafe { ghostty_surface_mouse_pos(surface, -1.0, -1.0, mods) };
             }
         });
         controllers.borrow_mut().push(motion.clone().upcast());
@@ -2569,11 +2807,13 @@ pub fn create_terminal(
     // Mouse scroll
     {
         let surface_cell = surface_cell.clone();
+        let motion_for_scroll = motion_coalescer.clone();
         let scroll = gtk::EventControllerScroll::new(
             gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
         );
         scroll.connect_scroll(move |ctrl, dx, dy| {
             if let Some(surface) = *surface_cell.borrow() {
+                motion_for_scroll.flush_to_surface(surface);
                 let mods = translate_mouse_mods(ctrl.current_event_state());
                 // GTK and Ghostty use opposite scroll conventions — negate both axes
                 unsafe { ghostty_surface_mouse_scroll(surface, -dx, -dy, mods) };
@@ -3614,6 +3854,52 @@ mod tests {
         // Non-textual keys have no unicode at all.
         assert!(key_event_text(gtk::gdk::Key::Up).is_none());
         assert!(key_event_text(gtk::gdk::Key::F1).is_none());
+    }
+
+    #[test]
+    fn motion_coalescer_deduplicates_unchanged_positions_and_overwrites_pending() {
+        let coalescer = MotionCoalescer::default();
+        assert!(coalescer.queue(10.1, 20.2, GHOSTTY_MODS_NONE));
+        assert!(coalescer.queue(15.4, 25.6, GHOSTTY_MODS_CTRL));
+        assert_eq!(
+            coalescer.pending.get(),
+            Some((15.4, 25.6, GHOSTTY_MODS_CTRL))
+        );
+
+        coalescer.record_sent(15.4, 25.6, GHOSTTY_MODS_CTRL);
+        assert_eq!(coalescer.pending.get(), None);
+        // Same rounded pixel and modifiers should be skipped.
+        assert!(!coalescer.queue(15.2, 25.8, GHOSTTY_MODS_CTRL));
+        // Different modifier or pixel re-queues.
+        assert!(coalescer.queue(15.2, 25.8, GHOSTTY_MODS_NONE));
+        coalescer.clear();
+        assert_eq!(coalescer.pending.get(), None);
+        assert_eq!(coalescer.last_sent.get(), None);
+    }
+
+    #[test]
+    fn layout_animation_guards_track_overlapping_animations() {
+        assert!(!layout_animation_active());
+        let first = begin_layout_animation();
+        assert!(layout_animation_active());
+        let second = begin_layout_animation();
+        assert!(layout_animation_active());
+        drop(first);
+        assert!(layout_animation_active());
+        drop(second);
+        assert!(!layout_animation_active());
+    }
+
+    #[test]
+    fn link_popover_anchor_point_applies_y_gap_with_saturation() {
+        assert_eq!(
+            link_popover_anchor_point(42.9, 50.4),
+            (42, 50 - LINK_PREVIEW_CURSOR_Y_GAP)
+        );
+        assert_eq!(
+            link_popover_anchor_point(0.0, 2.0),
+            (0, 2 - LINK_PREVIEW_CURSOR_Y_GAP)
+        );
     }
 
     #[test]

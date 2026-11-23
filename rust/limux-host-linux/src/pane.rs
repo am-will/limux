@@ -1790,6 +1790,7 @@ fn make_terminal_callbacks(
                     && !pane_outer
                         .root()
                         .and_then(|root| root.focus())
+                        .filter(|focus| !focus.is::<gtk::GLArea>())
                         .and_then(|focus| focus.ancestor(gtk::Entry::static_type()))
                         .is_some_and(|entry| entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS))
             }

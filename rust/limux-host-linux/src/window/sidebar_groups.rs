@@ -744,16 +744,26 @@ fn install_group_header_interactions(state: &State, group_id: &str, row: &gtk::L
     row.add_controller(drag_source);
 
     let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
-    let clear = |row: &gtk::ListBoxRow| {
-        row.remove_css_class("limux-drop-above");
-        row.remove_css_class("limux-drop-below");
-    };
+    let drop_indicator: Rc<Cell<Option<&'static str>>> = Rc::new(Cell::new(None));
+    let set_drop_indicator =
+        |row: &gtk::ListBoxRow, slot: &Cell<Option<&'static str>>, next: Option<&'static str>| {
+            let prev = slot.replace(next);
+            if prev == next {
+                return;
+            }
+            if let Some(class) = prev {
+                row.remove_css_class(class);
+            }
+            if let Some(class) = next {
+                row.add_css_class(class);
+            }
+        };
     {
         let state = state.clone();
         let group_id = group_id.to_string();
         let row = row.clone();
+        let drop_indicator = drop_indicator.clone();
         drop_target.connect_motion(move |_, _, y| {
-            clear(&row);
             let accepts = {
                 let s = state.borrow();
                 s.workspace_dragging.is_some()
@@ -761,26 +771,29 @@ fn install_group_header_interactions(state: &State, group_id: &str, row: &gtk::L
             };
             // Tabs cannot be dropped on a group.
             if !accepts {
+                set_drop_indicator(&row, &drop_indicator, None);
                 return gtk::gdk::DragAction::empty();
             }
-            row.add_css_class(if y < row.height() as f64 / 2.0 {
+            let next_class = if y < row.height() as f64 / 2.0 {
                 "limux-drop-above"
             } else {
                 "limux-drop-below"
-            });
+            };
+            set_drop_indicator(&row, &drop_indicator, Some(next_class));
             gtk::gdk::DragAction::MOVE
         });
     }
     {
         let row = row.clone();
-        drop_target.connect_leave(move |_| clear(&row));
+        let drop_indicator = drop_indicator.clone();
+        drop_target.connect_leave(move |_| set_drop_indicator(&row, &drop_indicator, None));
     }
     {
         let state = state.clone();
         let group_id = group_id.to_string();
         let row = row.clone();
         drop_target.connect_drop(move |_, value, _, y| {
-            clear(&row);
+            set_drop_indicator(&row, &drop_indicator, None);
             let Ok(payload) = value.get::<String>() else {
                 return false;
             };
