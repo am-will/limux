@@ -48,7 +48,7 @@ pub(super) fn queue_session_save_request<T: SessionSaveAccess>(
     }
 }
 
-pub(super) fn request_session_save(state: &State) {
+pub(crate) fn request_session_save(state: &State) {
     match queue_session_save_request(state) {
         SessionSaveRequest::Ignore => {}
         SessionSaveRequest::RetryOnIdle => {

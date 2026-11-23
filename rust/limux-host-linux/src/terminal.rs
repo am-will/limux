@@ -425,6 +425,10 @@ impl TerminalHandle {
         *self.callbacks.borrow_mut() = TerminalCallbacks::disconnected();
     }
 
+    pub fn is_mapped(&self) -> bool {
+        self.gl_area.is_mapped()
+    }
+
     pub fn focus_surface(&self) -> bool {
         self.refresh_display();
         self.gl_area.grab_focus();

@@ -7,10 +7,7 @@ use gtk4 as gtk;
 
 use crate::layout_state::{self, LayoutNodeState, PaneState, SplitOrientation, SplitState};
 use crate::pane;
-use crate::window::{
-    apply_split_ratio_after_layout, attach_split_position_persistence, update_split_ratio_state,
-    State,
-};
+use crate::window::{apply_split_ratio_after_layout, request_session_save, State};
 
 // ---------------------------------------------------------------------------
 // SplitNode — runtime data model for the split tree
@@ -551,7 +548,6 @@ impl SplitTreeContainer {
         if let Some(paned) = matched_paned {
             let applying = Rc::new(Cell::new(false));
             let applied = crate::window::apply_ratio_value(&paned, axis, updated, &applying);
-            update_split_ratio_state(&paned, updated);
             if applied && paned_extent > 0 {
                 let handle_size = paned.measure(axis, -1).0;
                 let resized_extent = expected_resized_child_extent(
@@ -614,6 +610,14 @@ impl SplitTreeContainer {
             // A lone or zoomed pane is the old root itself; the rebuild reuses it.
             old.set_visible(true);
             if let Some(container) = container.upgrade() {
+                // Old Paneds are already unrealized and detached from the window.
+                // Unparent surviving leaf panes now so `do_rebuild` mounts the new
+                // tree on the next idle tick without an extra detach pass.
+                if let Some(pane) = container.zoomed_pane.borrow().as_ref() {
+                    detach_pane_from_old_parent(pane);
+                } else {
+                    detach_panes_from_old_tree(&container.tree.borrow());
+                }
                 container.teardown_pending.set(false);
                 // Rebuild on the next idle tick. The tick separation between
                 // unrealize (above) and realize (rebuild) is critical.
@@ -794,11 +798,14 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
             paned.set_resize_start_child(true);
             paned.set_resize_end_child(true);
 
-            let ratio_val = *ratio.borrow();
-            update_split_ratio_state(&paned, ratio_val);
-            attach_split_position_persistence(state, &paned);
-
-            install_split_ratio_tracking(&paned, ratio);
+            let state_for_drag = state.clone();
+            install_split_ratio_tracking(
+                &paned,
+                ratio,
+                Some(Box::new(move || {
+                    request_session_save(&state_for_drag);
+                })),
+            );
 
             let left_widget = build_widget_tree(left, state);
             let right_widget = build_widget_tree(right, state);
@@ -810,41 +817,44 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
     }
 }
 
-fn install_split_ratio_tracking(paned: &gtk::Paned, ratio: &Rc<RefCell<f64>>) {
+pub(crate) fn paned_extent(paned: &gtk::Paned, orientation: gtk::Orientation) -> i32 {
+    if orientation == gtk::Orientation::Horizontal {
+        paned.width()
+    } else {
+        paned.height()
+    }
+}
+
+fn install_split_ratio_tracking(
+    paned: &gtk::Paned,
+    ratio: &Rc<RefCell<f64>>,
+    on_user_drag: Option<Box<dyn Fn()>>,
+) {
     // Flag to suppress position_notify during programmatic set_position calls
-    // (initial layout and workspace re-map). Without this, set_position triggers
-    // position_notify which recalculates the ratio from the not-yet-stable pixel
-    // position, corrupting the stored ratio.
+    // (initial layout, resize re-apply, and workspace re-map). Without this,
+    // set_position triggers position_notify which recalculates the ratio from
+    // the not-yet-stable pixel position, corrupting the stored ratio.
     let applying = Rc::new(Cell::new(false));
 
-    // Track the width we last saw, so position_notify can distinguish
-    // user drags (width unchanged → recompute ratio) from width-driven
-    // auto-adjust (width changed → preserve ratio by re-applying
-    // position = ratio * new_width). Without this, opening the
-    // sidebar (which shrinks the inner paned's width) silently skews
-    // the saved ratio because GtkPaned's position is absolute pixels.
+    // Track the extent we last saw so position_notify can distinguish user
+    // drags (extent unchanged -> recompute ratio and save session) from
+    // layout-driven auto-adjusts (extent changed -> preserve ratio by
+    // re-applying position = ratio * new_extent).
     let last_size = Rc::new(Cell::new(0i32));
+    // Shared with connect_position_notify so a resize bounce back to last_size
+    // before the coalesced idle runs is never misclassified as a user drag.
+    let reapply_pending = Rc::new(Cell::new(false));
+    let orientation = paned.orientation();
     let shared_ratio = ratio.clone();
     let applying_for_notify = applying.clone();
     let last_size_for_notify = last_size.clone();
+    let reapply_pending_for_notify = reapply_pending.clone();
     paned.connect_position_notify(move |paned| {
-        if applying_for_notify.get() {
+        if applying_for_notify.get() || reapply_pending_for_notify.get() {
             return;
         }
-        let size = if paned.orientation() == gtk::Orientation::Horizontal {
-            paned.width()
-        } else {
-            paned.height()
-        };
-        if size <= 0 {
-            return;
-        }
-        if last_size_for_notify.get() != size {
-            // Width changed — this position-notify is an auto-adjust,
-            // not a user drag. Don't update the ratio, and leave
-            // `last_size` for the tick callback to update after it
-            // re-applies the ratio; otherwise consuming the size change
-            // here would suppress the tick's re-apply and drift the split.
+        let size = paned_extent(paned, orientation);
+        if size <= 0 || last_size_for_notify.get() != size {
             return;
         }
         // A drag past a child's minimum would let GTK clip that pane.
@@ -854,58 +864,53 @@ fn install_split_ratio_tracking(paned: &gtk::Paned, ratio: &Rc<RefCell<f64>>) {
             paned.set_position(clamped);
             applying_for_notify.set(false);
         }
-        let new_ratio = layout_state::snapshot_split_ratio(
+        let new_ratio = layout_state::clamp_split_ratio(layout_state::snapshot_split_ratio(
             paned.position(),
             size,
             Some(*shared_ratio.borrow()),
-        );
-        *shared_ratio.borrow_mut() = layout_state::clamp_split_ratio(new_ratio);
+        ));
+        *shared_ratio.borrow_mut() = new_ratio;
+        if let Some(ref on_drag) = on_user_drag {
+            on_drag();
+        }
     });
 
-    // Re-apply position = ratio * size whenever the paned's actual
-    // size changes (sidebar toggles, window resizes). GtkWidget's
-    // `width`/`height` properties don't reliably emit notify across
-    // GTK 4.x versions, so we poll via a per-frame tick callback
-    // (intentional: O(1) integer comparison per frame; always returns
-    // Continue so the paned stays reactive for its entire lifetime).
+    // Both children shrink, so GTK4 updates `max-position` whenever this
+    // Paned's allocated extent changes (first layout, window resize, sidebar
+    // toggle/drag, parent split drag). Re-apply the live ratio in a coalesced
+    // high-priority one-shot idle instead of keeping a permanent
+    // add_tick_callback open, which would keep GdkFrameClock updating forever.
     let shared_ratio_for_resize = ratio.clone();
     let applying_for_resize = applying.clone();
     let last_size_for_resize = last_size.clone();
-    let resize_orientation = paned.orientation();
-    paned.add_tick_callback(move |paned, _| {
-        let size = if resize_orientation == gtk::Orientation::Horizontal {
-            paned.width()
-        } else {
-            paned.height()
-        };
-        if size <= 0 {
-            return glib::ControlFlow::Continue;
+    paned.connect_max_position_notify(move |paned| {
+        last_size_for_resize.set(0);
+        if reapply_pending.replace(true) {
+            return;
         }
-        if last_size_for_resize.get() != size {
-            // Debug-only jitter probe: each line is one ratio re-apply.
-            // Rapid repeated lines on a stable layout signal the size is
-            // oscillating (worth watching as split trees get deep). Costs
-            // nothing in release builds.
-            #[cfg(debug_assertions)]
-            {
-                let previous = last_size_for_resize.get();
-                eprintln!(
-                    "limux: split-ratio tick reapply ({resize_orientation:?}) size {previous} -> {size}"
-                );
+        let paned_weak = paned.downgrade();
+        let reapply_pending = reapply_pending.clone();
+        let shared_ratio = shared_ratio_for_resize.clone();
+        let applying = applying_for_resize.clone();
+        let last_size = last_size_for_resize.clone();
+        glib::idle_add_local_full(glib::Priority::HIGH_IDLE, move || {
+            reapply_pending.set(false);
+            let Some(paned) = paned_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let size = paned_extent(&paned, orientation);
+            if size <= 0 {
+                return glib::ControlFlow::Break;
             }
-            last_size_for_resize.set(size);
-            let ratio = *shared_ratio_for_resize.borrow();
-            crate::window::apply_ratio_value(
-                paned,
-                resize_orientation,
-                ratio,
-                &applying_for_resize,
-            );
-        }
-        glib::ControlFlow::Continue
+            let ratio = *shared_ratio.borrow();
+            if crate::window::apply_ratio_value(&paned, orientation, ratio, &applying) {
+                last_size.set(size);
+            }
+            glib::ControlFlow::Break
+        });
     });
 
-    apply_split_ratio_after_layout(paned, paned.orientation(), ratio.clone(), applying);
+    apply_split_ratio_after_layout(paned, orientation, ratio.clone(), applying, last_size);
 }
 
 fn pane_has_room_to_split(target: &gtk::Widget, orientation: gtk::Orientation) -> bool {
@@ -979,21 +984,13 @@ fn split_extent_has_room(size: i32, orientation: gtk::Orientation) -> bool {
 }
 
 fn refresh_terminal_displays_after_rebuild(root: &gtk::Widget) {
-    pane::refresh_terminal_displays_in_root(root);
-
-    let idle_root = root.clone();
+    // Realize, map, and resize signals already sync freshly mounted GLAreas;
+    // run one coalesced post-layout idle pass over mapped active tabs only.
+    let idle_root = root.downgrade();
     glib::idle_add_local_once(move || {
-        pane::refresh_terminal_displays_in_root(&idle_root);
-    });
-
-    let first_frame_root = root.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
-        pane::refresh_terminal_displays_in_root(&first_frame_root);
-    });
-
-    let settled_root = root.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
-        pane::refresh_terminal_displays_in_root(&settled_root);
+        if let Some(root) = idle_root.upgrade() {
+            pane::refresh_terminal_displays_in_root(&root);
+        }
     });
 }
 
@@ -1071,13 +1068,440 @@ mod tests {
         for orientation in [gtk::Orientation::Horizontal, gtk::Orientation::Vertical] {
             let paned = gtk::Paned::new(orientation);
             let weak = paned.downgrade();
-            install_split_ratio_tracking(&paned, &Rc::new(RefCell::new(0.5)));
+            install_split_ratio_tracking(&paned, &Rc::new(RefCell::new(0.5)), None);
             drop(paned);
             assert!(
                 weak.upgrade().is_none(),
                 "callbacks retained the split widget"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn split_ratio_tracks_resizes_without_idle_frame_clock_or_spurious_saves() {
+        let pump_for = |duration: std::time::Duration| {
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < deadline {
+                for _ in 0..100 {
+                    if !context.pending() {
+                        break;
+                    }
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        gtk::init().expect("initialize GTK");
+
+        let start = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let end = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let paned = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        paned.set_start_child(Some(&start));
+        paned.set_end_child(Some(&end));
+
+        let ratio = Rc::new(RefCell::new(0.35));
+        let user_drag_saves = Rc::new(Cell::new(0u32));
+        let saves_cb = user_drag_saves.clone();
+        install_split_ratio_tracking(
+            &paned,
+            &ratio,
+            Some(Box::new(move || {
+                saves_cb.set(saves_cb.get() + 1);
+            })),
+        );
+
+        let window = gtk::Window::new();
+        window.set_default_size(800, 500);
+        window.set_child(Some(&paned));
+        window.present();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(paned.is_mapped() && paned.width() == 800 && (paned.position() - 280).abs() <= 4) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial split ratio was not applied (width={}, pos={})",
+                paned.width(),
+                paned.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        pump_for(std::time::Duration::from_millis(120));
+        assert_eq!(
+            user_drag_saves.get(),
+            0,
+            "initial layout must not trigger user-drag session saves"
+        );
+
+        // Once settled, GdkFrameClock must not keep updating while idle.
+        let frame_clock = paned.frame_clock().expect("mapped paned has frame clock");
+        let idle_updates = Rc::new(Cell::new(0u32));
+        let idle_updates_cb = idle_updates.clone();
+        let clock_handler = frame_clock.connect_update(move |_| {
+            idle_updates_cb.set(idle_updates_cb.get() + 1);
+        });
+        pump_for(std::time::Duration::from_millis(250));
+        assert_eq!(
+            idle_updates.get(),
+            0,
+            "idle split Paned kept GdkFrameClock updating continuously"
+        );
+        frame_clock.disconnect(clock_handler);
+
+        // Shrinking to 600px (0.35 * 600 = 210px < MIN_PANE_WIDTH = 260px, while
+        // 600px still fits two MIN_PANE_WIDTH panes) clamps position to 260px without
+        // corrupting the stored ratio or triggering a session save, and re-expanding
+        // restores ~420px instead of GTK's drifted linear scaling (~520px).
+        window.set_default_size(600, 500);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(paned.width() == 600 && (paned.position() - pane::MIN_PANE_WIDTH).abs() <= 4) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shrunk split did not clamp to MIN_PANE_WIDTH (width={}, pos={})",
+                paned.width(),
+                paned.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert!(
+            (*ratio.borrow() - 0.35).abs() < 1e-9,
+            "clamped shrink corrupted stored ratio: {}",
+            *ratio.borrow()
+        );
+        assert_eq!(
+            user_drag_saves.get(),
+            0,
+            "clamped shrink must not trigger user-drag session saves"
+        );
+
+        // Programmatic window re-expand preserves the saved ratio via notify::max-position.
+        window.set_default_size(1200, 500);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(paned.width() == 1200 && (paned.position() - 420).abs() <= 4) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resized split ratio was not re-applied (width={}, pos={})",
+                paned.width(),
+                paned.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert!(
+            (*ratio.borrow() - 0.35).abs() < 1e-9,
+            "re-expand corrupted stored ratio: {}",
+            *ratio.borrow()
+        );
+        assert_eq!(
+            user_drag_saves.get(),
+            0,
+            "programmatic window resize must not trigger user-drag session saves"
+        );
+
+        // Genuine user drag at stable width updates the ratio and triggers persistence.
+        paned.set_position(600);
+        assert!(
+            (*ratio.borrow() - 0.5).abs() < 0.02,
+            "user drag did not update stored ratio: {}",
+            *ratio.borrow()
+        );
+        assert_eq!(user_drag_saves.get(), 1);
+
+        window.close();
+        pump_for(std::time::Duration::from_millis(30));
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn split_ratio_survives_bounce_unmapped_updates_and_nested_resizes() {
+        let pump_for = |duration: std::time::Duration| {
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < deadline {
+                for _ in 0..100 {
+                    if !context.pending() {
+                        break;
+                    }
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let make_paned = || {
+            let paned = gtk::Paned::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .shrink_start_child(true)
+                .shrink_end_child(true)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            paned.set_resize_start_child(true);
+            paned.set_resize_end_child(true);
+            paned
+        };
+
+        gtk::init().expect("initialize GTK");
+
+        // 1. Pre-map ratio mutation + resize bounce before idle + stack unmap/remap.
+        let paned = make_paned();
+        paned.set_start_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        paned.set_end_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+
+        let ratio = Rc::new(RefCell::new(0.35));
+        let user_drag_saves = Rc::new(Cell::new(0u32));
+        let saves_cb = user_drag_saves.clone();
+        install_split_ratio_tracking(
+            &paned,
+            &ratio,
+            Some(Box::new(move || {
+                saves_cb.set(saves_cb.get() + 1);
+            })),
+        );
+        // Updating the model before initial layout must not be clobbered by a stale initial ratio.
+        *ratio.borrow_mut() = 0.65;
+
+        let stack = gtk::Stack::new();
+        stack.set_hexpand(true);
+        stack.set_vexpand(true);
+        stack.add_named(&paned, Some("split"));
+        stack.add_named(&gtk::Box::new(gtk::Orientation::Vertical, 0), Some("other"));
+        stack.set_visible_child_name("split");
+
+        let window = gtk::Window::new();
+        window.set_default_size(800, 500);
+        window.set_child(Some(&stack));
+        window.present();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(paned.is_mapped() && paned.width() == 800 && (paned.position() - 520).abs() <= 4) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre-map updated split ratio was not applied (width={}, pos={})",
+                paned.width(),
+                paned.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert_eq!(user_drag_saves.get(), 0);
+
+        // Simulate a resize bounce that returns to `last_size` (800) with a drifted
+        // position before the coalesced idle executes.
+        paned.notify("max-position");
+        paned.set_position(300);
+        assert!(
+            (*ratio.borrow() - 0.65).abs() < 1e-9,
+            "resize bounce corrupted stored ratio: {}",
+            *ratio.borrow()
+        );
+        assert_eq!(
+            user_drag_saves.get(),
+            0,
+            "resize bounce must not trigger a user-drag session save"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (paned.position() - 520).abs() > 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "coalesced idle did not repair bounced split position (pos={})",
+                paned.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert_eq!(user_drag_saves.get(), 0);
+
+        // Hide the split behind another stack page, resize the window, then switch back.
+        stack.set_visible_child_name("other");
+        pump_for(std::time::Duration::from_millis(40));
+        window.set_default_size(1100, 500);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while window.width() != 1100 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "window did not resize while split was unmapped (width={})",
+                window.width()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        stack.set_visible_child_name("split");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(paned.is_mapped() && paned.width() == 1100 && (paned.position() - 715).abs() <= 4) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remapped split did not re-apply ratio after unmapped resize (width={}, pos={})",
+                paned.width(),
+                paned.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert!((*ratio.borrow() - 0.65).abs() < 1e-9);
+        assert_eq!(user_drag_saves.get(), 0);
+
+        window.close();
+        pump_for(std::time::Duration::from_millis(30));
+
+        // 2. Nested split resize propagation: dragging an outer handle updates an
+        // inner Paned via notify::max-position without inner saves or idle ticks.
+        let inner = make_paned();
+        inner.set_start_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        inner.set_end_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        let outer = make_paned();
+        outer.set_start_child(Some(&inner));
+        outer.set_end_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+
+        let outer_ratio = Rc::new(RefCell::new(0.55));
+        let inner_ratio = Rc::new(RefCell::new(0.45));
+        let inner_saves = Rc::new(Cell::new(0u32));
+        let inner_saves_cb = inner_saves.clone();
+        install_split_ratio_tracking(&outer, &outer_ratio, None);
+        install_split_ratio_tracking(
+            &inner,
+            &inner_ratio,
+            Some(Box::new(move || {
+                inner_saves_cb.set(inner_saves_cb.get() + 1);
+            })),
+        );
+
+        let nested_window = gtk::Window::new();
+        nested_window.set_default_size(1200, 500);
+        nested_window.set_child(Some(&outer));
+        nested_window.present();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(outer.width() == 1200
+            && (outer.position() - 660).abs() <= 4
+            && (inner.position() - 297).abs() <= 6)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nested splits did not settle initially (outer={}/{}, inner={}/{})",
+                outer.width(),
+                outer.position(),
+                inner.width(),
+                inner.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert_eq!(inner_saves.get(), 0);
+
+        // Drag the outer handle wider; inner must preserve its 0.45 ratio (~405px of 900px).
+        outer.set_position(900);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(inner.width() >= 895 && (inner.position() - 405).abs() <= 6) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "outer drag did not propagate ratio to inner split (inner={}/{})",
+                inner.width(),
+                inner.position()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert!(
+            (*inner_ratio.borrow() - 0.45).abs() < 1e-9,
+            "outer drag corrupted inner ratio: {}",
+            *inner_ratio.borrow()
+        );
+        assert_eq!(
+            inner_saves.get(),
+            0,
+            "outer drag must not trigger a user-drag save on the inner split"
+        );
+
+        // Settled nested splits must also keep GdkFrameClock idle.
+        pump_for(std::time::Duration::from_millis(80));
+        let frame_clock = inner.frame_clock().expect("mapped nested paned has clock");
+        let idle_updates = Rc::new(Cell::new(0u32));
+        let idle_updates_cb = idle_updates.clone();
+        let clock_handler = frame_clock.connect_update(move |_| {
+            idle_updates_cb.set(idle_updates_cb.get() + 1);
+        });
+        pump_for(std::time::Duration::from_millis(200));
+        assert_eq!(
+            idle_updates.get(),
+            0,
+            "nested split Paned kept GdkFrameClock updating while idle"
+        );
+        frame_clock.disconnect(clock_handler);
+
+        nested_window.close();
+        pump_for(std::time::Duration::from_millis(30));
+
+        // 3. Default 50/50 split on an even width (800px -> pos 400 matches GTK4's
+        // initial default position before `position-set` is true): `apply_ratio_value`
+        // must still mark `position-set` so later child minimum-width growth cannot
+        // skew the split or trigger a false user-drag save.
+        let half_paned = make_paned();
+        let half_start = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let half_end = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        half_start.set_size_request(pane::MIN_PANE_WIDTH, -1);
+        half_end.set_size_request(pane::MIN_PANE_WIDTH, -1);
+        half_paned.set_start_child(Some(&half_start));
+        half_paned.set_end_child(Some(&half_end));
+
+        let half_ratio = Rc::new(RefCell::new(0.5));
+        let half_saves = Rc::new(Cell::new(0u32));
+        let half_saves_cb = half_saves.clone();
+        install_split_ratio_tracking(
+            &half_paned,
+            &half_ratio,
+            Some(Box::new(move || {
+                half_saves_cb.set(half_saves_cb.get() + 1);
+            })),
+        );
+
+        let half_window = gtk::Window::new();
+        half_window.set_default_size(800, 500);
+        half_window.set_child(Some(&half_paned));
+        half_window.present();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(half_paned.is_mapped()
+            && half_paned.width() == 800
+            && half_paned.is_position_set()
+            && (half_paned.position() - 400).abs() <= 2)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "50/50 split did not lock position-set (width={}, pos={}, set={})",
+                half_paned.width(),
+                half_paned.position(),
+                half_paned.is_position_set()
+            );
+            pump_for(std::time::Duration::from_millis(15));
+        }
+        assert_eq!(half_saves.get(), 0);
+
+        // Growing one child's minimum width at the same 800px width must keep the
+        // 50/50 split locked at 400px with no ratio drift or user-drag save.
+        half_start.set_size_request(450, -1);
+        pump_for(std::time::Duration::from_millis(120));
+        assert!(half_paned.is_position_set());
+        assert!(
+            (half_paned.position() - 400).abs() <= 2,
+            "child minimum growth skewed 50/50 split position to {}",
+            half_paned.position()
+        );
+        assert!(
+            (*half_ratio.borrow() - 0.5).abs() < 1e-9,
+            "child minimum growth corrupted 50/50 stored ratio: {}",
+            *half_ratio.borrow()
+        );
+        assert_eq!(
+            half_saves.get(),
+            0,
+            "child minimum growth must not trigger a user-drag save"
+        );
+
+        half_window.close();
+        pump_for(std::time::Duration::from_millis(30));
     }
 
     #[test]
