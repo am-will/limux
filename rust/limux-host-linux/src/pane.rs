@@ -2910,14 +2910,21 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
     panes
 }
 
-/// Direct lookup of a live terminal handle and its owning workspace id by tab id
-/// via the pane registry, avoiding full workspace tree walks and vector clones.
-pub fn terminal_handle_by_tab_id(tab_id: &str) -> Option<(String, terminal::TerminalHandle)> {
+/// Direct lookup of a live terminal handle by tab id across panes belonging to
+/// matching workspaces via the pane registry, avoiding full workspace tree
+/// walks and vector clones.
+pub fn terminal_handle_by_tab_id_in_workspaces(
+    tab_id: &str,
+    matches_workspace: impl Fn(&str) -> bool,
+) -> Option<terminal::TerminalHandle> {
     PANE_REGISTRY.with(|registry| {
         for weak in registry.borrow().values() {
             let Some(internals) = weak.upgrade() else {
                 continue;
             };
+            if !matches_workspace(&internals.callbacks.workspace_id) {
+                continue;
+            }
             let tab_state = internals.tab_state.borrow();
             if let Some(TabKind::Terminal { state }) = tab_state
                 .tabs
@@ -2925,10 +2932,7 @@ pub fn terminal_handle_by_tab_id(tab_id: &str) -> Option<(String, terminal::Term
                 .find(|entry| entry.id == tab_id)
                 .map(|entry| &entry.kind)
             {
-                return Some((
-                    internals.callbacks.workspace_id.clone(),
-                    state.handle.clone(),
-                ));
+                return Some(state.handle.clone());
             }
         }
         None

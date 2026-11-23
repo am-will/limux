@@ -98,6 +98,16 @@ pub(super) fn build_tab_button_from_label(
             if !already_active {
                 activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
             } else if n_press == 1 {
+                if tab_strip
+                    .ancestor(gtk::ScrolledWindow::static_type())
+                    .and_downcast::<gtk::ScrolledWindow>()
+                    .is_some_and(|scroller| {
+                        let adjustment = scroller.hadjustment();
+                        adjustment.upper() > adjustment.page_size() + 0.5
+                    })
+                {
+                    queue_active_tab_reveal(&tab_strip, &tab_state);
+                }
                 let focus_target = tab_state
                     .borrow()
                     .tabs

@@ -7977,12 +7977,11 @@ fn run_startup_eager_restore(state: &State) {
             // before GTK emits callbacks.
             let terminal = {
                 let app_state = state.borrow();
-                pane::terminal_handle_by_tab_id(&tab_id).and_then(|(ws_id, handle)| {
+                pane::terminal_handle_by_tab_id_in_workspaces(&tab_id, |ws_id| {
                     app_state
                         .workspaces
                         .iter()
                         .any(|workspace| workspace.id == ws_id)
-                        .then_some(handle)
                 })
             };
             if let Some(terminal) = terminal {
