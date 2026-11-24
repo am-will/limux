@@ -233,6 +233,7 @@ export WAYLAND_DISPLAY=wayland-limux-smoke
 unset DISPLAY
 HOST_PID=""
 WESTON_PID=""
+AGY_SNAP_PID=""
 
 start_compositor() {
   setsid weston \
@@ -365,6 +366,9 @@ cleanup() {
   local rc=$?
   echo
   echo "-- cleanup (rc=$rc) --"
+  if [ -n "$AGY_SNAP_PID" ] && kill -0 "$AGY_SNAP_PID" 2>/dev/null; then
+    kill -KILL "$AGY_SNAP_PID" 2>/dev/null || true
+  fi
   if [ -n "$HOST_PID" ] && kill -0 -- "-$HOST_PID" 2>/dev/null; then
     kill -KILL -- "-$HOST_PID" 2>/dev/null || true
   fi
@@ -1129,9 +1133,8 @@ jq -e '.decision == "allow"' "$LOG_DIR/stage7-agy-stop.json" >/dev/null \
   || { echo "FAIL: hooks agy stop did not emit {\"decision\":\"allow\"}"; exit 1; }
 HOME="$AGY_SMOKE_HOME" "$LIMUX_CLI" hooks agy uninstall >"$LOG_DIR/stage7-agy-uninstall.txt"
 AGY_SNAP_BIN="$DEMO_DIR/agy-snap-bin"
-AGY_SNAP_STATE="$DEMO_DIR/agy-snap-state"
 AGY_SNAP_PRESENCE="$DEMO_DIR/agy-snap-home/.gemini/antigravity-cli/presence"
-mkdir -p "$AGY_SNAP_BIN" "$AGY_SNAP_STATE" "$AGY_SNAP_PRESENCE"
+mkdir -p "$AGY_SNAP_BIN" "$AGY_SNAP_PRESENCE"
 cat > "$AGY_SNAP_BIN/agy" <<'PY'
 #!/usr/bin/python3
 import os, pathlib, time
@@ -1155,24 +1158,32 @@ for _ in $(seq 1 50); do
 done
 [ -f "$DEMO_DIR/agy-snap-ready" ] \
   || { echo "FAIL: agy snapshot fixture did not open presence lock"; exit 1; }
-LIMUX_AGENT_HOOK_STATE_DIR="$AGY_SNAP_STATE" \
-  "$LIMUX_CLI" --json hooks snapshot agy >"$LOG_DIR/stage7-hooks-snapshot.json"
+"$LIMUX_CLI" --json hooks snapshot agy --save-session >"$LOG_DIR/stage7-hooks-snapshot.json"
 kill "$AGY_SNAP_PID" 2>/dev/null || true
 wait "$AGY_SNAP_PID" 2>/dev/null || true
-jq -e --arg ws "$WORKSPACE_ID" --arg surf "$CLAUDE_SURFACE" '
+AGY_SNAP_PID=""
+jq -e --arg ws "$WORKSPACE_ID" --arg surf "$CLAUDE_SURFACE" --arg path "$XDG_DATA_HOME/limux/session.json" '
   .dry_run == false and
   (.captured | length) == 1 and
   .captured[0].agent == "agy" and
   .captured[0].session_id == "smoke-live-conv" and
   .captured[0].source == "open_fd" and
   .captured[0].workspace_id == $ws and
-  .captured[0].surface_id == $surf
+  .captured[0].surface_id == $surf and
+  .session_save.saved == true and
+  .session_save.path == $path and
+  (.session_save.restorable_agents // 0) >= 1
 ' "$LOG_DIR/stage7-hooks-snapshot.json" >/dev/null \
-  || { echo "FAIL: hooks snapshot did not capture live agy presence lock"; cat "$LOG_DIR/stage7-hooks-snapshot.json"; exit 1; }
+  || { echo "FAIL: hooks snapshot --save-session did not capture and save live agy presence lock"; cat "$LOG_DIR/stage7-hooks-snapshot.json"; exit 1; }
 jq -e '.sessions["smoke-live-conv"].launch_command.arguments == ["'"$AGY_SNAP_BIN"'/agy", "--dangerously-skip-permissions"]' \
-  "$AGY_SNAP_STATE/agy-hook-sessions.json" >/dev/null \
-  || { echo "FAIL: hooks snapshot did not persist launch command"; cat "$AGY_SNAP_STATE/agy-hook-sessions.json"; exit 1; }
-echo "stage 7: OK (claude-hook, agy-hook, and live hooks snapshot verified)"
+  "$XDG_STATE_HOME/limux/agy-hook-sessions.json" >/dev/null \
+  || { echo "FAIL: hooks snapshot did not persist launch command"; cat "$XDG_STATE_HOME/limux/agy-hook-sessions.json"; exit 1; }
+jq -e '[.workspaces[].layout | .. | objects | select(.agent?.kind == "agy" and .agent?.session_id == "smoke-live-conv")] | length >= 1' \
+  "$XDG_DATA_HOME/limux/session.json" >/dev/null \
+  || { echo "FAIL: save-session did not attach snapshotted agy agent into session.json"; cat "$XDG_DATA_HOME/limux/session.json"; exit 1; }
+# Clear the synthetic fixture binding so Stage 8 restarts normal shells cleanly.
+rm -f "$XDG_STATE_HOME/limux/agy-hook-sessions.json" "$XDG_STATE_HOME/limux/agy-hook-sessions.lock"
+echo "stage 7: OK (claude-hook, agy-hook, and live hooks snapshot --save-session verified)"
 
 # --- 11. Stage 8: session persistence and clean process restart -----------
 echo

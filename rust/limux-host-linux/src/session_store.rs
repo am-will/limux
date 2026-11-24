@@ -10,7 +10,7 @@ use crate::layout_state::{
 };
 
 pub(crate) enum SaveOutcome {
-    Saved,
+    Saved(SavedSessionSummary),
     Conflict {
         recovery: PathBuf,
         workspaces: Vec<String>,
@@ -149,22 +149,13 @@ impl SessionStore {
     pub(crate) fn save_in_background(
         mut self,
         local: AppSessionState,
-    ) -> gtk4::gio::JoinHandle<(
-        Self,
-        AppSessionState,
-        io::Result<SaveOutcome>,
-        SavedSessionSummary,
-    )> {
+    ) -> gtk4::gio::JoinHandle<(Self, AppSessionState, io::Result<SaveOutcome>)> {
         gtk4::gio::spawn_blocking(move || {
             let mut persisted = local.clone();
             let agents = layout_state::RestorableAgentIndex::load();
             layout_state::attach_restorable_agents_to_session(&mut persisted, &agents);
-            let summary = summarize_saved_session(
-                layout_state::canonical_session_path_in(&self.directory),
-                &persisted,
-            );
             let result = self.save(&persisted);
-            (self, local, result, summary)
+            (self, local, result)
         })
     }
 
@@ -186,10 +177,14 @@ impl SessionStore {
                 {
                     layout_state::save_session_atomic_in(&self.directory, &merged)?;
                 }
+                let summary = summarize_saved_session(
+                    layout_state::canonical_session_path_in(&self.directory),
+                    &merged,
+                );
                 self.local = local;
                 self.ancestry = ancestry;
                 self.first_save = false;
-                Ok(SaveOutcome::Saved)
+                Ok(SaveOutcome::Saved(summary))
             }
             Err(workspaces) => {
                 layout_state::save_session_atomic_to(&self.recovery, &local)?;

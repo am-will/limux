@@ -134,12 +134,7 @@ pub fn proc_matches_agent(args: &[String], comm: Option<&str>, kind: AgentKind) 
         }
         if is_script_interpreter(&exe_name) {
             if let Some(script_idx) = interpreter_script_index(args) {
-                let script_lower = args[script_idx].to_ascii_lowercase();
-                if kind
-                    .process_needles()
-                    .iter()
-                    .any(|needle| script_lower.contains(needle))
-                {
+                if script_matches_agent(&args[script_idx], kind) {
                     return true;
                 }
             }
@@ -170,11 +165,7 @@ pub fn normalize_captured_process_args(
         let script_idx = interpreter_script_index(raw_args)?;
         let script = &raw_args[script_idx];
         let script_lower = script.to_ascii_lowercase();
-        if !kind
-            .process_needles()
-            .iter()
-            .any(|needle| script_lower.contains(needle))
-        {
+        if !script_matches_agent(script, kind) {
             return None;
         }
         let entrypoint = if is_script_source_path(&script_lower) {
@@ -361,6 +352,52 @@ fn matches_agent_needle(exe_name: &str, kind: AgentKind) -> bool {
             || exe_name.starts_with(&format!("{needle}-"))
             || exe_name.starts_with(&format!("{needle}_"))
     })
+}
+
+fn script_matches_agent(script: &str, kind: AgentKind) -> bool {
+    let path = Path::new(script.trim());
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    if matches_agent_needle(&stem, kind) {
+        return true;
+    }
+    let file_lower = file_name.to_ascii_lowercase();
+    if !matches!(
+        file_lower.as_str(),
+        "cli.js"
+            | "cli.mjs"
+            | "cli.cjs"
+            | "cli.ts"
+            | "index.js"
+            | "index.mjs"
+            | "index.cjs"
+            | "index.ts"
+            | "main.js"
+            | "main.mjs"
+            | "main.py"
+            | "__main__.py"
+    ) {
+        return false;
+    }
+    let mut parent = path.parent();
+    for _ in 0..2 {
+        let Some(dir) = parent else {
+            break;
+        };
+        if let Some(dir_name) = dir.file_name().and_then(|name| name.to_str()) {
+            if matches_agent_needle(&dir_name.to_ascii_lowercase(), kind) {
+                return true;
+            }
+        }
+        parent = dir.parent();
+    }
+    false
 }
 
 fn is_hook_wrapper_binary(exe_name: &str) -> bool {
@@ -861,5 +898,58 @@ mod tests {
         );
         assert!(!filtered.contains_key("GEMINI_CONFIG_DIR"));
         assert!(!filtered.contains_key("AGY_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn script_matching_distinguishes_agent_clis_from_unrelated_scripts() {
+        let agy_under_gemini = vec_str(&[
+            "/usr/bin/node",
+            "/home/u/.gemini/antigravity-cli/dist/cli.js",
+            "--dangerously-skip-permissions",
+        ]);
+        assert!(proc_matches_agent(
+            &agy_under_gemini,
+            Some("node"),
+            AgentKind::Agy
+        ));
+        assert!(!proc_matches_agent(
+            &agy_under_gemini,
+            Some("node"),
+            AgentKind::Gemini
+        ));
+
+        let gemini_cli = vec_str(&[
+            "/usr/bin/node",
+            "/usr/lib/node_modules/@google/gemini-cli/dist/index.js",
+            "--yolo",
+        ]);
+        assert!(proc_matches_agent(
+            &gemini_cli,
+            Some("node"),
+            AgentKind::Gemini
+        ));
+
+        let codex_wrapper = vec_str(&[
+            "/usr/bin/node",
+            "/usr/lib/node_modules/@openai/codex/bin/codex.js",
+            "--full-auto",
+        ]);
+        assert!(proc_matches_agent(
+            &codex_wrapper,
+            Some("node"),
+            AgentKind::Codex
+        ));
+
+        let unrelated_script = vec_str(&[
+            "/usr/bin/node",
+            "/home/u/claude-demo/server.js",
+            "-r",
+            "dotenv/config",
+        ]);
+        assert!(!proc_matches_agent(
+            &unrelated_script,
+            Some("node"),
+            AgentKind::Claude
+        ));
     }
 }
