@@ -24,6 +24,22 @@ cat > "$TMP_DIR/bin/zig" <<'STUB'
 set -euo pipefail
 if [ "$1" = version ]; then printf '%s\n' "${TEST_ZIG_VERSION:-0.16.0}"; exit; fi
 [ "$1" = build ]
+if [ -n "${TEST_ZIG_ATTEMPT_FILE:-}" ]; then
+  count=0
+  if [ -f "$TEST_ZIG_ATTEMPT_FILE" ]; then
+    count="$(cat "$TEST_ZIG_ATTEMPT_FILE")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$TEST_ZIG_ATTEMPT_FILE"
+  if [ "$count" -le "${TEST_ZIG_TRANSIENT_FETCH_FAILS:-0}" ]; then
+    if [ $((count % 2)) -eq 1 ]; then
+      echo "ghostty/pkg/wuffs/build.zig.zon:21:20: error: HTTP response read failure: ConnectionResetByPeer" >&2
+    else
+      echo "ghostty/build.zig.zon:120:20: error: HTTP request failed: WriteFailed" >&2
+    fi
+    exit 1
+  fi
+fi
 if [ "${TEST_ZIG_FAIL:-0}" = 1 ]; then exit 42; fi
 if [ "${TEST_ZIG_NO_OUTPUT:-0}" = 1 ]; then exit; fi
 mkdir -p zig-out/lib
@@ -129,6 +145,58 @@ mv "$FIXTURE/ghostty" "$TMP_DIR/aur-ghostty"
 ln -s "$TMP_DIR/aur-ghostty" "$FIXTURE/ghostty"
 "$FIXTURE/scripts/build-ghostty.sh" >/dev/null
 "$FIXTURE/scripts/check-ghostty.sh" >/dev/null
+
+# Transient Zig dependency fetch failures retry and succeed once downloads recover.
+ATTEMPT_FILE="$TMP_DIR/zig-attempts"
+rm -f "$ATTEMPT_FILE"
+LIMUX_GHOSTTY_FETCH_ATTEMPTS=4 \
+  LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS=0 \
+  TEST_ZIG_ATTEMPT_FILE="$ATTEMPT_FILE" \
+  TEST_ZIG_TRANSIENT_FETCH_FAILS=2 \
+  "$FIXTURE/scripts/build-ghostty.sh" >"$TMP_DIR/output" 2>&1
+[ "$(cat "$ATTEMPT_FILE")" -eq 3 ]
+grep -Fq 'retrying in 0s' "$TMP_DIR/output"
+"$FIXTURE/scripts/check-ghostty.sh" >/dev/null
+
+# Exhausting configured fetch attempts fails without recording provenance.
+rm -f "$ATTEMPT_FILE"
+if LIMUX_GHOSTTY_FETCH_ATTEMPTS=2 \
+  LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS=0 \
+  TEST_ZIG_ATTEMPT_FILE="$ATTEMPT_FILE" \
+  TEST_ZIG_TRANSIENT_FETCH_FAILS=3 \
+  "$FIXTURE/scripts/build-ghostty.sh" >"$TMP_DIR/output" 2>&1; then
+  echo 'FAIL: accepted exhausted transient Zig fetch retries' >&2
+  exit 1
+fi
+[ "$(cat "$ATTEMPT_FILE")" -eq 2 ]
+[ ! -e "$PROVENANCE" ]
+
+# Non-fetch Zig build failures must not retry.
+rm -f "$ATTEMPT_FILE"
+if LIMUX_GHOSTTY_FETCH_ATTEMPTS=4 \
+  LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS=0 \
+  TEST_ZIG_ATTEMPT_FILE="$ATTEMPT_FILE" \
+  TEST_ZIG_FAIL=1 \
+  "$FIXTURE/scripts/build-ghostty.sh" >"$TMP_DIR/output" 2>&1; then
+  echo 'FAIL: accepted non-fetch Zig failure' >&2
+  exit 1
+fi
+[ "$(cat "$ATTEMPT_FILE")" -eq 1 ]
+
+# Reject invalid retry configuration values.
+if LIMUX_GHOSTTY_FETCH_ATTEMPTS=0 "$FIXTURE/scripts/build-ghostty.sh" >"$TMP_DIR/output" 2>&1; then
+  echo 'FAIL: accepted zero fetch attempts' >&2
+  exit 1
+fi
+grep -Fq 'LIMUX_GHOSTTY_FETCH_ATTEMPTS must be a positive integer' "$TMP_DIR/output"
+if LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS=bad "$FIXTURE/scripts/build-ghostty.sh" >"$TMP_DIR/output" 2>&1; then
+  echo 'FAIL: accepted invalid fetch retry delay' >&2
+  exit 1
+fi
+grep -Fq 'LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS must be a non-negative integer' "$TMP_DIR/output"
+
+# Restore valid artifact before testing dirty submodule rejection.
+"$FIXTURE/scripts/build-ghostty.sh" >/dev/null
 printf 'uncommitted\n' >> "$FIXTURE/ghostty/build.zig"
 reject 'source has local changes' "$FIXTURE/scripts/check-ghostty.sh"
 

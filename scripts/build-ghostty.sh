@@ -18,6 +18,16 @@ if [[ ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
   echo 'ERROR: LIMUX_BUILD_JOBS must be a positive integer.' >&2
   exit 2
 fi
+FETCH_ATTEMPTS="${LIMUX_GHOSTTY_FETCH_ATTEMPTS:-4}"
+if [[ ! "$FETCH_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+  echo 'ERROR: LIMUX_GHOSTTY_FETCH_ATTEMPTS must be a positive integer.' >&2
+  exit 2
+fi
+FETCH_RETRY_DELAY="${LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS:-5}"
+if [[ ! "$FETCH_RETRY_DELAY" =~ ^[0-9]+$ ]]; then
+  echo 'ERROR: LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS must be a non-negative integer.' >&2
+  exit 2
+fi
 ZIG_BIN="$(command -v "${ZIG:-zig}")" || {
   ghostty_build_error "$ROOT_DIR" 'Zig 0.16.0 was not found. Set ZIG to its executable or add it to PATH.'
   exit 1
@@ -47,11 +57,37 @@ flock 9
 rm -f "$PROVENANCE" "$LIBRARY"
 ZIG_ARGS=(-Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline -Demit-docs=false -fno-sys=gtk4-layer-shell)
 if [ "$DEBUG_SYMBOLS" = 1 ]; then ZIG_ARGS+=(-Dstrip=false); fi
-(
-  cd "$ROOT_DIR/ghostty"
-  unset DESTDIR
-  "$ZIG_BIN" build "-j$JOBS" "${ZIG_ARGS[@]}" --prefix "$ROOT_DIR/ghostty/zig-out"
-)
+ZIG_STDERR_LOG="$(mktemp)"
+TEMP_RECORD=""
+trap 'rm -f "$ZIG_STDERR_LOG" "$TEMP_RECORD"' EXIT
+
+attempt=1
+while true; do
+  : > "$ZIG_STDERR_LOG"
+  build_rc=0
+  (
+    cd "$ROOT_DIR/ghostty"
+    unset DESTDIR
+    "$ZIG_BIN" build "-j$JOBS" "${ZIG_ARGS[@]}" --prefix "$ROOT_DIR/ghostty/zig-out"
+  ) 2>"$ZIG_STDERR_LOG" || build_rc=$?
+  if [ -s "$ZIG_STDERR_LOG" ]; then
+    cat "$ZIG_STDERR_LOG" >&2
+  fi
+  if [ "$build_rc" -eq 0 ]; then
+    break
+  fi
+  if [ "$attempt" -lt "$FETCH_ATTEMPTS" ] \
+    && grep -Eq '\.zig\.zon:[0-9]+:[0-9]+: error: (HTTP (request failed|response read failure)|unable to connect|TLS |.*(ConnectionResetByPeer|ConnectionRefused|ConnectionTimedOut|NetworkUnreachable|TemporaryNameServerFailure|NameServerFailure|ReadFailed|WriteFailed|EndOfStream|UnexpectedEof|BrokenPipe|TlsConnectionTruncated))' "$ZIG_STDERR_LOG"; then
+    delay=$((FETCH_RETRY_DELAY * attempt))
+    echo "WARNING: Ghostty Zig dependency fetch failed on attempt $attempt/$FETCH_ATTEMPTS; retrying in ${delay}s..." >&2
+    if [ "$delay" -gt 0 ]; then
+      sleep "$delay"
+    fi
+    attempt=$((attempt + 1))
+    continue
+  fi
+  exit "$build_rc"
+done
 if [ "$(ghostty_source_revision "$ROOT_DIR")" != "$REVISION" ]; then
   ghostty_build_error "$ROOT_DIR" 'Ghostty changed revision during the build; no provenance was recorded.'
   exit 1
@@ -70,7 +106,6 @@ if [ "$DEBUG_SYMBOLS" = 1 ]; then
 fi
 HASH="$(sha256sum < "$LIBRARY")"
 TEMP_RECORD="$(mktemp "$PROVENANCE.XXXXXX")"
-trap 'rm -f "$TEMP_RECORD"' EXIT
 printf '%s\n' \
   limux-ghostty-build-v1 \
   "ghostty_commit=$REVISION" \
