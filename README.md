@@ -381,6 +381,24 @@ time, enable **Settings → General → Ask for folder on new workspace**.
 | `Ctrl+Alt+Arrow` | Focus pane in direction |
 | `Ctrl+Alt+PageDown/Up` | Next or previous workspace |
 | `Ctrl+Alt+1-9` | Switch to workspace by number |
+| `Ctrl+Alt+O` | Switch to the most recent workspace, back to the pane you left |
+| `Ctrl+Alt+U` | Go to the next unread terminal, across workspaces and collapsed groups |
+| `Ctrl+Alt+Shift+U` | Go to the previous unread terminal |
+
+Switching back to a workspace returns to the pane you last used there, with its
+active tab.
+
+### When a terminal's process ends
+
+A terminal you are looking at closes when its process ends, as in any terminal;
+the workspace closes with its last terminal unless **Keep workspace open** is on.
+A process that ends while you are not looking (another workspace, a background
+tab, or another window in front) keeps its tab, output and workspace, marks them
+unread, and shows **Restart** and **Close**. If it failed (a non-zero exit or a
+signal), it also raises a desktop notification when notifications are on; a
+clean exit is only marked in the sidebar. **Restart** runs the same command
+again, including the workspace's autostart command. A command that fails right
+after it starts is kept the same way, so its error stays readable.
 
 ## Architecture
 

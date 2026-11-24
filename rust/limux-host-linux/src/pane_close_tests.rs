@@ -755,7 +755,17 @@ fn tab_unread_changes_preserve_independent_workspace_notifications() {
     };
     mark_workspace_unread_with_message(&state, &ws_id, "Tab notice", false, target);
     assert!(pane::workspace_has_unread_tabs(&ws_id));
-    assert!(handle.send_text("exit\n"));
+    assert!(handle.send_text("exit"));
+    assert!(handle.send_key("enter"));
+    // Nobody watched it exit, so the tab and its output stay until closed.
+    pump_until(wait, || handle.health().process_exited);
+    pump_for(std::time::Duration::from_millis(300));
+    assert_eq!(
+        pane::tab_count_in_pane(&pane),
+        2,
+        "an unattended exit keeps its tab"
+    );
+    assert!(pane::close_tab_in_pane(&pane, &surface.tab_id));
     pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
     assert_eq!(pane::tab_count_in_pane(&pane), 1, "unread terminal exited");
     let (row, notify_dot) = {
@@ -815,7 +825,23 @@ fn tab_unread_changes_preserve_independent_workspace_notifications() {
     let surface = pane::active_surface_summary(&pane).unwrap();
     let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
     pump_until(wait, || handle.health().realized);
-    assert!(handle.send_text("exit\n"));
+    // Only a watched exit closes on its own; Weston headless has no active
+    // window, so there nobody is watching and the exit is held until closed.
+    let watched = state.borrow().window.is_active();
+    assert!(handle.send_text("exit"));
+    assert!(handle.send_key("enter"));
+    pump_until(wait, || {
+        handle.health().process_exited || pane::tab_count_in_pane(&pane) == 1
+    });
+    if !watched {
+        pump_for(std::time::Duration::from_millis(300));
+        assert_eq!(
+            pane::tab_count_in_pane(&pane),
+            2,
+            "an unwatched exit keeps its tab"
+        );
+        assert!(pane::close_tab_in_pane(&pane, &surface.tab_id));
+    }
     pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
     assert_eq!(pane::tab_count_in_pane(&pane), 1);
     assert!(
@@ -848,6 +874,273 @@ fn tab_unread_changes_preserve_independent_workspace_notifications() {
     let window = state.borrow().window.clone();
     window.close();
     pump_until(wait, || !window.is_visible());
+}
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn an_exit_driven_through_the_control_socket_closes_its_tab_unwatched() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.DrivenExitTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    pane::add_terminal_tab_to_pane(&pane);
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    let wait = std::time::Duration::from_secs(5);
+    pump_until(wait, || handle.health().realized);
+    assert_eq!(pane::tab_count_in_pane(&pane), 2);
+
+    // Nobody is watching: another window has the focus (on Weston headless
+    // no window ever has it).
+    let peer = adw::ApplicationWindow::builder()
+        .application(&app)
+        .title("Focus peer")
+        .build();
+    peer.present();
+    let window = state.borrow().window.clone();
+    pump_until(wait, || !window.is_active());
+    assert!(!window.is_active());
+
+    // A script ends the shell through the socket, as `limux send` and
+    // `limux send-key` do: the tab closes as if watched.
+    let target = || WorkspaceTarget::Handle(ws_id.clone());
+    let (reply, rx) = std::sync::mpsc::channel();
+    handle_control_command(
+        &state,
+        ControlCommand::SendText {
+            target: target(),
+            surface_hint: Some(surface.surface_id.clone()),
+            text: "exit".to_string(),
+            reply,
+        },
+    );
+    rx.recv_timeout(wait).unwrap().expect("surface.send_text");
+    let (reply, rx) = std::sync::mpsc::channel();
+    handle_control_command(
+        &state,
+        ControlCommand::SendKey {
+            target: target(),
+            surface_hint: Some(surface.surface_id.clone()),
+            key: "enter".to_string(),
+            reply,
+        },
+    );
+    rx.recv_timeout(wait).unwrap().expect("surface.send_key");
+    pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
+    assert_eq!(
+        pane::tab_count_in_pane(&pane),
+        1,
+        "an exit a script caused closes its tab"
+    );
+    peer.close();
+    window.close();
+}
+
+// A command a script sent that then fails leaves output nobody has read: the
+// tab is held and marked unread instead of closing with a clean driven exit.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn a_failed_exit_driven_through_the_control_socket_is_held() {
+    let (state, _temp) = held_tab_test_window("dev.limux.DrivenFailureTest");
+    let app = state.borrow().window.application().unwrap();
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    pane::add_terminal_tab_to_pane(&pane);
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let wait = std::time::Duration::from_secs(5);
+    pump_until(wait, || live_terminal(&pane, &surface.surface_id));
+    // Past the quick-failure window, as a command that ran for a while is.
+    pump_for(std::time::Duration::from_millis(400));
+
+    let peer = adw::ApplicationWindow::builder()
+        .application(&app)
+        .title("Focus peer")
+        .build();
+    peer.present();
+    let window = state.borrow().window.clone();
+    pump_until(wait, || !window.is_active());
+    assert!(!window.is_active());
+
+    let target = || WorkspaceTarget::Handle(ws_id.clone());
+    // A key the terminal refuses is not input.
+    let (reply, rx) = std::sync::mpsc::channel();
+    handle_control_command(
+        &state,
+        ControlCommand::SendKey {
+            target: target(),
+            surface_hint: Some(surface.surface_id.clone()),
+            key: "no-such-key".to_string(),
+            reply,
+        },
+    );
+    assert!(rx.recv_timeout(wait).unwrap().is_err());
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    assert!(
+        !handle.driven_within(std::time::Duration::from_secs(60)),
+        "a refused key does not count as driving the terminal"
+    );
+
+    let (reply, rx) = std::sync::mpsc::channel();
+    handle_control_command(
+        &state,
+        ControlCommand::SendText {
+            target: target(),
+            surface_hint: Some(surface.surface_id.clone()),
+            text: "exit 3".to_string(),
+            reply,
+        },
+    );
+    rx.recv_timeout(wait).unwrap().expect("surface.send_text");
+    let (reply, rx) = std::sync::mpsc::channel();
+    handle_control_command(
+        &state,
+        ControlCommand::SendKey {
+            target: target(),
+            surface_hint: Some(surface.surface_id.clone()),
+            key: "enter".to_string(),
+            reply,
+        },
+    );
+    rx.recv_timeout(wait).unwrap().expect("surface.send_key");
+    pump_until(wait, || handle.health().process_exited);
+    pump_until(wait, || !buttons_labelled(&root, "Restart").is_empty());
+    pump_for(std::time::Duration::from_millis(200));
+    assert_eq!(
+        pane::tab_count_in_pane(&pane),
+        2,
+        "a failed command a script sent keeps its tab"
+    );
+    assert_eq!(buttons_labelled(&root, "Restart").len(), 1);
+    assert!(
+        pane::workspace_has_unread_tabs(&ws_id),
+        "the failure nobody saw is marked unread"
+    );
+    peer.close();
+    window.close();
+}
+
+// A command that fails as soon as it starts keeps its error on screen even
+// when its tab was built long before its terminal started (a restored project
+// shown later): the quick-failure window counts the process's own runtime,
+// not the tab's age.
+#[test]
+#[ignore = "requires a graphical display with an active window and Ghostty resources"]
+fn a_quick_failure_in_a_late_started_terminal_is_held() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let fail = temp.path().join("fail");
+    let command = temp.path().join("command.sh");
+    std::fs::write(
+        &command,
+        format!("[ -e '{}' ] && exit 3\nexec /bin/sh\n", fail.display()),
+    )
+    .unwrap();
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        format!(
+            "command = /bin/sh {}\nshell-integration = none\n",
+            command.display()
+        ),
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+    std::env::set_var("LIMUX_EAGER_RESTORE", "0");
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.LateStartFailureTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+    let window = state.borrow().window.clone();
+    pump_until(wait, || window.is_active());
+    assert!(window.is_active(), "this test needs an active window");
+
+    // A restored project builds its tabs at once and starts their terminals
+    // only when it is first shown.
+    add_restored_workspace_from_state(
+        &state,
+        &WorkspaceState {
+            color: None,
+            group_id: None,
+            id: None,
+            name: "late".to_string(),
+            favorite: false,
+            cwd: None,
+            folder_path: None,
+            autostart_command: None,
+            layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+        },
+    );
+    let (index, ws_id, root) = {
+        let s = state.borrow();
+        let index = s.workspaces.len() - 1;
+        let ws = &s.workspaces[index];
+        (index, ws.id.clone(), ws.root.clone())
+    };
+    let pane = first_leaf_pane(&root);
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    pump_for(std::time::Duration::from_millis(600));
+    assert!(!handle.health().realized, "the terminal has not started");
+
+    std::fs::write(&fail, "").unwrap();
+    select_workspace_by_index(&state, index);
+    pump_until(wait, || handle.health().process_exited);
+    pump_until(wait, || !buttons_labelled(&root, "Restart").is_empty());
+    pump_for(std::time::Duration::from_millis(200));
+    assert!(
+        state.borrow().workspaces.iter().any(|w| w.id == ws_id),
+        "the failed command's project was closed"
+    );
+    assert_eq!(
+        buttons_labelled(&root, "Restart").len(),
+        1,
+        "a command that failed at once keeps its output and offers a restart"
+    );
+    assert!(
+        !pane::workspace_has_unread_tabs(&ws_id),
+        "the user watched it fail"
+    );
+    window.close();
 }
 
 #[test]
@@ -1069,4 +1362,363 @@ fn localized_split_and_remove_keep_sibling_gl_areas_realized() {
     let window = state.borrow().window.clone();
     window.close();
     pump_until(wait, || !window.is_visible());
+}
+
+fn buttons_labelled(root: &gtk::Widget, label: &str) -> Vec<gtk::Button> {
+    widget_tree(root)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+        .filter(|button| button.label().is_some_and(|text| text == label))
+        .collect()
+}
+
+fn live_terminal(pane: &gtk::Widget, surface_id: &str) -> bool {
+    pane::terminal_handle_for_surface(pane, Some(surface_id))
+        .is_some_and(|(_, handle)| handle.health().realized && !handle.health().process_exited)
+}
+
+// A process that ends in a workspace nobody is looking at keeps the workspace,
+// its group place and the terminal's output, marks it unread and offers a
+// restart in place.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn unattended_exit_keeps_the_workspace_and_restarts_in_place() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.UnattendedExitTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    let original = pane::active_tab_in_pane(&pane).unwrap();
+    pane::add_terminal_tab_to_pane(&pane);
+    assert!(pane::close_tab_in_pane(&pane, &original));
+    pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    pump_until(wait, || live_terminal(&pane, &surface.surface_id));
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    select_workspace_by_index(&state, 0);
+
+    assert!(handle.send_text("exit 3"));
+    assert!(handle.send_key("enter"));
+    pump_until(wait, || handle.health().process_exited);
+    pump_until(wait, || !buttons_labelled(&root, "Restart").is_empty());
+    // The unread mark is applied from an idle callback.
+    pump_for(std::time::Duration::from_millis(200));
+    let (kept, message) = {
+        let s = state.borrow();
+        let workspace = s.workspaces.iter().find(|w| w.id == ws_id);
+        (
+            workspace.is_some(),
+            workspace.map(|w| w.notify_label.label().to_string()),
+        )
+    };
+    assert!(
+        kept,
+        "the only terminal exiting unseen must not close the workspace"
+    );
+    assert_eq!(message.as_deref(), Some("Process exited with code 3"));
+    assert_eq!(pane::tab_count_in_pane(&pane), 1, "the exited tab is held");
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+
+    buttons_labelled(&root, "Restart")[0].emit_clicked();
+    pump_until(wait, || live_terminal(&pane, &surface.surface_id));
+    assert!(
+        live_terminal(&pane, &surface.surface_id),
+        "restart runs a new process in the same tab"
+    );
+    pump_until(wait, || buttons_labelled(&root, "Restart").is_empty());
+    assert!(buttons_labelled(&root, "Restart").is_empty());
+
+    // Close on the held banner closes the tab, and with it the workspace.
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    assert!(handle.send_text("exit 4"));
+    assert!(handle.send_key("enter"));
+    pump_until(wait, || !buttons_labelled(&root, "Close").is_empty());
+    buttons_labelled(&root, "Close")[0].emit_clicked();
+    pump_until(wait, || {
+        !state.borrow().workspaces.iter().any(|w| w.id == ws_id)
+    });
+    assert!(!state.borrow().workspaces.iter().any(|w| w.id == ws_id));
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+// A terminal that exits in a background tab is held; opening that tab later
+// puts the keyboard on Restart, not on the dead terminal.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn opening_a_held_background_tab_focuses_restart() {
+    let (state, _temp) = held_tab_test_window("dev.limux.HeldBackgroundTabTest");
+    let wait = std::time::Duration::from_secs(5);
+
+    let (_ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    let background = pane::active_surface_summary(&pane).unwrap();
+    pump_until(wait, || live_terminal(&pane, &background.surface_id));
+    let (_, handle) =
+        pane::terminal_handle_for_surface(&pane, Some(&background.surface_id)).unwrap();
+    pane::add_terminal_tab_to_pane(&pane);
+    let front = pane::active_surface_summary(&pane).unwrap();
+    assert_ne!(front.tab_id, background.tab_id);
+    pump_for(std::time::Duration::from_millis(300));
+
+    assert!(handle.send_text("exit 5"));
+    assert!(handle.send_key("enter"));
+    pump_until(wait, || handle.health().process_exited);
+    pump_until(wait, || !buttons_labelled(&root, "Restart").is_empty());
+    pump_for(std::time::Duration::from_millis(200));
+    assert_eq!(
+        pane::active_tab_in_pane(&pane).as_deref(),
+        Some(front.tab_id.as_str()),
+        "the exit happened in a background tab"
+    );
+
+    assert!(pane::activate_tab_in_pane(&pane, &background.tab_id));
+    let restart = buttons_labelled(&root, "Restart")[0].clone();
+    pump_until(wait, || restart.has_focus());
+    assert!(
+        restart.has_focus(),
+        "opening a held tab focuses its Restart button"
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+fn held_tab_test_window(app_id: &str) -> (State, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder().application_id(app_id).build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    (state, temp)
+}
+
+// Returning to a workspace lands in the pane last used there, not its first
+// pane, and the recent-workspace action toggles between the last two.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn returning_to_a_workspace_focuses_its_last_pane() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.RecentWorkspaceTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let first = first_leaf_pane(&root);
+    let second = split_pane(
+        &state,
+        &ws_id,
+        &first,
+        gtk::Orientation::Horizontal,
+        split_options(),
+    )
+    .expect("split");
+    pump_until(wait, || shown(&second));
+    assert!(pane::focus_active_tab_in_pane(&second));
+    assert_focus_within("the second pane", &state, &second);
+    let index = state
+        .borrow()
+        .workspaces
+        .iter()
+        .position(|w| w.id == ws_id)
+        .unwrap();
+
+    activate_workspace_shortcut(&state, 0);
+    pump_for(std::time::Duration::from_millis(200));
+    assert_eq!(state.borrow().active_idx, 0);
+    assert_eq!(switch_to_recent_workspace(&state), Some(index));
+    assert_focus_within("the last used pane after returning", &state, &second);
+    assert_eq!(switch_to_recent_workspace(&state), Some(0));
+    // The shortcut goes through the same action.
+    assert!(dispatch_shortcut_command(
+        &state,
+        ShortcutCommand::RecentWorkspace
+    ));
+    assert_eq!(state.borrow().active_idx, index);
+    assert_focus_within("the last used pane after toggling", &state, &second);
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+// The next-unread action reaches a tab in a hidden workspace and focuses it.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn next_unread_terminal_reaches_a_hidden_tab() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.NextUnreadTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    pane::add_terminal_tab_to_pane(&pane);
+    let background = pane::active_surface_summary(&pane).unwrap();
+    pane::add_terminal_tab_to_pane(&pane);
+    activate_workspace_shortcut(&state, 0);
+    pump_for(std::time::Duration::from_millis(200));
+    assert_eq!(
+        pane::mark_tab_unread_in_workspace(&ws_id, background.pane_id, &background.tab_id),
+        Some(true)
+    );
+    sync_workspace_unread(&state, &ws_id);
+
+    assert!(dispatch_shortcut_command(
+        &state,
+        ShortcutCommand::NextUnreadTerminal
+    ));
+    pump_until(wait, || {
+        pane::active_tab_in_pane(&pane).as_deref() == Some(background.tab_id.as_str())
+            && focus_within(&state, &pane)
+    });
+    assert_eq!(
+        pane::active_tab_in_pane(&pane).as_deref(),
+        Some(background.tab_id.as_str())
+    );
+    assert_focus_within("the unread tab", &state, &pane);
+    assert!(
+        !pane::workspace_has_unread_tabs(&ws_id),
+        "viewing it reads it"
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+// The next-unread action unzooms another pane to show the unread tab, and
+// that reads it: the action must not keep landing on the same tab.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn next_unread_terminal_reads_a_tab_a_zoom_hid() {
+    let (state, _temp) = held_tab_test_window("dev.limux.NextUnreadZoomTest");
+    let wait = std::time::Duration::from_secs(5);
+
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    let unread = pane::active_surface_summary(&pane).unwrap();
+    // Marked by hand: only going to the tab reads it, a passive focus does not.
+    assert!(pane::mark_active_tab_manual_unread_in_root(&root));
+    sync_workspace_unread(&state, &ws_id);
+
+    let lead = split_before(&state, &ws_id, &pane);
+    toggle_focused_pane_zoom(&state);
+    pump_until(wait, || shown(&lead) && !shown(&pane));
+    assert!(!shown(&pane), "the zoom hides the other pane");
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+
+    assert!(dispatch_shortcut_command(
+        &state,
+        ShortcutCommand::NextUnreadTerminal
+    ));
+    pump_until(wait, || {
+        shown(&pane) && !pane::workspace_has_unread_tabs(&ws_id)
+    });
+    assert!(shown(&pane), "the unread tab's pane is shown again");
+    assert_eq!(
+        pane::active_tab_in_pane(&pane).as_deref(),
+        Some(unread.tab_id.as_str())
+    );
+    assert!(
+        !pane::workspace_has_unread_tabs(&ws_id),
+        "being taken to the tab reads it"
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
 }

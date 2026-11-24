@@ -134,6 +134,9 @@ These are the current supported config keys and defaults:
 | `activate_workspace_7` | `<Ctrl><Alt>7` |
 | `activate_workspace_8` | `<Ctrl><Alt>8` |
 | `activate_last_workspace` | `<Ctrl><Alt>9` |
+| `recent_workspace` | `<Ctrl><Alt>o` |
+| `next_unread_terminal` | `<Ctrl><Alt>u` |
+| `prev_unread_terminal` | `<Ctrl><Alt><Shift>u` |
 | `open_browser_in_split` | `<Ctrl><Shift>l` |
 | `browser_focus_location` | `<Ctrl>l` |
 | `browser_back` | `<Ctrl>bracketleft` |

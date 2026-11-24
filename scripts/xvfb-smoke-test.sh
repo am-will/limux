@@ -435,6 +435,9 @@ for regression in \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
   window::pane_close_tests::localized_split_and_remove_keep_sibling_gl_areas_realized \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
+  window::pane_close_tests::an_exit_driven_through_the_control_socket_closes_its_tab_unwatched \
+  window::pane_close_tests::a_failed_exit_driven_through_the_control_socket_is_held \
+  window::pane_close_tests::next_unread_terminal_reads_a_tab_a_zoom_hid \
   window::pane_close_tests::closing_inactive_workspace_preserves_active_manual_unread \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
@@ -475,6 +478,7 @@ command -v xdotool >/dev/null || {
 for regression in \
   window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
   window::pane_close_tests::passive_rename_focus_restore_preserves_manual_tab_unread \
+  window::pane_close_tests::a_quick_failure_in_a_late_started_terminal_is_held \
   pane::ssh_reconnect_tests::reconnect_preserves_neighbor_keyboard_focus_and_restores_its_own \
   window::eager_restore_tests::eager_restore_preserves_live_selection_focus_and_agent_bindings; do
   echo "== regression: $regression under isolated X11 =="
