@@ -6491,8 +6491,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            handle.note_driven_input();
-            handle.send_text(&text);
+            if handle.send_text(&text) {
+                handle.note_driven_input();
+            }
             if let Some(map) = payload.as_object_mut() {
                 map.insert("ok".to_string(), serde_json::Value::Bool(true));
             }

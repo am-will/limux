@@ -1805,7 +1805,7 @@ fn make_terminal_callbacks(
             // Whether someone watched it end is decided now: the user may open
             // the tab before the deferred handler runs.
             let seen = terminal_tab_owner(&tab_id).and_then(|pane| {
-                let generation = {
+                let (generation, active, driven) = {
                     let tabs = pane.tab_state.borrow();
                     let entry = tabs.tabs.iter().find(|entry| entry.id == tab_id)?;
                     let TabKind::Terminal { state } = &entry.kind else {
@@ -1815,7 +1815,6 @@ fn make_terminal_callbacks(
                     let driven = state.handle.driven_within(exit_hold::DRIVEN_EXIT_WINDOW);
                     (state.generation.clone(), active, driven)
                 };
-                let (generation, active, driven) = generation;
                 let seen = if active && pane_is_visible(&pane) {
                     exit_hold::ExitSeen::Watched
                 } else if driven {
