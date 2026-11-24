@@ -233,6 +233,7 @@ export WAYLAND_DISPLAY=wayland-limux-smoke
 unset DISPLAY
 HOST_PID=""
 WESTON_PID=""
+AGY_SNAP_PID=""
 
 start_compositor() {
   setsid weston \
@@ -365,6 +366,9 @@ cleanup() {
   local rc=$?
   echo
   echo "-- cleanup (rc=$rc) --"
+  if [ -n "$AGY_SNAP_PID" ] && kill -0 "$AGY_SNAP_PID" 2>/dev/null; then
+    kill -KILL "$AGY_SNAP_PID" 2>/dev/null || true
+  fi
   if [ -n "$HOST_PID" ] && kill -0 -- "-$HOST_PID" 2>/dev/null; then
     kill -KILL -- "-$HOST_PID" 2>/dev/null || true
   fi
@@ -1128,25 +1132,76 @@ echo '{"conversationId":"smoke-conv-1","message":"agy done"}' \
 jq -e '.decision == "allow"' "$LOG_DIR/stage7-agy-stop.json" >/dev/null \
   || { echo "FAIL: hooks agy stop did not emit {\"decision\":\"allow\"}"; exit 1; }
 HOME="$AGY_SMOKE_HOME" "$LIMUX_CLI" hooks agy uninstall >"$LOG_DIR/stage7-agy-uninstall.txt"
-echo "stage 7: OK (claude-hook and agy-hook accepted JSON on stdin)"
+AGY_SNAP_BIN="$DEMO_DIR/agy-snap-bin"
+AGY_SNAP_PRESENCE="$DEMO_DIR/agy-snap-home/.gemini/antigravity-cli/presence"
+mkdir -p "$AGY_SNAP_BIN" "$AGY_SNAP_PRESENCE"
+cat > "$AGY_SNAP_BIN/agy" <<'PY'
+#!/usr/bin/python3
+import os, pathlib, time
+fh = open(os.environ["AGY_SMOKE_LOCK"], "r")
+pathlib.Path(os.environ["AGY_SMOKE_READY"]).write_text("ready")
+time.sleep(30)
+PY
+chmod 700 "$AGY_SNAP_BIN/agy"
+: > "$AGY_SNAP_PRESENCE/smoke-live-conv.lock"
+rm -f "$DEMO_DIR/agy-snap-ready"
+LIMUX_WORKSPACE_ID="$WORKSPACE_ID" \
+  LIMUX_SURFACE_ID="$CLAUDE_SURFACE" \
+  LIMUX_SOCKET="$SOCKET" \
+  AGY_SMOKE_LOCK="$AGY_SNAP_PRESENCE/smoke-live-conv.lock" \
+  AGY_SMOKE_READY="$DEMO_DIR/agy-snap-ready" \
+  "$AGY_SNAP_BIN/agy" --dangerously-skip-permissions &
+AGY_SNAP_PID=$!
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/agy-snap-ready" ] && break
+  sleep 0.05
+done
+[ -f "$DEMO_DIR/agy-snap-ready" ] \
+  || { echo "FAIL: agy snapshot fixture did not open presence lock"; exit 1; }
+"$LIMUX_CLI" --json hooks snapshot agy --save-session >"$LOG_DIR/stage7-hooks-snapshot.json"
+kill "$AGY_SNAP_PID" 2>/dev/null || true
+wait "$AGY_SNAP_PID" 2>/dev/null || true
+AGY_SNAP_PID=""
+jq -e --arg ws "$WORKSPACE_ID" --arg surf "$CLAUDE_SURFACE" --arg path "$XDG_DATA_HOME/limux/session.json" '
+  .dry_run == false and
+  (.captured | length) == 1 and
+  .captured[0].agent == "agy" and
+  .captured[0].session_id == "smoke-live-conv" and
+  .captured[0].source == "open_fd" and
+  .captured[0].workspace_id == $ws and
+  .captured[0].surface_id == $surf and
+  .session_save.saved == true and
+  .session_save.path == $path and
+  (.session_save.restorable_agents // 0) >= 1
+' "$LOG_DIR/stage7-hooks-snapshot.json" >/dev/null \
+  || { echo "FAIL: hooks snapshot --save-session did not capture and save live agy presence lock"; cat "$LOG_DIR/stage7-hooks-snapshot.json"; exit 1; }
+jq -e '.sessions["smoke-live-conv"].launch_command.arguments == ["'"$AGY_SNAP_BIN"'/agy", "--dangerously-skip-permissions"]' \
+  "$XDG_STATE_HOME/limux/agy-hook-sessions.json" >/dev/null \
+  || { echo "FAIL: hooks snapshot did not persist launch command"; cat "$XDG_STATE_HOME/limux/agy-hook-sessions.json"; exit 1; }
+jq -e '[.workspaces[].layout | .. | objects | select(.agent?.kind == "agy" and .agent?.session_id == "smoke-live-conv")] | length >= 1' \
+  "$XDG_DATA_HOME/limux/session.json" >/dev/null \
+  || { echo "FAIL: save-session did not attach snapshotted agy agent into session.json"; cat "$XDG_DATA_HOME/limux/session.json"; exit 1; }
+# Clear the synthetic fixture binding so Stage 8 restarts normal shells cleanly.
+rm -f "$XDG_STATE_HOME/limux/agy-hook-sessions.json" "$XDG_STATE_HOME/limux/agy-hook-sessions.lock"
+echo "stage 7: OK (claude-hook, agy-hook, and live hooks snapshot --save-session verified)"
 
 # --- 11. Stage 8: session persistence and clean process restart -----------
 echo
 echo "== stage 8: session persistence and host restart =="
 RESTORED_WORKSPACE="limux-restored"
 "$LIMUX_CLI" rename-workspace --workspace "$WORKSPACE_ID" "$RESTORED_WORKSPACE"
-for _ in $(seq 1 50); do
-  if jq -e --arg name "$RESTORED_WORKSPACE" \
-    '.workspaces | any(.name == $name)' \
-    "$XDG_DATA_HOME/limux/session.json" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.1
-done
+"$LIMUX_CLI" --json save-session >"$LOG_DIR/stage8-save-session.json"
+jq -e --arg path "$XDG_DATA_HOME/limux/session.json" '
+  .saved == true and
+  .path == $path and
+  (.workspaces // 0) >= 1 and
+  (.tabs // 0) >= 4
+' "$LOG_DIR/stage8-save-session.json" >/dev/null \
+  || { echo "FAIL: save-session RPC did not report a saved session"; cat "$LOG_DIR/stage8-save-session.json"; exit 1; }
 jq -e --arg name "$RESTORED_WORKSPACE" \
   '.workspaces | any(.name == $name)' \
   "$XDG_DATA_HOME/limux/session.json" >/dev/null \
-  || { echo "FAIL: renamed workspace was not persisted"; exit 1; }
+  || { echo "FAIL: renamed workspace was not persisted by save-session"; exit 1; }
 
 stop_host
 start_host host-restart

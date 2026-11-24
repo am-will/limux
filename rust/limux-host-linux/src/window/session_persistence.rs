@@ -90,10 +90,78 @@ pub(super) fn report_session_save_notice(state: &State, detail: String) {
     show_runtime_error(state, "Session could not be merged", &detail);
 }
 
-pub(super) fn save_session_now(state: &State) {
-    let store = {
+pub(super) fn save_session_for_rpc(
+    state: &State,
+    reply: std::sync::mpsc::Sender<crate::control_bridge::BridgeResult>,
+) {
+    {
         let mut s = state.borrow_mut();
         if s.persistence_suspended {
+            let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                "session persistence is suspended",
+            )));
+            return;
+        }
+        if s.session_close_dialog_open {
+            let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                "session close dialog is open",
+            )));
+            return;
+        }
+        s.session_save_waiters.push(reply);
+    }
+    save_session_now(state);
+}
+
+fn reject_session_save_waiters(
+    waiters: Vec<std::sync::mpsc::Sender<crate::control_bridge::BridgeResult>>,
+    error: crate::control_bridge::BridgeError,
+) {
+    for waiter in waiters {
+        let _ = waiter.send(Err(error.clone()));
+    }
+}
+
+fn notify_session_save_waiters(
+    waiters: Vec<std::sync::mpsc::Sender<crate::control_bridge::BridgeResult>>,
+    result: &Result<crate::session_store::SaveOutcome, String>,
+) {
+    if waiters.is_empty() {
+        return;
+    }
+    let response = match result {
+        Ok(crate::session_store::SaveOutcome::Saved(summary)) => Ok(serde_json::json!({
+            "saved": true,
+            "path": summary.path.to_string_lossy(),
+            "workspaces": summary.workspaces,
+            "tabs": summary.tabs,
+            "restorable_agents": summary.restorable_agents,
+        })),
+        Ok(crate::session_store::SaveOutcome::Conflict {
+            recovery,
+            workspaces,
+        }) => Err(crate::control_bridge::BridgeError::conflict(
+            session_conflict_detail(recovery, workspaces),
+        )),
+        Err(error) => Err(crate::control_bridge::BridgeError::internal(format!(
+            "Failed to save session: {error}"
+        ))),
+    };
+    for waiter in waiters {
+        let _ = waiter.send(response.clone());
+    }
+}
+
+pub(super) fn save_session_now(state: &State) {
+    let (store, waiters) = {
+        let mut s = state.borrow_mut();
+        if s.persistence_suspended {
+            let waiters = std::mem::take(&mut s.session_save_waiters);
+            drop(s);
+            reject_session_save_waiters(
+                waiters,
+                crate::control_bridge::BridgeError::conflict("session persistence is suspended"),
+            );
             return;
         }
         if let Some(timer) = s.session_save_timer.take() {
@@ -101,25 +169,36 @@ pub(super) fn save_session_now(state: &State) {
         }
         if s.session_close_dialog_open {
             s.save_queued = true;
+            let waiters = std::mem::take(&mut s.session_save_waiters);
+            drop(s);
+            reject_session_save_waiters(
+                waiters,
+                crate::control_bridge::BridgeError::conflict("session close dialog is open"),
+            );
             return;
         }
         s.save_queued = false;
         match s.session_store.as_mut() {
             Ok(store) => match store.take() {
-                Some(store) => Ok(store),
+                Some(store) => (Ok(store), std::mem::take(&mut s.session_save_waiters)),
                 None => {
                     // The in-flight writer owns the store and its merge ancestry.
-                    // Its completion captures the latest GTK state before saving again.
+                    // Its completion captures the latest GTK state before saving again,
+                    // carrying any queued RPC waiters onto that fresh save.
                     s.save_queued = true;
                     return;
                 }
             },
-            Err(error) => Err(format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")),
+            Err(error) => (
+                Err(format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")),
+                std::mem::take(&mut s.session_save_waiters),
+            ),
         }
     };
     let store = match store {
         Ok(store) => store,
         Err(error) => {
+            notify_session_save_waiters(waiters, &Err(error.clone()));
             finish_session_save(state, Err(error));
             return;
         }
@@ -135,6 +214,12 @@ pub(super) fn save_session_now(state: &State) {
                 // saving, including control-socket commands behind a modal dialog.
                 let closing = state.borrow().session_close_pending.is_some();
                 if closing && result.is_ok() && snapshot_session_state(&state) != saved_session {
+                    if !waiters.is_empty() {
+                        let mut s = state.borrow_mut();
+                        let mut requeued = waiters;
+                        requeued.append(&mut s.session_save_waiters);
+                        s.session_save_waiters = requeued;
+                    }
                     save_session_now(&state);
                     return;
                 }
@@ -146,11 +231,25 @@ pub(super) fn save_session_now(state: &State) {
                 Err(error)
             }
         };
+        notify_session_save_waiters(waiters, &result);
         finish_session_save(&state, result);
-        let pending = {
-            let s = state.borrow();
-            s.save_queued && s.session_save_timer.is_none() && !s.session_close_dialog_open
+        let (pending, dialog_waiters) = {
+            let mut s = state.borrow_mut();
+            let dialog_waiters = if s.session_close_dialog_open {
+                std::mem::take(&mut s.session_save_waiters)
+            } else {
+                Vec::new()
+            };
+            let pending =
+                s.save_queued && s.session_save_timer.is_none() && !s.session_close_dialog_open;
+            (pending, dialog_waiters)
         };
+        if !dialog_waiters.is_empty() {
+            reject_session_save_waiters(
+                dialog_waiters,
+                crate::control_bridge::BridgeError::conflict("session close dialog is open"),
+            );
+        }
         if pending {
             save_session_now(&state);
         }
@@ -167,7 +266,7 @@ pub(super) fn finish_session_save(
         return;
     }
     match result {
-        Ok(crate::session_store::SaveOutcome::Saved) => {
+        Ok(crate::session_store::SaveOutcome::Saved(_)) => {
             state.borrow_mut().session_save_notice = None
         }
         Ok(crate::session_store::SaveOutcome::Conflict {
@@ -215,14 +314,22 @@ pub(super) fn finish_session_close(
     result: Result<crate::session_store::SaveOutcome, String>,
 ) {
     match result {
-        Ok(crate::session_store::SaveOutcome::Saved) => close_after_session_save(state),
+        Ok(crate::session_store::SaveOutcome::Saved(_)) => close_after_session_save(state),
         Err(error) => {
             let window = state.borrow().window.clone();
             let dialog = gtk::AlertDialog::builder().modal(true)
                 .message("Close without saving this session?")
                 .detail(format!("The session could not be saved: {error}. Closing will discard this window's unsaved session changes."))
                 .buttons(["Cancel", "Close without Saving"]).cancel_button(0).default_button(0).build();
-            state.borrow_mut().session_close_dialog_open = true;
+            let waiters = {
+                let mut s = state.borrow_mut();
+                s.session_close_dialog_open = true;
+                std::mem::take(&mut s.session_save_waiters)
+            };
+            reject_session_save_waiters(
+                waiters,
+                crate::control_bridge::BridgeError::conflict("session close dialog is open"),
+            );
             let state = state.clone();
             dialog.choose(Some(&window), gio::Cancellable::NONE, move |answer| {
                 state.borrow_mut().session_close_dialog_open = false;
@@ -251,7 +358,15 @@ pub(super) fn finish_session_close(
                 .cancel_button(0)
                 .default_button(0)
                 .build();
-            state.borrow_mut().session_close_dialog_open = true;
+            let waiters = {
+                let mut s = state.borrow_mut();
+                s.session_close_dialog_open = true;
+                std::mem::take(&mut s.session_save_waiters)
+            };
+            reject_session_save_waiters(
+                waiters,
+                crate::control_bridge::BridgeError::conflict("session close dialog is open"),
+            );
             let state = state.clone();
             dialog.choose(Some(&window), gio::Cancellable::NONE, move |answer| {
                 state.borrow_mut().session_close_dialog_open = false;
@@ -273,11 +388,19 @@ pub(super) fn suspend_persistence(state: &State, suspended: bool) {
 }
 
 pub(super) fn stop_session_saves_for_shutdown(state: &State) {
-    let mut s = state.borrow_mut();
-    s.save_queued = false;
-    s.persistence_suspended = true;
-    if let Some(timer) = s.session_save_timer.take() {
-        timer.remove();
+    let waiters = {
+        let mut s = state.borrow_mut();
+        s.save_queued = false;
+        s.persistence_suspended = true;
+        if let Some(timer) = s.session_save_timer.take() {
+            timer.remove();
+        }
+        std::mem::take(&mut s.session_save_waiters)
+    };
+    for waiter in waiters {
+        let _ = waiter.send(Err(crate::control_bridge::BridgeError::conflict(
+            "window is closing",
+        )));
     }
 }
 
@@ -447,4 +570,60 @@ pub(super) fn snapshot_session_state(state: &State) -> AppSessionState {
 
 pub(super) fn sidebar_is_visible(state: &AppState) -> bool {
     state.sidebar_shell.is_visible() && sidebar_width(&state.sidebar_shell) > 10
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_and_reject_session_save_waiters_deliver_expected_bridge_results() {
+        let (tx_ok, rx_ok) = std::sync::mpsc::channel();
+        let summary = crate::session_store::SavedSessionSummary {
+            path: PathBuf::from("/tmp/limux/session.json"),
+            workspaces: 2,
+            tabs: 5,
+            restorable_agents: 1,
+        };
+        notify_session_save_waiters(
+            vec![tx_ok],
+            &Ok(crate::session_store::SaveOutcome::Saved(summary)),
+        );
+        let payload = rx_ok.try_recv().expect("saved reply").expect("ok payload");
+        assert_eq!(payload["saved"], true);
+        assert_eq!(payload["path"], "/tmp/limux/session.json");
+        assert_eq!(payload["workspaces"], 2);
+        assert_eq!(payload["tabs"], 5);
+        assert_eq!(payload["restorable_agents"], 1);
+
+        let (tx_conflict, rx_conflict) = std::sync::mpsc::channel();
+        notify_session_save_waiters(
+            vec![tx_conflict],
+            &Ok(crate::session_store::SaveOutcome::Conflict {
+                recovery: PathBuf::from("/tmp/recovery.json"),
+                workspaces: vec!["ws-1".to_string()],
+            }),
+        );
+        let conflict_err = rx_conflict
+            .try_recv()
+            .expect("conflict reply")
+            .expect_err("conflict error");
+        let conflict_debug = format!("{conflict_err:?}");
+        assert!(conflict_debug.contains("ws-1"), "{conflict_debug}");
+
+        let (tx_dialog, rx_dialog) = std::sync::mpsc::channel();
+        reject_session_save_waiters(
+            vec![tx_dialog],
+            crate::control_bridge::BridgeError::conflict("session close dialog is open"),
+        );
+        let dialog_err = rx_dialog
+            .try_recv()
+            .expect("dialog reply")
+            .expect_err("dialog conflict");
+        let dialog_debug = format!("{dialog_err:?}");
+        assert!(
+            dialog_debug.contains("session close dialog is open"),
+            "{dialog_debug}"
+        );
+    }
 }

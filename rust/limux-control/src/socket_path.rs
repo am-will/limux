@@ -37,6 +37,22 @@ pub fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+pub fn open_regular_file_readonly(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 pub fn default_runtime_dir() -> PathBuf {
     if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
         let candidate = PathBuf::from(&runtime_dir);

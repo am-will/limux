@@ -141,6 +141,7 @@ pub(crate) struct AppState {
     save_queued: bool,
     session_save_timer: Option<glib::SourceId>,
     session_store: Result<Option<crate::session_store::SessionStore>, String>,
+    session_save_waiters: Vec<std::sync::mpsc::Sender<crate::control_bridge::BridgeResult>>,
     session_save_notice: Option<String>,
     session_close_dialog_open: bool,
     session_close_pending: Option<SessionCloseMode>,
@@ -2086,6 +2087,7 @@ pub fn build_window(app: &adw::Application) {
         save_queued: false,
         session_save_timer: None,
         session_store: Err("Session storage has not been initialized".to_string()),
+        session_save_waiters: Vec::new(),
         session_save_notice: None,
         session_close_dialog_open: false,
         session_close_pending: None,
@@ -6017,6 +6019,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let window = state.borrow().window.clone();
             present_existing_window(&window, activation_token.as_deref());
             let _ = reply.send(Ok(serde_json::json!({ "presented": true })));
+        }
+        ControlCommand::SaveSession { reply } => {
+            save_session_for_rpc(state, reply);
         }
         ControlCommand::CurrentWorkspace { reply } => {
             let result = {

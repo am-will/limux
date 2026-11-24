@@ -96,6 +96,65 @@ impl AgentHookSessionStore {
         Ok(file.sessions.get(session_id.as_deref().unwrap()).cloned())
     }
 
+    pub(crate) fn session_for_live_pid(
+        &self,
+        pid: u32,
+        workspace_id: &str,
+        surface_id: &str,
+    ) -> Result<Option<String>> {
+        let file = self.load()?;
+        let target_tab = tab_identity(surface_id);
+        let best = file
+            .sessions
+            .values()
+            .filter(|record| {
+                record.pid == Some(pid)
+                    && record.workspace_id == workspace_id
+                    && (record.surface_id == surface_id
+                        || (!target_tab.is_empty()
+                            && tab_identity(&record.surface_id) == target_tab))
+            })
+            .max_by(|a, b| a.updated_at.total_cmp(&b.updated_at));
+        Ok(best.map(|record| record.session_id.clone()))
+    }
+
+    pub(crate) fn upsert_snapshot(
+        &self,
+        mut record: AgentHookSessionRecord,
+    ) -> Result<Vec<String>> {
+        let Some(session_id) = normalized(&record.session_id) else {
+            return Ok(Vec::new());
+        };
+        record.session_id = session_id.clone();
+        let _lock = self.lock()?;
+        let mut file = self.load()?;
+        let mut superseded = Vec::new();
+        let target_tab = tab_identity(&record.surface_id);
+        file.sessions.retain(|key, existing| {
+            let same_surface = existing.workspace_id == record.workspace_id
+                && (existing.surface_id == record.surface_id
+                    || (!target_tab.is_empty()
+                        && tab_identity(&existing.surface_id) == target_tab));
+            if same_surface && key != &session_id {
+                superseded.push(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        file.ended_sessions.retain(|ended| {
+            ended.session_id != session_id
+                || tab_identity(&ended.surface_id) != tab_identity(&record.surface_id)
+        });
+        prune_ended_sessions(&mut file.ended_sessions, now_seconds(), || {
+            SessionReferences::load(&self.session_dir)
+        });
+        file.version = 1;
+        file.sessions.insert(session_id, record);
+        self.save(&file)?;
+        Ok(superseded)
+    }
+
     pub(crate) fn update(
         &self,
         session_id: &str,
@@ -430,9 +489,31 @@ fn prune_ended_sessions(
     }
 }
 
-fn tab_identity(surface_id: &str) -> &str {
+pub(crate) fn tab_identity(surface_id: &str) -> &str {
     let surface_id = surface_id.trim();
     surface_id.rsplit(':').next().unwrap_or(surface_id)
+}
+
+pub(crate) fn launch_record_from_process(
+    kind: AgentKind,
+    proc_args: Option<&[String]>,
+    proc_cwd: Option<&str>,
+    proc_env: Option<&BTreeMap<String, String>>,
+) -> Option<AgentLaunchCommandRecord> {
+    let args = proc_args
+        .and_then(|raw| normalize_captured_process_args(kind, raw))
+        .unwrap_or_else(|| vec![kind.fallback_executable().to_string()]);
+    let sanitized = sanitize_launch_arguments(kind, &args);
+    let executable = sanitized.first().cloned()?;
+    let environment = proc_env.map(filter_allowed_environment).unwrap_or_default();
+
+    Some(AgentLaunchCommandRecord {
+        executable,
+        arguments: sanitized,
+        cwd: proc_cwd.and_then(normalized),
+        environment,
+        captured_at: Some(now_seconds()),
+    })
 }
 
 pub(crate) fn launch_record_from_context(
@@ -1296,5 +1377,47 @@ mod tests {
             .expect("lookup")
             .expect("record");
         assert_eq!(persisted.updated_at, 250.0);
+    }
+
+    #[test]
+    fn upsert_snapshot_supersedes_same_tab_across_panes_and_clears_ended_tombstone() {
+        let dir = tempdir().expect("tempdir");
+        let store = AgentHookSessionStore::new_for_dir("agy", dir.path());
+
+        let mut old = test_record("old-conv");
+        old.workspace_id = "ws-1".to_string();
+        old.surface_id = "1:tab-a".to_string();
+        old.pid = Some(500);
+        store.update("old-conv", |_| old).expect("seed old");
+        store
+            .remove("new-conv", Some("ws-1"), Some("1:tab-a"))
+            .expect("seed ended tombstone");
+
+        // Tab moved from pane 1 to pane 2 while preserving `tab-a`.
+        assert_eq!(
+            store
+                .session_for_live_pid(500, "ws-1", "2:tab-a")
+                .expect("lookup live pid across pane move"),
+            Some("old-conv".to_string())
+        );
+
+        let mut replacement = test_record("  new-conv  ");
+        replacement.workspace_id = "ws-1".to_string();
+        replacement.surface_id = "2:tab-a".to_string();
+        replacement.pid = Some(600);
+        let superseded = store.upsert_snapshot(replacement).expect("upsert snapshot");
+        assert_eq!(superseded, vec!["old-conv".to_string()]);
+
+        assert!(store.lookup("old-conv").expect("lookup old").is_none());
+        let saved = store
+            .lookup("new-conv")
+            .expect("lookup new")
+            .expect("saved record");
+        assert_eq!(saved.session_id, "new-conv");
+        assert_eq!(saved.surface_id, "2:tab-a");
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).expect("read store")).expect("json");
+        assert!(raw.get("ended_sessions").is_none());
     }
 }
