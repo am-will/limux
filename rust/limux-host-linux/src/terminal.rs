@@ -114,7 +114,7 @@ struct SurfaceEntry {
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
     on_bell: Option<Box<BellCallback>>,
     on_open_url: Option<Rc<OpenUrlCallback>>,
-    on_close: Option<Box<dyn Fn(Option<u32>)>>,
+    on_close: Option<Box<dyn Fn(Option<ChildExit>)>>,
     exit_reported: Cell<bool>,
     hold_config_error: bool,
     clipboard_context: *mut ClipboardContext,
@@ -1828,7 +1828,11 @@ unsafe extern "C" fn ghostty_action_cb(
         }
         GHOSTTY_ACTION_SHOW_CHILD_EXITED => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
-                let exit_code = unsafe { action.action.child_exited }.exit_code;
+                let exited = unsafe { action.action.child_exited };
+                let exit = ChildExit {
+                    code: exited.exit_code,
+                    runtime: std::time::Duration::from_millis(exited.runtime_ms),
+                };
                 let surface_key = unsafe { target.target.surface } as usize;
                 let Some(identity) = current_surface_identity(surface_key) else {
                     return true;
@@ -1845,7 +1849,7 @@ unsafe extern "C" fn ghostty_action_cb(
                             }
                             if let Some(cb) = &entry.on_close {
                                 if !entry.exit_reported.replace(true) {
-                                    cb(Some(exit_code));
+                                    cb(Some(exit));
                                 }
                             }
                         }
@@ -2012,13 +2016,21 @@ unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_al
 // Surface creation
 // ---------------------------------------------------------------------------
 
+/// A terminal's child process ending, as Ghostty reports it. `runtime` is how
+/// long the process itself ran, which a late surface start does not stretch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildExit {
+    pub code: u32,
+    pub runtime: std::time::Duration,
+}
+
 pub struct TerminalCallbacks {
     pub on_output_activity: Rc<dyn Fn(Instant)>,
     pub on_title_changed: Box<TitleChangedCallback>,
     pub on_pwd_changed: Box<PwdChangedCallback>,
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
     pub on_bell: Box<BellCallback>,
-    pub on_close: Box<dyn Fn(Option<u32>)>,
+    pub on_close: Box<dyn Fn(Option<ChildExit>)>,
     pub on_open_url: Box<OpenUrlCallback>,
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
@@ -2794,9 +2806,9 @@ pub fn create_terminal(
                         hold_config_error,
                         on_close: Some(Box::new({
                             let cb = callbacks.clone();
-                            move |code| {
+                            move |exit| {
                                 let callbacks = cb.borrow();
-                                (callbacks.on_close)(code);
+                                (callbacks.on_close)(exit);
                             }
                         })),
                         clipboard_context,

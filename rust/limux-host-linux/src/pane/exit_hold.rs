@@ -9,13 +9,14 @@
 //! does not flash and vanish.
 
 use super::*;
+use crate::terminal::ChildExit;
 use std::time::Duration;
 
 /// Matches Ghostty's `abnormal-command-exit-runtime` default.
 pub(super) const ABNORMAL_EXIT_RUNTIME: Duration = Duration::from_millis(250);
 
 /// An exit this soon after control-socket input was caused by it: whoever
-/// sent it is driving the terminal, so it closes as if watched.
+/// sent it is driving the terminal.
 pub(super) const DRIVEN_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
 pub(super) const EXITED_TAB_CSS_CLASS: &str = "limux-tab-exited";
@@ -31,24 +32,35 @@ pub(super) enum ExitDisposition {
     Hold { notify: bool },
 }
 
-/// `code` is `None` when the surface asked to close itself rather than its
-/// child exiting; that is always a close. `attended` means the tab is the
-/// active tab of a pane shown in the active project of the active window.
-pub(super) fn exit_disposition(
-    code: Option<u32>,
-    attended: bool,
-    runtime: Duration,
-) -> ExitDisposition {
-    let Some(code) = code else {
+/// Who saw a terminal's process end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExitSeen {
+    /// The tab was the active tab of a pane shown in the active project of
+    /// the active window.
+    Watched,
+    /// Not watched, but control-socket input reached the terminal within
+    /// `DRIVEN_EXIT_WINDOW`.
+    Driven,
+    Unseen,
+}
+
+/// `exit` is `None` when the surface asked to close itself rather than its
+/// child exiting; that is always a close.
+pub(super) fn exit_disposition(exit: Option<ChildExit>, seen: ExitSeen) -> ExitDisposition {
+    let Some(exit) = exit else {
         return ExitDisposition::Close;
     };
-    if !attended {
-        return ExitDisposition::Hold { notify: true };
+    let failed = exit.code != 0;
+    match seen {
+        ExitSeen::Watched if failed && exit.runtime <= ABNORMAL_EXIT_RUNTIME => {
+            ExitDisposition::Hold { notify: false }
+        }
+        ExitSeen::Watched => ExitDisposition::Close,
+        // A script that ends a shell is tearing it down; one whose command
+        // failed left output nobody has read.
+        ExitSeen::Driven if !failed => ExitDisposition::Close,
+        ExitSeen::Driven | ExitSeen::Unseen => ExitDisposition::Hold { notify: true },
     }
-    if code != 0 && runtime <= ABNORMAL_EXIT_RUNTIME {
-        return ExitDisposition::Hold { notify: false };
-    }
-    ExitDisposition::Close
 }
 
 /// A non-zero code (signals arrive as one too). Only a failure that nobody
@@ -131,28 +143,26 @@ mod tests {
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(40);
 
-    #[test]
-    fn attended_exit_closes_like_any_terminal() {
-        assert_eq!(
-            exit_disposition(Some(0), true, LONG),
-            ExitDisposition::Close
-        );
-        assert_eq!(
-            exit_disposition(Some(1), true, LONG),
-            ExitDisposition::Close
-        );
-        assert_eq!(
-            exit_disposition(Some(0), true, SHORT),
-            ExitDisposition::Close
-        );
+    fn disposition(code: u32, seen: ExitSeen, runtime: Duration) -> ExitDisposition {
+        exit_disposition(Some(ChildExit { code, runtime }), seen)
     }
 
     #[test]
-    fn unattended_exit_is_held_and_notifies() {
+    fn watched_exit_closes_like_any_terminal() {
+        for (code, runtime) in [(0, LONG), (1, LONG), (0, SHORT)] {
+            assert_eq!(
+                disposition(code, ExitSeen::Watched, runtime),
+                ExitDisposition::Close
+            );
+        }
+    }
+
+    #[test]
+    fn unseen_exit_is_held_and_notifies() {
         for code in [0, 1, 129] {
             for runtime in [SHORT, LONG] {
                 assert_eq!(
-                    exit_disposition(Some(code), false, runtime),
+                    disposition(code, ExitSeen::Unseen, runtime),
                     ExitDisposition::Hold { notify: true }
                 );
             }
@@ -160,21 +170,34 @@ mod tests {
     }
 
     #[test]
-    fn attended_failure_right_after_start_is_held_quietly() {
-        assert_eq!(
-            exit_disposition(Some(127), true, SHORT),
-            ExitDisposition::Hold { notify: false }
-        );
-        assert_eq!(
-            exit_disposition(Some(127), true, ABNORMAL_EXIT_RUNTIME),
-            ExitDisposition::Hold { notify: false }
-        );
+    fn watched_failure_right_after_start_is_held_quietly() {
+        for runtime in [SHORT, ABNORMAL_EXIT_RUNTIME] {
+            assert_eq!(
+                disposition(127, ExitSeen::Watched, runtime),
+                ExitDisposition::Hold { notify: false }
+            );
+        }
+    }
+
+    #[test]
+    fn a_driven_exit_closes_only_when_it_is_clean() {
+        for runtime in [SHORT, LONG] {
+            assert_eq!(
+                disposition(0, ExitSeen::Driven, runtime),
+                ExitDisposition::Close
+            );
+            assert_eq!(
+                disposition(1, ExitSeen::Driven, runtime),
+                ExitDisposition::Hold { notify: true }
+            );
+        }
     }
 
     #[test]
     fn surface_close_request_always_closes() {
-        assert_eq!(exit_disposition(None, false, LONG), ExitDisposition::Close);
-        assert_eq!(exit_disposition(None, true, SHORT), ExitDisposition::Close);
+        for seen in [ExitSeen::Watched, ExitSeen::Driven, ExitSeen::Unseen] {
+            assert_eq!(exit_disposition(None, seen), ExitDisposition::Close);
+        }
     }
 
     #[test]

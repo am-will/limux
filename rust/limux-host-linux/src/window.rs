@@ -3577,6 +3577,12 @@ fn focus_desktop_notification_target(state: &State, target: &DesktopNotification
                         pane::activate_tab_in_pane(&pane_widget, tab_id);
                     }
                     if container.reveal_pane(&pane_widget) {
+                        // The tab was activated while a zoom hid its pane,
+                        // and a rebuild may still keep it out of the window:
+                        // the user was taken to it, so it is read either way.
+                        if let Some(tab_id) = target.tab_id.as_deref() {
+                            pane::mark_tab_read_in_pane(&pane_widget, tab_id);
+                        }
                         return true;
                     }
                 }
@@ -6773,13 +6779,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            handle.note_driven_input();
             if !handle.send_key(&key) {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
                     "unsupported key",
                 )));
                 return;
             }
+            handle.note_driven_input();
             if let Some(map) = payload.as_object_mut() {
                 map.insert("ok".to_string(), serde_json::Value::Bool(true));
             }

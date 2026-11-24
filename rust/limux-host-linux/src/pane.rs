@@ -1003,6 +1003,17 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
     true
 }
 
+/// Mark `tab_id` read for a user who was just taken to it, whether or not its
+/// pane is on screen yet.
+pub fn mark_tab_read_in_pane(pane_widget: &gtk::Widget, tab_id: &str) {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return;
+    };
+    if clear_tab_unread(&internals.tab_state, tab_id) {
+        (internals.callbacks.on_unread_changed)();
+    }
+}
+
 /// Terminal identities and handles, including tabs that have no surface yet.
 pub(crate) fn terminal_tabs_in_pane(
     pane_widget: &gtk::Widget,
@@ -1789,11 +1800,11 @@ fn make_terminal_callbacks(
                 (callbacks_for_bell.on_bell)(source_focused, pane_id, &tab_id);
             }
         }),
-        on_close: Box::new(move |code| {
+        on_close: Box::new(move |exit| {
             let tab_id = tid_for_close.clone();
             // Whether someone watched it end is decided now: the user may open
             // the tab before the deferred handler runs.
-            let exit = terminal_tab_owner(&tab_id).and_then(|pane| {
+            let seen = terminal_tab_owner(&tab_id).and_then(|pane| {
                 let generation = {
                     let tabs = pane.tab_state.borrow();
                     let entry = tabs.tabs.iter().find(|entry| entry.id == tab_id)?;
@@ -1805,11 +1816,18 @@ fn make_terminal_callbacks(
                     (state.generation.clone(), active, driven)
                 };
                 let (generation, active, driven) = generation;
-                Some((generation, driven || (active && pane_is_visible(&pane))))
+                let seen = if active && pane_is_visible(&pane) {
+                    exit_hold::ExitSeen::Watched
+                } else if driven {
+                    exit_hold::ExitSeen::Driven
+                } else {
+                    exit_hold::ExitSeen::Unseen
+                };
+                Some((generation, seen))
             });
-            if let Some((generation, attended)) = exit {
+            if let Some((generation, seen)) = seen {
                 glib::idle_add_local_once(move || {
-                    handle_terminal_exit(&tab_id, code, &generation, attended)
+                    handle_terminal_exit(&tab_id, exit, &generation, seen)
                 });
             }
         }),
@@ -2081,15 +2099,21 @@ fn terminal_tab_owner(tab_id: &str) -> Option<Rc<PaneInternals>> {
     })
 }
 
-/// `attended`: the tab was the active tab of a visible pane when its process
-/// ended.
-fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>, attended: bool) {
+/// `exit` is `None` when the surface asked to close itself rather than its
+/// child exiting. `seen`: who, if anyone, saw the process end.
+fn handle_terminal_exit(
+    tab_id: &str,
+    exit: Option<crate::terminal::ChildExit>,
+    generation: &Rc<()>,
+    seen: exit_hold::ExitSeen,
+) {
+    let code = exit.map(|exit| exit.code);
     let Some(internals) = terminal_tab_owner(tab_id) else {
         return;
     };
     enum ExitStep {
         Reconnect(Rc<()>, std::time::Duration),
-        Decide(std::time::Duration, bool),
+        Decide,
         Hold(String, bool),
     }
     let step = {
@@ -2122,9 +2146,9 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>, at
             // Retain errors and the saved target (e.g. tmux is not installed).
             Some(_) if code.is_some_and(|code| code != 0) => ExitStep::Hold(
                 format!("SSH exited with code {}", code.unwrap_or_default()),
-                !attended,
+                seen != exit_hold::ExitSeen::Watched,
             ),
-            _ => ExitStep::Decide(state.spawned_at.elapsed(), attended),
+            _ => ExitStep::Decide,
         }
     };
     match step {
@@ -2135,16 +2159,14 @@ fn handle_terminal_exit(tab_id: &str, code: Option<u32>, generation: &Rc<()>, at
         ExitStep::Hold(message, background) => {
             hold_exited_terminal(&internals, tab_id, &message, background, true);
         }
-        ExitStep::Decide(runtime, attended) => {
-            match exit_hold::exit_disposition(code, attended, runtime) {
-                exit_hold::ExitDisposition::Close => remove_terminal_tab(&internals, tab_id),
-                exit_hold::ExitDisposition::Hold { notify } => {
-                    let message = exit_hold::exit_message(code.unwrap_or_default());
-                    let failed = exit_hold::exit_failed(code);
-                    hold_exited_terminal(&internals, tab_id, &message, notify, failed);
-                }
+        ExitStep::Decide => match exit_hold::exit_disposition(exit, seen) {
+            exit_hold::ExitDisposition::Close => remove_terminal_tab(&internals, tab_id),
+            exit_hold::ExitDisposition::Hold { notify } => {
+                let message = exit_hold::exit_message(code.unwrap_or_default());
+                let failed = exit_hold::exit_failed(code);
+                hold_exited_terminal(&internals, tab_id, &message, notify, failed);
             }
-        }
+        },
     }
 }
 
