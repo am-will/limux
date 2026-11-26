@@ -18,7 +18,7 @@ pub async fn run_server<P: AsRef<Path>>(
     dispatcher: Dispatcher,
 ) -> io::Result<()> {
     let socket_path = socket_path.as_ref();
-    let control_mode = SocketControlMode::from_env();
+    let control_mode = SocketControlMode::from_env_for_server();
     let listener = bind_tokio_listener(
         socket_path,
         socket_mode,
@@ -28,7 +28,7 @@ pub async fn run_server<P: AsRef<Path>>(
 }
 
 pub async fn serve(listener: UnixListener, dispatcher: Dispatcher) -> io::Result<()> {
-    let control_mode = SocketControlMode::from_env();
+    let control_mode = SocketControlMode::from_env_for_server();
     serve_with_mode(listener, dispatcher, control_mode).await
 }
 

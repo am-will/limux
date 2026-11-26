@@ -1087,10 +1087,12 @@ impl ControlState {
             .get_mut(window_idx)?;
 
         let source_idx = window.panes.iter().position(|pane| pane.id == source_id)?;
+        if !window.panes.iter().any(|pane| pane.id == target_id) {
+            return None;
+        }
         let mut source = window.panes.remove(source_idx);
 
-        let target_idx = window.panes.iter().position(|pane| pane.id == target_id)?;
-        let target = window.panes.get_mut(target_idx)?;
+        let target = window.panes.iter_mut().find(|pane| pane.id == target_id)?;
         let moved_current_id = source.current_surface_id;
         target.surfaces.append(&mut source.surfaces);
         target.last_surface_id = target.current_surface_id;
@@ -2674,7 +2676,7 @@ fn decode_handle_id(raw: &str) -> Option<u64> {
 
     let hex: String = s.chars().filter(|ch| *ch != '-').collect();
     if hex.len() == 32 {
-        let tail = &hex[hex.len().saturating_sub(12)..];
+        let tail = hex.get(20..)?;
         if tail.chars().all(|ch| ch.is_ascii_hexdigit()) {
             return u64::from_str_radix(tail, 16).ok();
         }
@@ -7099,6 +7101,39 @@ mod tests {
             source_url.result.expect("source browser url")["url"],
             "https://cmux.dev/docs"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_rejects_a_non_ascii_handle_and_keeps_serving() {
+        let dispatcher = Dispatcher::new();
+        // 32 bytes, as a UUID without dashes, with a character across byte 20.
+        let handle = format!("{}é{}", "a".repeat(19), "b".repeat(11));
+        let response = dispatcher
+            .dispatch(request(
+                "workspace.close",
+                json!({ "workspace_id": handle }),
+            ))
+            .await;
+        assert_eq!(response.error.map(|error| error.code), Some(-32602));
+        let ping = dispatcher.dispatch(request("system.ping", json!({}))).await;
+        assert!(ping.ok);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_pane_join_with_a_missing_target_keeps_the_source() {
+        let dispatcher = Dispatcher::new();
+        let created = dispatcher.dispatch(request("pane.create", json!({}))).await;
+        let source = created.result.expect("pane created")["pane_id"].clone();
+        let before = dispatcher.dispatch(request("pane.list", json!({}))).await;
+        let response = dispatcher
+            .dispatch(request(
+                "pane.join",
+                json!({ "pane_id": source, "target_pane_id": 9999 }),
+            ))
+            .await;
+        assert!(response.error.is_some());
+        let after = dispatcher.dispatch(request("pane.list", json!({}))).await;
+        assert_eq!(before.result, after.result);
     }
 
     #[tokio::test]

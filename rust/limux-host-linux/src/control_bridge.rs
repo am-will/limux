@@ -330,6 +330,48 @@ pub enum ControlCommand {
 }
 
 impl ControlCommand {
+    /// The workspace this request acts on. Group requests take handles only.
+    pub fn workspace_target(&self) -> Option<&WorkspaceTarget> {
+        match self {
+            Self::CreatePane { request, .. } => Some(&request.target),
+            Self::ListPanes { target, .. }
+            | Self::ListPaneSurfaces { target, .. }
+            | Self::SwapPanes { target, .. }
+            | Self::BreakPane { target, .. }
+            | Self::JoinPane { target, .. }
+            | Self::LastPane { target, .. }
+            | Self::ResizePane { target, .. }
+            | Self::ListSurfaces { target, .. }
+            | Self::SurfaceHealth { target, .. }
+            | Self::ReadSurfaceText { target, .. }
+            | Self::ClearSurfaceHistory { target, .. }
+            | Self::SelectWorkspace { target, .. }
+            | Self::RenameWorkspace { target, .. }
+            | Self::SetWorkspaceColor { target, .. }
+            | Self::CloseWorkspace { target, .. }
+            | Self::SendText { target, .. }
+            | Self::SendKey { target, .. }
+            | Self::CreateSurface { target, .. }
+            | Self::CloseSurface { target, .. }
+            | Self::FocusSurface { target, .. }
+            | Self::FocusPane { target, .. }
+            | Self::TabAction { target, .. }
+            | Self::BrowserOpenSplit { target, .. }
+            | Self::BrowserAction { target, .. }
+            | Self::CreateNotification { target, .. } => Some(target),
+            Self::Identify { .. }
+            | Self::ActivateWindow { .. }
+            | Self::SaveSession { .. }
+            | Self::CurrentWorkspace { .. }
+            | Self::ListWorkspaces { .. }
+            | Self::CreateWorkspace { .. }
+            | Self::RelativeWorkspace { .. }
+            | Self::LastWorkspace { .. }
+            | Self::WorkspaceGroup { .. }
+            | Self::GuiHook { .. } => None,
+        }
+    }
+
     pub fn respond(self, result: BridgeResult) {
         match self {
             Self::Identify { reply, .. }
@@ -658,22 +700,24 @@ fn parse_surface_kind(params: &Map<String, Value>) -> Result<(bool, Option<Strin
 
 fn looks_like_workspace_handle(raw: &str) -> bool {
     let raw = raw.trim();
-    if raw.starts_with("workspace:") {
-        return true;
-    }
-    let value = raw;
-    uuid::Uuid::parse_str(value).is_ok() || value.chars().all(|ch| ch.is_ascii_digit())
+    raw.starts_with("workspace:") || uuid::Uuid::parse_str(raw).is_ok()
 }
 
 fn parse_optional_workspace_target(
     params: &Map<String, Value>,
     allow_name: bool,
 ) -> Result<WorkspaceTarget, BridgeError> {
-    if let Some(handle) = optional_handle(params, &["workspace_id", "id"])? {
-        if allow_name && !looks_like_workspace_handle(&handle) {
-            return Ok(WorkspaceTarget::Name(handle));
-        }
-        return Ok(WorkspaceTarget::Handle(handle));
+    for key in ["workspace_id", "id"] {
+        let Some(handle) = optional_handle(params, &[key])? else {
+            continue;
+        };
+        // A JSON number is an id. Digits in a string are a name.
+        let is_handle = params[key].is_number() || looks_like_workspace_handle(&handle);
+        return Ok(if allow_name && !is_handle {
+            WorkspaceTarget::Name(handle)
+        } else {
+            WorkspaceTarget::Handle(handle)
+        });
     }
     if allow_name {
         if let Some(name) = optional_string(params, &["name"]) {
@@ -1876,7 +1920,7 @@ pub fn start(dispatch: fn(ControlCommand)) {
         .name("limux-control".into())
         .spawn(move || {
             let path = resolve_socket_path(None, SocketMode::Runtime);
-            let control_mode = SocketControlMode::from_env();
+            let control_mode = SocketControlMode::from_env_for_server();
             let listener = match bind_listener(
                 &path,
                 SocketMode::Runtime,
@@ -2175,6 +2219,20 @@ mod tests {
             parse_optional_workspace_target(params.as_object().expect("object params"), true)
                 .expect("target should parse");
         assert_eq!(target, WorkspaceTarget::Name("claude".to_string()));
+    }
+
+    #[test]
+    fn workspace_target_treats_digits_in_a_string_as_a_name() {
+        for (value, expected) in [
+            (json!("2024"), WorkspaceTarget::Name("2024".to_string())),
+            (json!(2024), WorkspaceTarget::Handle("2024".to_string())),
+        ] {
+            let params = json!({ "workspace_id": value });
+            let target =
+                parse_optional_workspace_target(params.as_object().expect("object params"), true)
+                    .expect("target should parse");
+            assert_eq!(target, expected);
+        }
     }
 
     #[test]
