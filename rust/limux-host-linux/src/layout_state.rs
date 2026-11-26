@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -567,9 +566,6 @@ impl RestorableAgentIndex {
                 if index.session_ended(kind, &session_id, surface_tab_id(&surface_id)) {
                     continue;
                 }
-                let tab_id = surface_id
-                    .rsplit_once(':')
-                    .map(|(_, tab_id)| tab_id.to_string());
                 let key = (workspace_id, surface_id);
                 if index
                     .by_surface
@@ -579,11 +575,11 @@ impl RestorableAgentIndex {
                     continue;
                 }
                 index.by_surface.insert(
-                    key.clone(),
+                    key,
                     (
                         RestorableAgentState {
                             kind,
-                            session_id: session_id.clone(),
+                            session_id,
                             cwd: record.cwd.clone(),
                             launch_command: record.launch_command.clone(),
                             restore_on_startup: true,
@@ -591,45 +587,28 @@ impl RestorableAgentIndex {
                         record.updated_at,
                     ),
                 );
-                match index.by_any_workspace_surface.entry(key.1) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(Some((
-                            RestorableAgentState {
-                                kind,
-                                session_id: session_id.clone(),
-                                cwd: record.cwd.clone(),
-                                launch_command: record.launch_command.clone(),
-                                restore_on_startup: true,
-                            },
-                            record.updated_at,
-                        )));
-                    }
-                    Entry::Occupied(mut entry) => {
-                        entry.insert(None);
-                    }
-                }
-                if let Some(tab_id) = tab_id {
-                    match index.by_tab_id.entry(tab_id) {
-                        Entry::Vacant(entry) => {
-                            entry.insert(Some((
-                                RestorableAgentState {
-                                    kind,
-                                    session_id: session_id.clone(),
-                                    cwd: record.cwd.clone(),
-                                    launch_command: record.launch_command.clone(),
-                                    restore_on_startup: true,
-                                },
-                                record.updated_at,
-                            )));
-                        }
-                        Entry::Occupied(mut entry) => {
-                            entry.insert(None);
-                        }
-                    }
-                }
             }
         }
+        index.index_moved_surfaces();
         index
+    }
+
+    /// Find a moved tab by its surface or tab id alone. Only the newest session
+    /// of each surface counts, so a tab's earlier sessions do not make it
+    /// ambiguous.
+    fn index_moved_surfaces(&mut self) {
+        for ((_, surface_id), newest) in &self.by_surface {
+            self.by_any_workspace_surface
+                .entry(surface_id.clone())
+                .and_modify(|candidate| *candidate = None)
+                .or_insert_with(|| Some(newest.clone()));
+            if let Some((_, tab_id)) = surface_id.rsplit_once(':') {
+                self.by_tab_id
+                    .entry(tab_id.to_string())
+                    .and_modify(|candidate| *candidate = None)
+                    .or_insert_with(|| Some(newest.clone()));
+            }
+        }
     }
 
     pub fn agent_for_surface(
@@ -1580,6 +1559,43 @@ mod tests {
             .agent_for_surface("workspace-a", Some(42), "terminal-0")
             .expect("exact surface match");
         assert_eq!(exact_agent.session_id, "session-a");
+    }
+
+    #[test]
+    fn hook_index_uses_the_newest_session_of_a_moved_tab() {
+        let dir = tempdir().expect("tempdir");
+        let record = |session_id: &str, updated_at: f64| {
+            serde_json::json!({
+                "session_id": session_id,
+                "workspace_id": "workspace-a",
+                "surface_id": "42:tab-a",
+                "updated_at": updated_at
+            })
+        };
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {
+                    "a-earlier": record("a-earlier", 10.0),
+                    "b-newest": record("b-newest", 11.0)
+                }
+            })
+            .to_string(),
+        )
+        .expect("write hook state");
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+
+        for (workspace_id, pane_id) in [
+            ("workspace-a", Some(42)),
+            ("workspace-a", Some(7)),
+            ("workspace-b", Some(42)),
+        ] {
+            let agent = index
+                .agent_for_surface(workspace_id, pane_id, "tab-a")
+                .expect("agent of the moved tab");
+            assert_eq!(agent.session_id, "b-newest");
+        }
     }
 
     #[test]

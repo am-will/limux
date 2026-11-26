@@ -514,6 +514,32 @@ fn merge_keeps_selected_workspace_by_identity_and_local_reordering() {
 }
 
 #[test]
+fn new_workspace_is_saved_where_the_sidebar_shows_it() {
+    let dir = tempdir().unwrap();
+    let mut local = initial(dir.path());
+    let (mut store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    local.workspaces.insert(0, workspace(3));
+    local.workspaces.insert(2, workspace(4));
+    local.workspaces.push(workspace(5));
+    saved(&mut store, &local);
+    assert_eq!(workspace_order(&disk(dir.path())), workspace_order(&local));
+}
+
+#[test]
+fn favorite_saved_for_the_first_time_does_not_make_a_later_reorder_conflict() {
+    let dir = tempdir().unwrap();
+    let mut local = initial(dir.path());
+    let (mut store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let mut favorite = workspace(3);
+    favorite.favorite = true;
+    local.workspaces.insert(0, favorite);
+    saved(&mut store, &local);
+    local.workspaces.swap(1, 2);
+    saved(&mut store, &local);
+    assert_eq!(workspace_order(&disk(dir.path())), workspace_order(&local));
+}
+
+#[test]
 fn local_reorder_preserves_remote_addition_order() {
     let dir = tempdir().unwrap();
     let base = initial(dir.path());
