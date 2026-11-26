@@ -22,6 +22,7 @@ mod terminal_notifications;
 
 const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_STATE_LOCK_RETRY: Duration = Duration::from_millis(25);
+const HOOK_OSC_ENV: &str = "env LIMUX_NOTIFY_OSC=1 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdFormat {
@@ -2089,45 +2090,39 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
 }
 
 fn install_agy_hooks(path: &Path, osc: bool) -> Result<()> {
+    let agent = agent_hooks::AgentKind::Agy;
+    let mut desired = Vec::new();
+    for (agent_event, limux_event, fallback_json) in [
+        ("SessionStart", "session-start", "{}"),
+        ("PreInvocation", "pre-invocation", "{}"),
+        ("Stop", "stop", "{\"decision\":\"allow\"}"),
+    ] {
+        desired.push((
+            agent_event,
+            json!({
+                "type": "command",
+                "command": hook_command_with_fallback(agent, limux_event, osc, fallback_json)?,
+                "timeout": hook_timeout(agent)
+            }),
+        ));
+    }
+
     let mut root = read_json_object(path)?;
-    let marker = hook_marker(agent_hooks::AgentKind::Agy);
-    prune_agy_limux_entries(&mut root, marker);
-    root.insert(
-        "limux".to_string(),
-        json!({
-            "SessionStart": [{
-                "type": "command",
-                "command": hook_command_with_fallback(
-                    agent_hooks::AgentKind::Agy,
-                    "session-start",
-                    osc,
-                    "{}",
-                )?,
-                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
-            }],
-            "PreInvocation": [{
-                "type": "command",
-                "command": hook_command_with_fallback(
-                    agent_hooks::AgentKind::Agy,
-                    "pre-invocation",
-                    osc,
-                    "{}",
-                )?,
-                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
-            }],
-            "Stop": [{
-                "type": "command",
-                "command": hook_command_with_fallback(
-                    agent_hooks::AgentKind::Agy,
-                    "stop",
-                    osc,
-                    "{\"decision\":\"allow\"}",
-                )?,
-                "timeout": hook_timeout(agent_hooks::AgentKind::Agy)
-            }]
-        }),
-    );
-    write_json_object(path, &root)
+    let before = root.clone();
+    for (_, group) in root.iter_mut().filter(|(name, _)| *name != "limux") {
+        if let Some(events) = group.as_object_mut() {
+            prune_limux_hooks(events, agent, &[]);
+        }
+    }
+    drop_emptied_objects(&mut root, &before);
+    let group = root
+        .entry("limux".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let events = group
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} has non-object limux hooks", path.display()))?;
+    merge_limux_hooks(path, events, agent, &desired)?;
+    write_changed_json_object(path, &before, &root)
 }
 
 fn uninstall_agy_hooks(path: &Path) -> Result<()> {
@@ -2135,36 +2130,14 @@ fn uninstall_agy_hooks(path: &Path) -> Result<()> {
         return Ok(());
     }
     let mut root = read_json_object(path)?;
-    let marker = hook_marker(agent_hooks::AgentKind::Agy);
-    prune_agy_limux_entries(&mut root, marker);
-    write_json_object(path, &root)
-}
-
-fn prune_agy_limux_entries(root: &mut Map<String, Value>, marker: &str) {
+    let before = root.clone();
     for group in root.values_mut() {
         if let Some(events) = group.as_object_mut() {
-            for handlers in events.values_mut() {
-                if let Some(entries) = handlers.as_array_mut() {
-                    entries.retain(|entry| !json_value_contains(entry, marker));
-                }
-            }
-            events.retain(|_, handlers| {
-                handlers
-                    .as_array()
-                    .map(|entries| !entries.is_empty())
-                    .unwrap_or(true)
-            });
+            prune_limux_hooks(events, agent_hooks::AgentKind::Agy, &[]);
         }
     }
-    root.retain(|name, group| {
-        if name == "limux" && json_value_contains(group, marker) {
-            return false;
-        }
-        group
-            .as_object()
-            .map(|events| !events.is_empty())
-            .unwrap_or(true)
-    });
+    drop_emptied_objects(&mut root, &before);
+    write_changed_json_object(path, &before, &root)
 }
 
 fn install_json_hooks(
@@ -2173,34 +2146,8 @@ fn install_json_hooks(
     osc: bool,
     events: &[(&str, &str)],
 ) -> Result<()> {
-    let mut root = read_json_object(path)?;
-    let hooks = root
-        .entry("hooks".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let hooks = hooks
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("{} has non-object hooks field", path.display()))?;
-    let marker = hook_marker(agent);
-    for value in hooks.values_mut() {
-        if let Some(entries) = value.as_array_mut() {
-            entries.retain(|entry| !json_value_contains(entry, marker));
-        }
-    }
-    hooks.retain(|_, value| {
-        value
-            .as_array()
-            .map(|entries| !entries.is_empty())
-            .unwrap_or(true)
-    });
-
+    let mut desired = Vec::new();
     for (agent_event, limux_event) in events {
-        let entries = hooks
-            .entry((*agent_event).to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let entries = entries
-            .as_array_mut()
-            .ok_or_else(|| anyhow!("{} hook {agent_event} is not an array", path.display()))?;
-        entries.retain(|entry| !json_value_contains(entry, marker));
         let mut entry = json!({
             "hooks": [{
                 "type": "command",
@@ -2212,10 +2159,138 @@ fn install_json_hooks(
         if matches!(agent, agent_hooks::AgentKind::Claude) {
             entry["matcher"] = Value::String("*".to_string());
         }
-        entries.push(entry);
+        desired.push((*agent_event, entry));
     }
 
-    write_json_object(path, &root)
+    let mut root = read_json_object(path)?;
+    let before = root.clone();
+    let hooks = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} has non-object hooks field", path.display()))?;
+    merge_limux_hooks(path, hooks, agent, &desired)?;
+    write_changed_json_object(path, &before, &root)
+}
+
+/// Replace this agent's Limux handlers in `events` with the `desired` entries.
+/// Every other handler keeps its place, and so does an entry that is current.
+fn merge_limux_hooks(
+    path: &Path,
+    events: &mut Map<String, Value>,
+    agent: agent_hooks::AgentKind,
+    desired: &[(&str, Value)],
+) -> Result<()> {
+    prune_limux_hooks(events, agent, desired);
+    for (event, entry) in desired {
+        let entries = events
+            .entry((*event).to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("{} hook {event} is not an array", path.display()))?;
+        if !entries.contains(entry) {
+            entries.push(entry.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Drop this agent's Limux handlers, except one copy of each `keep` entry. A
+/// matcher group or an event goes away only when that leaves it empty.
+fn prune_limux_hooks(
+    events: &mut Map<String, Value>,
+    agent: agent_hooks::AgentKind,
+    keep: &[(&str, Value)],
+) {
+    events.retain(|event, value| {
+        let Some(entries) = value.as_array_mut() else {
+            return true;
+        };
+        let mut current = keep
+            .iter()
+            .find_map(|(name, entry)| (name == event).then_some(entry));
+        let count = entries.len();
+        entries.retain_mut(|entry| {
+            if current.is_some_and(|keep| keep == entry) {
+                current = None;
+                return true;
+            }
+            if is_limux_handler(entry, agent) {
+                return false;
+            }
+            let Some(handlers) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let count = handlers.len();
+            handlers.retain(|handler| !is_limux_handler(handler, agent));
+            handlers.len() == count || !handlers.is_empty()
+        });
+        entries.len() == count || !entries.is_empty()
+    });
+}
+
+/// Drop the objects in `root` that lost their last member since `before`.
+fn drop_emptied_objects(root: &mut Map<String, Value>, before: &Map<String, Value>) {
+    root.retain(|name, value| {
+        let empty = value.as_object().is_some_and(Map::is_empty);
+        !empty || before.get(name) == Some(value)
+    });
+}
+
+fn is_limux_handler(handler: &Value, agent: agent_hooks::AgentKind) -> bool {
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| is_limux_hook_command(command, agent))
+}
+
+/// Whether `command` is one Limux wrote for `agent`, or the bare call inside it:
+/// `[ <guard> ] && [env LIMUX_NOTIFY_OSC=1] <cli> --json hooks <agent> <event> || echo '<json>'`
+/// Anything else is the user's own, even if it calls Limux along the way.
+fn is_limux_hook_command(command: &str, agent: agent_hooks::AgentKind) -> bool {
+    let guard = format!("{} && ", hook_guard(agent));
+    let (guarded, rest) = match command.strip_prefix(&guard) {
+        Some(rest) => (true, rest),
+        None => (false, command),
+    };
+    let rest = match rest.rsplit_once(" || echo ") {
+        Some((rest, fallback)) if unquote_shell_word(fallback).is_some() => rest,
+        Some(_) => return false,
+        None => rest,
+    };
+    let rest = rest.strip_prefix(HOOK_OSC_ENV).unwrap_or(rest);
+    let Some((cli, event)) = rest.rsplit_once(&format!(" hooks {} ", agent.store_name())) else {
+        return false;
+    };
+    let Some(cli) = unquote_shell_word(cli.strip_suffix(" --json").unwrap_or(cli)) else {
+        return false;
+    };
+    // A guarded command names the Limux agent variable, so any CLI path is ours.
+    let calls_limux = guarded
+        || Path::new(&cli)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "limux" | "limux-cli" | "limux-host-cli"));
+    calls_limux
+        && !event.is_empty()
+        && event
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+/// The value of one shell word: single-quoted as `shell_single_quote` writes it,
+/// or bare without characters the shell would expand or split on.
+fn unquote_shell_word(word: &str) -> Option<String> {
+    if let Some(quoted) = word.strip_prefix('\'') {
+        let parts: Vec<&str> = quoted.strip_suffix('\'')?.split("'\\''").collect();
+        return (!parts.iter().any(|part| part.contains('\''))).then(|| parts.join("'"));
+    }
+    (!word.is_empty()
+        && word
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | '+' | '~')))
+    .then(|| word.to_string())
 }
 
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
@@ -2231,21 +2306,12 @@ fn uninstall_json_hooks(path: &Path, agent: agent_hooks::AgentKind) -> Result<()
         return Ok(());
     }
     let mut root = read_json_object(path)?;
+    let before = root.clone();
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
-        let marker = hook_marker(agent);
-        for value in hooks.values_mut() {
-            if let Some(entries) = value.as_array_mut() {
-                entries.retain(|entry| !json_value_contains(entry, marker));
-            }
-        }
-        hooks.retain(|_, value| {
-            value
-                .as_array()
-                .map(|entries| !entries.is_empty())
-                .unwrap_or(true)
-        });
+        prune_limux_hooks(hooks, agent, &[]);
     }
-    write_json_object(path, &root)
+    drop_emptied_objects(&mut root, &before);
+    write_changed_json_object(path, &before, &root)
 }
 
 fn install_opencode_plugin() -> Result<()> {
@@ -2261,6 +2327,7 @@ fn install_opencode_plugin() -> Result<()> {
 fn opencode_config_register_plugin(plugin_path: &Path) -> Result<()> {
     let config_path = opencode_config_path();
     let mut root = read_json_object(&config_path)?;
+    let before = root.clone();
     let plugins = root
         .entry("plugin".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -2271,7 +2338,7 @@ fn opencode_config_register_plugin(plugin_path: &Path) -> Result<()> {
     if !plugins.iter().any(|v| v.as_str() == Some(&plugin_str)) {
         plugins.push(Value::String(plugin_str));
     }
-    write_json_object(&config_path, &root)
+    write_changed_json_object(&config_path, &before, &root)
 }
 
 fn opencode_config_unregister_plugin() -> Result<()> {
@@ -2282,10 +2349,11 @@ fn opencode_config_unregister_plugin() -> Result<()> {
     let plugin_path = opencode_plugin_path();
     let plugin_str = plugin_path.to_string_lossy().into_owned();
     let mut root = read_json_object(&config_path)?;
+    let before = root.clone();
     if let Some(plugins) = root.get_mut("plugin").and_then(Value::as_array_mut) {
         plugins.retain(|v| v.as_str() != Some(&plugin_str));
     }
-    write_json_object(&config_path, &root)
+    write_changed_json_object(&config_path, &before, &root)
 }
 
 fn hook_command(agent: agent_hooks::AgentKind, event: &str, osc: bool) -> Result<String> {
@@ -2303,22 +2371,26 @@ fn hook_command_with_fallback(
     osc: bool,
     fallback_json: &str,
 ) -> Result<String> {
-    let disable_var = format!(
-        "LIMUX_{}_HOOKS_DISABLED",
-        agent.store_name().to_ascii_uppercase()
-    );
+    let guard = hook_guard(agent);
     let limux_command = hook_cli_command()?;
     let limux_command = if osc {
-        format!("env LIMUX_NOTIFY_OSC=1 {limux_command}")
+        format!("{HOOK_OSC_ENV}{limux_command}")
     } else {
         limux_command
     };
     Ok(format!(
-        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo {}",
+        "{guard} && {limux_command} --json hooks {} {} || echo {}",
         agent.store_name(),
         event,
         shell_single_quote(fallback_json)
     ))
+}
+
+fn hook_guard(agent: agent_hooks::AgentKind) -> String {
+    format!(
+        "[ \"${{LIMUX_{}_HOOKS_DISABLED:-}}\" != \"1\" ]",
+        agent.store_name().to_ascii_uppercase()
+    )
 }
 
 fn hook_cli_command() -> Result<String> {
@@ -2355,16 +2427,6 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
-    match agent {
-        agent_hooks::AgentKind::Claude => "hooks claude",
-        agent_hooks::AgentKind::Codex => "hooks codex",
-        agent_hooks::AgentKind::OpenCode => "hooks opencode",
-        agent_hooks::AgentKind::Gemini => "hooks gemini",
-        agent_hooks::AgentKind::Agy => "hooks agy",
-    }
-}
-
 fn read_json_object(path: &Path) -> Result<Map<String, Value>> {
     if !path.exists() {
         return Ok(Map::new());
@@ -2382,26 +2444,48 @@ fn read_json_object(path: &Path) -> Result<Map<String, Value>> {
         .ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))
 }
 
-fn write_json_object(path: &Path, object: &Map<String, Value>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+/// Agent configs are user files: leave them alone when nothing changed, and
+/// otherwise replace the file a symlink points at while keeping its mode.
+fn write_changed_json_object(
+    path: &Path,
+    before: &Map<String, Value>,
+    object: &Map<String, Value>,
+) -> Result<()> {
+    if before == object {
+        return Ok(());
     }
-    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let target = resolve_symlinks(path)?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let encoded = serde_json::to_vec_pretty(object).context("failed to encode hook config")?;
-    fs::write(&temp, encoded).with_context(|| format!("failed to write {}", temp.display()))?;
-    fs::rename(&temp, path).with_context(|| format!("failed to replace {}", path.display()))
+    // The temporary file is private, and removed unless it replaces the target.
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to stage {}", target.display()))?;
+    std::io::Write::write_all(&mut temp, &encoded)
+        .with_context(|| format!("failed to write {}", temp.path().display()))?;
+    if let Ok(existing) = fs::metadata(&target) {
+        fs::set_permissions(temp.path(), existing.permissions())
+            .with_context(|| format!("failed to keep the mode of {}", target.display()))?;
+    }
+    temp.persist(&target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", target.display()))?;
+    Ok(())
 }
 
-fn json_value_contains(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(value) => value.contains(needle),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| json_value_contains(value, needle)),
-        Value::Object(map) => map.values().any(|value| json_value_contains(value, needle)),
-        _ => false,
+/// The file `path` names, following links even when the last target is missing.
+fn resolve_symlinks(path: &Path) -> Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::read_link(&target) {
+            Ok(link) => target = target.parent().unwrap_or(Path::new("")).join(link),
+            Err(_) => return Ok(target),
+        }
     }
+    bail!("too many symbolic links at {}", path.display())
 }
 
 fn non_empty_env_path(name: &str) -> Option<PathBuf> {
@@ -5683,6 +5767,105 @@ mod cli_arg_tests {
             serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn hook_config_updates_keep_user_handlers_in_shared_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let agent = agent_hooks::AgentKind::Claude;
+        let mine = json!({"type": "command", "command": "~/bin/on-stop.sh"});
+        let with_limux = |command: &str| {
+            json!({"hooks": {
+                "PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "python3 ~/hooks claude_guard.py"},
+                    {"type": "command", "command": "~/bin/log && limux --json hooks claude stop"}
+                ]}],
+                "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": command}, mine]}],
+                "SubagentStop": []
+            }})
+        };
+        for command in [
+            // The command every release wrote, with each CLI path and option it used.
+            r#"[ "${LIMUX_CLAUDE_HOOKS_DISABLED:-}" != "1" ] && limux --json hooks claude stop || echo '{"continue":true,"suppressOutput":false}'"#,
+            r#"[ "${LIMUX_CLAUDE_HOOKS_DISABLED:-}" != "1" ] && '/opt/it'\''s/limux-cli' --json hooks claude stop || echo '{"continue":true,"suppressOutput":false}'"#,
+            r#"[ "${LIMUX_CLAUDE_HOOKS_DISABLED:-}" != "1" ] && env LIMUX_NOTIFY_OSC=1 '/h/ssh-helpers/0a/limux-cli' --json hooks claude stop || echo '{"continue":true,"suppressOutput":false}'"#,
+            "limux --json hooks claude stop",
+        ] {
+            let original = with_limux(command);
+            let mut expected = original.clone();
+            expected["hooks"]["Stop"][0]["hooks"] = json!([mine]);
+
+            fs::write(&path, original.to_string()).unwrap();
+            uninstall_json_hooks(&path, agent).unwrap();
+            let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(config, expected, "uninstall of {command}");
+
+            fs::write(&path, original.to_string()).unwrap();
+            install_json_hooks(&path, agent, false, &[("Stop", "stop")]).unwrap();
+            let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let stop = config["hooks"]["Stop"].as_array_mut().unwrap();
+            assert_eq!(stop.len(), 2, "install over {command}");
+            stop.truncate(1);
+            assert_eq!(config, expected, "install over {command}");
+        }
+    }
+
+    #[test]
+    fn agy_hook_updates_keep_user_handlers_in_the_limux_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original = json!({"limux": {"Stop": [{"type": "command", "command": "echo mine"}]}});
+        fs::write(&path, original.to_string()).unwrap();
+        for _ in 0..2 {
+            install_agy_hooks(&path, false).unwrap();
+        }
+        let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let stop = config["limux"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2);
+        assert_eq!(stop[0]["command"], "echo mine");
+
+        uninstall_agy_hooks(&path).unwrap();
+        let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn hook_config_updates_follow_symlinks_keep_the_mode_and_skip_unchanged_files() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("settings.json");
+        let target = dir.path().join("dotfiles/settings.json");
+        fs::create_dir(target.parent().unwrap()).unwrap();
+        symlink("dotfiles/settings.json", &link).unwrap();
+        let agent = agent_hooks::AgentKind::Claude;
+        let install = || install_json_hooks(&link, agent, false, &[("Stop", "stop")]).unwrap();
+
+        // A config that does not exist yet may hold secrets later, so it starts private.
+        install();
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o600);
+
+        fs::write(&target, "{ \"theme\": \"dark\" }").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        uninstall_json_hooks(&link, agent).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "{ \"theme\": \"dark\" }"
+        );
+
+        install();
+        let installed = fs::metadata(&target).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(installed.mode() & 0o777, 0o640);
+        install();
+        assert_eq!(fs::metadata(&target).unwrap().ino(), installed.ino());
+        uninstall_json_hooks(&link, agent).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&link).unwrap()).unwrap(),
+            json!({"theme": "dark"})
+        );
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
     }
 
     #[test]
