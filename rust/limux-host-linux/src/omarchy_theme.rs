@@ -200,10 +200,8 @@ pub fn parse_colors_toml(contents: &str) -> Option<OmarchyPalette> {
             "foreground" => foreground = Rgb::parse_hex(val),
             "fg" => fg = Rgb::parse_hex(val),
             "accent" => accent = Rgb::parse_hex(val),
-            "selection_background" | "selection" => {
-                if selection_background.is_none() {
-                    selection_background = Rgb::parse_hex(val);
-                }
+            "selection_background" | "selection" if selection_background.is_none() => {
+                selection_background = Rgb::parse_hex(val);
             }
             "selection_foreground" => selection_foreground = Rgb::parse_hex(val),
             "blue" => blue = Rgb::parse_hex(val),
@@ -770,6 +768,7 @@ pub struct OmarchyThemeWatcher {
 struct WatcherInner {
     monitors: Vec<gio::FileMonitor>,
     pending_reload: Option<glib::SourceId>,
+    pending_reattach: bool,
     callback: Rc<dyn Fn()>,
     stopped: bool,
 }
@@ -782,6 +781,7 @@ impl OmarchyThemeWatcher {
         let inner = Rc::new(RefCell::new(WatcherInner {
             monitors: Vec::new(),
             pending_reload: None,
+            pending_reattach: false,
             callback: Rc::new(on_change),
             stopped: false,
         }));
@@ -792,6 +792,7 @@ impl OmarchyThemeWatcher {
     pub fn stop(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.stopped = true;
+        inner.pending_reattach = false;
         if let Some(source) = inner.pending_reload.take() {
             source.remove();
         }
@@ -833,6 +834,7 @@ impl OmarchyThemeWatcher {
                 if state.stopped {
                     return;
                 }
+                state.pending_reattach |= needs_reattach;
                 if let Some(existing) = state.pending_reload.take() {
                     existing.remove();
                 }
@@ -843,15 +845,18 @@ impl OmarchyThemeWatcher {
                         let Some(inner) = weak_for_timer.upgrade() else {
                             return;
                         };
-                        let callback = {
+                        let (should_reattach, callback) = {
                             let mut state = inner.borrow_mut();
                             state.pending_reload = None;
                             if state.stopped {
                                 return;
                             }
-                            state.callback.clone()
+                            (
+                                std::mem::take(&mut state.pending_reattach),
+                                state.callback.clone(),
+                            )
                         };
-                        if needs_reattach {
+                        if should_reattach {
                             Self::reattach_monitors(&inner);
                         }
                         callback();
