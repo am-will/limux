@@ -9056,6 +9056,21 @@ fn quit_app(state: &State) {
     window.close();
 }
 
+fn new_instance_command(exe: &Path) -> std::process::Command {
+    // An AppImage launcher prepares the WebKit runtime of one instance and
+    // removes it when that instance ends, so every instance needs its own.
+    let launcher = exe.with_file_name("appimage-host-launcher.sh");
+    let program = if launcher.is_file() { &launcher } else { exe };
+    let mut command = std::process::Command::new(program);
+    for (name, value) in crate::launch_environment() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    command
+}
+
 fn spawn_new_instance(state: &State) -> bool {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -9067,8 +9082,11 @@ fn spawn_new_instance(state: &State) -> bool {
         }
     };
 
-    match std::process::Command::new(exe).spawn() {
-        Ok(_) => true,
+    match new_instance_command(&exe).spawn() {
+        Ok(child) => {
+            glib::child_watch_add_local(glib::Pid(child.id() as i32), |_, _| {});
+            true
+        }
         Err(err) => {
             let detail = format!("Failed to launch a new Limux instance: {err}");
             eprintln!("limux: {detail}");
@@ -9363,6 +9381,18 @@ mod tests {
             Some("ssh user@server")
         );
         assert_eq!(normalize_autostart_command("  \t "), None);
+    }
+
+    #[test]
+    fn new_instance_starts_through_the_appimage_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("limux-host");
+        let program =
+            || std::path::PathBuf::from(super::new_instance_command(&exe).get_program().to_owned());
+        assert_eq!(program(), exe);
+        let launcher = dir.path().join("appimage-host-launcher.sh");
+        std::fs::write(&launcher, "").unwrap();
+        assert_eq!(program(), launcher);
     }
 
     #[test]

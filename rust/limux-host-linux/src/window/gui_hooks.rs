@@ -77,6 +77,47 @@ pub(super) fn notify_workspace_created(state: &State, mut context: GuiHookContex
     notify_gui_hook(state, GuiHookEvent::AfterWorkspaceCreate, &context);
 }
 
+fn hook_launch_environment(
+    event: GuiHookEvent,
+    default_action_runs: bool,
+    context: &GuiHookContext,
+    show_terminal: bool,
+    socket: Option<&str>,
+) -> (Vec<(String, String)>, Vec<&'static str>) {
+    let mut env = hook_environment(event, default_action_runs, context);
+    let mut unset = Vec::new();
+    let original = crate::original_child_environment();
+    if show_terminal {
+        // Ghostty spawns `/bin/sh -c "bash -c 'unset ...; <hook>'"` before
+        // `unset` runs, so terminal overrides must clear AppImage variables
+        // like LD_LIBRARY_PATH in extra_env while `unset` still removes them
+        // inside bash before the user's hook executes.
+        env.extend(crate::terminal_child_environment_overrides());
+        unset.extend(
+            original
+                .into_iter()
+                .filter_map(|(name, value)| value.is_none().then_some(name)),
+        );
+    } else {
+        for (name, value) in original {
+            match value {
+                Some(value) => env.push((name.to_string(), value)),
+                None => unset.push(name),
+            }
+        }
+    }
+    if let Some(socket) = socket {
+        env.push(("LIMUX_SOCKET".to_string(), socket.to_string()));
+    }
+    unset.extend(
+        INHERITED_IDENTITY_VARS
+            .iter()
+            .copied()
+            .filter(|name| !env.iter().any(|(set, _)| set == name)),
+    );
+    (env, unset)
+}
+
 fn launch_hook(
     state: &State,
     event: GuiHookEvent,
@@ -84,21 +125,17 @@ fn launch_hook(
     default_action_runs: bool,
     context: &GuiHookContext,
 ) {
-    let mut env = hook_environment(event, default_action_runs, context);
-    env.extend(crate::terminal_child_environment_overrides());
-    if let Some(socket) = limux_control::socket_path::resolve_socket_path(
+    let socket = limux_control::socket_path::resolve_socket_path(
         None,
         limux_control::socket_path::SocketMode::Runtime,
-    )
-    .to_str()
-    {
-        env.push(("LIMUX_SOCKET".to_string(), socket.to_string()));
-    }
-    let unset: Vec<&str> = INHERITED_IDENTITY_VARS
-        .iter()
-        .copied()
-        .filter(|name| !env.iter().any(|(set, _)| set == name))
-        .collect();
+    );
+    let (env, unset) = hook_launch_environment(
+        event,
+        default_action_runs,
+        context,
+        hook.show_terminal,
+        socket.to_str(),
+    );
     let cwd = context
         .folder
         .as_deref()
@@ -338,8 +375,146 @@ pub(super) fn handle_gui_hook_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    struct EnvGuard {
+        values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                values: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.values.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn background_hook_environment_unsets_originally_missing_appimage_vars() {
+        let _lock = crate::GHOSTTY_ENV_LOCK
+            .lock()
+            .expect("hook env test lock poisoned");
+        let _guard = EnvGuard::capture(&[
+            "LD_LIBRARY_PATH",
+            "LIMUX_ORIGINAL_LD_LIBRARY_PATH",
+            "LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET",
+            "GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET",
+            "LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET",
+        ]);
+
+        std::env::set_var("LD_LIBRARY_PATH", "/tmp/.mount_Limux/usr/lib");
+        std::env::set_var("LIMUX_ORIGINAL_LD_LIBRARY_PATH", "");
+        std::env::set_var("LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET", "0");
+        std::env::set_var("GBM_BACKENDS_PATH", "/usr/lib/gbm");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH", "");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET", "0");
+        std::env::set_var("LIBGL_DRIVERS_PATH", "/usr/lib/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH", "/host/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET", "1");
+
+        let (env, unset) = hook_launch_environment(
+            GuiHookEvent::OnWorkspaceCreate,
+            true,
+            &GuiHookContext::default(),
+            false,
+            Some("/tmp/limux-hook.sock"),
+        );
+
+        assert!(!env.iter().any(|(name, _)| name == "LD_LIBRARY_PATH"));
+        assert!(!env.iter().any(|(name, _)| name == "GBM_BACKENDS_PATH"));
+        assert!(env.contains(&("LIBGL_DRIVERS_PATH".to_string(), "/host/dri".to_string())));
+        assert!(unset.contains(&"LD_LIBRARY_PATH"));
+        assert!(unset.contains(&"GBM_BACKENDS_PATH"));
+        assert!(!unset.contains(&"LIBGL_DRIVERS_PATH"));
+
+        let command = native_background_command("printf ok", &env, &unset, Path::new("/tmp"));
+        let child_env: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(child_env.get("LD_LIBRARY_PATH"), Some(&None));
+        assert_eq!(child_env.get("GBM_BACKENDS_PATH"), Some(&None));
+        assert_eq!(
+            child_env.get("LIBGL_DRIVERS_PATH").unwrap().as_deref(),
+            Some("/host/dri")
+        );
+    }
+
+    #[test]
+    fn terminal_hook_environment_clears_appimage_ld_library_path_before_bash_unsets_it() {
+        let _lock = crate::GHOSTTY_ENV_LOCK
+            .lock()
+            .expect("hook env test lock poisoned");
+        let _guard = EnvGuard::capture(&[
+            "LD_LIBRARY_PATH",
+            "LIMUX_ORIGINAL_LD_LIBRARY_PATH",
+            "LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET",
+            "GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET",
+            "LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET",
+        ]);
+
+        std::env::set_var("LD_LIBRARY_PATH", "/tmp/.mount_Limux/usr/lib");
+        std::env::set_var("LIMUX_ORIGINAL_LD_LIBRARY_PATH", "");
+        std::env::set_var("LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET", "0");
+        std::env::set_var("GBM_BACKENDS_PATH", "/usr/lib/gbm");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH", "");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET", "0");
+        std::env::set_var("LIBGL_DRIVERS_PATH", "/usr/lib/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH", "/host/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET", "1");
+
+        let (env, unset) = hook_launch_environment(
+            GuiHookEvent::OnWorkspaceCreate,
+            true,
+            &GuiHookContext::default(),
+            true,
+            Some("/tmp/limux-hook.sock"),
+        );
+
+        assert!(env.contains(&("LD_LIBRARY_PATH".to_string(), String::new())));
+        assert_eq!(
+            env.iter()
+                .filter(|(name, _)| name == "LIBGL_DRIVERS_PATH")
+                .collect::<Vec<_>>(),
+            vec![&("LIBGL_DRIVERS_PATH".to_string(), "/host/dri".to_string())]
+        );
+        assert!(!env.iter().any(|(name, _)| name == "GBM_BACKENDS_PATH"));
+        assert!(unset.contains(&"LD_LIBRARY_PATH"));
+        assert!(unset.contains(&"GBM_BACKENDS_PATH"));
+        assert!(!unset.contains(&"LIBGL_DRIVERS_PATH"));
+        let command = terminal_command("true", &unset);
+        assert!(command.contains("LD_LIBRARY_PATH"));
+        assert!(command.contains("GBM_BACKENDS_PATH"));
+    }
 
     #[test]
     fn flatpak_background_command_forwards_hook_env_and_clears_host_identity() {
