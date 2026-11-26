@@ -441,6 +441,9 @@ for regression in \
   window::pane_close_tests::closing_inactive_workspace_preserves_active_manual_unread \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
+  window::window_state_tests::hiding_the_sidebar_is_saved_when_it_is_the_first_change \
+  window::window_state_tests::close_focused_pane_keeps_the_only_pane_of_a_workspace \
+  window::window_state_tests::changed_shortcuts_show_in_the_tooltips_of_open_panes \
   window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \
   window::eager_restore_tests::eager_restore_follows_moved_tabs_and_skips_closed_tabs_after_reordering \
   window::gui_hook_tests::gui_actions_run_their_hooks_and_socket_requests_do_not \
@@ -480,6 +483,7 @@ for regression in \
   window::pane_close_tests::passive_rename_focus_restore_preserves_manual_tab_unread \
   window::pane_close_tests::a_quick_failure_in_a_late_started_terminal_is_held \
   pane::ssh_reconnect_tests::reconnect_preserves_neighbor_keyboard_focus_and_restores_its_own \
+  window::window_state_tests::focusing_a_split_pane_reads_its_tab \
   window::eager_restore_tests::eager_restore_preserves_live_selection_focus_and_agent_bindings; do
   echo "== regression: $regression under isolated X11 =="
   regression_log="$LOG_DIR/${regression##*::}-x11.txt"

@@ -2964,14 +2964,14 @@ fn apply_shortcuts_to_application(app: &adw::Application, shortcuts: &ResolvedSh
 }
 
 fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
-    let (app, workspace_roots, shortcuts_rc) = {
+    let (app, panes, shortcuts_rc) = {
         let mut s = state.borrow_mut();
         s.shortcuts = Rc::new(shortcuts);
         (
             s.app.clone(),
             s.workspaces
                 .iter()
-                .map(|ws| ws.root.clone())
+                .flat_map(|ws| ws.split_container.panes())
                 .collect::<Vec<_>>(),
             s.shortcuts.clone(),
         )
@@ -2979,23 +2979,9 @@ fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
 
     apply_shortcuts_to_application(&app, &shortcuts_rc);
     sync_sidebar_toggle(state);
-    for root in workspace_roots {
-        refresh_shortcut_tooltips_in_layout(&root, &shortcuts_rc);
+    for pane_widget in panes {
+        pane::refresh_shortcut_tooltips(&pane_widget, &shortcuts_rc);
     }
-}
-
-fn refresh_shortcut_tooltips_in_layout(widget: &gtk::Widget, shortcuts: &ResolvedShortcutConfig) {
-    if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
-        if let Some(start) = paned.start_child() {
-            refresh_shortcut_tooltips_in_layout(&start, shortcuts);
-        }
-        if let Some(end) = paned.end_child() {
-            refresh_shortcut_tooltips_in_layout(&end, shortcuts);
-        }
-        return;
-    }
-
-    pane::refresh_shortcut_tooltips(widget, shortcuts);
 }
 
 /// Open the Settings dialog from the top bar (the cog used to live on the
@@ -4173,7 +4159,7 @@ fn build_sidebar_row(
         .build();
     path_label.add_css_class("limux-ws-path");
     if let Some(p) = folder_path {
-        path_label.set_label(&abbreviate_path(p));
+        path_label.set_label(&abbreviate_path(p, dirs::home_dir().as_deref()));
         path_label.set_tooltip_text(Some(p));
     } else {
         path_label.set_label("");
@@ -4242,14 +4228,12 @@ fn sync_workspace_path_visibility(state: &State, show_workspace_path: bool) {
 }
 
 /// Abbreviate a path by replacing the home directory with ~.
-fn abbreviate_path(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        let home_str = home.to_string_lossy();
-        if path.starts_with(home_str.as_ref()) {
-            return format!("~{}", &path[home_str.len()..]);
-        }
+fn abbreviate_path(path: &str, home_dir: Option<&Path>) -> String {
+    match home_dir.and_then(|home| Path::new(path).strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.to_string(),
     }
-    path.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -8507,11 +8491,26 @@ fn record_last_focused_surface_from_window(state: &State, window: &gtk::Window) 
                     note_workspace_pane_focus(&mut app_state, &workspace_id, target.pane_id);
                     app_state.last_focused_surface = Some(target);
                 }
+                read_tab_once_focused(&widget);
                 return;
             }
         }
         focused_widget = widget.parent();
     }
+}
+
+/// Read the active tab of the pane the focus settles in. A split rebuild moves
+/// the focus through other panes first, and they must keep their marks.
+fn read_tab_once_focused(pane_widget: &gtk::Widget) {
+    let pane_widget = pane_widget.downgrade();
+    glib::idle_add_local_once(move || {
+        if let Some(pane_widget) = pane_widget
+            .upgrade()
+            .filter(crate::terminal::focus_is_within)
+        {
+            pane::read_active_tab_in_pane(&pane_widget);
+        }
+    });
 }
 
 fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
@@ -8852,19 +8851,23 @@ fn should_keep_workspace_open_for_empty_pane(
     ws_id: &str,
     reason: pane::PaneEmptyReason,
 ) -> bool {
-    let s = state.borrow();
-    let enabled = s
+    let enabled = state
+        .borrow()
         .config
         .borrow()
         .workspace
         .keep_open_after_last_terminal_closes;
-    let is_only_pane = s
+
+    keep_workspace_open_after_empty_pane(enabled, reason, has_only_one_pane(state, ws_id))
+}
+
+fn has_only_one_pane(state: &State, ws_id: &str) -> bool {
+    state
+        .borrow()
         .workspaces
         .iter()
         .find(|workspace| workspace.id == ws_id)
-        .is_some_and(|workspace| workspace.split_container.is_single_pane());
-
-    keep_workspace_open_after_empty_pane(enabled, reason, is_only_pane)
+        .is_some_and(|workspace| workspace.split_container.is_single_pane())
 }
 
 fn keep_workspace_open_after_empty_pane(
@@ -9181,14 +9184,10 @@ fn cycle_focused_pane_tab(state: &State, delta: i32) {
 
 fn close_focused_pane(state: &State) {
     if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
-        let parent = pane_widget.parent();
-        // If this is the only pane (parent is Stack), don't close — keep workspace alive
-        if let Some(ref p) = parent {
-            if p.downcast_ref::<gtk::Stack>().is_some() {
-                return;
-            }
+        // Closing the only pane would close the workspace with all its tabs.
+        if !has_only_one_pane(state, &ws_id) {
+            remove_pane(state, &ws_id, &pane_widget);
         }
-        remove_pane(state, &ws_id, &pane_widget);
     }
 }
 
@@ -9196,20 +9195,6 @@ fn close_focused_tab(state: &State) {
     let Some((_ws_id, pane_widget)) = find_focused_pane(state) else {
         return;
     };
-
-    let config = state.borrow().config.clone();
-    let keep_workspace_open = config
-        .borrow()
-        .workspace
-        .keep_open_after_last_terminal_closes;
-    if let Some(parent) = pane_widget.parent() {
-        if parent.downcast_ref::<gtk::Stack>().is_some()
-            && pane::tab_count_in_pane(&pane_widget) <= 1
-            && !keep_workspace_open
-        {
-            return;
-        }
-    }
 
     if let Some(tab_id) = pane::active_tab_in_pane(&pane_widget) {
         pane::close_tab_in_pane(&pane_widget, &tab_id);
@@ -10291,6 +10276,20 @@ mod tests {
     }
 
     #[test]
+    fn workspace_path_shortens_only_the_home_folder_itself() {
+        let home = Some(std::path::Path::new("/home/al"));
+        for (path, shown) in [
+            ("/home/al", "~"),
+            ("/home/al/src/app", "~/src/app"),
+            ("/home/alice/src", "/home/alice/src"),
+            ("/srv", "/srv"),
+        ] {
+            assert_eq!(super::abbreviate_path(path, home), shown);
+        }
+        assert_eq!(super::abbreviate_path("/home/al", None), "/home/al");
+    }
+
+    #[test]
     fn workspace_folder_path_input_rejects_empty_value() {
         assert_eq!(
             workspace_folder_path_from_input("  ", None, None).unwrap_err(),
@@ -10562,6 +10561,10 @@ mod ssh_launch_tests;
 #[cfg(test)]
 #[path = "tab_move_tests.rs"]
 mod tab_move_tests;
+
+#[cfg(test)]
+#[path = "window_state_tests.rs"]
+mod window_state_tests;
 
 #[cfg(test)]
 #[path = "pane_create_tests.rs"]
