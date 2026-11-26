@@ -223,9 +223,8 @@ pub(super) unsafe extern "C" fn ghostty_write_clipboard_cb(
         return;
     }
     let text = unsafe { std::ffi::CStr::from_ptr(content.data) }
-        .to_str()
-        .unwrap_or("")
-        .to_string();
+        .to_string_lossy()
+        .into_owned();
     let Some(context) = (unsafe { clipboard_context_from_userdata(userdata) }) else {
         return;
     };

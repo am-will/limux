@@ -1672,18 +1672,12 @@ unsafe extern "C" fn ghostty_action_cb(
                 let title = if title_ptr.is_null() {
                     String::new()
                 } else {
-                    unsafe { std::ffi::CStr::from_ptr(title_ptr) }
-                        .to_str()
-                        .unwrap_or("")
-                        .to_string()
+                    notification_text(unsafe { std::ffi::CStr::from_ptr(title_ptr) }.to_bytes())
                 };
                 let body = if body_ptr.is_null() {
                     String::new()
                 } else {
-                    unsafe { std::ffi::CStr::from_ptr(body_ptr) }
-                        .to_str()
-                        .unwrap_or("")
-                        .to_string()
+                    notification_text(unsafe { std::ffi::CStr::from_ptr(body_ptr) }.to_bytes())
                 };
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
@@ -1700,17 +1694,16 @@ unsafe extern "C" fn ghostty_action_cb(
                 let surface_key = unsafe { target.target.surface } as usize;
                 let pwd_ptr = unsafe { action.action.pwd.pwd };
                 if !pwd_ptr.is_null() {
-                    let pwd = unsafe { std::ffi::CStr::from_ptr(pwd_ptr) }
-                        .to_str()
-                        .unwrap_or("")
-                        .to_string();
-                    SURFACE_MAP.with(|map| {
-                        if let Some(entry) = map.borrow().get(&surface_key) {
-                            if let Some(cb) = &entry.on_pwd_changed {
-                                cb(&pwd);
+                    let pwd = unsafe { std::ffi::CStr::from_ptr(pwd_ptr) };
+                    if let Some(pwd) = reported_pwd(pwd.to_bytes()) {
+                        SURFACE_MAP.with(|map| {
+                            if let Some(entry) = map.borrow().get(&surface_key) {
+                                if let Some(cb) = &entry.on_pwd_changed {
+                                    cb(pwd);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
             true
@@ -1882,6 +1875,24 @@ unsafe extern "C" fn ghostty_action_cb(
     }
 }
 
+/// Ghostty cuts notification fields at a byte count, which can split the last
+/// character. Drop that partial character, not the whole field.
+fn notification_text(bytes: &[u8]) -> String {
+    let complete = match std::str::from_utf8(bytes) {
+        Err(error) if error.error_len().is_none() => &bytes[..error.valid_up_to()],
+        _ => bytes,
+    };
+    String::from_utf8_lossy(complete).into_owned()
+}
+
+/// Ghostty reports an empty path when a program resets the directory. Limux
+/// keeps the last known directory then, and for a path it cannot save.
+fn reported_pwd(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .filter(|pwd| !pwd.is_empty())
+}
+
 fn ghostty_open_url_to_string(open_url: ghostty_action_open_url_s) -> Option<String> {
     if open_url.url.is_null() || open_url.len == 0 {
         return None;
@@ -1927,7 +1938,10 @@ fn clipboard_completion_text_ptr(text: *const c_char) -> *const c_char {
 }
 
 fn clipboard_from_type(display: &gtk::gdk::Display, clipboard_type: c_int) -> gtk::gdk::Clipboard {
-    if clipboard_type == GHOSTTY_CLIPBOARD_SELECTION {
+    if matches!(
+        clipboard_type,
+        GHOSTTY_CLIPBOARD_SELECTION | GHOSTTY_CLIPBOARD_PRIMARY
+    ) {
         display.primary_clipboard()
     } else {
         display.clipboard()
@@ -1976,6 +1990,13 @@ fn clipboard_write_policy(
             write_clipboard: copy_selection_to_clipboard,
             write_primary: true,
             show_toast: copy_selection_to_clipboard,
+        }
+    } else if clipboard_type == GHOSTTY_CLIPBOARD_PRIMARY {
+        // A program asked for the primary selection alone.
+        ClipboardWritePolicy {
+            write_clipboard: false,
+            write_primary: true,
+            show_toast: false,
         }
     } else {
         ClipboardWritePolicy {
@@ -3767,6 +3788,101 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display and Ghostty resources"]
+    fn terminal_sequences_keep_their_text_and_target() {
+        crate::prepare_ghostty_runtime();
+        gtk::init().expect("GTK display required");
+        init_ghostty();
+
+        let notifications = Rc::new(RefCell::new(Vec::new()));
+        let directories = Rc::new(RefCell::new(Vec::new()));
+        let mut callbacks = TerminalCallbacks::disconnected();
+        callbacks.copy_selection_to_clipboard = Box::new(|| true);
+        callbacks.on_desktop_notification = Box::new({
+            let notifications = notifications.clone();
+            move |title, body, _| {
+                notifications
+                    .borrow_mut()
+                    .push((title.to_string(), body.to_string()))
+            }
+        });
+        callbacks.on_pwd_changed = Box::new({
+            let directories = directories.clone();
+            move |pwd| directories.borrow_mut().push(pwd.to_string())
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("sequences.sh");
+        let (primary, standard) = (temp.path().join("primary"), temp.path().join("standard"));
+        let body = "x".to_string() + &"完了".repeat(50);
+        std::fs::write(
+            &script,
+            format!(
+                "printf '\\033]777;notify;done;{body}\\007'\n\
+                 for path in /tmp /tmp/%ff; do printf '\\033]7;file://localhost%s\\007' $path; done\n\
+                 printf '\\033]7;\\007'\n\
+                 while ! [ -e '{}' ]; do sleep 0.05; done\n\
+                 printf '\\033]52;p;cHJpbWFyeQ==\\007'\n\
+                 while ! [ -e '{}' ]; do sleep 0.05; done\n\
+                 printf '\\033]52;c;Y2Fm6Q==\\007'\n\
+                 sleep 30\n",
+                primary.display(),
+                standard.display()
+            ),
+        )
+        .unwrap();
+        let terminal = create_terminal(
+            Some("/tmp"),
+            TerminalOptions {
+                startup_command: Some(format!("/bin/sh {}", script.display())),
+                ..TerminalOptions::default()
+            },
+            callbacks,
+        );
+        let window = gtk::Window::builder().child(&terminal.root).build();
+        window.present();
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let display = gtk::gdk::Display::default().unwrap();
+        let text = |clipboard: gtk::gdk::Clipboard| {
+            let value = clipboard
+                .content()
+                .and_then(|content| content.value(String::static_type()).ok());
+            value.and_then(|value| value.get::<String>().ok())
+        };
+        display.clipboard().set_text("mine");
+
+        wait_for("the notification", &|| !notifications.borrow().is_empty());
+        assert_eq!(
+            *notifications.borrow(),
+            [("done".to_string(), body[..253].to_string())]
+        );
+
+        std::fs::write(primary, "").unwrap();
+        wait_for("the primary selection", &|| {
+            text(display.primary_clipboard()).as_deref() == Some("primary")
+        });
+        assert_eq!(text(display.clipboard()).as_deref(), Some("mine"));
+        // The directory reports came before this write.
+        assert_eq!(*directories.borrow(), ["/tmp"]);
+
+        std::fs::write(standard, "").unwrap();
+        wait_for("the clipboard", &|| {
+            text(display.clipboard()).as_deref() != Some("mine")
+        });
+        assert_eq!(text(display.clipboard()).as_deref(), Some("caf\u{fffd}"));
+
+        terminal.handle.shutdown();
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display and Ghostty resources"]
     fn shutdown_with_pending_terminal_messages() {
         crate::prepare_ghostty_runtime();
         gtk::init().expect("GTK display required");
@@ -4468,7 +4584,7 @@ mod tests {
     fn shell_escape_quotes_paths_with_spaces() {
         assert_eq!(
             shell_escape_bytes(b"/home/user/my file.txt"),
-            b"$'/home/user/my file.txt'"
+            b"'/home/user/my file.txt'"
         );
     }
 
@@ -4476,7 +4592,7 @@ mod tests {
     fn shell_escape_handles_single_quotes() {
         assert_eq!(
             shell_escape_bytes(b"/tmp/it's a file"),
-            b"$'/tmp/it\\'s a file'"
+            b"'/tmp/it'\\''s a file'"
         );
     }
 
@@ -4562,6 +4678,37 @@ mod tests {
                 show_toast: true,
             }
         );
+        for copy_selection in [false, true] {
+            assert_eq!(
+                clipboard_write_policy(GHOSTTY_CLIPBOARD_PRIMARY, copy_selection),
+                ClipboardWritePolicy {
+                    write_clipboard: false,
+                    write_primary: true,
+                    show_toast: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn notification_text_drops_only_a_split_last_character() {
+        let text = "x".to_string() + &"完了".repeat(50);
+        // 255 bytes is the limit of a notification body in Ghostty.
+        assert!(std::str::from_utf8(&text.as_bytes()[..255]).is_err());
+        assert_eq!(notification_text(&text.as_bytes()[..255]), &text[..253]);
+        assert_eq!(notification_text("完了".as_bytes()), "完了");
+        assert_eq!(notification_text(b"caf\xe9 done"), "caf\u{fffd} done");
+        assert_eq!(notification_text(b""), "");
+    }
+
+    #[test]
+    fn pwd_reports_without_a_usable_path_are_ignored() {
+        assert_eq!(
+            reported_pwd("/home/ユーザー".as_bytes()),
+            Some("/home/ユーザー")
+        );
+        assert_eq!(reported_pwd(b""), None);
+        assert_eq!(reported_pwd(b"/tmp/\xff"), None);
     }
 
     #[test]
@@ -4577,7 +4724,28 @@ mod tests {
 
         assert_eq!(
             text.as_bytes(),
-            b"/tmp/plain $'/tmp/space name' $'/tmp/it\\'s' $'/tmp/\\xFF\\xFE' $'/tmp/line\\nbreak'"
+            b"/tmp/plain '/tmp/space name' '/tmp/it'\\''s' $'/tmp/\\xFF\\xFE' $'/tmp/line\\nbreak'"
+        );
+    }
+
+    #[test]
+    fn dropped_paths_are_one_argument_each_in_a_posix_shell() {
+        let paths = [
+            "/tmp/plain",
+            "/tmp/space name",
+            "/tmp/it's",
+            "/tmp/$HOME `id` !! * \"q\" \\ ~",
+            "/tmp/完了 é",
+        ];
+        let text = shell_escape_joined_bytes(paths).unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {}", text.to_str().unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            paths.map(|path| format!("{path}\0")).concat()
         );
     }
 

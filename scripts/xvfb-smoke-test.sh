@@ -403,6 +403,7 @@ for regression in \
   pane::activity_tests::real_pty_output_drives_tab_activity_lifecycle \
   terminal::ssh_notification_tests::detached_agent_hook_notifies_only_its_originating_terminal \
   terminal::ssh_notification_tests::linked_tmux_sessions_keep_the_originating_notification_client \
+  terminal::tests::terminal_sequences_keep_their_text_and_target \
   ssh_helpers::tests::helper_transfer_configures_only_selected_agent_and_keeps_backup \
   pane::ssh_reconnect_tests::image_paste_follows_moves_and_cancels_on_reconnect \
   pane::ssh_reconnect_tests::local_image_paste_inserts_one_private_path \
