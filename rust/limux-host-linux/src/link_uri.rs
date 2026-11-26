@@ -23,6 +23,28 @@ pub fn is_embedded_browser_url(url: &str) -> bool {
     matches!(scheme.as_str(), "http" | "https") && rest.starts_with("://")
 }
 
+/// Whether text typed in the address bar is a URL with its own scheme. Wider
+/// than the link checks above: the user asked for this page.
+#[cfg(any(feature = "webkit", test))]
+pub fn is_typed_browser_url(text: &str) -> bool {
+    let Some((scheme, rest)) = scheme_and_rest(text) else {
+        return false;
+    };
+
+    match scheme.as_str() {
+        "http" | "https" => rest
+            .strip_prefix("://")
+            .is_some_and(|body| !body.is_empty() && !body.contains(char::is_whitespace)),
+        "file" => rest
+            .strip_prefix("://")
+            .is_some_and(|path| !path.is_empty()),
+        "about" => rest
+            .strip_prefix(':')
+            .is_some_and(|body| !body.is_empty() && !body.contains(char::is_whitespace)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +100,35 @@ mod tests {
         ] {
             assert!(!is_safe_external_url(url), "should reject {url}");
             assert!(!is_embedded_browser_url(url), "should reject {url}");
+        }
+    }
+
+    #[test]
+    fn typed_browser_urls_validate_scheme_body_and_whitespace() {
+        for url in [
+            "http://example.com",
+            "https://example.com/path",
+            "HTTPS://example.com",
+            "file:///home/me/index.html",
+            "file:///home/me/my file.html",
+            "about:blank",
+        ] {
+            assert!(is_typed_browser_url(url), "should accept {url}");
+        }
+
+        for url in [
+            "http://",
+            "https://",
+            "http://example.com foo",
+            "https://example.com\tbar",
+            "about:",
+            "about:blank foo",
+            "file://",
+            "ftp://ftp.example.com/file",
+            "javascript:alert(1)",
+            "mailto:user@example.com",
+        ] {
+            assert!(!is_typed_browser_url(url), "should reject {url}");
         }
     }
 }
