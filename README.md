@@ -33,7 +33,7 @@ On a Mac? Use [cmux](https://github.com/manaflow-ai/cmux), the app that inspired
 
 ## What you get
 
-| | |
+| Feature | What it does |
 |---|---|
 | **Attention that finds you** | Unread marks on the tab, the workspace, and the top bar. `Ctrl+Alt+U` jumps to the next unread terminal. A process that ends out of sight keeps its output and offers **Restart**. |
 | **Workspaces** | One per project, with favorites, colors, groups, and drag-and-drop. Everything comes back after a restart. |

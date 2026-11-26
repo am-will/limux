@@ -2,7 +2,7 @@
 
 Most defaults use `Ctrl+Alt`, so plain terminal `Ctrl` editing keys pass through to your program. Fullscreen is `F11`.
 
-Change shortcuts in **Settings > Keybindings**, or in `~/.config/limux/shortcuts.json` (see [shortcut-remap-testing.md](shortcut-remap-testing.md) for the format). Custom shortcuts may also use `Cmd`, which matches the Linux `Meta` or `Super` modifier. `Opt` maps to `Alt`.
+Change shortcuts in **Settings > Keybindings**, or in `~/.config/limux/shortcuts.json` (see [shortcut-remap-testing.md](shortcut-remap-testing.md) for the format). Custom shortcuts may also use `Cmd`, which matches the Linux `Meta` or `Super` modifier. `Option` maps to `Alt`.
 
 ## Workspaces
 
@@ -39,7 +39,7 @@ Change shortcuts in **Settings > Keybindings**, or in `~/.config/limux/shortcuts
 | `Ctrl+Shift+C` | Copy selection |
 | `Ctrl+Shift+V` | Paste (text, or a copied image as a file) |
 | `Ctrl+Alt+K` | Clear scrollback |
-| `Ctrl+Alt++` | Increase font size |
+| `Ctrl+Alt+=` | Increase font size |
 | `Ctrl+Alt+-` | Decrease font size |
 | `Ctrl+Alt+Shift+0` | Reset font size |
 
