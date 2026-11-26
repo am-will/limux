@@ -47,6 +47,8 @@ leaves `config.json` untouched.
 - Most default shortcuts use `Ctrl`; fullscreen defaults to `F11`.
 - `Cmd` is a logical Limux modifier that matches either Linux `Meta` or Linux `Super` for custom remaps. `Opt` is another name for `Alt`.
 - App-global shortcuts still fire inside editable widgets, but surface and browser shortcuts bypass editable widgets so native text editing keeps working.
+- A binding names a key of the active keyboard layout, without its Shift or AltGr level. If no binding matches that key, Limux also tries the symbol that the key typed, the digit on the key (for example the top row of a French layout), and, on a layout without Latin letters, the key of another configured layout.
+- While they have their default bindings, `Ctrl+Alt++` and the keypad `+` also increase the terminal font size, and the keypad `-` decreases it.
 
 ## Keybinds Editor
 
