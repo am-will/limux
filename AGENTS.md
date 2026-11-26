@@ -141,4 +141,5 @@ Useful references:
 
 - Roadmap/current bridge status: `docs/cmux-parity-plan.md`
 - Maintainability rules: `docs/maintainability.md`
-- CLI usage: `README.md` and `./target/debug/limux-cli --help`
+- User guides: `README.md` and `docs/` (`install.md`, `usage.md`, `agents.md`)
+- CLI usage: `docs/agents.md` and `./target/debug/limux-cli --help`

@@ -1,419 +1,191 @@
-# Limux
+<p align="center">
+  <img src="rust/limux-host-linux/icons/app/128.png" alt="" width="96" height="96">
+</p>
 
-A GPU-accelerated terminal workspace manager for Linux, powered by Ghostty's rendering engine. A special thanks to the cmux contributors who inspired this build. 
+<h1 align="center">Limux</h1>
 
-If you are on Mac, please visit https://github.com/manaflow-ai/cmux to download the original. 
+<p align="center">
+  <b>Know which terminal needs you.</b><br>
+  A native terminal workspace manager for Linux, rendered on the GPU by Ghostty.
+</p>
 
-https://github.com/user-attachments/assets/6f3047c2-e2b6-49f2-b536-570a1570d0f8
+<p align="center">
+  <a href="https://github.com/am-will/limux/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/am-will/limux?label=release"></a>
+  <a href="https://github.com/am-will/limux/actions/workflows/rust-quality.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/am-will/limux/rust-quality.yml?branch=main&label=build"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/am-will/limux"></a>
+</p>
 
-## Features
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#your-first-five-minutes">First five minutes</a> ·
+  <a href="#coding-agents">Coding agents</a> ·
+  <a href="#keyboard-shortcuts">Shortcuts</a> ·
+  <a href="#documentation">Docs</a>
+</p>
 
-- **GPU-rendered terminals** via embedded Ghostty (OpenGL)
-- **Workspaces** with folder-based naming, persistence across restarts, and sidebar management
-- **Workspace autostart** commands configured directly from the workspace menu
-- **Split panes** (horizontal/vertical) with keyboard navigation
-- **Tabbed terminals** within each pane
-- **Built-in browser** (WebKitGTK)
-- **Right-click context menu** with copy, paste, split, clear
-- **Drag-and-drop** workspace reordering with favorites/pinning
-- **Animated sidebar** collapse/expand
+![Limux with grouped workspaces in the sidebar, one of them marked unread in amber, and a split layout of terminals](docs/images/overview.webp)
+
+Limux keeps every project in its own workspace, with its own folder, splits, tabs, and browser. When a build fails or an agent asks a question in a terminal you are not looking at, that terminal lights up. One shortcut takes you to it.
+
+[Watch the demo video](https://github.com/user-attachments/assets/6f3047c2-e2b6-49f2-b536-570a1570d0f8) (85 seconds).
+
+On a Mac? Use [cmux](https://github.com/manaflow-ai/cmux), the app that inspired Limux.
+
+## What you get
+
+| Feature | What it does |
+|---|---|
+| **Attention that finds you** | Unread marks on the tab, the workspace, and the top bar. `Ctrl+Alt+U` jumps to the next unread terminal. A process that ends out of sight keeps its output and offers **Restart**. |
+| **Workspaces** | One per project, with favorites, colors, groups, and drag-and-drop. Everything comes back after a restart. |
+| **Splits, tabs, and zoom** | Native panes with keyboard navigation. Drag tabs between panes and workspaces. |
+| **Ghostty terminals** | OpenGL rendering through embedded Ghostty. Limux reads your existing Ghostty configuration. |
+| **A browser next to your code** | WebKitGTK in a tab or a split, sandboxed by default, with the Web Inspector. |
+| **A command line for everything** | Open panes, type into them, and read their screens from any script with the `limux` command. |
+| **Coding agent support** | Hooks for Codex, Claude Code, Gemini CLI, Antigravity (`agy`), and OpenCode: notifications, and sessions that resume after a restart. |
+| **SSH workspaces** | Optional tmux-backed tabs that reconnect after a dropped link, with image paste to the remote host. |
 
 ## Install
 
-Download the latest release from [GitHub Releases](https://github.com/am-will/limux/releases).
-Each release includes x86_64 and ARM64 builds. ARM64 files are named `aarch64`, except the `.deb`, which uses `arm64`.
+Release packages need glibc 2.39 or newer: Ubuntu 24.04, Debian 13, Fedora 40, Arch Linux, or anything more recent. Get the files from the [latest release](https://github.com/am-will/limux/releases/latest).
 
-**Debian/Ubuntu (.deb)** — recommended:
-```bash
-sudo dpkg -i ./limux_*_amd64.deb   # x86_64
-sudo dpkg -i ./limux_*_arm64.deb   # aarch64
-```
+| Distribution | Commands |
+|---|---|
+| **Debian, Ubuntu** | `sudo apt install ./limux_*_amd64.deb` |
+| **Fedora** | `sudo dnf install ./limux-*.x86_64.rpm` |
+| **Arch Linux** | `yay -S limux-bin` |
+| **AppImage** | `chmod +x Limux-*.AppImage`, then `./Limux-*-x86_64.AppImage` |
+| **Tarball, no root** | `./install.sh --prefix="$HOME/.local"` |
+| **Source** | See [Build from source](#build-from-source) |
 
-**AppImage** — portable across Ubuntu 24.04-era desktops and newer, with no
-Limux installation needed:
-```bash
-chmod +x Limux-*-x86_64.AppImage   # or Limux-*-aarch64.AppImage
-./Limux-*-x86_64.AppImage
-```
+Start it from your application menu, or run `limux`.
 
-Release AppImages are built and checked on the Ubuntu 24.04 `GLIBC_2.39`
-floor. They bundle Limux, Ghostty resources, WebKitGTK helper processes, and
-AppImage-only loader modules such as the gdk-pixbuf SVG loader. They still use
-the host GTK4 and libadwaita runtime. The release tarball, `.deb`, and RPM use
-the same Limux host binary and also require `GLIBC_2.39`; choosing one of those
-formats does not lower the glibc requirement. For an older glibc, build from
-source on the target distribution or use a release built against an older
-baseline.
+[docs/install.md](docs/install.md) covers ARM64 files, runtime dependencies, the browser sandbox, AppImage details, and how to uninstall. Ubuntu 22.04 is not supported ([#10](https://github.com/am-will/limux/issues/10)).
 
-The embedded [AppImage type-2 runtime](https://github.com/AppImage/type2-runtime)
-statically includes FUSE 3, so the AppImage does not require a host
-`libfuse.so.2` or `libfuse.so.3`. It works with versioned FUSE 3 helpers such as
-`fusermount3` while retaining support for the traditional `fusermount` helper.
-The launcher also discovers host GBM and DRI driver directories, allowing the
-Ubuntu-built bundle to use Mesa correctly on Fedora- and Arch-family systems.
-The AppImage does not bundle the host's `bwrap` (`bubblewrap`) or
-`xdg-dbus-proxy`, which WebKitGTK needs for sandboxed browser processes. Install
-these tools from your distribution's packages if they are missing.
-The launcher creates private WebKit helper paths under `/tmp` and keeps their
-executables in `${XDG_CACHE_HOME:-$HOME/.cache}/limux`. The cache must allow
-execution; `/tmp` may be mounted with `noexec`. Both are removed on exit.
+## Your first five minutes
 
-AppImage runtime library paths are scoped to the Limux app process. Terminals
-spawned inside Limux restore the user's original library/loader environment so
-host tools such as Flatpak do not load AppImage-private libraries first.
+1. **Open a project.** Select the folder icon in the top bar and choose a folder. The workspace takes its name.
+2. **Split it.** Press `Ctrl+Alt+D` to split right and `Ctrl+Alt+Shift+D` to split down. Move between panes with `Ctrl+Alt+Arrow`.
+3. **Zoom.** Press `Ctrl+Shift+Z` to fill the window with one pane. Press it again to go back.
+4. **Make something ask for you.** Run this command, then switch to another workspace before it finishes:
+   ```bash
+   sleep 5; limux notify "Look at me"
+   ```
+5. **Answer it.** Press `Ctrl+Alt+U`. You are in the terminal that called you.
+6. **Make it yours.** Right-click a workspace to rename, color, or group it. Settings has fonts, color schemes, and key bindings.
 
-**Tarball** — manual install:
-```bash
-tar xzf limux-*-linux-x86_64.tar.gz   # or limux-*-linux-aarch64.tar.gz
-cd limux-*-linux-x86_64
-sudo ./install.sh
-```
+## Coding agents
 
-To install into a user-writable prefix without root, use:
-```bash
-./install.sh --prefix="$HOME/.local"
-export PATH="$HOME/.local/bin:$PATH"
-```
-Uninstall with `./install.sh --prefix="$HOME/.local" --uninstall`.
-
-**Arch Linux (AUR):**
-```bash
-# Prebuilt release package
-yay -S limux-bin
-
-# Build Limux and Ghostty from source
-yay -S limux
-```
-
-Both [`limux-bin`](https://aur.archlinux.org/packages/limux-bin) and the source-built [`limux`](https://aur.archlinux.org/packages/limux) package are published from this repository for `x86_64` and `aarch64` (Arch Linux ARM). Thanks to [Anton Barchukov](https://github.com/antonbarchukov) for creating the original Arch packaging in [PR #50](https://github.com/am-will/limux/pull/50).
-
-To uninstall:
-```bash
-# deb
-sudo apt remove limux
-
-# tarball
-sudo ./install.sh --uninstall
-```
-
-### System dependencies
+Install the hooks once:
 
 ```bash
-# Ubuntu/Debian
-sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
-
-# AppImage WebKit sandbox helpers
-sudo apt install bubblewrap xdg-dbus-proxy
+limux hooks setup
 ```
 
-Limux enables WebKit's browser sandbox by default. At host startup, Limux checks
-real WebKit startup in a disposable process before allowing in-app browser views.
-If the sandbox cannot start, browser tabs show an explanation and retain their
-saved state. Terminals remain available. The check normally completes quickly; a
-failed startup can take fifteen seconds plus up to two seconds for helper
-cleanup.
+Your agents now notify you when they finish or need input. Their sessions resume when Limux restarts.
 
-Ubuntu 24.04 and later require an
-[application AppArmor allowance for user namespaces](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
-The Debian and RPM packages include an allowance for the installed host.
-Tarball installs into `/usr` or `/usr/local` register their host path when
-AppArmor is active. User and custom-prefix installs print administrator
-instructions instead. Paths with special characters require a manually written
-profile. For a source build, an administrator can register the exact executable:
+Agents can also use the window themselves. Limux tells every terminal its own workspace, pane, and surface, so these commands need no IDs:
 
 ```bash
-sudo ./scripts/install-apparmor-profile.sh --install "$(realpath target/debug/limux)"
+# Open a helper next to the current pane
+limux new-pane --direction right --command claude
+
+# Start one pane per agent and write an AGENTS.md that explains how they talk
+limux agent-team --agents codex,claude --cwd "$PWD"
+
+# Ask the human
+limux notify --subtitle "needs review" --body "blocked on auth choice" "Input needed"
+
+# Save running agent sessions before an upgrade
+limux hooks snapshot --save-session
 ```
 
-For a portable AppImage, pass its absolute executable path instead. The helper
-is also included at `share/limux/install-apparmor-profile.sh` in native packages.
-Moving the executable requires updating its allowance; use `--remove` with the
-old path to remove it. Restart Limux after changing the policy.
+[docs/agents.md](docs/agents.md) has the full guide. `limux --help` lists every command.
 
-An explicitly inherited `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` still
-disables browser isolation. Limux does not select this workaround automatically,
-and `surface-health` reports `sandboxed: false` when it is used.
+## Keyboard shortcuts
 
-On Wayland, also install `wl-clipboard` (`apt install wl-clipboard`, `dnf install wl-clipboard` or `pacman -S wl-clipboard`). `Ctrl+Shift+V` is Limux's own paste, but plain `Ctrl+V` goes to the program running in the terminal, and some programs read the clipboard themselves (fish's `Ctrl+V`, for example). Without `wl-paste` they fall back to X11 tools like `xclip`, and depending on the compositor the X11 clipboard may not have what you copied in Limux, so `Ctrl+V` pastes something older than `Ctrl+Shift+V`.
+Most defaults use `Ctrl+Alt`, so plain `Ctrl` editing keys still reach the program in the terminal.
 
-Limux Paste (Ctrl+Shift+V, or Paste in the terminal menu) can also turn a copied image into a file. In a local terminal it saves a private PNG at `/tmp/limux-paste.<random>/image.png` and inserts that path plus a space, so a local Codex or Claude Code composer can attach it. The file stays until you delete it or the system cleans `/tmp`. A persistent SSH tab uploads the image to that host instead. Paste does not press Enter. An `ssh` or container command you type yourself is not detected; use a persistent SSH tab when the file has to land on another machine. The Flatpak build writes a local image on the host. See [docs/ssh.md](docs/ssh.md) for the path, lifetime, and limits.
+| Shortcut | Action |
+|---|---|
+| `Ctrl+Alt+U` | Next unread terminal |
+| `Ctrl+Alt+O` | Most recent workspace |
+| `Ctrl+Alt+1-9` | Workspace by number |
+| `Ctrl+Alt+Shift+N` | New workspace |
+| `Ctrl+Alt+D` / `Ctrl+Alt+Shift+D` | Split right / split down |
+| `Ctrl+Alt+Arrow` | Focus pane in direction |
+| `Ctrl+Shift+Z` | Zoom the focused pane |
+| `Ctrl+Alt+T` | New terminal tab |
+| `Ctrl+Shift+W` / `Ctrl+Alt+W` | Close tab / close pane |
+| `Ctrl+Alt+F` | Find in the terminal or browser |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
+| `Ctrl+Alt+M` | Toggle the sidebar |
+
+See [all shortcuts](docs/keyboard-shortcuts.md). Change them in **Settings > Keybindings**.
+
+## Configuration
+
+| File | What it holds |
+|---|---|
+| `~/.config/ghostty/config` | Your Ghostty settings. Limux reads them. |
+| `~/.config/limux/settings.json` | Limux settings. Use the Settings window to change them. |
+| `~/.config/limux/shortcuts.json` | Custom key bindings ([format](docs/shortcut-remap-testing.md)). |
+| `~/.local/share/limux/session.json` | Saved workspaces and layouts. |
+
+Limux has no telemetry and no account. Its control API is a Unix socket on your machine.
+
+## Documentation
+
+| Guide | Contents |
+|---|---|
+| [Install](docs/install.md) | Packages, dependencies, browser sandbox, uninstall |
+| [Using Limux](docs/usage.md) | Workspaces, autostart, notifications, exited terminals, image paste, window activation |
+| [Coding agents](docs/agents.md) | Hooks, notifications, agent teams, scripting panes |
+| [Keyboard shortcuts](docs/keyboard-shortcuts.md) | Every default binding |
+| [SSH workspaces](docs/ssh.md) | Persistent sessions, reconnect, remote notifications |
+| [Flatpak](flatpak/README.md) | Local Flatpak build |
+| [Roadmap](docs/cmux-parity-plan.md) | What is done and what is next |
 
 ## Build from source
 
-### Prerequisites
-
-- Rust toolchain (stable)
-- Zig 0.16.0
-- GTK4, libadwaita, WebKitGTK dev packages
-- Initialized Ghostty submodule
+You need stable Rust, Zig 0.16.0, and the development packages for GTK4, libadwaita, and WebKitGTK 6.0.
 
 ```bash
-# Install dev dependencies (Ubuntu/Debian)
+# Ubuntu or Debian
 sudo apt install libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev pkg-config build-essential
 
-# Initialize the Ghostty submodule and build the embedded library
-git submodule update --init --recursive
+git clone --recurse-submodules https://github.com/am-will/limux
+cd limux
 ./scripts/build-ghostty.sh
-
-# Build limux
 cargo build --release
 
-# Run (point to libghostty-internal.so location)
 LD_LIBRARY_PATH=ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
-### Package a release tarball
+`./scripts/package.sh` builds the binary, bundles `libghostty-internal.so`, icons, and an install script into a tarball. It rebuilds the library with `ReleaseFast` and `-Dcpu=baseline`, so it also needs Zig 0.16.0 and an initialized Ghostty submodule.
 
-```bash
-./scripts/package.sh
-```
+## Contributing
 
-This builds the binary, bundles `libghostty-internal.so`, icons, and an install script into a tarball.
-`package.sh` uses `build-ghostty.sh` to rebuild `libghostty-internal.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig 0.16.0 and an initialized Ghostty submodule must be present.
-
-## Development
-
-`build-ghostty.sh` records the clean Ghostty commit, library checksum, and resolved
-library path next to the artifact. The quality gate and GTK smoke tests reject
-missing or stale provenance before starting Cargo or a display session. After
-updating the submodule, rebuild with `./scripts/build-ghostty.sh`; linking an
-installed library into `ghostty/zig-out/lib` does not establish build provenance.
-Use `ZIG=/path/to/zig` to select Zig 0.16.0 and `LIMUX_BUILD_JOBS` to change the
-default four build jobs.
-
-Run the canonical local quality gate before committing:
+Run the quality gate before you commit:
 
 ```bash
 ./scripts/check.sh
 ```
 
-Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
-The [contributing guide](CONTRIBUTING.md) documents the CPU-only Rust formatting workflow.
-Release procedure lives in [`docs/releasing.md`](docs/releasing.md).
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Coding agents that work on Limux itself should read [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md).
 
-## Workspace autostart
-
-Right-click a workspace in the sidebar and select **Set Autostart…** to run a
-command whenever Limux creates a terminal in that workspace. The command is
-stored as part of the workspace session and runs inside the terminal, so
-interactive commands such as `ssh user@server` work without modifying `.bashrc`.
-Open **Edit Autostart…** and save an empty command to disable it.
-
-Limux writes the command to a private, self-deleting `/bin/sh` script and asks
-the interactive terminal shell to source it, so changes such as `cd` and
-`export` remain in that shell. Autostart is enabled only when both `command` and
-`initial-command` in Ghostty's finalized configuration launch a recognized
-POSIX-compatible shell with no arguments other than interactive/login flags.
-Non-shell commands such as
-`command = direct:/usr/bin/vim` and non-interactive wrappers such as
-`command = direct:/bin/bash -lc "exec /usr/bin/vim"` skip autostart, so Limux
-does not inject keystrokes into the launched program.
-
-## Agent integrations
-
-Background terminal tabs show an activity spinner for five seconds after receiving
-output, including animated titles from tools such as Codex and output in renamed
-tabs. Viewing a tab clears its activity; leaving it does not restart the spinner
-until new output arrives. A notification dot replaces the spinner until the
-notification is read. In **Settings > General**, turn off **Tab activity indicators**
-or adjust **Tab activity timeout** from 1 to 60 seconds. Cursor blinking and
-scrolling alone do not count as output.
-
-Limux ships first-class hooks for coding agents (Codex, Claude Code,
-Gemini CLI, and Antigravity (`agy`)). Every terminal limux spawns auto-exports
-`LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /
-`LIMUX_TAB_ID` / `LIMUX_SOCKET`, so the CLI auto-targets the right place
-with no flags needed from inside the agent's own terminal.
-
-```bash
-# Fire a libadwaita toast + tab/workspace unread badges from any agent
-limux notify --subtitle "needs review" --body "blocked on auth choice" "Input needed"
-
-# Install Limux session-restore and notification hooks for supported agents
-limux hooks setup
-# Or configure a single agent (codex, claude, gemini, agy, opencode):
-limux hooks setup agy
-
-# Snapshot already-running Limux-hosted agent sessions before a restart/upgrade
-# and flush the host's session.json:
-limux hooks snapshot --save-session
-# Or flush session.json directly:
-limux save-session
-
-# Drop-in hook handlers translate hook JSON on stdin into notify/session state
-echo '{"event":"stop"}' | limux claude-hook --event stop
-echo '{"event":"finished"}' | limux gemini-hook --event finished
-echo '{"conversationId":"conv-1","terminationReason":"NO_TOOL_CALL","fullyIdle":true}' | limux agy-hook --event stop
-
-# Spin up a multi-agent collaboration team (supports codex, claude, opencode,
-# gemini, agy) that launches each agent's CLI and writes AGENTS.md describing
-# the <agent-msg> XML protocol so peers can talk to each other:
-limux agent-team --agents codex,claude --cwd "$PWD"
-# → Codex and Claude can now do:
-#   limux send --workspace claude $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
-
-# Or split the current agent's pane and launch another terminal agent.
-# Inside Limux, workspace/surface/pane default from LIMUX_*:
-limux new-pane --direction right --command claude
-# Live GTK self-spawn currently supports terminal panes only.
-
-# Explicit source targets are also accepted and serialized unchanged:
-limux new-pane --surface "$LIMUX_SURFACE_ID" \
-  --pane "$LIMUX_PANE_ID" --direction down --command "codex"
-
-# Keep both agents in the same workspace on separate splits/tabs:
-limux identify --json
-limux list-panels --workspace "$LIMUX_WORKSPACE_ID"
-# A named surface is found in any workspace; --workspace would restrict the search.
-limux send --surface "<peer-surface-id>" \
-  $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
-```
-
-See the auto-generated `AGENTS.md` (written into the shared cwd) for
-the full protocol spec, peer table, and editable Policies section.
-`agent-team` refuses to replace an existing `AGENTS.md`, including one from a
-previous team, before creating any panes. Preserve or move existing instructions
-before running it again, then merge any project policies you want to keep.
-`limux --json agent-team --dry-run` previews the protocol in `agents_md_preview`
-without writing files or contacting the host.
-
-Checked-in hook templates live in [`hooks/`](hooks/). They mirror
-`limux hooks setup` for Codex, Claude Code, Gemini CLI, and Antigravity
-(`agy`); OpenCode is omitted from default `limux hooks setup` and can be
-installed explicitly with `limux hooks setup opencode`.
-
-Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
-and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build
-loop, crate map, and the `feat/cmux-parity` roadmap tracked in
-[`docs/cmux-parity-plan.md`](docs/cmux-parity-plan.md).
-
-## Activate an existing window
-
-Bind a desktop global shortcut to `limux activate` to bring the running Limux
-window forward without opening another instance or changing its selected
-workspace or tab. Use the full executable path in your shortcut if your desktop
-does not include Limux's install directory in `PATH`.
-
-The command uses the existing control socket. To target a particular instance:
-
-```bash
-limux --socket /path/to/instance.sock activate
-```
-
-An explicit `--socket` takes precedence over `LIMUX_SOCKET`, `LIMUX_SOCKET_PATH`,
-and the default runtime socket. If no instance is listening there, activation
-fails with a socket connection error; it never launches an instance. Running
-plain `limux` still launches the app, and independent instances remain supported.
-
-Limux forwards `XDG_ACTIVATION_TOKEN`, or `DESKTOP_STARTUP_ID` when no token is
-available, to GTK. Your compositor decides whether to grant focus, especially
-on Wayland where a global shortcut may need a valid activation token. A successful
-command means presentation was requested, not that focus was guaranteed.
-Socket authentication is unchanged: the default `localUser` policy permits a
-shortcut run by the same user; `LIMUX_SOCKET_MODE=limuxOnly` rejects commands
-from outside that Limux process's descendants, including desktop shortcuts.
-
-## Keyboard shortcuts
-
-Most host-owned defaults use `Ctrl+Alt` so plain terminal `Ctrl` editing keys pass through. Fullscreen defaults to `F11`. Custom remaps may also use `Cmd`, which Limux maps to either the Linux `Meta` or `Super` modifier. `Opt` maps to `Alt`.
-
-### App
-
-| Shortcut | Action |
+| Crate | Role |
 |---|---|
-| `Ctrl+Alt+Q` | Quit Limux |
-| `Ctrl+Alt+N` | Open a new Limux instance |
-| `F11` | Toggle fullscreen |
+| `rust/limux-host-linux` | GTK4 and libadwaita app: window, sidebar, panes, tabs |
+| `rust/limux-cli` | The `limux` command |
+| `rust/limux-control` | Unix socket path, authentication, and server |
+| `rust/limux-core` | Command dispatcher and state engine |
+| `rust/limux-protocol` | Socket message types and the method registry |
+| `rust/limux-ghostty-sys` | FFI bindings to libghostty |
 
-### Browser
+## Thanks
 
-| Shortcut | Action |
-|---|---|
-| `Ctrl+Shift+L` | Open the focused browser page in a new split |
-| `Ctrl+L` | Focus browser address bar |
-| `Ctrl+[` | Browser back |
-| `Ctrl+]` | Browser forward |
-| `Ctrl+R` | Browser reload |
-| `Ctrl+Alt+I` | Open Web Inspector |
-| `Ctrl+Alt+C` | Open Web Inspector (console-only targeting is not exposed by WebKitGTK) |
-
-### Find
-
-| Shortcut | Action |
-|---|---|
-| `Ctrl+Alt+F` | Open find on the focused terminal or browser |
-| `Ctrl+Alt+G` | Find next |
-| `Ctrl+Alt+Shift+G` | Find previous |
-| `Ctrl+Alt+Shift+F` | Hide find |
-| `Ctrl+Alt+E` | Use selection for find |
-
-### Terminal
-
-| Shortcut | Action |
-|---|---|
-| `Ctrl+Alt+K` | Clear scrollback |
-| `Ctrl+Shift+C` | Copy selection |
-| `Ctrl+Shift+V` | Paste |
-| `Ctrl+Alt++` | Increase font size |
-| `Ctrl+Alt+-` | Decrease font size |
-| `Ctrl+Alt+Shift+0` | Reset font size |
-
-### Workspace And Pane
-
-Use **+** for a workspace in your home folder. Select the folder icon beside it
-to open a workspace from a chosen folder. To make **+** ask for a folder each
-time, enable **Settings → General → Ask for folder on new workspace**.
-
-| Shortcut | Action |
-|---|---|
-| `Ctrl+Alt+Shift+N` | New workspace (uses the configured folder prompt) |
-| `Ctrl+Alt+Shift+W` | Close workspace |
-| `Ctrl+Alt+Shift+Left/Right` | Cycle tabs in focused pane |
-| `Ctrl+Alt+Shift+D` | Split down |
-| `Ctrl+Shift+T` | New terminal tab in the focused pane |
-| `Ctrl+Alt+D` | Split right |
-| `Ctrl+Shift+W` | Close focused tab |
-| `Ctrl+Alt+W` | Close focused pane |
-| `Ctrl+Shift+Z` | Toggle focused pane zoom |
-| `Ctrl+Alt+M` | Toggle sidebar |
-| `Ctrl+Alt+Shift+M` | Toggle top bar |
-| `Ctrl+Alt+T` | New terminal tab |
-| `Ctrl+Alt+Arrow` | Focus pane in direction |
-| `Ctrl+Alt+PageDown/Up` | Next or previous workspace |
-| `Ctrl+Alt+1-9` | Switch to workspace by number |
-| `Ctrl+Alt+O` | Switch to the most recent workspace, back to the pane you left |
-| `Ctrl+Alt+U` | Go to the next unread terminal, across workspaces and collapsed groups |
-| `Ctrl+Alt+Shift+U` | Go to the previous unread terminal |
-
-Switching back to a workspace returns to the pane you last used there, with its
-active tab.
-
-### When a terminal's process ends
-
-A terminal you are looking at closes when its process ends, as in any terminal;
-the workspace closes with its last terminal unless **Keep workspace open** is on.
-A process that ends while you are not looking (another workspace, a background
-tab, or another window in front) keeps its tab, output and workspace, marks them
-unread, and shows **Restart** and **Close**. If it failed (a non-zero exit or a
-signal), it also raises a desktop notification when notifications are on; a
-clean exit is only marked in the sidebar. **Restart** runs the same command
-again, including the workspace's autostart command. A command that fails right
-after it starts is kept the same way, so its error stays readable.
-
-## Architecture
-
-```
-rust/
-  limux-host-linux/    # GTK4/Adwaita UI (window, sidebar, panes, tabs)
-  limux-ghostty-sys/   # FFI bindings to libghostty
-  limux-core/          # Command dispatcher and state engine
-  limux-protocol/      # Socket wire format types
-  limux-control/       # Unix socket server
-  limux-cli/           # CLI client
-```
-
-The terminal rendering is handled entirely by Ghostty's embedded library (`libghostty-internal.so`), which provides GPU-accelerated OpenGL rendering. The UI layer is native GTK4 with libadwaita.
+Limux exists because of [Ghostty](https://ghostty.org) and [cmux](https://github.com/manaflow-ai/cmux). [Anton Barchukov](https://github.com/antonbarchukov) created the original Arch packaging in [#50](https://github.com/am-will/limux/pull/50).
 
 ## License
 
-MIT
+[MIT](LICENSE)
