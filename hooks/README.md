@@ -20,6 +20,11 @@ That writes the equivalent configuration into each agent's user config:
 | Gemini CLI | `$GEMINI_CLI_HOME/.gemini/settings.json` or `~/.gemini/settings.json` |
 | Antigravity (`agy`) | `~/.gemini/config/hooks.json` |
 
+`limux hooks setup` and `limux hooks uninstall` change only the handlers that
+Limux wrote. They keep your other handlers and settings, follow a symlinked
+config file, keep its permissions, and do not rewrite a file that is already
+up to date.
+
 Use the files in this directory as canonical examples when reviewing or
 manually repairing an agent config:
 
