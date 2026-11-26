@@ -449,6 +449,8 @@ for regression in \
   window::pane_close_tests::only_the_pane_in_use_takes_the_keyboard \
   window::pane_close_tests::directional_focus_reaches_a_pane_without_a_terminal \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
+  window::session_save_tests::close_completes_with_a_pane_kept_open_without_tabs \
+  window::session_save_tests::close_completes_while_the_session_keeps_changing \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
   window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \
   window::eager_restore_tests::eager_restore_follows_moved_tabs_and_skips_closed_tabs_after_reordering \

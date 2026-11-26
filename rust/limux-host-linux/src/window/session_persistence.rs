@@ -13,6 +13,31 @@ pub(super) enum SessionCloseMode {
     AcceptRecovery,
 }
 
+/// Background saves a close repeats because the session changed during one.
+/// After these, the close saves on the GTK thread, where nothing can change
+/// the session before the window is gone.
+const MAX_CLOSE_RESAVES: u8 = 3;
+
+pub(super) struct PendingSessionClose {
+    mode: SessionCloseMode,
+    resaves_left: u8,
+}
+
+impl PendingSessionClose {
+    fn new(mode: SessionCloseMode) -> Self {
+        Self {
+            mode,
+            resaves_left: MAX_CLOSE_RESAVES,
+        }
+    }
+
+    fn take_resave(&mut self) -> bool {
+        let allowed = self.resaves_left > 0;
+        self.resaves_left = self.resaves_left.saturating_sub(1);
+        allowed
+    }
+}
+
 pub(super) trait SessionSaveAccess {
     fn persistence_suspended(&self) -> bool;
     fn save_queued(&self) -> bool;
@@ -208,21 +233,32 @@ pub(super) fn save_session_now(state: &State) {
     let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
         let result = match task.await {
-            Ok((store, saved_session, result)) => {
-                state.borrow_mut().session_store = Ok(Some(store));
+            Ok((mut store, saved_session, mut result)) => {
                 // A close request must include changes made while the worker was
                 // saving, including control-socket commands behind a modal dialog.
                 let closing = state.borrow().session_close_pending.is_some();
-                if closing && result.is_ok() && snapshot_session_state(&state) != saved_session {
-                    if !waiters.is_empty() {
-                        let mut s = state.borrow_mut();
+                let latest = (closing && result.is_ok())
+                    .then(|| snapshot_session_state(&state))
+                    .filter(|latest| *latest != saved_session);
+                if let Some(latest) = latest {
+                    let mut s = state.borrow_mut();
+                    let resave = s
+                        .session_close_pending
+                        .as_mut()
+                        .is_some_and(PendingSessionClose::take_resave);
+                    if resave {
+                        s.session_store = Ok(Some(store));
                         let mut requeued = waiters;
                         requeued.append(&mut s.session_save_waiters);
                         s.session_save_waiters = requeued;
+                        drop(s);
+                        save_session_now(&state);
+                        return;
                     }
-                    save_session_now(&state);
-                    return;
+                    drop(s);
+                    result = store.save_with_agents(&latest);
                 }
+                state.borrow_mut().session_store = Ok(Some(store));
                 result.map_err(|error| error.to_string())
             }
             Err(_) => {
@@ -261,8 +297,8 @@ pub(super) fn finish_session_save(
     result: Result<crate::session_store::SaveOutcome, String>,
 ) {
     let closing = state.borrow_mut().session_close_pending.take();
-    if let Some(mode) = closing {
-        finish_session_close(state, mode, result);
+    if let Some(closing) = closing {
+        finish_session_close(state, closing.mode, result);
         return;
     }
     match result {
@@ -286,7 +322,8 @@ pub(super) fn prepare_session_close(state: &State) -> bool {
     if state.borrow().session_close_dialog_open || state.borrow().session_close_pending.is_some() {
         return false;
     }
-    state.borrow_mut().session_close_pending = Some(SessionCloseMode::Save);
+    state.borrow_mut().session_close_pending =
+        Some(PendingSessionClose::new(SessionCloseMode::Save));
     save_session_now(state);
     false
 }
@@ -376,7 +413,8 @@ pub(super) fn finish_session_close(
                 }
                 // Control-socket commands can still change the session while the
                 // dialog is open. Capture the latest state before allowing close.
-                state.borrow_mut().session_close_pending = Some(SessionCloseMode::AcceptRecovery);
+                state.borrow_mut().session_close_pending =
+                    Some(PendingSessionClose::new(SessionCloseMode::AcceptRecovery));
                 save_session_now(&state);
             });
         }
