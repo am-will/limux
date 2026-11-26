@@ -3390,14 +3390,15 @@ fn build_set_workspace_color_params(
     args: &[String],
     env_value: impl Fn(&str) -> Option<String>,
 ) -> Result<Value> {
-    let color = trailing_title(args)
-        .ok_or_else(|| anyhow!("set-workspace-color requires a color name or \"none\""))?;
+    let (args, color) = split_text_args(args, &["--workspace"], &[]);
+    let workspace = lifecycle_option(&args, "--workspace")?
+        .or_else(|| nonempty(env_value("LIMUX_WORKSPACE_ID")));
+    let color =
+        color?.ok_or_else(|| anyhow!("set-workspace-color requires a color name or \"none\""))?;
 
     let mut params = Map::new();
     params.insert("color".to_string(), Value::String(color));
-    if let Some(workspace) =
-        lifecycle_option(args, "--workspace")?.or_else(|| nonempty(env_value("LIMUX_WORKSPACE_ID")))
-    {
+    if let Some(workspace) = workspace {
         params.insert("workspace_id".to_string(), Value::String(workspace));
     }
     Ok(Value::Object(params))
@@ -4590,12 +4591,8 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             )?;
             let pane = parse_opt(&args, "--pane");
             let surface = parse_opt(&args, "--surface");
-            // A named pane is as explicit a target as a named surface.
-            let workspace = request_workspace(
-                parse_opt(&args, "--workspace"),
-                surface.as_deref().or(pane.as_deref()),
-                env_opt,
-            );
+            let workspace =
+                request_workspace(parse_opt(&args, "--workspace"), surface.as_deref(), env_opt);
             let mut p = Map::new();
             if let Some(pane) = pane {
                 p.insert("pane_id".to_string(), Value::String(pane));
@@ -5372,8 +5369,10 @@ mod cli_arg_tests {
             &["focus-pane", "5"],
             &["clear-history", "--pane", "5"],
             &["respawn-pane", "-t", "4:a"],
+            &["respawn-pane", "--command"],
             &["rename-workspace", "--workspace", "", "title"],
             &["set-workspace-color", "--workspace", "", "blue"],
+            &["set-workspace-color", "--workspace=", "blue"],
             &["set-workspace-group", "--workspace", "", "group"],
         ] {
             let mut client = Client::new(PathBuf::from("/does/not/exist.sock"));
@@ -6410,6 +6409,28 @@ mod new_pane_tests {
         assert_eq!(
             params,
             json!({ "color": "none", "workspace_id": "raw-workspace" })
+        );
+
+        let inline =
+            build_set_workspace_color_params(&args(&["--workspace=ws-other", "blue"]), test_env)
+                .unwrap();
+
+        assert_eq!(
+            inline,
+            json!({ "color": "blue", "workspace_id": "ws-other" })
+        );
+    }
+
+    #[test]
+    fn set_workspace_color_rejects_empty_inline_workspace() {
+        let error = build_set_workspace_color_params(&args(&["--workspace=", "blue"]), test_env)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--workspace requires a non-empty value"),
+            "{error}"
         );
     }
 

@@ -54,6 +54,7 @@ fn untargeted_tmux_commands_act_on_the_callers_workspace() {
         &["read-screen"][..],
         &["clear-history"],
         &["break-pane"],
+        &["break-pane", "--pane", "9"],
         &["paste-buffer", "--name", "b"],
         &["respawn-pane", "--command", "make"],
         &["pipe-pane", "--command", "cat"],
@@ -64,7 +65,7 @@ fn untargeted_tmux_commands_act_on_the_callers_workspace() {
     }
     for args in [
         &["clear-history", "--surface", "9:other"][..],
-        &["break-pane", "--pane", "9"],
+        &["break-pane", "--surface", "9:other"],
     ] {
         let params = &caller_requests(home.path(), args)[0]["params"];
         assert!(params.get("workspace_id").is_none(), "{args:?}: {params}");
@@ -89,6 +90,16 @@ fn respawn_pane_presses_enter_in_the_terminal_that_took_the_command() {
     let requests = caller_requests(home.path(), &["respawn-pane"]);
     assert_eq!(requests.len(), 1, "no command types nothing: {requests:?}");
     assert_eq!(requests[0]["params"]["key"], "Enter");
+
+    let missing = cli(home.path())
+        .args(["respawn-pane", "--command"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("--command requires a value"),
+        "{missing:?}"
+    );
 }
 
 #[test]

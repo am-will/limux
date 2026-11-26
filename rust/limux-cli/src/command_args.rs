@@ -136,11 +136,15 @@ pub(crate) fn checked_args(
     let mut words = 0;
     let mut rest = args.iter().map(String::as_str);
     while let Some(arg) = rest.next() {
-        if let Some((name, value)) = values
-            .contains(&arg)
-            .then(|| (arg, rest.next().unwrap_or_default()))
-            .or_else(|| inline_value(arg, values))
-        {
+        let option = if values.contains(&arg) {
+            let value = rest
+                .next()
+                .ok_or_else(|| anyhow!("{arg} requires a value"))?;
+            Some((arg, value))
+        } else {
+            inline_value(arg, values)
+        };
+        if let Some((name, value)) = option {
             if name != "--command" && (value.trim().is_empty() || value.starts_with("--")) {
                 bail!("{name} requires a non-empty value");
             }
@@ -148,7 +152,16 @@ pub(crate) fn checked_args(
         } else if switches.contains(&arg) || is_output_switch(arg) {
             checked.push(arg.to_string());
         } else if arg == "--id-format" {
-            rest.next();
+            let value = rest
+                .next()
+                .ok_or_else(|| anyhow!("--id-format requires a value"))?;
+            if value.trim().is_empty() || value.starts_with('-') {
+                bail!("--id-format requires a non-empty value");
+            }
+        } else if let Some((_, value)) = inline_value(arg, &["--id-format"]) {
+            if value.trim().is_empty() || value.starts_with('-') {
+                bail!("--id-format requires a non-empty value");
+            }
         } else if !arg.starts_with('-') && words < max_words {
             words += 1;
             checked.push(arg.to_string());
@@ -261,8 +274,47 @@ mod tests {
             "--pane 5",
             "-t 4:a",
             "--surface 4:a 5:b",
+            "--id-format",
+            "--id-format=",
+            "--id-format --surface 4:a",
+            "--id-format -x",
+            "--id-format=--surface",
         ] {
             assert!(check(line).is_err(), "{line}");
         }
+        assert_eq!(
+            check("--id-format refs --surface 4:a").unwrap(),
+            words("--surface 4:a")
+        );
+        assert_eq!(
+            check("--id-format=uuids --surface 4:a").unwrap(),
+            words("--surface 4:a")
+        );
+    }
+
+    #[test]
+    fn checked_args_require_a_command_value_when_omitted_but_allow_any_supplied_value() {
+        let check = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            checked_args(
+                "respawn-pane",
+                &owned,
+                &["--workspace", "--surface", "--command"],
+                &["-k"],
+                0,
+            )
+        };
+        let error = check(&["--command"]).unwrap_err().to_string();
+        assert_eq!(error, "--command requires a value");
+        assert_eq!(check(&["--command", ""]).unwrap(), vec!["--command", ""]);
+        assert_eq!(
+            check(&["--command", "--foo"]).unwrap(),
+            vec!["--command", "--foo"]
+        );
+        assert_eq!(check(&["--command="]).unwrap(), vec!["--command", ""]);
+        assert_eq!(
+            check(&["--command=--foo"]).unwrap(),
+            vec!["--command", "--foo"]
+        );
     }
 }
