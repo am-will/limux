@@ -80,6 +80,32 @@ assert_glibc_compatibility() {
     echo "Verified ${label} GLIBC requirement: GLIBC_${required_glibc} (target max GLIBC_${MAX_GLIBC_VERSION})"
 }
 
+# The newest glibc that any shipped binary needs.
+release_glibc_requirement() {
+    local binary
+    local required
+
+    required="$(
+        for binary in "$GHOSTTY_SO" "$CLI_BINARY" "$HOST_BINARY"; do
+            glibc_requirement_for "$binary" || true
+        done | sort -Vu | tail -n1
+    )"
+    printf '%s\n' "${required:-$MAX_GLIBC_VERSION}"
+}
+
+# The GTK version that the host binary is built for.
+gtk_requirement() {
+    local required
+
+    required="$(sed -n 's/^gtk4 = .*"v\([0-9]*\)_\([0-9]*\)".*/\1.\2/p' \
+        "$ROOT_DIR/rust/limux-host-linux/Cargo.toml")"
+    if [ -z "$required" ]; then
+        echo "ERROR: no GTK version feature found in rust/limux-host-linux/Cargo.toml" >&2
+        return 1
+    fi
+    printf '%s\n' "$required"
+}
+
 assert_cli_entrypoint() {
     local path="$1"
     local label="$2"
@@ -120,7 +146,7 @@ assert_pixbuf_svg_loader_bundle() {
         exit 1
     fi
     if ! grep -q "@LOADER_DIR@" "${appdir}/${cache_dir_rel}/loaders.cache.template"; then
-        echo "ERROR: loaders.cache.template missing @LOADER_DIR@ placeholder — AppRun substitution will fail"
+        echo "ERROR: loaders.cache.template missing @LOADER_DIR@ placeholder, so the launcher cannot activate it"
         exit 1
     fi
     echo "Verified bundled SVG pixbuf loader, librsvg-2.so.2, and loaders.cache.template"
@@ -461,6 +487,11 @@ for arg in "$@"; do
             echo "Usage: install.sh [--prefix=/usr/local] [--uninstall]"
             exit 0
             ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            echo "Usage: install.sh [--prefix=/usr/local] [--uninstall]" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -587,7 +618,7 @@ need_root() {
     fi
 
     echo "This operation requires write access to managed files under ${PREFIX}. Re-running with sudo..."
-    exec sudo "$0" "$@"
+    exec sudo "$SCRIPT_DIR/$(basename "$0")" "$@"
 }
 
 limux_ldconfig_config_matches_prefix() {
@@ -803,8 +834,11 @@ populate_tree "$DEB_ROOT" "/usr"
 mkdir -p "$DEB_ROOT/etc/ld.so.conf.d"
 echo "/usr/lib/limux" > "$DEB_ROOT/etc/ld.so.conf.d/limux.conf"
 
-# Control file
+# Control file. The binaries fail to start on an older glibc or GTK, so the
+# package must not install there.
 INSTALLED_SIZE=$(du -sk "$DEB_ROOT" | cut -f1)
+DEB_GLIBC="$(release_glibc_requirement)"
+DEB_GTK="$(gtk_requirement)"
 mkdir -p "$DEB_ROOT/DEBIAN"
 printf '%s\n' /etc/apparmor.d/dev.limux.linux > "$DEB_ROOT/DEBIAN/conffiles"
 cat > "$DEB_ROOT/DEBIAN/control" << EOF
@@ -814,7 +848,7 @@ Section: utils
 Priority: optional
 Architecture: ${DEB_ARCH}
 Installed-Size: ${INSTALLED_SIZE}
-Depends: libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4, bubblewrap, xdg-dbus-proxy
+Depends: libc6 (>= ${DEB_GLIBC}), libgtk-4-1 (>= ${DEB_GTK}), libadwaita-1-0, libwebkitgtk-6.0-4, bubblewrap, xdg-dbus-proxy
 Recommends: wl-clipboard
 Maintainer: Will R <will@limux.dev>
 Description: GPU-accelerated terminal workspace manager for Linux
@@ -929,6 +963,7 @@ copy_appimage_webkit_runtime "$APPDIR"
 
 # Ghostty resources required for named themes and shell integration
 cp -r "$GHOSTTY_SHARE_DIR" "$APPDIR/usr/share/limux/ghostty"
+copy_ghostty_terminfo_entries "$GHOSTTY_TERMINFO_DIR" "$APPDIR/usr/share/limux/terminfo"
 
 # Desktop file (at AppDir root and in usr/share)
 cp "$DESKTOP_FILE" "$APPDIR/dev.limux.linux.desktop"
@@ -1007,7 +1042,7 @@ if [ -n "$PIXBUF_SVG_LOADER" ]; then
     # Drag in librsvg-2 and its closure — the loader dlopens it at runtime.
     copy_appimage_library_closure "$APPDIR/usr/lib" "$PIXBUF_SVG_LOADER"
 
-    # Generate a relocatable loaders.cache template. AppRun substitutes
+    # Generate a relocatable loaders.cache template. The host launcher substitutes
     # @LOADER_DIR@ with the live mount path at runtime. Use a tab delimiter
     # for sed since neither the AppDir path nor "@LOADER_DIR@" can contain
     # a literal tab.
@@ -1065,7 +1100,6 @@ fi
 cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
 #!/bin/bash
 HERE="$(dirname "$(readlink -f "$0")")"
-cd "$HERE"
 
 if [ "${LD_LIBRARY_PATH+x}" = x ]; then
     export LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET=1
@@ -1132,27 +1166,6 @@ if [ -z "${LIBGL_DRIVERS_PATH:-}" ]; then
         fi
     done
 fi
-
-# Activate bundled gdk-pixbuf SVG loader by materializing loaders.cache with
-# the current mount path. Written to $XDG_CACHE_HOME so it works on a
-# read-only FUSE-mounted AppImage. See packaging step that bundles the loader.
-# Only export GDK_PIXBUF_MODULE_FILE if mkdir and sed both succeed — otherwise
-# pointing at a missing/stale cache silently breaks SVG rendering.
-PIXBUF_DIR="${HERE}/usr/lib/gdk-pixbuf-2.0/2.10.0"
-if [ -f "${PIXBUF_DIR}/loaders.cache.template" ] && [ -d "${PIXBUF_DIR}/loaders" ]; then
-    LIMUX_CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}"
-    LIMUX_CACHE="${LIMUX_CACHE_BASE}/limux"
-    PIXBUF_CACHE="${LIMUX_CACHE}/pixbuf-loaders.cache.$$"
-    if [ -n "${LIMUX_CACHE_BASE}" ] \
-       && mkdir -p "$LIMUX_CACHE" 2>/dev/null \
-       && sed -e $'s\t@LOADER_DIR@\t'"${PIXBUF_DIR}/loaders"$'\tg' \
-              "${PIXBUF_DIR}/loaders.cache.template" > "${PIXBUF_CACHE}" 2>/dev/null \
-       && [ -s "${PIXBUF_CACHE}" ]; then
-        export GDK_PIXBUF_MODULE_FILE="${PIXBUF_CACHE}"
-    fi
-    unset LIMUX_CACHE_BASE LIMUX_CACHE PIXBUF_CACHE
-fi
-unset PIXBUF_DIR
 
 if [ ! -f "${LIMUX_HOST_BIN:-}" ]; then
     export LIMUX_HOST_BIN="$HERE/usr/libexec/limux/appimage-host-launcher.sh"

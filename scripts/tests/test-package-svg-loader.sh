@@ -80,65 +80,9 @@ else
     fail "regression check" "old sed unexpectedly worked: $BAD"
 fi
 
-# ----- T3: AppRun materializes cache only on successful mkdir+sed -----
+# ----- T3: AppRun preserves original loader environment for terminal children -----
 
-echo "T3: AppRun GDK_PIXBUF_MODULE_FILE conditional export"
-
-# Run the AppRun pixbuf block in isolation with read-only HOME.
-run_apprun_block() {
-    local home_dir="$1"
-    local pixbuf_dir="$2"
-
-    HOME="$home_dir" XDG_CACHE_HOME="" \
-    PIXBUF_DIR="$pixbuf_dir" \
-    bash -c '
-        if [ -f "${PIXBUF_DIR}/loaders.cache.template" ] && [ -d "${PIXBUF_DIR}/loaders" ]; then
-            LIMUX_CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}"
-            LIMUX_CACHE="${LIMUX_CACHE_BASE}/limux"
-            PIXBUF_CACHE="${LIMUX_CACHE}/pixbuf-loaders.cache.$$"
-            if [ -n "${LIMUX_CACHE_BASE}" ] \
-               && mkdir -p "$LIMUX_CACHE" 2>/dev/null \
-               && sed -e $'"'"'s\t@LOADER_DIR@\t'"'"'"${PIXBUF_DIR}/loaders"$'"'"'\tg'"'"' \
-                      "${PIXBUF_DIR}/loaders.cache.template" > "${PIXBUF_CACHE}" 2>/dev/null \
-               && [ -s "${PIXBUF_CACHE}" ]; then
-                export GDK_PIXBUF_MODULE_FILE="${PIXBUF_CACHE}"
-            fi
-        fi
-        # Report whether the export happened.
-        echo "${GDK_PIXBUF_MODULE_FILE:-NOT_SET}"
-    '
-}
-
-# Setup a valid pixbuf dir with template + loaders.
-PIXBUF_DIR="$HEREDOC_TMP/pixbuf"
-mkdir -p "$PIXBUF_DIR/loaders"
-printf '"@LOADER_DIR@/libpixbufloader_svg.so"\n' > "$PIXBUF_DIR/loaders.cache.template"
-
-# Case 1: writable HOME → export should happen
-WRITABLE_HOME="$HEREDOC_TMP/home1"
-mkdir -p "$WRITABLE_HOME"
-result=$(run_apprun_block "$WRITABLE_HOME" "$PIXBUF_DIR")
-if [[ "$result" == *"pixbuf-loaders.cache."* ]] && [[ "$result" != "NOT_SET" ]]; then
-    pass "export with writable HOME"
-else
-    fail "export with writable HOME" "got: $result"
-fi
-
-# Case 2: read-only HOME (mkdir fails) → export should NOT happen
-RO_HOME="$HEREDOC_TMP/home2_ro"
-mkdir -p "$RO_HOME"
-chmod 555 "$RO_HOME"
-result=$(run_apprun_block "$RO_HOME" "$PIXBUF_DIR")
-chmod 755 "$RO_HOME"
-if [[ "$result" == "NOT_SET" ]]; then
-    pass "skip export on read-only HOME"
-else
-    fail "skip export on read-only HOME" "expected NOT_SET, got: $result"
-fi
-
-# ----- T4: AppRun preserves original loader environment for terminal children -----
-
-echo "T4: AppRun original environment markers"
+echo "T3: AppRun original environment markers"
 
 run_apprun_preserve_block() {
     LD_LIBRARY_PATH="${1-}" \
@@ -208,9 +152,9 @@ else
     fail "records original app-sensitive environment" "got: $result"
 fi
 
-# ----- T5: AppRun discovers host Mesa module directories -----
+# ----- T4: AppRun discovers host Mesa module directories -----
 
-echo "T5: AppRun host Mesa module discovery"
+echo "T4: AppRun host Mesa module discovery"
 
 HOST_GBM_DIR="$HEREDOC_TMP/host/lib/gbm"
 HOST_DRI_DIR="$HEREDOC_TMP/host/lib/dri"
@@ -242,9 +186,9 @@ else
     fail "DRI driver discovery" "did not select $HOST_DRI_DIR"
 fi
 
-# ----- T6: LIMUX_REQUIRE_SVG_LOADER hard-fail vs warn-only -----
+# ----- T5: LIMUX_REQUIRE_SVG_LOADER hard-fail vs warn-only -----
 
-echo "T6: LIMUX_REQUIRE_SVG_LOADER gates exit 1"
+echo "T5: LIMUX_REQUIRE_SVG_LOADER gates exit 1"
 
 # Excerpt the warn-or-exit logic — paste-equivalent to the script.
 warn_or_exit() {
@@ -272,9 +216,9 @@ else
     fail "hard-fail path" "expected exit 99, got $ec"
 fi
 
-# ----- T7: host graphics libraries stay outside the AppImage -----
+# ----- T6: host graphics libraries stay outside the AppImage -----
 
-echo "T7: AppImage uses host graphics libraries"
+echo "T6: AppImage uses host graphics libraries"
 
 for library in \
     libEGL.so.1 \
@@ -306,9 +250,9 @@ else
     fail "application runtime closure" "libwebkitgtk-6.0.so.4 would be excluded"
 fi
 
-# ----- T8: WebKitGTK process paths use an absolute runtime placeholder -----
+# ----- T7: WebKitGTK process paths use an absolute runtime placeholder -----
 
-echo "T8: AppImage relocates WebKitGTK process path"
+echo "T7: AppImage relocates WebKitGTK process path"
 
 WEBKIT_APPDIR="$HEREDOC_TMP/webkit-appdir"
 WEBKIT_LIBRARY="$WEBKIT_APPDIR/usr/lib/libwebkitgtk-6.0.so.4"
@@ -331,7 +275,7 @@ else
     pass "rewrites compiled-in process and injected-bundle paths"
 fi
 
-echo 'T9: AppImage materializes absolute sandbox helper paths'
+echo 'T8: AppImage materializes absolute sandbox helper paths'
 mkdir -p "$WEBKIT_APPDIR/usr/lib/webkitgtk-6.0/injected-bundle"
 printf '#!/bin/sh\nprintf "helper executable OK\\n"\n' > "$WEBKIT_APPDIR/usr/lib/webkitgtk-6.0/WebKitWebProcess"
 chmod 755 "$WEBKIT_APPDIR/usr/lib/webkitgtk-6.0/WebKitWebProcess"

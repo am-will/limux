@@ -202,6 +202,17 @@ grep -Fq "Install prefix cannot be the filesystem root." "$TMP_DIR/root-prefix.l
 [ ! -e "$SUDO_LOG" ] || fail "filesystem-root alias attempted privilege escalation"
 rm -f "$SUDO_LOG" "$SIDE_EFFECT_LOG"
 
+for arguments in "--prefix $TMP_DIR/space-prefix" "--prefix $TMP_DIR/space-prefix --uninstall" "--unistall"; do
+    # shellcheck disable=SC2086 # Each word is one argument.
+    if "$PACKAGE_DIR/install.sh" $arguments > "$TMP_DIR/unknown-option.log" 2>&1; then
+        fail "installer accepted an unknown option: $arguments"
+    fi
+    grep -Fq 'Unknown option: --' "$TMP_DIR/unknown-option.log" || \
+        fail "installer did not name the unknown option: $arguments"
+    [ ! -e "$SUDO_LOG" ] || fail "unknown option attempted privilege escalation: $arguments"
+    rm -f "$SUDO_LOG" "$SIDE_EFFECT_LOG"
+done
+
 PERCENT_PREFIX="$TMP_DIR/percent%prefix"
 if "$PACKAGE_DIR/install.sh" --prefix="$PERCENT_PREFIX" > "$TMP_DIR/percent-prefix.log" 2>&1; then
     fail "percent-containing install prefix was accepted"

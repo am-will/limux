@@ -89,6 +89,11 @@ verify_tree() {
         echo "ERROR: $label contains the legacy host entrypoint" >&2
         exit 1
     fi
+    # The host ignores Ghostty resources without a terminfo entry beside them.
+    if [ ! -f "$prefix/share/limux/terminfo/x/xterm-ghostty" ]; then
+        echo "ERROR: $label is missing the Ghostty terminfo entry" >&2
+        exit 1
+    fi
     if ! dynamic="$(LD_LIBRARY_PATH="$library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd -r "$host" 2>&1)"; then
         printf '%s\n' "$dynamic" >&2
         exit 1
