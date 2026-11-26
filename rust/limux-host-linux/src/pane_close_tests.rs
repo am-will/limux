@@ -1540,6 +1540,23 @@ fn held_tab_test_window(app_id: &str) -> (State, tempfile::TempDir) {
     (state, temp)
 }
 
+// Settings is an application window, so it must not outlive the main window.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn closing_the_window_closes_its_settings() {
+    let wait = std::time::Duration::from_secs(10);
+    let (state, _temp) = held_tab_test_window("dev.limux.CloseSettingsTest");
+    let window = state.borrow().window.clone();
+    let app = window.application().unwrap();
+    pump_until(wait, || window.is_mapped());
+    open_settings_dialog(&state);
+    assert_eq!(app.windows().len(), 2);
+
+    window.close();
+    pump_until(wait, || app.windows().is_empty());
+    assert!(app.windows().is_empty(), "a window keeps the app running");
+}
+
 // Returning to a workspace lands in the pane last used there, not its first
 // pane, and the recent-workspace action toggles between the last two.
 #[test]

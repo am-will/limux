@@ -232,6 +232,9 @@ pub fn build_keybind_editor(
             let Some(shortcut_id) = *listening.borrow() else {
                 return gtk::glib::Propagation::Proceed;
             };
+            if !crate::terminal::focus_is_within(outer_for_controller.upcast_ref()) {
+                return gtk::glib::Propagation::Proceed;
+            }
             let Some(definition) = shortcut_config::definitions()
                 .iter()
                 .find(|definition| definition.id == shortcut_id)
@@ -283,7 +286,17 @@ pub fn build_keybind_editor(
             );
             gtk::glib::Propagation::Stop
         });
-        outer.add_controller(key_controller);
+        // GTK runs the application shortcuts in the capture phase of the
+        // window, before the editor sees the key. A controller that is added
+        // to the window later runs first.
+        outer.connect_root_notify(move |outer| {
+            if let Some(previous) = key_controller.widget() {
+                previous.remove_controller(&key_controller);
+            }
+            if let Some(root) = outer.root() {
+                root.add_controller(key_controller.clone());
+            }
+        });
     }
 
     refresh_rows(&rows.borrow(), shortcuts, None, &HashMap::new());
@@ -417,13 +430,94 @@ fn validation_error_message(err: &ShortcutConfigError) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_button_label, capture_outcome_for_key_event, validation_error_message,
-        CaptureOutcome,
+        binding_button_label, build_keybind_editor, capture_outcome_for_key_event,
+        validation_error_message, CaptureOutcome,
     };
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, ShortcutConfigError, ShortcutId,
     };
-    use gtk4::gdk;
+    use gtk4::prelude::*;
+    use gtk4::{self as gtk, gdk, gio, glib};
+    use std::cell::{Cell, RefCell};
+    use std::process::Command;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    fn pump_until(condition: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !condition() && Instant::now() < until {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn capture_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+        if widget.has_css_class("limux-keybind-capture") {
+            return widget.clone().downcast().ok();
+        }
+        std::iter::successors(widget.first_child(), |child| child.next_sibling())
+            .find_map(|child| capture_button(&child))
+    }
+
+    #[test]
+    #[ignore = "requires X11 and xdotool; exercised by xvfb-smoke-test.sh"]
+    fn recording_takes_the_key_before_the_application_shortcut_runs() {
+        gtk::init().expect("GTK display required");
+        let app = gtk::Application::builder()
+            .application_id("dev.limux.KeybindRecordingTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let quits = Rc::new(Cell::new(0));
+        let quit = gio::SimpleAction::new("quit", None);
+        quit.connect_activate({
+            let quits = quits.clone();
+            move |_, _| quits.set(quits.get() + 1)
+        });
+        app.add_action(&quit);
+        app.set_accels_for_action("app.quit", &["<Ctrl><Alt>q"]);
+
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let editor = build_keybind_editor(&default_shortcuts(), {
+            let captured = captured.clone();
+            Rc::new(move |id, binding| {
+                captured
+                    .borrow_mut()
+                    .push((id, binding.map(|binding| binding.to_config_accel())));
+                Err("already assigned".to_string())
+            })
+        });
+        let window = gtk::ApplicationWindow::builder()
+            .application(&app)
+            .title("Limux keybind recording test")
+            .child(&editor)
+            .build();
+        window.present();
+        pump_until(|| window.is_mapped());
+
+        let xdotool = |args: &[&str]| Command::new("xdotool").args(args).output().unwrap();
+        let search = xdotool(&["search", "--name", "^Limux keybind recording test$"]);
+        let window_id = String::from_utf8(search.stdout).unwrap();
+        let window_id = window_id.lines().next().expect("test window id");
+        xdotool(&["windowfocus", "--sync", window_id]);
+
+        capture_button(&editor).unwrap().emit_clicked();
+        pump_until(|| crate::terminal::focus_is_within(&editor));
+        xdotool(&["key", "--clearmodifiers", "ctrl+alt+q"]);
+        pump_until(|| quits.get() > 0 || !captured.borrow().is_empty());
+        assert_eq!(quits.get(), 0, "recording ran the application shortcut");
+        assert_eq!(
+            *captured.borrow(),
+            [(ShortcutId::NewWorkspace, Some("<Ctrl><Alt>q".to_string()))]
+        );
+
+        // The error ended the recording, so the shortcut works again.
+        xdotool(&["key", "--clearmodifiers", "ctrl+alt+q"]);
+        pump_until(|| quits.get() > 0);
+        assert_eq!(quits.get(), 1);
+        assert_eq!(captured.borrow().len(), 1);
+        window.destroy();
+    }
 
     #[test]
     fn binding_button_label_prefers_current_binding_and_listening_state() {
