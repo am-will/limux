@@ -434,11 +434,11 @@ for regression in \
   window::pane_create_tests::terminal_commands_retry_until_ready_then_reply_without_a_timer \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
   window::pane_close_tests::localized_split_and_remove_keep_sibling_gl_areas_realized \
+  window::pane_close_tests::terminal_find_works_from_its_entry_and_gives_the_focus_back \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
   window::pane_close_tests::an_exit_driven_through_the_control_socket_closes_its_tab_unwatched \
   window::pane_close_tests::a_failed_exit_driven_through_the_control_socket_is_held \
   window::pane_close_tests::next_unread_terminal_reads_a_tab_a_zoom_hid \
-  window::pane_close_tests::terminal_find_works_from_its_entry_and_gives_the_focus_back \
   window::pane_close_tests::closing_inactive_workspace_preserves_active_manual_unread \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
