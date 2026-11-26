@@ -570,6 +570,25 @@ fn parse_lifecycle_workspace_target(
     parse_optional_workspace_target(params, true)
 }
 
+/// The workspace to change. An empty id, such as an unset shell variable, must not
+/// become the active workspace.
+fn parse_changed_workspace_target(
+    params: &Map<String, Value>,
+) -> Result<WorkspaceTarget, BridgeError> {
+    for key in ["workspace_id", "id"] {
+        if params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|raw| raw.trim().is_empty())
+        {
+            return Err(BridgeError::invalid_params(format!(
+                "{key} must not be empty"
+            )));
+        }
+    }
+    parse_optional_workspace_target(params, false)
+}
+
 fn optional_tab_handle(params: &Map<String, Value>) -> Result<Option<String>, BridgeError> {
     let mut selected = None;
     for key in ["surface_id", "tab_id"] {
@@ -827,7 +846,7 @@ fn parse_group_request(
                 Some(Value::Null) => None,
                 Some(_) => Some(required_group(params, method)?),
             };
-            let target = parse_optional_workspace_target(params, false)?;
+            let target = parse_changed_workspace_target(params)?;
             Ok(GroupRequest::SetWorkspaceGroup { target, group })
         }
         _ => Err(BridgeError::new(
@@ -1364,7 +1383,7 @@ fn handle_method(
                     BridgeError::invalid_params("workspace.rename requires title/name"),
                 );
             };
-            let target = match parse_optional_workspace_target(params, false) {
+            let target = match parse_changed_workspace_target(params) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
@@ -1383,7 +1402,7 @@ fn handle_method(
                 Ok(color) => color,
                 Err(error) => return error_response(id, error),
             };
-            let target = match parse_optional_workspace_target(params, false) {
+            let target = match parse_changed_workspace_target(params) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
@@ -1420,7 +1439,7 @@ fn handle_method(
             (ControlCommand::GuiHook { request, reply }, rx)
         }
         "workspace.close" => {
-            let target = match parse_optional_workspace_target(params, false) {
+            let target = match parse_changed_workspace_target(params) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
@@ -2721,6 +2740,30 @@ mod tests {
             response.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
+    }
+
+    #[test]
+    fn workspace_changes_reject_empty_ids_before_dispatch() {
+        for method in [
+            "workspace.close",
+            "workspace.rename",
+            "workspace.set_color",
+            "workspace.set_group",
+        ] {
+            for key in ["workspace_id", "id"] {
+                let mut params = json!({ "title": "t", "color": "blue", "group_id": "g" });
+                params[key] = json!(" ");
+                let response = dispatch_request(
+                    &json!({ "method": method, "params": params }).to_string(),
+                    &|command| panic!("empty target dispatched: {command:?}"),
+                );
+                assert_eq!(
+                    response.error.map(|error| error.code),
+                    Some(INVALID_PARAMS_CODE),
+                    "{method} {key}"
+                );
+            }
+        }
     }
 
     #[test]
