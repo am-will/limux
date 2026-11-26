@@ -966,7 +966,8 @@ impl SplitTreeContainer {
             .borrow()
             .as_ref()
             .and_then(|w| w.upgrade());
-        if let Some(focused) = focused {
+        // A hidden workspace must not take the focus from the one on screen.
+        if let Some(focused) = focused.filter(|_| self.bin.is_mapped()) {
             if !focused.has_focus() && !pane::focus_active_tab_in_pane(&focused) {
                 focused.grab_focus();
             }

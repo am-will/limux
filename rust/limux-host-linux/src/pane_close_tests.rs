@@ -1751,3 +1751,154 @@ fn next_unread_terminal_reads_a_tab_a_zoom_hid() {
     let window = state.borrow().window.clone();
     window.close();
 }
+
+/// Two panes side by side, the second with two terminal tabs, and the focus in
+/// the first.
+fn show_focused_first_of_two_panes(state: &State) -> (gtk::Widget, gtk::Widget) {
+    let (_ws_id, root) = show_focused_workspace(
+        state,
+        LayoutNodeState::Split(SplitState {
+            orientation: SplitOrientation::Horizontal,
+            ratio: 0.5,
+            start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+            end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        }),
+    );
+    let first = find_leaf_pane(&root, gtk::Orientation::Horizontal, true);
+    let second = find_leaf_pane(&root, gtk::Orientation::Horizontal, false);
+    pane::add_terminal_tab_to_pane(&second);
+    pump_for(std::time::Duration::from_millis(300));
+    assert!(pane::focus_active_tab_in_pane(&first));
+    pump_for(std::time::Duration::from_millis(200));
+    assert_focus_within("before", state, &first);
+    (first, second)
+}
+
+// Enter commits a tab rename and gives the keyboard back to the terminal, not
+// to the tab's close button. Focus that moves elsewhere commits it too.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn tab_rename_commit_returns_the_focus_to_its_terminal() {
+    let (state, _temp) = held_tab_test_window("dev.limux.TabRenameFocusTest");
+    let wait = std::time::Duration::from_secs(5);
+    let (first, second) = show_focused_first_of_two_panes(&state);
+    let start_rename = || {
+        let tab = widget_tree(&first)
+            .into_iter()
+            .find(|w| w.has_css_class("limux-tab"))
+            .expect("a tab button");
+        focus_menu_item(&open_context_menu(&tab), "Rename").emit_clicked();
+        pump_until(wait, || pane::find_tab_rename_entry(&first).is_some());
+        let entry = pane::find_tab_rename_entry(&first).expect("rename entry");
+        pump_for(std::time::Duration::from_millis(200));
+        assert_focus_within("rename started", &state, entry.upcast_ref());
+        entry
+    };
+    let tab_id = pane::active_tab_in_pane(&first).unwrap();
+    let title = || pane::tab_title(&first, &tab_id).unwrap();
+
+    let entry = start_rename();
+    entry.set_text("entered");
+    entry.emit_activate();
+    pump_for(std::time::Duration::from_millis(300));
+    let terminal = find_gl_area(&first).expect("terminal").upcast();
+    assert_focus_within("rename committed", &state, &terminal);
+    assert_eq!(title(), "entered");
+
+    let entry = start_rename();
+    entry.set_text("left");
+    assert!(find_gl_area(&second).expect("terminal").grab_focus());
+    pump_for(std::time::Duration::from_millis(300));
+    assert!(pane::find_tab_rename_entry(&first).is_none());
+    assert_eq!(title(), "left");
+    assert_focus_within("rename left", &state, &second);
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+// A tab that closes in another pane, or anything that happens in a workspace
+// that is not on screen, leaves the keyboard where the user is typing.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn only_the_pane_in_use_takes_the_keyboard() {
+    let (state, _temp) = held_tab_test_window("dev.limux.KeyboardOwnerTest");
+    let settle = || pump_for(std::time::Duration::from_millis(400));
+    let (first, second) = show_focused_first_of_two_panes(&state);
+    let close_active = |pane: &gtk::Widget| {
+        let active = pane::active_tab_in_pane(pane).unwrap();
+        assert!(pane::close_tab_in_pane(pane, &active));
+        settle();
+    };
+    close_active(&second);
+    assert_eq!(pane::tab_count_in_pane(&second), 1);
+    assert_focus_within("tab closed in the other pane", &state, &first);
+
+    pane::add_terminal_tab_to_pane(&first);
+    settle();
+    close_active(&first);
+    assert_focus_within("tab closed in the focused pane", &state, &first);
+
+    pane::add_terminal_tab_to_pane(&second);
+    settle();
+    let hidden_ws = {
+        let s = state.borrow();
+        s.active_workspace().unwrap().id.clone()
+    };
+    let (_ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let shown = first_leaf_pane(&root);
+    assert!(!second.is_mapped());
+
+    close_active(&second);
+    assert_focus_within("tab closed in a hidden workspace", &state, &root);
+    pane::add_terminal_tab_to_pane(&second);
+    settle();
+    assert_focus_within("tab created in a hidden workspace", &state, &root);
+    assert!(split_pane(
+        &state,
+        &hidden_ws,
+        &second,
+        gtk::Orientation::Vertical,
+        split_options(),
+    )
+    .is_some());
+    settle();
+    assert_focus_within("split in a hidden workspace", &state, &root);
+
+    // A tab dropped on the sidebar row of a hidden workspace.
+    pane::add_terminal_tab_to_pane(&shown);
+    settle();
+    let moved = pane::active_surface_summary(&shown).unwrap();
+    assert!(handle_tab_drop_to_workspace(
+        &state,
+        &hidden_ws,
+        &moved.surface_id
+    ));
+    settle();
+    assert_eq!(pane::tab_count_in_pane(&shown), 1);
+    assert_focus_within("tab moved to a hidden workspace", &state, &root);
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+// Moving the focus between panes also reaches a pane that shows no terminal.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn directional_focus_reaches_a_pane_without_a_terminal() {
+    let (state, _temp) = held_tab_test_window("dev.limux.DirectionalFocusTest");
+    let (first, second) = show_focused_first_of_two_panes(&state);
+    open_keybind_editor_tab(&state, &second);
+    pump_for(std::time::Duration::from_millis(300));
+    assert!(pane::focus_active_tab_in_pane(&first));
+    pump_for(std::time::Duration::from_millis(200));
+
+    focus_pane_in_direction(&state, Direction::Right);
+    assert_focus_within("focus right", &state, &second);
+    focus_pane_in_direction(&state, Direction::Left);
+    assert_focus_within("focus left", &state, &first);
+
+    let window = state.borrow().window.clone();
+    window.close();
+}

@@ -592,7 +592,6 @@ pub(super) fn show_rename_dialog(
     parent.insert_child_after(&entry, Some(label));
     crate::window::register_active_inline_rename(&entry);
     tab_state.borrow_mut().active_rename_tab = Some(tab_id.to_string());
-    focus_tab_rename_entry(&entry);
 
     // On activate (Enter) or blur, commit rename.
     let lbl = label.clone();
@@ -617,6 +616,12 @@ pub(super) fn show_rename_dialog(
             if let Some(tab) = state.borrow_mut().find_tab_mut(&tid) {
                 tab.rename(&entry.text());
             }
+            // Removing the focused entry makes GTK focus the tab's close
+            // button, and the next Space or Enter would close the tab.
+            let root = entry
+                .root()
+                .filter(|_| crate::terminal::focus_is_within(entry.upcast_ref()));
+            crate::terminal::unset_focus_within(entry.upcast_ref());
             lbl.set_visible(true);
             if entry.parent().is_some() {
                 parent.remove(entry);
@@ -624,6 +629,15 @@ pub(super) fn show_rename_dialog(
             parent.set_can_target(parent_was_targetable);
             if state.borrow().active_rename_tab.as_deref() == Some(tid.as_str()) {
                 state.borrow_mut().active_rename_tab = None;
+            }
+            if let Some(root) = root {
+                let state = state.clone();
+                glib::idle_add_local_once(move || {
+                    // The click that ended the rename may have taken the focus.
+                    if root.focus().is_none() {
+                        focus_active_tab_content(&state);
+                    }
+                });
             }
             (callbacks.on_state_changed)();
         }
@@ -637,17 +651,25 @@ pub(super) fn show_rename_dialog(
     }
     {
         let do_rename = do_rename.clone();
-        entry.connect_notify_local(Some("has-focus"), move |entry, _| {
-            if entry.has_focus() {
+        // Not `has-focus`: an entry's focus is on the text inside it.
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |controller| {
+            let Some(entry) = controller.widget().and_downcast::<gtk::Entry>() else {
                 return;
-            }
+            };
             let do_rename = do_rename.clone();
-            let entry = entry.clone();
             glib::idle_add_local_once(move || {
-                if !entry.has_focus() && entry.parent().is_some() {
+                // No focus at all is a split being rebuilt, which gives it
+                // back, and an inactive window keeps it.
+                let left = entry.root().is_some_and(|root| root.focus().is_some())
+                    && !crate::terminal::focus_is_within(entry.upcast_ref());
+                if left {
                     do_rename(&entry);
                 }
             });
         });
+        entry.add_controller(focus);
     }
+    // After the controller, which only reports a focus it saw arrive.
+    focus_tab_rename_entry(&entry);
 }
