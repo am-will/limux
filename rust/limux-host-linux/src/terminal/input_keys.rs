@@ -30,6 +30,15 @@ pub(super) fn translate_key_event(
     if modifier.contains(gtk::gdk::ModifierType::SUPER_MASK) {
         mods |= GHOSTTY_MODS_SUPER;
     }
+    let resolved_key = ghostty_key_for_keyval(keyval);
+    // GDK reports the modifiers from before the event, so a modifier key's own
+    // press is missing from them and its release is still in them.
+    let own_modifier = modifier_for_ghostty_key(resolved_key);
+    if action == GHOSTTY_ACTION_RELEASE {
+        mods &= !own_modifier;
+    } else {
+        mods |= own_modifier;
+    }
 
     let unshifted = widget
         .zip(key_event)
@@ -39,7 +48,6 @@ pub(super) fn translate_key_event(
     let consumed = key_event
         .map(translate_consumed_mods)
         .unwrap_or_else(|| fallback_consumed_mods(keyval, modifier));
-    let keycode = ghostty_keycode_with_keyval_remap(keyval, keycode);
 
     TranslatedKeyEvent {
         input: ghostty_input_key_s {
@@ -51,31 +59,66 @@ pub(super) fn translate_key_event(
             unshifted_codepoint: unshifted,
             composing: false,
         },
-        resolved_key: ghostty_key_for_keyval(keyval),
+        resolved_key,
     }
 }
 
-pub(super) fn ghostty_keycode_with_keyval_remap(keyval: gtk::gdk::Key, keycode: u32) -> u32 {
-    const XKB_KEYCODE_ESCAPE: u32 = 9;
-    const XKB_KEYCODE_CAPS_LOCK: u32 = 66;
-
-    match keyval {
-        gtk::gdk::Key::Escape => XKB_KEYCODE_ESCAPE,
-        gtk::gdk::Key::Caps_Lock => XKB_KEYCODE_CAPS_LOCK,
-        _ => keycode,
-    }
-}
-
-/// Keypad keyvals as Ghostty keys, matching Ghostty's GTK apprt.
+/// Keyvals as Ghostty keys, matching Ghostty's GTK apprt without the
+/// writing-system keys, which keep their physical key.
 ///
-/// Embedded Ghostty derives its key from the XKB keycode, so with Num Lock off
-/// keypad 1 (`KP_End`) would still resolve to `numpad_1`. Passing the keyval's
-/// key keeps keypad identity (`numpad_end`) for `kp_*` keybinds and Kitty
-/// keyboard sequences while still producing navigation.
+/// Embedded Ghostty derives its key from the XKB keycode, so a key the layout
+/// remaps would keep its physical identity: Caps Lock remapped to BackSpace
+/// would type nothing. Keypad 1 (`KP_End` with Num Lock off) also keeps keypad
+/// identity (`numpad_end`) for `kp_*` keybinds and Kitty keyboard sequences.
 pub(super) fn ghostty_key_for_keyval(keyval: gtk::gdk::Key) -> c_int {
     use gtk::gdk::Key;
 
     match keyval {
+        Key::space => GHOSTTY_KEY_SPACE,
+        Key::Up => GHOSTTY_KEY_ARROW_UP,
+        Key::Down => GHOSTTY_KEY_ARROW_DOWN,
+        Key::Right => GHOSTTY_KEY_ARROW_RIGHT,
+        Key::Left => GHOSTTY_KEY_ARROW_LEFT,
+        Key::Home => GHOSTTY_KEY_HOME,
+        Key::End => GHOSTTY_KEY_END,
+        Key::Insert => GHOSTTY_KEY_INSERT,
+        Key::Delete => GHOSTTY_KEY_DELETE,
+        Key::Caps_Lock => GHOSTTY_KEY_CAPS_LOCK,
+        Key::Scroll_Lock => GHOSTTY_KEY_SCROLL_LOCK,
+        Key::Num_Lock => GHOSTTY_KEY_NUM_LOCK,
+        Key::Page_Up => GHOSTTY_KEY_PAGE_UP,
+        Key::Page_Down => GHOSTTY_KEY_PAGE_DOWN,
+        Key::Escape => GHOSTTY_KEY_ESCAPE,
+        Key::Return => GHOSTTY_KEY_ENTER,
+        Key::Tab => GHOSTTY_KEY_TAB,
+        Key::BackSpace => GHOSTTY_KEY_BACKSPACE,
+        Key::Print => GHOSTTY_KEY_PRINT_SCREEN,
+        Key::Pause => GHOSTTY_KEY_PAUSE,
+        Key::F1 => GHOSTTY_KEY_F1,
+        Key::F2 => GHOSTTY_KEY_F2,
+        Key::F3 => GHOSTTY_KEY_F3,
+        Key::F4 => GHOSTTY_KEY_F4,
+        Key::F5 => GHOSTTY_KEY_F5,
+        Key::F6 => GHOSTTY_KEY_F6,
+        Key::F7 => GHOSTTY_KEY_F7,
+        Key::F8 => GHOSTTY_KEY_F8,
+        Key::F9 => GHOSTTY_KEY_F9,
+        Key::F10 => GHOSTTY_KEY_F10,
+        Key::F11 => GHOSTTY_KEY_F11,
+        Key::F12 => GHOSTTY_KEY_F12,
+        Key::F13 => GHOSTTY_KEY_F13,
+        Key::F14 => GHOSTTY_KEY_F14,
+        Key::F15 => GHOSTTY_KEY_F15,
+        Key::F16 => GHOSTTY_KEY_F16,
+        Key::F17 => GHOSTTY_KEY_F17,
+        Key::F18 => GHOSTTY_KEY_F18,
+        Key::F19 => GHOSTTY_KEY_F19,
+        Key::F20 => GHOSTTY_KEY_F20,
+        Key::F21 => GHOSTTY_KEY_F21,
+        Key::F22 => GHOSTTY_KEY_F22,
+        Key::F23 => GHOSTTY_KEY_F23,
+        Key::F24 => GHOSTTY_KEY_F24,
+        Key::F25 => GHOSTTY_KEY_F25,
         Key::KP_0 => GHOSTTY_KEY_NUMPAD_0,
         Key::KP_1 => GHOSTTY_KEY_NUMPAD_1,
         Key::KP_2 => GHOSTTY_KEY_NUMPAD_2,
@@ -105,7 +148,28 @@ pub(super) fn ghostty_key_for_keyval(keyval: gtk::gdk::Key) -> c_int {
         Key::KP_Insert => GHOSTTY_KEY_NUMPAD_INSERT,
         Key::KP_Delete => GHOSTTY_KEY_NUMPAD_DELETE,
         Key::KP_Begin => GHOSTTY_KEY_NUMPAD_BEGIN,
+        Key::Copy => GHOSTTY_KEY_COPY,
+        Key::Cut => GHOSTTY_KEY_CUT,
+        Key::Paste => GHOSTTY_KEY_PASTE,
+        Key::Shift_L => GHOSTTY_KEY_SHIFT_LEFT,
+        Key::Control_L => GHOSTTY_KEY_CONTROL_LEFT,
+        Key::Alt_L => GHOSTTY_KEY_ALT_LEFT,
+        Key::Super_L => GHOSTTY_KEY_META_LEFT,
+        Key::Shift_R => GHOSTTY_KEY_SHIFT_RIGHT,
+        Key::Control_R => GHOSTTY_KEY_CONTROL_RIGHT,
+        Key::Alt_R => GHOSTTY_KEY_ALT_RIGHT,
+        Key::Super_R => GHOSTTY_KEY_META_RIGHT,
         _ => GHOSTTY_KEY_UNIDENTIFIED,
+    }
+}
+
+fn modifier_for_ghostty_key(key: c_int) -> c_int {
+    match key {
+        GHOSTTY_KEY_SHIFT_LEFT | GHOSTTY_KEY_SHIFT_RIGHT => GHOSTTY_MODS_SHIFT,
+        GHOSTTY_KEY_CONTROL_LEFT | GHOSTTY_KEY_CONTROL_RIGHT => GHOSTTY_MODS_CTRL,
+        GHOSTTY_KEY_ALT_LEFT | GHOSTTY_KEY_ALT_RIGHT => GHOSTTY_MODS_ALT,
+        GHOSTTY_KEY_META_LEFT | GHOSTTY_KEY_META_RIGHT => GHOSTTY_MODS_SUPER,
+        _ => GHOSTTY_MODS_NONE,
     }
 }
 

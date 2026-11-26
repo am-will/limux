@@ -965,6 +965,7 @@ fn load_ghostty_config_with_font(
 
     unsafe {
         let config = ghostty_config_new();
+        unbind_unsupported_default_keybinds(config);
         ghostty_config_load_default_files(config);
         ghostty_config_load_recursive_files(config);
         let base_contents = serialized_config(config);
@@ -1018,6 +1019,44 @@ fn load_ghostty_config_with_font(
             Ordering::Relaxed,
         );
         config
+    }
+}
+
+/// Default Ghostty keybinds for actions that `ghostty_action_cb` does not
+/// implement. Defaults marked `performable` are not here: Ghostty already
+/// passes those keys on when the action does nothing.
+const UNSUPPORTED_DEFAULT_KEYBINDS: [&str; 14] = [
+    "ctrl+,",           // open_config
+    "ctrl+tab",         // next_tab
+    "ctrl+shift+tab",   // previous_tab
+    "ctrl+shift+n",     // new_window
+    "ctrl+shift+w",     // close_tab
+    "ctrl+shift+q",     // quit
+    "alt+f4",           // close_window
+    "ctrl+shift+t",     // new_tab
+    "ctrl+shift+o",     // new_split:right
+    "ctrl+shift+e",     // new_split:down
+    "ctrl+shift+i",     // inspector:toggle
+    "ctrl+enter",       // toggle_fullscreen
+    "ctrl+shift+enter", // toggle_split_zoom
+    "ctrl+shift+p",     // toggle_command_palette
+];
+
+/// Let these keys reach the program in the terminal. Ghostty consumes a bound
+/// key even when the host does not perform its action. Load this before the
+/// user's files, so that their keybinds win.
+fn unbind_unsupported_default_keybinds(config: ghostty_config_t) {
+    let contents: String = UNSUPPORTED_DEFAULT_KEYBINDS
+        .iter()
+        .map(|trigger| format!("keybind = {trigger}=unbind\n"))
+        .collect();
+    unsafe {
+        ghostty_config_load_string(
+            config,
+            contents.as_ptr().cast::<c_char>(),
+            contents.len(),
+            c"/limux/default-keybinds.ghostty".as_ptr(),
+        );
     }
 }
 
@@ -4080,36 +4119,153 @@ mod tests {
     }
 
     #[test]
-    fn key_translation_honors_caps_lock_escape_remaps() {
-        let modifiers = gtk::gdk::ModifierType::empty();
-        let caps_as_escape = translate_key_event(
-            GHOSTTY_ACTION_PRESS,
-            None,
-            None,
-            gtk::gdk::Key::Escape,
-            66,
-            modifiers,
-        );
-        let escape_as_caps = translate_key_event(
-            GHOSTTY_ACTION_PRESS,
-            None,
-            None,
-            gtk::gdk::Key::Caps_Lock,
-            9,
-            modifiers,
-        );
-        let writing_key = translate_key_event(
-            GHOSTTY_ACTION_PRESS,
-            None,
-            None,
-            gtk::gdk::Key::a,
-            38,
-            modifiers,
-        );
+    fn key_translation_honors_layout_remaps() {
+        // Caps Lock and letter keycodes with the keyvals that layouts such as
+        // Colemak (Caps Lock as BackSpace) and Neo (arrow layer) give them.
+        for (keyval, physical, key) in [
+            (gtk::gdk::Key::Escape, 66, GHOSTTY_KEY_ESCAPE),
+            (gtk::gdk::Key::Caps_Lock, 9, GHOSTTY_KEY_CAPS_LOCK),
+            (gtk::gdk::Key::BackSpace, 66, GHOSTTY_KEY_BACKSPACE),
+            (gtk::gdk::Key::Control_L, 66, GHOSTTY_KEY_CONTROL_LEFT),
+            (gtk::gdk::Key::Left, 39, GHOSTTY_KEY_ARROW_LEFT),
+            (gtk::gdk::Key::a, 38, GHOSTTY_KEY_UNIDENTIFIED),
+        ] {
+            let event = translate_key_event(
+                GHOSTTY_ACTION_PRESS,
+                None,
+                None,
+                keyval,
+                physical,
+                gtk::gdk::ModifierType::empty(),
+            );
+            assert_eq!(event.resolved_key, key, "{keyval:?}");
+        }
+    }
 
-        assert_eq!(caps_as_escape.input.keycode, 9);
-        assert_eq!(escape_as_caps.input.keycode, 66);
-        assert_eq!(writing_key.input.keycode, 38);
+    #[test]
+    fn modifier_keys_report_the_state_after_their_own_event() {
+        use gtk::gdk::{Key, ModifierType};
+
+        for (keyval, mask, bit) in [
+            (Key::Shift_L, ModifierType::SHIFT_MASK, GHOSTTY_MODS_SHIFT),
+            (
+                Key::Control_R,
+                ModifierType::CONTROL_MASK,
+                GHOSTTY_MODS_CTRL,
+            ),
+            (Key::Alt_L, ModifierType::ALT_MASK, GHOSTTY_MODS_ALT),
+            (Key::Super_L, ModifierType::SUPER_MASK, GHOSTTY_MODS_SUPER),
+        ] {
+            let mods = |action, modifier| {
+                translate_key_event(action, None, None, keyval, 0, modifier)
+                    .input
+                    .mods
+            };
+            assert_eq!(mods(GHOSTTY_ACTION_PRESS, ModifierType::empty()), bit);
+            assert_eq!(mods(GHOSTTY_ACTION_RELEASE, mask), GHOSTTY_MODS_NONE);
+        }
+        // Another held modifier stays in the state.
+        let press = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            Key::Control_L,
+            37,
+            ModifierType::SHIFT_MASK,
+        );
+        assert_eq!(press.input.mods, GHOSTTY_MODS_SHIFT | GHOSTTY_MODS_CTRL);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display and Ghostty resources"]
+    fn keys_without_a_limux_action_reach_the_program() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("ghostty");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config"),
+            "keybind = ctrl+shift+p=text:user-keybind\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", temp.path());
+        crate::prepare_ghostty_runtime();
+        gtk::init().expect("GTK display required");
+        init_ghostty();
+
+        let terminal = create_terminal(
+            Some("/tmp"),
+            TerminalOptions {
+                startup_command: Some(
+                    "/bin/sh -c 'stty raw -echo; printf READY; exec cat -v'".to_string(),
+                ),
+                ..TerminalOptions::default()
+            },
+            TerminalCallbacks::disconnected(),
+        );
+        let window = gtk::Window::builder()
+            .default_width(800)
+            .default_height(400)
+            .child(&terminal.root)
+            .build();
+        window.present();
+        let handle = &terminal.handle;
+        let screen = || {
+            handle
+                .read_viewport_text()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let wait_for = |expected: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while screen() != expected {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "expected {expected:?}, the program received {:?}",
+                    screen()
+                );
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for("READY");
+
+        // Caps Lock remapped to BackSpace.
+        let surface = handle.surface_cell.borrow().unwrap();
+        let press = |keyval, keycode| {
+            let event = translate_key_event(
+                GHOSTTY_ACTION_PRESS,
+                None,
+                None,
+                keyval,
+                keycode,
+                gtk::gdk::ModifierType::empty(),
+            );
+            unsafe { ghostty_surface_key_with_key(surface, event.input, event.resolved_key) };
+        };
+        press(gtk::gdk::Key::BackSpace, 66);
+        wait_for("READY^?");
+        press(gtk::gdk::Key::Escape, 66);
+        wait_for("READY^?^[");
+        // A modifier or Caps Lock on its own sends nothing.
+        press(gtk::gdk::Key::Caps_Lock, 9);
+        for keyval in [
+            gtk::gdk::Key::Alt_L,
+            gtk::gdk::Key::Control_L,
+            gtk::gdk::Key::Shift_L,
+            gtk::gdk::Key::Super_L,
+        ] {
+            press(keyval, 0);
+        }
+        // Ghostty binds this one by default, to an action Limux does not have.
+        assert!(handle.send_key("<Ctrl>Return"));
+        wait_for("READY^?^[^[[27;5;13~");
+        // The user's keybind for another such default still applies.
+        assert!(handle.send_key("<Ctrl><Shift>p"));
+        wait_for("READY^?^[^[[27;5;13~user-keybind");
+
+        handle.shutdown();
+        window.close();
     }
 
     #[test]
@@ -4164,7 +4320,7 @@ mod tests {
             modifiers,
         );
         assert_eq!(regular_end.input.keycode, 115);
-        assert_eq!(regular_end.resolved_key, GHOSTTY_KEY_UNIDENTIFIED);
+        assert_eq!(regular_end.resolved_key, GHOSTTY_KEY_END);
     }
 
     #[test]

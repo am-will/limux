@@ -226,6 +226,7 @@ pub const GHOSTTY_KEY_ARROW_LEFT: c_int = 76;
 pub const GHOSTTY_KEY_ARROW_RIGHT: c_int = 77;
 pub const GHOSTTY_KEY_ARROW_UP: c_int = 78;
 // Numpad Section
+pub const GHOSTTY_KEY_NUM_LOCK: c_int = 79;
 pub const GHOSTTY_KEY_NUMPAD_0: c_int = 80;
 pub const GHOSTTY_KEY_NUMPAD_1: c_int = 81;
 pub const GHOSTTY_KEY_NUMPAD_2: c_int = 82;
@@ -280,6 +281,26 @@ pub const GHOSTTY_KEY_F9: c_int = 129;
 pub const GHOSTTY_KEY_F10: c_int = 130;
 pub const GHOSTTY_KEY_F11: c_int = 131;
 pub const GHOSTTY_KEY_F12: c_int = 132;
+pub const GHOSTTY_KEY_F13: c_int = 133;
+pub const GHOSTTY_KEY_F14: c_int = 134;
+pub const GHOSTTY_KEY_F15: c_int = 135;
+pub const GHOSTTY_KEY_F16: c_int = 136;
+pub const GHOSTTY_KEY_F17: c_int = 137;
+pub const GHOSTTY_KEY_F18: c_int = 138;
+pub const GHOSTTY_KEY_F19: c_int = 139;
+pub const GHOSTTY_KEY_F20: c_int = 140;
+pub const GHOSTTY_KEY_F21: c_int = 141;
+pub const GHOSTTY_KEY_F22: c_int = 142;
+pub const GHOSTTY_KEY_F23: c_int = 143;
+pub const GHOSTTY_KEY_F24: c_int = 144;
+pub const GHOSTTY_KEY_F25: c_int = 145;
+pub const GHOSTTY_KEY_PRINT_SCREEN: c_int = 148;
+pub const GHOSTTY_KEY_SCROLL_LOCK: c_int = 149;
+pub const GHOSTTY_KEY_PAUSE: c_int = 150;
+// Legacy, Non-standard, and Special Keys
+pub const GHOSTTY_KEY_COPY: c_int = 173;
+pub const GHOSTTY_KEY_CUT: c_int = 174;
+pub const GHOSTTY_KEY_PASTE: c_int = 175;
 
 // -------------------------------------------------------------------
 // Structs
