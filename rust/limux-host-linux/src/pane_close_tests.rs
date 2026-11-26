@@ -1680,49 +1680,6 @@ fn next_unread_terminal_reaches_a_hidden_tab() {
     window.close();
 }
 
-// The next-unread action unzooms another pane to show the unread tab, and
-// that reads it: the action must not keep landing on the same tab.
-#[test]
-#[ignore = "requires a graphical display and Ghostty resources"]
-fn next_unread_terminal_reads_a_tab_a_zoom_hid() {
-    let (state, _temp) = held_tab_test_window("dev.limux.NextUnreadZoomTest");
-    let wait = std::time::Duration::from_secs(5);
-
-    let (ws_id, root) =
-        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
-    let pane = first_leaf_pane(&root);
-    let unread = pane::active_surface_summary(&pane).unwrap();
-    // Marked by hand: only going to the tab reads it, a passive focus does not.
-    assert!(pane::mark_active_tab_manual_unread_in_root(&root));
-    sync_workspace_unread(&state, &ws_id);
-
-    let lead = split_before(&state, &ws_id, &pane);
-    toggle_focused_pane_zoom(&state);
-    pump_until(wait, || shown(&lead) && !shown(&pane));
-    assert!(!shown(&pane), "the zoom hides the other pane");
-    assert!(pane::workspace_has_unread_tabs(&ws_id));
-
-    assert!(dispatch_shortcut_command(
-        &state,
-        ShortcutCommand::NextUnreadTerminal
-    ));
-    pump_until(wait, || {
-        shown(&pane) && !pane::workspace_has_unread_tabs(&ws_id)
-    });
-    assert!(shown(&pane), "the unread tab's pane is shown again");
-    assert_eq!(
-        pane::active_tab_in_pane(&pane).as_deref(),
-        Some(unread.tab_id.as_str())
-    );
-    assert!(
-        !pane::workspace_has_unread_tabs(&ws_id),
-        "being taken to the tab reads it"
-    );
-
-    let window = state.borrow().window.clone();
-    window.close();
-}
-
 // The find entry has the focus while the bar is open, so the find shortcuts
 // must work from there. However the bar closes, the keyboard is back at once.
 #[test]
@@ -1786,5 +1743,48 @@ fn terminal_find_works_from_its_entry_and_gives_the_focus_back() {
         assert!(gl_area.is_focus(), "{what} gives the focus back at once");
         assert!(!blocked(ShortcutCommand::TerminalCopy));
     }
+    window.close();
+}
+
+// The next-unread action unzooms another pane to show the unread tab, and
+// that reads it: the action must not keep landing on the same tab.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn next_unread_terminal_reads_a_tab_a_zoom_hid() {
+    let (state, _temp) = held_tab_test_window("dev.limux.NextUnreadZoomTest");
+    let wait = std::time::Duration::from_secs(5);
+
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    let unread = pane::active_surface_summary(&pane).unwrap();
+    // Marked by hand: only going to the tab reads it, a passive focus does not.
+    assert!(pane::mark_active_tab_manual_unread_in_root(&root));
+    sync_workspace_unread(&state, &ws_id);
+
+    let lead = split_before(&state, &ws_id, &pane);
+    toggle_focused_pane_zoom(&state);
+    pump_until(wait, || shown(&lead) && !shown(&pane));
+    assert!(!shown(&pane), "the zoom hides the other pane");
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+
+    assert!(dispatch_shortcut_command(
+        &state,
+        ShortcutCommand::NextUnreadTerminal
+    ));
+    pump_until(wait, || {
+        shown(&pane) && !pane::workspace_has_unread_tabs(&ws_id)
+    });
+    assert!(shown(&pane), "the unread tab's pane is shown again");
+    assert_eq!(
+        pane::active_tab_in_pane(&pane).as_deref(),
+        Some(unread.tab_id.as_str())
+    );
+    assert!(
+        !pane::workspace_has_unread_tabs(&ws_id),
+        "being taken to the tab reads it"
+    );
+
+    let window = state.borrow().window.clone();
     window.close();
 }
