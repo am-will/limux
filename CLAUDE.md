@@ -118,6 +118,6 @@ rg -n "PaneCallbacks \{"                           rust/limux-host-linux/src/win
 - **Architecture / full CLI** → `AGENTS.md`
 - **Roadmap & phase status** → `docs/cmux-parity-plan.md`
 - **Maintainability rules** → `docs/maintainability.md`
-- **User install/usage** → `README.md`
+- **User install/usage** → `README.md`, `docs/install.md`, `docs/usage.md`, `docs/agents.md`
 - **Inter-agent message format** → the AGENTS.md that `limux agent-team`
   writes into the shared cwd at runtime (not this repo's AGENTS.md).
