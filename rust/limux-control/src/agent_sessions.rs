@@ -237,16 +237,15 @@ pub fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -> Vec<S
             }
             continue;
         }
+        if arg == "--" {
+            break;
+        }
         if option_is_safe_flag_or_assignment(kind, arg) {
             result.push(arg.clone());
-            index += 1;
-            continue;
         }
-        if arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        break;
+        // Skip any other flag, and a word that is its value or the prompt.
+        // Options after it still apply, so keep looking for them.
+        index += 1;
     }
 
     if result.is_empty() {
@@ -262,6 +261,20 @@ pub fn build_resume_command(
     launch: Option<&AgentLaunchCommand>,
     cwd: Option<&str>,
 ) -> Option<String> {
+    let (cwd, command) = build_resume_invocation(kind, session_id, launch, cwd)?;
+    Some(match cwd {
+        Some(cwd) => format!("cd {} && {command}", shell_single_quote(&cwd)),
+        None => command,
+    })
+}
+
+/// The directory to resume in, if known, and the quoted command to run there.
+pub fn build_resume_invocation(
+    kind: AgentKind,
+    session_id: &str,
+    launch: Option<&AgentLaunchCommand>,
+    cwd: Option<&str>,
+) -> Option<(Option<String>, String)> {
     let session_id = normalized(session_id)?;
     let fallback = kind.fallback_executable().to_string();
     let raw_args = launch
@@ -323,10 +336,7 @@ pub fn build_resume_command(
             .and_then(|launch| launch.cwd.as_deref())
             .and_then(normalized)
     });
-    Some(match cwd {
-        Some(cwd) => format!("cd {} && {command}", shell_single_quote(&cwd)),
-        None => command,
-    })
+    Some((cwd, command))
 }
 
 pub fn shell_single_quote(value: &str) -> String {
@@ -488,7 +498,7 @@ fn option_takes_safe_value(kind: AgentKind, arg: &str) -> bool {
     if arg == "-c" {
         return kind == AgentKind::Codex;
     }
-    if matches!(arg, "--sandbox" | "-s") {
+    if matches!(arg, "--sandbox" | "-s" | "-a" | "-p" | "-C") {
         return kind == AgentKind::Codex;
     }
     matches!(
@@ -515,6 +525,10 @@ fn option_takes_safe_value(kind: AgentKind, arg: &str) -> bool {
 }
 
 fn option_value_is_safe(kind: AgentKind, option: &str, value: &str) -> bool {
+    if option == "-C" {
+        // The resume command already changes to the recorded directory.
+        return Path::new(value).is_absolute();
+    }
     if kind != AgentKind::Codex || !matches!(option, "-c" | "--config") {
         return !value.trim().is_empty();
     }
@@ -592,6 +606,39 @@ mod tests {
 
     fn vec_str(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn sanitizer_keeps_safe_options_after_other_options_and_prompts() {
+        for (kind, args, expected) in [
+            (
+                AgentKind::Codex,
+                "codex -C /repo -i shot.png -s read-only -a untrusted -p work",
+                "codex -C /repo -s read-only -a untrusted -p work",
+            ),
+            (
+                AgentKind::Codex,
+                "codex -C sub prompt -s read-only -- -a never",
+                "codex -s read-only",
+            ),
+            (
+                AgentKind::Claude,
+                "claude -p prompt --allowedTools Read Edit --permission-mode plan",
+                "claude --permission-mode plan",
+            ),
+            (
+                AgentKind::Claude,
+                "claude --session-id id --add-dir docs",
+                "claude --add-dir docs",
+            ),
+        ] {
+            let words = |line: &str| vec_str(&line.split(' ').collect::<Vec<_>>());
+            assert_eq!(
+                sanitize_launch_arguments(kind, &words(args)),
+                words(expected),
+                "{args}"
+            );
+        }
     }
 
     #[test]

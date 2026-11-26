@@ -125,9 +125,9 @@ pub(crate) fn snapshot_running_agents(options: &SnapshotOptions) -> Result<Snaps
 fn source_priority(source: SessionIdSource) -> u8 {
     match source {
         SessionIdSource::OpenFd => 4,
-        SessionIdSource::Env => 3,
-        SessionIdSource::Cmdline => 2,
-        SessionIdSource::ExistingHookStore => 1,
+        SessionIdSource::ExistingHookStore => 3,
+        SessionIdSource::Env => 2,
+        SessionIdSource::Cmdline => 1,
     }
 }
 
@@ -191,11 +191,14 @@ fn snapshot_from_probes(
             &probe.open_paths,
             &read_file_prefix,
         );
+        // The environment and arguments are fixed at launch, while hooks follow the
+        // process when it starts, forks or switches to another session.
         let discovered = match extracted {
-            Some(found) => Some(found),
-            None => store
+            Some((_, SessionIdSource::OpenFd)) => extracted,
+            _ => store
                 .session_for_live_pid(probe.pid, &workspace_id, &surface_id)?
-                .map(|session_id| (session_id, SessionIdSource::ExistingHookStore)),
+                .map(|session_id| (session_id, SessionIdSource::ExistingHookStore))
+                .or(extracted),
         };
         resolved.push(ResolvedCandidate {
             candidate: MatchedCandidate {
@@ -206,6 +209,13 @@ fn snapshot_from_probes(
             },
             discovered,
         });
+    }
+
+    let relaunchers = relaunching_parents(&resolved, ppid_map);
+    for entry in &mut resolved {
+        if relaunchers.contains(&entry.candidate.probe.pid) {
+            entry.discovered = None;
+        }
     }
 
     // Resolve session IDs before parent/child deduplication so launcher wrappers
@@ -391,6 +401,46 @@ fn snapshot_from_probes(
         captured,
         skipped,
     })
+}
+
+/// Launchers that run the agent again with their own arguments, such as npm
+/// `codex.js` or `gemini`. When all they know is how they were launched, the
+/// child knows that too and may have moved on to another session.
+#[cfg(any(target_os = "linux", test))]
+fn relaunching_parents(
+    resolved: &[ResolvedCandidate],
+    ppid_map: &HashMap<u32, u32>,
+) -> HashSet<u32> {
+    fn options(candidate: &MatchedCandidate) -> Vec<String> {
+        let args = &candidate.probe.args;
+        normalize_captured_process_args(candidate.kind, args)
+            .unwrap_or_else(|| args.clone())
+            .into_iter()
+            .skip(1)
+            .collect()
+    }
+    resolved
+        .iter()
+        .filter(|entry| entry.discovered.is_some())
+        .filter_map(|entry| {
+            let child = &entry.candidate;
+            let parent_pid = ppid_map.get(&child.probe.pid)?;
+            let parent = resolved
+                .iter()
+                .find(|entry| entry.candidate.probe.pid == *parent_pid)?;
+            let launch_only = matches!(
+                parent.discovered,
+                Some((_, SessionIdSource::Env | SessionIdSource::Cmdline))
+            );
+            let parent = &parent.candidate;
+            (launch_only
+                && parent.kind == child.kind
+                && parent.workspace_id == child.workspace_id
+                && parent.surface_id == child.surface_id
+                && options(parent) == options(child))
+            .then_some(*parent_pid)
+        })
+        .collect()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1450,6 +1500,87 @@ mod tests {
         assert_eq!(report.captured[0].pid, 201);
         assert_eq!(report.captured[0].session_id, codex_uuid);
         assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn recorded_session_of_a_live_process_outranks_its_stale_resume_argument() {
+        let dir = tempdir().expect("tempdir");
+        let store_for =
+            |kind: AgentKind| AgentHookSessionStore::new_for_dir(kind.store_name(), dir.path());
+        let record = |kind: AgentKind, session_id: &str, surface_id: &str, pid: u32| {
+            store_for(kind)
+                .update(session_id, |_| AgentHookSessionRecord {
+                    session_id: session_id.to_string(),
+                    workspace_id: "ws".to_string(),
+                    surface_id: surface_id.to_string(),
+                    cwd: None,
+                    pid: Some(pid),
+                    launch_command: None,
+                    updated_at: 100.0,
+                })
+                .expect("seed record");
+        };
+        let probe = |pid: u32, surface_id: &str, args: &[&str]| ProcessProbe {
+            pid,
+            args: vec_str(args),
+            comm: None,
+            cwd: None,
+            environ: encode_env(&[
+                ("LIMUX_WORKSPACE_ID", "ws"),
+                ("LIMUX_SURFACE_ID", surface_id),
+            ]),
+            open_paths: vec![],
+        };
+        // Both agents were resumed and then moved to a new session.
+        record(AgentKind::Claude, "claude-now", "1:tab-a", 200);
+        record(AgentKind::Gemini, "gemini-now", "1:tab-b", 301);
+        let probes = vec![
+            probe(200, "1:tab-a", &["claude", "--resume", "claude-old"]),
+            probe(
+                300,
+                "1:tab-b",
+                &["node", "/usr/bin/gemini", "--resume", "gemini-old"],
+            ),
+            probe(
+                301,
+                "1:tab-b",
+                &[
+                    "node",
+                    "--max-old-space-size=8192",
+                    "/usr/bin/gemini",
+                    "--resume",
+                    "gemini-old",
+                ],
+            ),
+        ];
+        let options = SnapshotOptions {
+            agent: None,
+            workspace_id: None,
+            surface_id: None,
+            target_socket: None,
+            all_sockets: true,
+            dry_run: false,
+        };
+
+        let report = snapshot_from_probes(
+            probes,
+            &HashMap::from([(200, 100), (300, 100), (301, 300)]),
+            &options,
+            store_for,
+            no_file_read,
+        )
+        .expect("snapshot");
+
+        let captured: Vec<_> = report
+            .captured
+            .iter()
+            .map(|item| (item.pid, item.session_id.as_str()))
+            .collect();
+        assert_eq!(captured, [(200, "claude-now"), (301, "gemini-now")]);
+        assert!(report
+            .captured
+            .iter()
+            .all(|item| item.superseded_session_ids.is_empty()));
     }
 
     #[test]

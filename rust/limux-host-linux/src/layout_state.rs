@@ -860,14 +860,23 @@ fn build_resume_command(
     cwd: Option<&str>,
 ) -> Option<String> {
     let session_id = normalized_str(session_id)?;
-    let run_command =
-        limux_control::agent_sessions::build_resume_command(kind, &session_id, launch, cwd)?;
-    Some(wrap_restored_agent_command(kind, &session_id, &run_command))
+    let (cwd, run_command) =
+        limux_control::agent_sessions::build_resume_invocation(kind, &session_id, launch, cwd)?;
+    Some(wrap_restored_agent_command(
+        kind,
+        &session_id,
+        cwd.as_deref(),
+        &run_command,
+    ))
 }
 
+/// Run the agent, forget its session once it ends, and leave a login shell. The
+/// session stays saved when its directory is missing or the agent did not start
+/// (126 and 127), so a later launch can still restore it.
 fn wrap_restored_agent_command(
     kind: RestorableAgentKind,
     session_id: &str,
+    cwd: Option<&str>,
     run_command: &str,
 ) -> String {
     let payload = format!(
@@ -880,7 +889,17 @@ fn wrap_restored_agent_command(
         limux_control::agent_sessions::shell_single_quote(&limux_cli_executable()),
         kind.store_name()
     );
-    format!("{run_command}; limux_agent_status=$?; {cleanup}; exec \"${{SHELL:-/bin/sh}}\" -l")
+    let run = format!("{run_command}; limux_agent_status=$?");
+    let run = match cwd {
+        Some(cwd) => format!(
+            "if cd {}; then {run}; else limux_agent_status=127; fi",
+            limux_control::agent_sessions::shell_single_quote(cwd)
+        ),
+        None => run,
+    };
+    format!(
+        "{run}; case $limux_agent_status in 126|127) ;; *) {cleanup} ;; esac; exec \"${{SHELL:-/bin/sh}}\" -l"
+    )
 }
 
 fn limux_cli_executable() -> String {
@@ -1391,7 +1410,7 @@ mod tests {
                 assert_eq!(agent.kind, RestorableAgentKind::Codex);
                 assert_eq!(agent.session_id, "session-a");
                 let command = agent.resume_command().expect("resume command");
-                assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'session-a'"));
+                assert!(command.contains("cd '/tmp/project'; then 'codex' 'resume' 'session-a'"));
                 assert!(command.contains("hooks codex cleanup"));
             }
             other => panic!("expected terminal tab, got {other:?}"),
@@ -1833,9 +1852,39 @@ mod tests {
         };
 
         let command = agent.resume_command().expect("resume command");
-        assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'sess-123'"));
+        assert!(command.contains("cd '/tmp/project'; then 'codex' 'resume' 'sess-123'"));
         assert!(command.contains("hooks codex cleanup"));
         assert!(command.contains("exec \"${SHELL:-/bin/sh}\" -l"));
+    }
+
+    #[test]
+    fn restored_agent_forgets_its_session_only_after_it_ran() {
+        let dir = tempdir().expect("tempdir");
+        let forgotten = dir.path().join("forgotten");
+        let cli = dir.path().join("cli");
+        fs::write(&cli, format!("#!/bin/sh\n: > '{}'\n", forgotten.display())).expect("stub cli");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).expect("stub mode");
+        let missing = dir.path().join("missing").to_string_lossy().into_owned();
+        let present = dir.path().to_string_lossy().into_owned();
+
+        for (cwd, agent, forgets) in [
+            (Some(missing.as_str()), "true", false),
+            (Some(present.as_str()), missing.as_str(), false),
+            (None, missing.as_str(), false),
+            (Some(present.as_str()), "true", true),
+            (None, "false", true),
+        ] {
+            let command =
+                wrap_restored_agent_command(RestorableAgentKind::Codex, "sess", cwd, agent)
+                    .replace(&limux_cli_executable(), &cli.to_string_lossy());
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env("SHELL", "true")
+                .status()
+                .expect("run restored agent");
+            assert!(status.success(), "{command}");
+            assert_eq!(forgotten.exists(), forgets, "{command}");
+        }
     }
 
     #[test]
@@ -2062,7 +2111,7 @@ mod tests {
 
         let command = agent.resume_command().expect("resume command");
         assert!(command.contains(
-            "cd '/tmp/project' && 'env' 'GEMINI_CLI_HOME=/tmp/gemini-home' 'gemini' '--resume' 'gem-sess-1' '--sandbox' '--config-dir' '/tmp/gemini-work' '--yolo' '--model' 'gemini-2.5-pro'"
+            "cd '/tmp/project'; then 'env' 'GEMINI_CLI_HOME=/tmp/gemini-home' 'gemini' '--resume' 'gem-sess-1' '--sandbox' '--config-dir' '/tmp/gemini-work' '--yolo' '--model' 'gemini-2.5-pro'"
         ));
         assert!(!command.contains("GEMINI_CONFIG_DIR"));
         assert!(command.contains("hooks gemini cleanup"));
@@ -2103,7 +2152,7 @@ mod tests {
         assert_eq!(agent.kind, RestorableAgentKind::Agy);
         let command = agent.resume_command().expect("agy resume command");
         assert!(command.contains(
-            "cd '/tmp/agy-repo' && 'agy' '--conversation' 'conv-99' '--sandbox' '--model' 'gemini-2.5-pro'"
+            "cd '/tmp/agy-repo'; then 'agy' '--conversation' 'conv-99' '--sandbox' '--model' 'gemini-2.5-pro'"
         ));
         assert!(!command.contains("AGY_CONFIG_DIR"));
         assert!(command.contains("hooks agy cleanup"));
