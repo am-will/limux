@@ -144,7 +144,7 @@ pub(crate) struct AppState {
     session_save_waiters: Vec<std::sync::mpsc::Sender<crate::control_bridge::BridgeResult>>,
     session_save_notice: Option<String>,
     session_close_dialog_open: bool,
-    session_close_pending: Option<SessionCloseMode>,
+    session_close_pending: Option<PendingSessionClose>,
     close_after_recovery: bool,
     workspace_dragging: Option<String>,
     group_dragging: Option<String>,

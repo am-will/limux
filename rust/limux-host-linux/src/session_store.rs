@@ -151,12 +151,16 @@ impl SessionStore {
         local: AppSessionState,
     ) -> gtk4::gio::JoinHandle<(Self, AppSessionState, io::Result<SaveOutcome>)> {
         gtk4::gio::spawn_blocking(move || {
-            let mut persisted = local.clone();
-            let agents = layout_state::RestorableAgentIndex::load();
-            layout_state::attach_restorable_agents_to_session(&mut persisted, &agents);
-            let result = self.save(&persisted);
+            let result = self.save_with_agents(&local);
             (self, local, result)
         })
+    }
+
+    pub(crate) fn save_with_agents(&mut self, local: &AppSessionState) -> io::Result<SaveOutcome> {
+        let mut persisted = local.clone();
+        let agents = layout_state::RestorableAgentIndex::load();
+        layout_state::attach_restorable_agents_to_session(&mut persisted, &agents);
+        self.save(&persisted)
     }
 
     pub(crate) fn save(&mut self, local: &AppSessionState) -> io::Result<SaveOutcome> {

@@ -4,7 +4,7 @@
 //!
 //! All on one line. Tabs left-justified, icons right-justified.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -693,6 +693,7 @@ pub fn create_pane(
     let pane_id = pane_id_for_initial_state(initial_state);
     let internals = Rc::new(PaneInternals {
         pane_id,
+        empty_tab_id: OnceCell::new(),
         tab_state: tab_state.clone(),
         tab_strip: tab_strip.clone(),
         content_stack: content_stack.clone(),
@@ -1510,6 +1511,9 @@ struct TabState {
 /// Shared internals stored on the pane outer Box for external access.
 pub struct PaneInternals {
     pane_id: u32,
+    /// Id of the terminal saved for this pane while it is kept open without
+    /// tabs. It never changes, so the saved session does not either.
+    empty_tab_id: OnceCell<String>,
     tab_state: Rc<std::cell::RefCell<TabState>>,
     tab_strip: gtk::Box,
     content_stack: gtk::Stack,
@@ -3029,6 +3033,14 @@ pub fn refresh_shortcut_tooltips(pane_widget: &gtk::Widget, shortcuts: &Resolved
 pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
     let internals = find_pane_internals(pane_widget)?;
     let ts = internals.tab_state.borrow();
+    if ts.tabs.is_empty() {
+        let id = internals.empty_tab_id.get_or_init(new_tab_id);
+        return Some(PaneState {
+            pane_id: Some(internals.pane_id),
+            active_tab_id: Some(id.clone()),
+            tabs: vec![SavedTabState::terminal(id, None)],
+        });
+    }
     let tabs = ts
         .tabs
         .iter()
