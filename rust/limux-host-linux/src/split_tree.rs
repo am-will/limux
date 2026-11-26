@@ -673,8 +673,8 @@ impl SplitTreeContainer {
             signed_units * 0.02
         };
 
-        let updated = apply_pane_resize_delta(*ratio_cell.borrow(), side, raw_delta);
-        *ratio_cell.borrow_mut() = updated;
+        let current = *ratio_cell.borrow();
+        let mut updated = apply_pane_resize_delta(current, side, raw_delta);
 
         if let Some(paned) = matched_paned {
             if paned_both_children_visible(&paned) {
@@ -683,6 +683,13 @@ impl SplitTreeContainer {
                     .unwrap_or_else(|| Rc::new(Cell::new(false)));
                 let applied = crate::window::apply_ratio_value(&paned, axis, updated, &applying);
                 if applied && paned_extent > 0 {
+                    // The divider stops at the pane minimums. A ratio past them
+                    // would make the opposite resize undo the excess first.
+                    updated = layout_state::snapshot_split_ratio(
+                        paned.position(),
+                        paned_extent,
+                        Some(updated),
+                    );
                     let handle_size = paned.measure(axis, -1).0;
                     let resized_extent = expected_resized_child_extent(
                         paned_extent,
@@ -699,8 +706,9 @@ impl SplitTreeContainer {
                 }
             }
         }
+        *ratio_cell.borrow_mut() = updated;
         Some(PaneResizeOutcome {
-            changed: true,
+            changed: updated != current,
             width,
             height,
         })

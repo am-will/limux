@@ -455,6 +455,7 @@ for regression in \
   split_tree::tests::split_node_swaps_leaf_panes_and_locates_nearest_split_ratio \
   window::tests::swapped_split_node_panes_report_swapped_order_and_indices \
   window::pane_create_tests::pane_swap_and_list_preserve_swapped_leaf_order \
+  window::pane_close_tests::pane_resize_stops_at_the_neighbor_minimum \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
   window::ssh_launch_tests::persistent_ssh_restores_retries_moves_and_closes \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
