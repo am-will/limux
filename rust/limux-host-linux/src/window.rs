@@ -2359,9 +2359,16 @@ pub fn build_window(app: &adw::Application) {
     // Save the full session on window close.
     {
         let state = state.clone();
-        window.connect_close_request(move |_| {
+        window.connect_close_request(move |window| {
             if !prepare_session_close(&state) {
                 return glib::Propagation::Stop;
+            }
+            // Settings left open would keep the application running.
+            let windows = window.application().map(|app| app.windows());
+            for other in windows.unwrap_or_default() {
+                if other.transient_for().as_ref() == Some(window.upcast_ref()) {
+                    other.destroy();
+                }
             }
             stop_session_saves_for_shutdown(&state);
             let split_containers: Vec<_> = state
@@ -3143,18 +3150,15 @@ fn persist_shortcut_binding(
         return Err("config directory unavailable".to_string());
     };
 
-    shortcut_config::write_shortcuts(&path, &updated).map_err(|err| err.to_string())?;
     let display = {
         let s = state.borrow();
         s.stack.display()
     };
-    let reloaded = shortcut_config::load_shortcuts_or_default_with_display(&path, Some(&display));
-    if !reloaded.warnings.is_empty() {
-        return Err(reloaded.warnings.join("; "));
-    }
+    let saved = shortcut_config::write_shortcuts(&path, &updated, &[id], Some(&display))
+        .map_err(|err| err.to_string())?;
 
-    apply_shortcut_config(state, reloaded.clone());
-    Ok(reloaded)
+    apply_shortcut_config(state, saved.clone());
+    Ok(saved)
 }
 
 fn adw_color_scheme_for(scheme: app_config::ColorScheme) -> adw::ColorScheme {

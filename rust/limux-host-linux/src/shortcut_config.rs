@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -328,6 +328,7 @@ pub enum ShortcutConfigWriteError {
     InvalidExistingRoot {
         path: PathBuf,
     },
+    InvalidShortcuts(ShortcutConfigError),
     CreateParentDir {
         path: PathBuf,
         reason: String,
@@ -356,6 +357,7 @@ impl std::fmt::Display for ShortcutConfigWriteError {
                     path.display()
                 )
             }
+            Self::InvalidShortcuts(err) => write!(f, "{err}"),
             Self::CreateParentDir { path, reason } => {
                 write!(
                     f,
@@ -1013,7 +1015,7 @@ impl NormalizedShortcut {
             match modifier.as_str() {
                 "ctrl" | "control" => ctrl = true,
                 "shift" => shift = true,
-                "alt" | "option" => alt = true,
+                "alt" | "opt" | "option" => alt = true,
                 "meta" | "super" | "cmd" | "command" => cmd = true,
                 _ => {
                     return Err(ShortcutConfigError::UnknownModifier {
@@ -1318,7 +1320,19 @@ impl ResolvedShortcutConfig {
         {
             shortcut.binding = binding;
         }
-        ensure_valid_active_bindings(&updated.shortcuts)?;
+        ensure_valid_active_bindings(&updated.shortcuts).map_err(|err| match err {
+            // The edited shortcut is the new one, wherever the table lists it.
+            ShortcutConfigError::DuplicateBinding {
+                first,
+                second,
+                accel,
+            } if first == id => ShortcutConfigError::DuplicateBinding {
+                first: second,
+                second: first,
+                accel,
+            },
+            err => err,
+        })?;
         updated.rebuild_index();
         Ok(updated)
     }
@@ -1474,9 +1488,21 @@ fn load_legacy_shortcuts_or_default(
         return default_shortcuts();
     };
 
-    match resolve_shortcuts_from_file(parsed, display) {
+    let ids: Vec<ShortcutId> = parsed
+        .shortcuts
+        .keys()
+        .filter_map(|key| definition_by_config_key(key))
+        .map(|definition| definition.id)
+        .collect();
+    // The new file replaces the legacy one, so an entry that cannot be read
+    // stops the migration instead of being left behind.
+    let unreadable = parsed.shortcuts.iter().find_map(|(key, value)| {
+        override_binding(definition_by_config_key(key)?, value, display).err()
+    });
+
+    match unreadable.map_or_else(|| resolve_shortcuts_from_file(parsed, display), Err) {
         Ok(mut config) => {
-            if let Err(err) = write_shortcuts(canonical_path, &config) {
+            if let Err(err) = write_shortcuts(canonical_path, &config, &ids, display) {
                 config.warnings.push(format!(
                     "loaded legacy shortcut config `{}` but failed to migrate to `{}`: {err}",
                     legacy_path.display(),
@@ -1536,18 +1562,64 @@ pub fn load_shortcuts_for_display(display: &gdk::Display) -> ResolvedShortcutCon
     load_shortcuts_or_default_with_display(&path, Some(display))
 }
 
+/// Save the bindings of `ids` and return what the file now resolves to.
+///
+/// Every other entry stays as it is. It can belong to another instance or a
+/// newer build, or be one that this build cannot read.
 pub fn write_shortcuts(
     path: &Path,
     shortcuts: &ResolvedShortcutConfig,
-) -> Result<(), ShortcutConfigWriteError> {
+    ids: &[ShortcutId],
+    display: Option<&gdk::Display>,
+) -> Result<ResolvedShortcutConfig, ShortcutConfigWriteError> {
     let mut root = read_existing_config_root(path)?;
-    let overrides = shortcuts.override_bindings_json();
-    if overrides.is_empty() {
-        root.remove("shortcuts");
-    } else {
-        root.insert("shortcuts".to_string(), Value::Object(overrides));
+    let mut entries = match root.remove("shortcuts") {
+        Some(Value::Object(entries)) => entries,
+        _ => Map::new(),
+    };
+    let mut overrides = shortcuts.override_bindings_json();
+    for definition in definitions().iter().filter(|def| ids.contains(&def.id)) {
+        match overrides.remove(definition.config_key) {
+            Some(value) => entries.insert(definition.config_key.to_string(), value),
+            None => entries.remove(definition.config_key),
+        };
     }
-    write_config_root_atomically(path, root)
+
+    let saved = resolve_shortcuts_from_file(
+        ShortcutConfigFile {
+            shortcuts: entries.clone().into_iter().collect(),
+        },
+        display,
+    )
+    .map_err(ShortcutConfigWriteError::InvalidShortcuts)?;
+    if !entries.is_empty() {
+        root.insert("shortcuts".to_string(), Value::Object(entries));
+    }
+    write_config_root_atomically(path, root)?;
+    Ok(saved)
+}
+
+/// The binding that an entry in the config file asks for.
+fn override_binding(
+    definition: &ShortcutDefinition,
+    value: &Value,
+    display: Option<&gdk::Display>,
+) -> Result<Option<NormalizedShortcut>, ShortcutConfigError> {
+    let accel = match value {
+        Value::Null => return Ok(None),
+        Value::String(value) => value.trim(),
+        _ => {
+            return Err(ShortcutConfigError::InvalidBindingType {
+                shortcut_id: definition.config_key.to_string(),
+            });
+        }
+    };
+    if accel.is_empty() {
+        return Ok(None);
+    }
+    let binding = canonicalize_loaded_binding(display, NormalizedShortcut::parse(accel)?);
+    binding.validate_host_binding(definition)?;
+    Ok(Some(binding))
 }
 
 fn resolve_shortcuts_from_file(
@@ -1555,6 +1627,7 @@ fn resolve_shortcuts_from_file(
     display: Option<&gdk::Display>,
 ) -> Result<ResolvedShortcutConfig, ShortcutConfigError> {
     let mut resolved = default_shortcuts();
+    let mut overridden = HashSet::new();
 
     for (shortcut_id, value) in parsed.shortcuts {
         let Some(definition) = definition_by_config_key(&shortcut_id) else {
@@ -1564,23 +1637,13 @@ fn resolve_shortcuts_from_file(
             continue;
         };
 
-        let binding = match value {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(canonicalize_loaded_binding(
-                        display,
-                        NormalizedShortcut::parse(trimmed)?,
-                    ))
-                }
-            }
-            _ => {
-                return Err(ShortcutConfigError::InvalidBindingType {
-                    shortcut_id: shortcut_id.clone(),
-                });
+        let binding = match override_binding(definition, &value, display) {
+            Ok(binding) => binding,
+            Err(err) => {
+                resolved
+                    .warnings
+                    .push(format!("ignoring shortcut `{shortcut_id}`: {err}"));
+                continue;
             }
         };
 
@@ -1590,12 +1653,46 @@ fn resolve_shortcuts_from_file(
             .find(|shortcut| shortcut.definition.id == definition.id)
         {
             slot.binding = binding;
+            overridden.insert(definition.id);
         }
     }
 
+    unbind_overridden_defaults(&mut resolved, &overridden);
     ensure_valid_active_bindings(&resolved.shortcuts)?;
     resolved.rebuild_index();
     Ok(resolved)
+}
+
+/// The user's choice wins over a default, which can be newer than that choice.
+fn unbind_overridden_defaults(
+    resolved: &mut ResolvedShortcutConfig,
+    overridden: &HashSet<ShortcutId>,
+) {
+    let chosen: HashMap<NormalizedShortcut, &'static ShortcutDefinition> = resolved
+        .shortcuts
+        .iter()
+        .filter(|shortcut| overridden.contains(&shortcut.definition.id))
+        .filter_map(|shortcut| Some((shortcut.binding.clone()?, shortcut.definition)))
+        .collect();
+
+    for shortcut in &mut resolved.shortcuts {
+        if overridden.contains(&shortcut.definition.id) {
+            continue;
+        }
+        if let Some((accel, owner)) = shortcut
+            .binding
+            .as_ref()
+            .and_then(|binding| chosen.get_key_value(binding))
+        {
+            resolved.warnings.push(format!(
+                "`{}` is assigned to {}, so {} has no shortcut",
+                accel.to_config_accel(),
+                owner.label,
+                shortcut.definition.label
+            ));
+            shortcut.binding = None;
+        }
+    }
 }
 
 fn ensure_valid_active_bindings(shortcuts: &[ResolvedShortcut]) -> Result<(), ShortcutConfigError> {
@@ -1941,6 +2038,10 @@ mod tests {
         );
         assert_eq!(shortcut.to_runtime_combo(), "shift+cmd+t");
         assert_eq!(shortcut.to_display_label(), "Shift+Cmd+T");
+        assert_eq!(
+            NormalizedShortcut::parse("<Opt>x"),
+            NormalizedShortcut::parse("<Alt>x")
+        );
     }
 
     #[test]
@@ -2258,8 +2359,8 @@ mod tests {
             &legacy_path,
             r#"{
                 "shortcuts": {
-                    "split_right": "<Ctrl>h",
-                    "unknown_action": "<Ctrl><Alt>u"
+                    "split_right": "<Ctrl><Alt>u",
+                    "unknown_action": "<Ctrl>x"
                 }
             }"#,
         )
@@ -2267,12 +2368,15 @@ mod tests {
 
         let resolved = load_shortcuts_or_default(&path);
 
-        assert_eq!(resolved.warnings.len(), 1);
+        assert_eq!(resolved.warnings.len(), 2);
         assert!(resolved.warnings[0].contains("unknown shortcut id `unknown_action`"));
         let migrated: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap())
             .expect("migrated shortcuts config should be valid");
-        assert_eq!(migrated["shortcuts"]["split_right"], "<Ctrl>h");
-        assert!(migrated["shortcuts"].get("unknown_action").is_none());
+        assert_eq!(
+            migrated["shortcuts"],
+            serde_json::json!({ "split_right": "<Ctrl><Alt>u" }),
+            "a default that gave way is not a user choice to save"
+        );
     }
 
     #[test]
@@ -2505,12 +2609,12 @@ mod tests {
             }"#,
         )
         .unwrap();
-        write_shortcuts(&path, &resolved).unwrap();
+        write_shortcuts(&path, &resolved, &[ShortcutId::SplitRight], None).unwrap();
 
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["appearance"]["theme"], "solarized");
         assert_eq!(saved["shortcuts"]["split_right"], "<Ctrl>h");
-        assert!(saved["shortcuts"].get("toggle_sidebar").is_none());
+        assert_eq!(saved["shortcuts"]["toggle_sidebar"], "<Ctrl><Alt>b");
     }
 
     #[test]
@@ -2522,7 +2626,7 @@ mod tests {
 
         let original = fs::read_to_string(&path).unwrap();
         let resolved = default_shortcuts();
-        let err = write_shortcuts(&path, &resolved).unwrap_err();
+        let err = write_shortcuts(&path, &resolved, &[ShortcutId::SplitRight], None).unwrap_err();
 
         assert!(matches!(
             err,
@@ -2567,21 +2671,161 @@ mod tests {
     }
 
     #[test]
-    fn resolve_shortcuts_from_str_rejects_bindings_without_ctrl_alt_or_cmd() {
-        let err = resolve_shortcuts_from_str(
+    fn resolve_shortcuts_from_str_ignores_only_the_entries_it_cannot_read() {
+        for (entry, reason) in [
+            (r#""<Shift>h""#, "use Ctrl, Alt, or Cmd with another key"),
+            (r#""<Ctrl>Control_L""#, "choose a non-modifier key"),
+            (r#""<Hyper>h""#, "unknown modifier `hyper`"),
+            ("5", "must be a string"),
+        ] {
+            let resolved = resolve_shortcuts_from_str(&format!(
+                r#"{{"shortcuts": {{"split_right": {entry}, "toggle_sidebar": "<Ctrl><Alt>b"}}}}"#
+            ))
+            .unwrap();
+
+            assert_eq!(
+                resolved.command_for_runtime_combo("ctrl+alt+d"),
+                Some(ShortcutCommand::SplitRight),
+                "{entry} must leave the default"
+            );
+            assert_eq!(
+                resolved.command_for_runtime_combo("ctrl+alt+b"),
+                Some(ShortcutCommand::ToggleSidebar),
+                "{entry} must not discard the other entry"
+            );
+            assert_eq!(resolved.warnings.len(), 1);
+            assert!(
+                resolved.warnings[0].contains("ignoring shortcut `split_right`")
+                    && resolved.warnings[0].contains(reason),
+                "{:?}",
+                resolved.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_takes_the_binding_of_another_default() {
+        let resolved = resolve_shortcuts_from_str(
+            r#"{"shortcuts": {"new_terminal": "<Ctrl><Alt>u", "split_right": "<Ctrl><Alt>h"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.command_for_runtime_combo("ctrl+alt+u"),
+            Some(ShortcutCommand::NewTerminal)
+        );
+        assert_eq!(
+            resolved.display_label_for_id(ShortcutId::NextUnreadTerminal),
+            None
+        );
+        assert_eq!(
+            resolved
+                .display_label_for_id(ShortcutId::SplitRight)
+                .as_deref(),
+            Some("Ctrl+Alt+H")
+        );
+        assert_eq!(
+            resolved.warnings,
+            ["`<Ctrl><Alt>u` is assigned to New Terminal, so Next Unread Terminal has no shortcut"]
+        );
+    }
+
+    #[test]
+    fn saving_one_shortcut_keeps_every_other_entry() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
             r#"{
                 "shortcuts": {
-                    "split_right": "<Shift>h"
+                    "new_terminal": "<Ctrl><Alt>u",
+                    "split_down": null,
+                    "focus_left": "<Hyper>h",
+                    "from_a_newer_build": "<Ctrl>x"
                 }
             }"#,
         )
-        .unwrap_err();
+        .unwrap();
 
+        let edited = load_shortcuts_or_default(&path)
+            .with_binding(
+                ShortcutId::ToggleSidebar,
+                Some(NormalizedShortcut::parse("<Ctrl><Alt>b").unwrap()),
+            )
+            .unwrap();
+        let saved = write_shortcuts(&path, &edited, &[ShortcutId::ToggleSidebar], None).unwrap();
+
+        assert_eq!(saved.shortcuts, edited.shortcuts);
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "shortcuts": {
+                    "new_terminal": "<Ctrl><Alt>u",
+                    "split_down": null,
+                    "focus_left": "<Hyper>h",
+                    "from_a_newer_build": "<Ctrl>x",
+                    "toggle_sidebar": "<Ctrl><Alt>b"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn saving_over_conflicting_overrides_changes_nothing_until_the_conflict_is_gone() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"{"shortcuts": {"toggle_sidebar": "<Ctrl><Alt>b", "split_right": "<Ctrl><Alt>b", "focus_left": "<Alt>h"}}"#;
+        fs::write(&path, original).unwrap();
+        let loaded = load_shortcuts_or_default(&path);
+
+        let unrelated = loaded
+            .with_binding(
+                ShortcutId::FocusRight,
+                Some(NormalizedShortcut::parse("<Alt>l").unwrap()),
+            )
+            .unwrap();
+        let err = write_shortcuts(&path, &unrelated, &[ShortcutId::FocusRight], None).unwrap_err();
         assert!(matches!(
             err,
-            ShortcutConfigError::BaseModifierRequired { shortcut_id, .. }
-                if shortcut_id == "split_right"
+            ShortcutConfigWriteError::InvalidShortcuts(
+                ShortcutConfigError::DuplicateBinding { .. }
+            )
         ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        let resolved = loaded
+            .with_binding(
+                ShortcutId::SplitRight,
+                Some(NormalizedShortcut::parse("<Ctrl><Alt>h").unwrap()),
+            )
+            .unwrap();
+        let saved = write_shortcuts(&path, &resolved, &[ShortcutId::SplitRight], None).unwrap();
+        assert_eq!(
+            saved.display_label_for_id(ShortcutId::FocusLeft).as_deref(),
+            Some("Alt+H"),
+            "the overrides apply again once they no longer conflict"
+        );
+    }
+
+    #[test]
+    fn duplicate_error_names_the_current_owner_first() {
+        // Rows before and after the owner of Ctrl+Alt+N.
+        for id in [ShortcutId::NewWorkspace, ShortcutId::SplitRight] {
+            let err = default_shortcuts()
+                .with_binding(id, Some(NormalizedShortcut::parse("<Ctrl><Alt>n").unwrap()))
+                .unwrap_err();
+            assert_eq!(
+                err,
+                ShortcutConfigError::DuplicateBinding {
+                    first: ShortcutId::NewInstance,
+                    second: id,
+                    accel: "<Ctrl><Alt>n".to_string(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -2637,24 +2881,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_shortcuts_from_str_rejects_modifier_only_keys() {
-        let err = resolve_shortcuts_from_str(
-            r#"{
-                "shortcuts": {
-                    "split_right": "<Ctrl>Control_L"
-                }
-            }"#,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            ShortcutConfigError::ModifierOnlyBinding { shortcut_id, .. }
-                if shortcut_id == "split_right"
-        ));
-    }
-
-    #[test]
     fn write_shortcuts_omits_defaults_and_preserves_unrelated_settings() {
         let dir = tempdir().unwrap();
         let path = shortcuts_path_in(dir.path());
@@ -2680,7 +2906,13 @@ mod tests {
         )
         .unwrap();
 
-        write_shortcuts(&path, &updated).unwrap();
+        write_shortcuts(
+            &path,
+            &updated,
+            &[ShortcutId::SplitRight, ShortcutId::CloseFocusedPane],
+            None,
+        )
+        .unwrap();
 
         let written: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -2709,7 +2941,7 @@ mod tests {
         )
         .unwrap();
 
-        write_shortcuts(&path, &default_shortcuts()).unwrap();
+        write_shortcuts(&path, &default_shortcuts(), &[ShortcutId::SplitRight], None).unwrap();
 
         let written: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
