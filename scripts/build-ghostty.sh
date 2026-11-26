@@ -77,7 +77,7 @@ while true; do
     break
   fi
   if [ "$attempt" -lt "$FETCH_ATTEMPTS" ] \
-    && grep -Eq '\.zig\.zon:[0-9]+:[0-9]+: error: (HTTP (request failed|response read failure)|unable to connect|TLS |.*(ConnectionResetByPeer|ConnectionRefused|ConnectionTimedOut|NetworkUnreachable|TemporaryNameServerFailure|NameServerFailure|ReadFailed|WriteFailed|EndOfStream|UnexpectedEof|BrokenPipe|TlsConnectionTruncated))' "$ZIG_STDERR_LOG"; then
+    && grep -Eq '\.zig\.zon:[0-9]+:[0-9]+: error: (HTTP (request failed|response read failure)|invalid HTTP response|bad HTTP response code: .(429|5[0-9][0-9]) |unable to connect|TLS |.*(ConnectionResetByPeer|ConnectionRefused|ConnectionTimedOut|NetworkUnreachable|TemporaryNameServerFailure|NameServerFailure|ReadFailed|WriteFailed|EndOfStream|UnexpectedEof|BrokenPipe|TlsConnectionTruncated))' "$ZIG_STDERR_LOG"; then
     delay=$((FETCH_RETRY_DELAY * attempt))
     echo "WARNING: Ghostty Zig dependency fetch failed on attempt $attempt/$FETCH_ATTEMPTS; retrying in ${delay}s..." >&2
     if [ "$delay" -gt 0 ]; then

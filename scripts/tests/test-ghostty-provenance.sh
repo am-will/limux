@@ -32,11 +32,12 @@ if [ -n "${TEST_ZIG_ATTEMPT_FILE:-}" ]; then
   count=$((count + 1))
   printf '%s\n' "$count" > "$TEST_ZIG_ATTEMPT_FILE"
   if [ "$count" -le "${TEST_ZIG_TRANSIENT_FETCH_FAILS:-0}" ]; then
-    if [ $((count % 2)) -eq 1 ]; then
-      echo "ghostty/pkg/wuffs/build.zig.zon:21:20: error: HTTP response read failure: ConnectionResetByPeer" >&2
-    else
-      echo "ghostty/build.zig.zon:120:20: error: HTTP request failed: WriteFailed" >&2
-    fi
+    case $((count % 4)) in
+      1) echo "ghostty/pkg/wuffs/build.zig.zon:21:20: error: HTTP response read failure: ConnectionResetByPeer" >&2 ;;
+      2) echo "ghostty/build.zig.zon:120:20: error: HTTP request failed: WriteFailed" >&2 ;;
+      3) echo "ghostty/pkg/wuffs/build.zig.zon:14:20: error: invalid HTTP response: HttpConnectionClosing" >&2 ;;
+      0) echo "ghostty/build.zig.zon:120:20: error: bad HTTP response code: '503 Service Unavailable'" >&2 ;;
+    esac
     exit 1
   fi
 fi
@@ -149,12 +150,12 @@ ln -s "$TMP_DIR/aur-ghostty" "$FIXTURE/ghostty"
 # Transient Zig dependency fetch failures retry and succeed once downloads recover.
 ATTEMPT_FILE="$TMP_DIR/zig-attempts"
 rm -f "$ATTEMPT_FILE"
-LIMUX_GHOSTTY_FETCH_ATTEMPTS=4 \
+LIMUX_GHOSTTY_FETCH_ATTEMPTS=5 \
   LIMUX_GHOSTTY_FETCH_RETRY_DELAY_SECS=0 \
   TEST_ZIG_ATTEMPT_FILE="$ATTEMPT_FILE" \
-  TEST_ZIG_TRANSIENT_FETCH_FAILS=2 \
+  TEST_ZIG_TRANSIENT_FETCH_FAILS=4 \
   "$FIXTURE/scripts/build-ghostty.sh" >"$TMP_DIR/output" 2>&1
-[ "$(cat "$ATTEMPT_FILE")" -eq 3 ]
+[ "$(cat "$ATTEMPT_FILE")" -eq 5 ]
 grep -Fq 'retrying in 0s' "$TMP_DIR/output"
 "$FIXTURE/scripts/check-ghostty.sh" >/dev/null
 
