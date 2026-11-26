@@ -2658,12 +2658,17 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
     key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
         let matched = {
             let s = state.borrow();
+            let group = controller
+                .current_event()
+                .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok())
+                .map(|event| event.layout() as i32);
             shortcut_match_from_key_press(
                 &s.shortcuts,
                 || controller.widget().map(|widget| widget.display()),
                 keyval,
                 keycode,
                 modifier,
+                group,
             )
         }
         .filter(|matched| {
@@ -2793,9 +2798,10 @@ fn shortcut_match_from_key_press(
     keyval: gtk::gdk::Key,
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
+    group: Option<i32>,
 ) -> Option<MatchedShortcut> {
     shortcuts
-        .find_for_key_press_with_display(display, keyval, keycode, modifier)
+        .find_for_key_press_with_display(display, keyval, keycode, modifier, group)
         .map(|shortcut| MatchedShortcut {
             command: shortcut.definition.command,
             editable_capture_policy: shortcut.definition.editable_capture_policy,
