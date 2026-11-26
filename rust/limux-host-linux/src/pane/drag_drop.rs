@@ -304,13 +304,8 @@ pub(super) fn transfer_tab_between_panes(
     };
     let moved_was_unread = entry.unread;
 
-    if let Some(window) = entry
-        .content
-        .root()
-        .and_then(|root| root.downcast::<gtk::Window>().ok())
-    {
-        gtk::prelude::GtkWindowExt::set_focus(&window, gtk::Widget::NONE);
-    }
+    crate::terminal::unset_focus_within(&entry.content);
+    crate::terminal::unset_focus_within(entry.tab_button.upcast_ref());
 
     if entry.tab_button.parent().is_some() {
         source.tab_strip.remove(&entry.tab_button);

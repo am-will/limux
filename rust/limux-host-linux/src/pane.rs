@@ -851,6 +851,30 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
     true
 }
 
+/// Focus the pane's active tab at once: a key typed right after a move between
+/// panes must not reach the pane left behind.
+pub fn grab_active_tab_focus(pane_widget: &gtk::Widget) {
+    if let Some(internals) = find_pane_internals(pane_widget) {
+        focus_active_tab_content(&internals.tab_state);
+    }
+}
+
+fn focus_active_tab_content(tab_state: &Rc<RefCell<TabState>>) {
+    let target = {
+        let state = tab_state.borrow();
+        state
+            .tabs
+            .iter()
+            .find(|entry| Some(entry.id.as_str()) == state.active_tab.as_deref())
+            // Content on its way from another pane gets focus when it arrives.
+            .filter(|entry| entry.content.is_mapped())
+            .map(TabFocusTarget::from_entry)
+    };
+    if let Some(target) = target {
+        target.focus();
+    }
+}
+
 /// A pane's unread tabs, for jumping between unread terminals.
 pub struct PaneUnreadTabs {
     pub pane_id: u32,
@@ -2529,7 +2553,9 @@ fn add_terminal_tab_inner(
             &internals.tab_state,
             &tab_id,
         );
-        term.handle.focus_surface();
+        if internals.content_stack.is_mapped() {
+            term.handle.focus_surface();
+        }
     }
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
@@ -3733,8 +3759,13 @@ fn activate_tab_with_focus(
         // Mouse-initiated tab switches can leave focus on the click target if we
         // refocus synchronously. Deferring to the next idle tick makes the newly
         // active surface or webview the final focus owner.
+        let content_stack = content_stack.clone();
         glib::idle_add_local_once(move || {
-            target.focus();
+            // GTK would also focus a tab nobody can see, in a hidden workspace
+            // or behind a zoomed pane.
+            if content_stack.is_mapped() {
+                target.focus();
+            }
         });
     }
 }
@@ -3749,6 +3780,10 @@ fn remove_tab(
     empty_reason: PaneEmptyReason,
 ) {
     commit_active_tab_rename(tab_state);
+
+    // A tab that closes in a pane the user is not in must not take the keyboard.
+    let takes_focus = crate::terminal::focus_is_within(pane_outer.upcast_ref())
+        || pane_outer.root().is_some_and(|root| root.focus().is_none());
 
     let (entry, removed_was_unread, closed_terminal, new_id, was_active) = {
         let mut ts = tab_state.borrow_mut();
@@ -3798,7 +3833,7 @@ fn remove_tab(
         // maps its first child the instant the visible one is hidden, so
         // detaching after activation keeps that first child from flashing on
         // screen (see `terminal::detach_after_repaint`).
-        activate_tab(tab_strip, content_stack, tab_state, &new_id);
+        activate_tab_with_focus(tab_strip, content_stack, tab_state, &new_id, takes_focus);
         clear_tab_unread_if_visible(tab_state, &new_id, &pane_outer.clone().upcast(), callbacks);
     }
     crate::terminal::remove_from_stack_after_repaint(&entry.content);

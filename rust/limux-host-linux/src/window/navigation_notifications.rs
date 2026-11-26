@@ -35,9 +35,7 @@ pub(super) fn focus_pane_in_direction(state: &State, direction: Direction) {
     let Some(leaf) = pane_in_direction(state, &pane_widget, direction) else {
         return;
     };
-    if let Some(gl) = find_gl_area(&leaf) {
-        gl.grab_focus();
-    }
+    pane::grab_active_tab_focus(&leaf);
 }
 
 pub(super) fn pane_in_direction(

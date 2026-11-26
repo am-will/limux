@@ -439,6 +439,9 @@ for regression in \
   window::pane_close_tests::a_failed_exit_driven_through_the_control_socket_is_held \
   window::pane_close_tests::next_unread_terminal_reads_a_tab_a_zoom_hid \
   window::pane_close_tests::closing_inactive_workspace_preserves_active_manual_unread \
+  window::pane_close_tests::tab_rename_commit_returns_the_focus_to_its_terminal \
+  window::pane_close_tests::only_the_pane_in_use_takes_the_keyboard \
+  window::pane_close_tests::directional_focus_reaches_a_pane_without_a_terminal \
   window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
   window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
   window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \
