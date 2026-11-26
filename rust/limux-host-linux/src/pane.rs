@@ -2961,14 +2961,16 @@ pub fn add_keybind_editor_tab_to_pane(
     on_capture: Rc<PaneShortcutCaptureCallback>,
 ) {
     if let Some(internals) = find_pane_internals(pane_widget) {
-        if let Some(existing_id) = internals
+        // Its own statement: an `if let` would keep the tab state borrowed
+        // while `activate_tab` changes it.
+        let existing_id = internals
             .tab_state
             .borrow()
             .tabs
             .iter()
             .find(|entry| matches!(entry.kind, TabKind::Keybinds))
-            .map(|entry| entry.id.clone())
-        {
+            .map(|entry| entry.id.clone());
+        if let Some(existing_id) = existing_id {
             activate_tab(
                 &internals.tab_strip,
                 &internals.content_stack,

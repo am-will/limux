@@ -1512,6 +1512,35 @@ fn opening_a_held_background_tab_focuses_restart() {
     window.close();
 }
 
+// Choosing Keybinds in a pane that already has the tab shows that tab.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn opening_keybinds_again_shows_the_open_tab() {
+    let (state, _temp) = held_tab_test_window("dev.limux.KeybindsAgainTest");
+    let (_ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    let terminal = pane::active_tab_in_pane(&pane).unwrap();
+    open_keybind_editor_tab(&state, &pane);
+    let keybinds = pane::active_tab_in_pane(&pane).unwrap();
+    assert_ne!(keybinds, terminal);
+    assert!(pane::activate_tab_in_pane(&pane, &terminal));
+
+    open_keybind_editor_tab(&state, &pane);
+    assert_eq!(
+        pane::tab_count_in_pane(&pane),
+        2,
+        "one Keybinds tab per pane"
+    );
+    assert_eq!(
+        pane::active_tab_in_pane(&pane).as_deref(),
+        Some(keybinds.as_str())
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
 fn held_tab_test_window(app_id: &str) -> (State, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {

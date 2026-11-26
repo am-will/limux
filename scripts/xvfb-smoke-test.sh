@@ -433,6 +433,7 @@ for regression in \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
   window::pane_create_tests::terminal_commands_retry_until_ready_then_reply_without_a_timer \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
+  window::pane_close_tests::opening_keybinds_again_shows_the_open_tab \
   window::pane_close_tests::localized_split_and_remove_keep_sibling_gl_areas_realized \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
   window::pane_close_tests::an_exit_driven_through_the_control_socket_closes_its_tab_unwatched \
