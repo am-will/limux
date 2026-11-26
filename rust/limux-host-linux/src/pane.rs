@@ -5056,19 +5056,25 @@ fn browser_entry_host_scheme(input: &str) -> Option<&'static str> {
         return None;
     }
     let uri = glib::Uri::parse(&format!("http://{input}"), glib::UriFlags::PARSE_RELAXED).ok()?;
+    if uri.userinfo().is_some() {
+        return None;
+    }
     let host = uri.host().filter(|host| !host.is_empty())?;
+    let has_valid_dotted_host = host.contains('.')
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..");
     // As in other browsers, only public names default to https. One word
     // without a port stays a search.
     let single_label_with_port = uri.port() != -1
         && !host.contains('.')
         && host.starts_with(|ch: char| ch.is_ascii_alphabetic());
-    if host.eq_ignore_ascii_case("localhost")
-        || host.parse::<std::net::IpAddr>().is_ok()
-        || single_label_with_port
-    {
+    let is_localhost = host.eq_ignore_ascii_case("localhost")
+        || (has_valid_dotted_host && host.to_ascii_lowercase().ends_with(".localhost"));
+    if is_localhost || host.parse::<std::net::IpAddr>().is_ok() || single_label_with_port {
         return Some("http");
     }
-    input.contains('.').then_some("https")
+    has_valid_dotted_host.then_some("https")
 }
 
 #[cfg(not(feature = "webkit"))]
@@ -5610,6 +5616,8 @@ mod tests {
             ("localhost/path", "http://localhost/path"),
             ("localhost?q=1", "http://localhost?q=1"),
             ("LOCALHOST:3000", "http://LOCALHOST:3000"),
+            ("sub.localhost:3000", "http://sub.localhost:3000"),
+            ("SUB.LOCALHOST:3000", "http://SUB.LOCALHOST:3000"),
             ("localhost.run", "https://localhost.run"),
             ("localhost.example.com", "https://localhost.example.com"),
             (
@@ -5635,6 +5643,10 @@ mod tests {
             ("HTTPS://example.com", "HTTPS://example.com"),
             (" https://example.com ", "https://example.com"),
             ("file:///home/me/index.html", "file:///home/me/index.html"),
+            (
+                "file:///home/me/my file.html",
+                "file:///home/me/my file.html",
+            ),
             ("about:blank", "about:blank"),
             // Searches keep every character.
             (
@@ -5652,6 +5664,41 @@ mod tests {
                 "site:example.com",
                 "https://www.google.com/search?q=site%3Aexample.com",
             ),
+            // Non-host paths, queries, unsupported schemes, userinfo, and malformed URLs stay searches.
+            ("src/main.rs", "https://www.google.com/search?q=src%2Fmain.rs"),
+            ("word?a=1.2", "https://www.google.com/search?q=word%3Fa%3D1.2"),
+            (
+                "ftp://ftp.example.com/file",
+                "https://www.google.com/search?q=ftp%3A%2F%2Fftp.example.com%2Ffile",
+            ),
+            (
+                "mailto:user@example.com",
+                "https://www.google.com/search?q=mailto%3Auser%40example.com",
+            ),
+            (
+                "user@example.com",
+                "https://www.google.com/search?q=user%40example.com",
+            ),
+            (
+                "javascript:alert(1)",
+                "https://www.google.com/search?q=javascript%3Aalert%281%29",
+            ),
+            (
+                "javascript://example.com/%0aalert(1)",
+                "https://www.google.com/search?q=javascript%3A%2F%2Fexample.com%2F%250aalert%281%29",
+            ),
+            (
+                "http://example.com foo",
+                "https://www.google.com/search?q=http%3A%2F%2Fexample.com+foo",
+            ),
+            ("http://", "https://www.google.com/search?q=http%3A%2F%2F"),
+            ("https://", "https://www.google.com/search?q=https%3A%2F%2F"),
+            ("about:", "https://www.google.com/search?q=about%3A"),
+            ("file://", "https://www.google.com/search?q=file%3A%2F%2F"),
+            (".env", "https://www.google.com/search?q=.env"),
+            ("..", "https://www.google.com/search?q=.."),
+            ("foo.", "https://www.google.com/search?q=foo."),
+            (".localhost", "https://www.google.com/search?q=.localhost"),
         ];
 
         for (input, expected) in cases {

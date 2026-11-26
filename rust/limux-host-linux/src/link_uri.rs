@@ -32,8 +32,15 @@ pub fn is_typed_browser_url(text: &str) -> bool {
     };
 
     match scheme.as_str() {
-        "http" | "https" | "file" => rest.starts_with("://"),
-        "about" => !rest.contains(char::is_whitespace),
+        "http" | "https" => rest
+            .strip_prefix("://")
+            .is_some_and(|body| !body.is_empty() && !body.contains(char::is_whitespace)),
+        "file" => rest
+            .strip_prefix("://")
+            .is_some_and(|path| !path.is_empty()),
+        "about" => rest
+            .strip_prefix(':')
+            .is_some_and(|body| !body.is_empty() && !body.contains(char::is_whitespace)),
         _ => false,
     }
 }
@@ -93,6 +100,35 @@ mod tests {
         ] {
             assert!(!is_safe_external_url(url), "should reject {url}");
             assert!(!is_embedded_browser_url(url), "should reject {url}");
+        }
+    }
+
+    #[test]
+    fn typed_browser_urls_validate_scheme_body_and_whitespace() {
+        for url in [
+            "http://example.com",
+            "https://example.com/path",
+            "HTTPS://example.com",
+            "file:///home/me/index.html",
+            "file:///home/me/my file.html",
+            "about:blank",
+        ] {
+            assert!(is_typed_browser_url(url), "should accept {url}");
+        }
+
+        for url in [
+            "http://",
+            "https://",
+            "http://example.com foo",
+            "https://example.com\tbar",
+            "about:",
+            "about:blank foo",
+            "file://",
+            "ftp://ftp.example.com/file",
+            "javascript:alert(1)",
+            "mailto:user@example.com",
+        ] {
+            assert!(!is_typed_browser_url(url), "should reject {url}");
         }
     }
 }
