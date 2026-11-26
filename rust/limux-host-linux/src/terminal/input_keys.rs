@@ -409,10 +409,16 @@ pub(super) fn dropped_file_text(file_list: &gtk::gdk::FileList) -> Option<CStrin
     )
 }
 
-/// Bash-escape a path so it can be safely pasted into the terminal without
-/// sending raw control bytes to Ghostty.
+/// Escape a path so it can be safely pasted into the terminal without sending
+/// raw control bytes to Ghostty. Only Bash-like shells read the `$'...'` form
+/// that those bytes need, so other paths get plain single quotes.
 pub(super) fn shell_escape_bytes(s: &[u8]) -> Vec<u8> {
-    Bash::quote_vec(s)
+    match std::str::from_utf8(s) {
+        Ok(text) if !text.chars().any(char::is_control) => {
+            crate::pane::shell_quote(text).into_bytes()
+        }
+        _ => Bash::quote_vec(s),
+    }
 }
 
 pub(super) fn shell_escape_joined_bytes<I, B>(paths: I) -> Option<CString>

@@ -38,6 +38,8 @@ pub const GHOSTTY_PLATFORM_LINUX: c_int = 7;
 
 pub const GHOSTTY_CLIPBOARD_STANDARD: c_int = 0;
 pub const GHOSTTY_CLIPBOARD_SELECTION: c_int = 1;
+// Not in ghostty.h: an OSC 52 write to `p` passes apprt.Clipboard.primary.
+pub const GHOSTTY_CLIPBOARD_PRIMARY: c_int = 2;
 
 pub const GHOSTTY_CLIPBOARD_REQUEST_PASTE: c_int = 0;
 pub const GHOSTTY_CLIPBOARD_REQUEST_OSC_52_READ: c_int = 1;

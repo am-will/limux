@@ -2726,7 +2726,7 @@ fn is_safe_shell_bareword(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if is_safe_shell_bareword(value) {
         value.to_string()
     } else {
