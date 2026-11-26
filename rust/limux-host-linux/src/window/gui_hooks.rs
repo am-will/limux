@@ -327,7 +327,7 @@ pub(super) fn handle_gui_hook_request(
             event
         }
     };
-    app_config::save(&updated).map_err(BridgeError::internal)?;
+    app_config::save(&config.borrow(), &updated).map_err(BridgeError::internal)?;
     let payload = updated.hooks.describe(event);
     let hooks = updated.hooks.clone();
     *config.borrow_mut() = updated;

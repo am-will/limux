@@ -3064,7 +3064,7 @@ fn handle_config_change(
     {
         apply_top_bar_mode(state);
     }
-    if let Err(err) = app_config::save(updated) {
+    if let Err(err) = app_config::save(previous, updated) {
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
         if updated.appearance.ui_scale != previous.appearance.ui_scale
@@ -9077,13 +9077,14 @@ fn persist_font_size_reset(state: &State) -> bool {
 }
 
 fn persist_font_size(state: &State, font_size: Option<f32>) -> Result<(), String> {
-    let mut updated = {
+    let previous = {
         let s = state.borrow();
-        let updated = s.config.borrow().clone();
-        updated
+        let previous = s.config.borrow().clone();
+        previous
     };
+    let mut updated = previous.clone();
     updated.font_size = font_size;
-    app_config::save(&updated)?;
+    app_config::save(&previous, &updated)?;
 
     state.borrow().config.borrow_mut().font_size = font_size;
     Ok(())
