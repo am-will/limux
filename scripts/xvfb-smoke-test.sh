@@ -476,6 +476,7 @@ command -v xdotool >/dev/null || {
   exit 2
 }
 for regression in \
+  shortcut_config::tests::default_shortcuts_work_on_other_layouts \
   window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
   window::pane_close_tests::passive_rename_focus_restore_preserves_manual_tab_unread \
   window::pane_close_tests::a_quick_failure_in_a_late_started_terminal_is_held \
