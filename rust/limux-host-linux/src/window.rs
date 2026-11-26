@@ -749,6 +749,12 @@ fn control_terminal_target(
     ))
 }
 
+/// Input for a terminal that is still not running must fail: nothing would
+/// deliver it later.
+fn terminal_not_started() -> BridgeError {
+    BridgeError::conflict("terminal has not started yet")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum PaneCreateDirection {
@@ -6496,9 +6502,11 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            if handle.send_text(&text) {
-                handle.note_driven_input();
+            if !handle.ensure_started() || !handle.send_text(&text) {
+                let _ = reply.send(Err(terminal_not_started()));
+                return;
             }
+            handle.note_driven_input();
             if let Some(map) = payload.as_object_mut() {
                 map.insert("ok".to_string(), serde_json::Value::Bool(true));
             }
@@ -6785,6 +6793,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
+            if !handle.ensure_started() {
+                let _ = reply.send(Err(terminal_not_started()));
+                return;
+            }
             if !handle.send_key(&key) {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
                     "unsupported key",

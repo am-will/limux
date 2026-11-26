@@ -403,6 +403,16 @@ impl TerminalHandle {
             .realize(&self.gl_area, &self.shutting_down);
     }
 
+    /// Start the terminal unless it already runs. A terminal in a workspace or
+    /// tab that was never shown has no process yet. False while a split or a
+    /// tab move keeps it out of the window.
+    pub(crate) fn ensure_started(&self) -> bool {
+        if self.surface_cell.borrow().is_none() {
+            self.realize_in_background();
+        }
+        self.surface_cell.borrow().is_some()
+    }
+
     /// Note input sent through the control socket.
     pub fn note_driven_input(&self) {
         self.driven_at.set(Some(std::time::Instant::now()));
