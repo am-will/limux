@@ -607,7 +607,9 @@ pub(super) fn snapshot_session_state(state: &State) -> AppSessionState {
 }
 
 pub(super) fn sidebar_is_visible(state: &AppState) -> bool {
-    state.sidebar_shell.is_visible() && sidebar_width(&state.sidebar_shell) > 10
+    // `is_visible` is false for a shown sidebar until its window is presented,
+    // and the session is restored before that.
+    state.sidebar_shell.get_visible() && sidebar_width(&state.sidebar_shell) > 10
 }
 
 #[cfg(test)]

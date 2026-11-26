@@ -1043,6 +1043,23 @@ pub fn mark_tab_read_in_pane(pane_widget: &gtk::Widget, tab_id: &str) {
     }
 }
 
+/// Mark the active tab read for a user whose focus entered its pane. A tab
+/// marked unread by hand stays unread.
+pub fn read_active_tab_in_pane(pane_widget: &gtk::Widget) {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return;
+    };
+    let active_tab = internals.tab_state.borrow().active_tab.clone();
+    if let Some(tab_id) = active_tab {
+        clear_tab_unread_if_visible_and_not_manual(
+            &internals.tab_state,
+            &tab_id,
+            pane_widget,
+            &internals.callbacks,
+        );
+    }
+}
+
 /// Terminal identities and handles, including tabs that have no surface yet.
 pub(crate) fn terminal_tabs_in_pane(
     pane_widget: &gtk::Widget,

@@ -265,7 +265,7 @@ Launch Limux and verify:
 - `Ctrl+Alt+Shift+D` splits down
 - `Ctrl+W` reaches the focused terminal
 - `Ctrl+Shift+W` closes the focused tab
-- `Ctrl+Alt+W` closes the focused pane
+- `Ctrl+Alt+W` closes the focused pane, but not the only pane of a workspace
 - `Ctrl+Alt+Page_Down` and `Ctrl+Alt+Page_Up` switch workspaces
 - pane button tooltips show the default shortcut suffixes where applicable
 - `Ctrl+Alt+Q` quits Limux
