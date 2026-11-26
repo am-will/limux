@@ -1758,6 +1758,72 @@ fn next_unread_terminal_reaches_a_hidden_tab() {
     window.close();
 }
 
+// The find entry has the focus while the bar is open, so the find shortcuts
+// must work from there. However the bar closes, the keyboard is back at once.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn terminal_find_works_from_its_entry_and_gives_the_focus_back() {
+    let (state, _temp) = held_tab_test_window("dev.limux.TerminalFindTest");
+    let (_, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let window = state.borrow().window.clone();
+    let gl_area = find_gl_area(&root).expect("terminal");
+    let search_bar = widget_tree(gl_area.parent().as_ref().unwrap())
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::SearchBar>().ok())
+        .expect("find bar");
+    let widgets = widget_tree(search_bar.upcast_ref());
+    let entry = widgets
+        .iter()
+        .find_map(|widget| widget.downcast_ref::<gtk::SearchEntry>())
+        .expect("find entry");
+    let close_button = widgets
+        .iter()
+        .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+        .find(|button| button.has_css_class("close"))
+        .expect("find bar close button");
+    let blocked = |command| {
+        shortcut_blocked_by_editable(
+            command,
+            EditableCapturePolicy::BypassInEditable,
+            focused_editable_capture_context(&state, window.upcast_ref()),
+        )
+    };
+
+    type Close<'a> = &'a dyn Fn();
+    let closings: [(&str, Close); 3] = [
+        ("Escape", &|| entry.emit_by_name::<()>("stop-search", &[])),
+        ("the close button", &|| close_button.emit_clicked()),
+        ("the shortcut", &|| {
+            assert!(dispatch_shortcut_command(
+                &state,
+                ShortcutCommand::SurfaceFindHide
+            ));
+        }),
+    ];
+    for (what, close) in closings {
+        assert!(dispatch_shortcut_command(
+            &state,
+            ShortcutCommand::SurfaceFind
+        ));
+        assert_focus_within(what, &state, entry.upcast_ref());
+        for command in [
+            ShortcutCommand::SurfaceFindNext,
+            ShortcutCommand::SurfaceFindPrevious,
+            ShortcutCommand::SurfaceFindHide,
+        ] {
+            assert!(!blocked(command), "{command:?} in the find entry");
+        }
+        assert!(blocked(ShortcutCommand::TerminalCopy));
+
+        close();
+        assert!(!search_bar.is_search_mode(), "{what} closes the bar");
+        assert!(gl_area.is_focus(), "{what} gives the focus back at once");
+        assert!(!blocked(ShortcutCommand::TerminalCopy));
+    }
+    window.close();
+}
+
 // The next-unread action unzooms another pane to show the unread tab, and
 // that reads it: the action must not keep landing on the same tab.
 #[test]

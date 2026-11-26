@@ -436,6 +436,7 @@ for regression in \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
   window::pane_close_tests::opening_keybinds_again_shows_the_open_tab \
   window::pane_close_tests::localized_split_and_remove_keep_sibling_gl_areas_realized \
+  window::pane_close_tests::terminal_find_works_from_its_entry_and_gives_the_focus_back \
   window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
   window::pane_close_tests::an_exit_driven_through_the_control_socket_closes_its_tab_unwatched \
   window::pane_close_tests::a_failed_exit_driven_through_the_control_socket_is_held \

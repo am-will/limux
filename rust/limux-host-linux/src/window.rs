@@ -2722,7 +2722,12 @@ fn focused_editable_capture_context(state: &State, window: &gtk::Window) -> Edit
         pane::FocusedShortcutTarget::Browser(target) => EditableCaptureContext {
             gtk_editable,
             browser_dom_editable: target.is_page_editable(),
-            browser_find_active: target.is_find_active(),
+            find_active: target.is_find_active(),
+        },
+        pane::FocusedShortcutTarget::Terminal(target) => EditableCaptureContext {
+            gtk_editable,
+            find_active: target.is_find_active(),
+            ..EditableCaptureContext::default()
         },
         _ => EditableCaptureContext {
             gtk_editable,
@@ -2731,7 +2736,7 @@ fn focused_editable_capture_context(state: &State, window: &gtk::Window) -> Edit
     }
 }
 
-fn shortcut_allowed_while_browser_find_active(command: ShortcutCommand) -> bool {
+fn shortcut_allowed_while_find_active(command: ShortcutCommand) -> bool {
     matches!(
         command,
         ShortcutCommand::SurfaceFindNext
@@ -2749,7 +2754,7 @@ fn shortcut_blocked_by_editable(
         return false;
     }
 
-    if context.browser_find_active && shortcut_allowed_while_browser_find_active(command) {
+    if context.find_active && shortcut_allowed_while_find_active(command) {
         return false;
     }
 
@@ -2784,7 +2789,7 @@ struct MatchedShortcut {
 struct EditableCaptureContext {
     gtk_editable: bool,
     browser_dom_editable: bool,
-    browser_find_active: bool,
+    find_active: bool,
 }
 
 fn shortcut_match_from_key_press(
@@ -9288,7 +9293,7 @@ mod tests {
         keep_workspace_open_after_empty_pane, next_active_workspace_index,
         normalize_autostart_command, pane_create_split_placement, queue_session_save_request,
         resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
+        shortcut_allowed_while_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_autostart_dialog_dismisses,
@@ -10105,7 +10110,7 @@ mod tests {
     fn browser_find_navigation_shortcuts_are_allowed_while_find_ui_is_active() {
         let context = EditableCaptureContext {
             gtk_editable: true,
-            browser_find_active: true,
+            find_active: true,
             ..EditableCaptureContext::default()
         };
 
@@ -10133,16 +10138,16 @@ mod tests {
 
     #[test]
     fn browser_find_active_exception_is_limited_to_navigation_shortcuts() {
-        assert!(shortcut_allowed_while_browser_find_active(
+        assert!(shortcut_allowed_while_find_active(
             ShortcutCommand::SurfaceFindNext
         ));
-        assert!(shortcut_allowed_while_browser_find_active(
+        assert!(shortcut_allowed_while_find_active(
             ShortcutCommand::SurfaceFindPrevious
         ));
-        assert!(shortcut_allowed_while_browser_find_active(
+        assert!(shortcut_allowed_while_find_active(
             ShortcutCommand::SurfaceFindHide
         ));
-        assert!(!shortcut_allowed_while_browser_find_active(
+        assert!(!shortcut_allowed_while_find_active(
             ShortcutCommand::SurfaceFind
         ));
     }
