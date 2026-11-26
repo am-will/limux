@@ -329,3 +329,131 @@ fn pane_swap_and_list_preserve_swapped_leaf_order() {
     let window = state.borrow().window.clone();
     window.close();
 }
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn input_starts_a_terminal_that_was_never_shown_or_is_rejected() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config"),
+        "command = direct:/bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.HiddenTerminalInputTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let hidden = state.borrow().active_workspace().unwrap().id.clone();
+    add_workspace_from_state(&state, &workspace_state_with_folder("shown", "/"));
+
+    let context = glib::MainContext::default();
+    let wait_until = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    };
+    let request = |command: &dyn Fn(
+        std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+    ) -> ControlCommand| {
+        let (reply, rx) = std::sync::mpsc::channel();
+        handle_control_command(&state, command(reply));
+        let mut result = None;
+        wait_until("no reply", &mut || {
+            result = rx.try_recv().ok();
+            result.is_some()
+        });
+        result.unwrap()
+    };
+    let target = || WorkspaceTarget::Handle(hidden.clone());
+    let send_text = |surface: &str, text: &str| {
+        request(&|reply| ControlCommand::SendText {
+            target: target(),
+            surface_hint: Some(surface.to_string()),
+            text: text.to_string(),
+            reply,
+        })
+    };
+    let send_key = |surface: &str, key: &str| {
+        request(&|reply| ControlCommand::SendKey {
+            target: target(),
+            surface_hint: Some(surface.to_string()),
+            key: key.to_string(),
+            reply,
+        })
+    };
+
+    let created = request(&|reply| ControlCommand::CreatePane {
+        request: crate::control_bridge::CreatePaneRequest {
+            target: target(),
+            source_pane_id: None,
+            source_surface_id: None,
+            direction: BridgePaneCreateDirection::Right,
+            pane_type: PaneCreateType::Terminal,
+            command: None,
+            url: None,
+        },
+        reply,
+    })
+    .unwrap();
+    let surface = created["surface_id"].as_str().unwrap();
+    let pane_id = created["pane_id"].as_str().unwrap().parse().unwrap();
+    let pane = pane::pane_widget_for_workspace(&hidden, pane_id).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(surface)).unwrap();
+    assert!(!handle.health().realized, "the hidden pane already started");
+
+    let marker = temp.path().join("marker");
+    send_text(surface, &format!("printf ran > '{}'", marker.display())).unwrap();
+    send_key(surface, "Enter").unwrap();
+    wait_until("the hidden terminal never ran the command", &mut || {
+        std::fs::read_to_string(&marker).is_ok_and(|text| text == "ran")
+    });
+    assert_eq!(
+        send_key(surface, "not-a-key"),
+        Err(BridgeError::invalid_params("unsupported key"))
+    );
+
+    // Outside the window it cannot start, as while a split is being rebuilt.
+    let shortcuts = state.borrow().shortcuts.clone();
+    let unrooted: gtk::Widget = create_pane_for_workspace(
+        &state,
+        &shortcuts,
+        &hidden,
+        temp.path().to_str(),
+        Rc::new(RefCell::new(None)),
+        PaneCreationOptions {
+            initial_state: None,
+            skip_default_tab: false,
+            suppress_initial_autostart: true,
+            initial_command: None,
+        },
+    )
+    .upcast();
+    let surface = pane::active_surface_summary(&unrooted).unwrap().surface_id;
+    assert_eq!(send_text(&surface, "lost"), Err(terminal_not_started()));
+    assert_eq!(send_key(&surface, "Enter"), Err(terminal_not_started()));
+
+    let window = state.borrow().window.clone();
+    window.close();
+}

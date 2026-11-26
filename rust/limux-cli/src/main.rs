@@ -3201,11 +3201,10 @@ fn lifecycle_scope(
 /// `limux select-workspace --workspace <id|ref>` — bring a workspace to the front.
 ///
 /// The host has always implemented `workspace.select`; it just wasn't reachable
-/// from the CLI. It needs to be, because a pane only realizes its ghostty surface
-/// once its workspace is displayed. Splits made in a background workspace stay
-/// unrealized — `surface-health` reports `healthy=false` and `send-key` fails —
-/// until something selects it. Without this verb a purely CLI-driven fleet cannot
-/// bring its own workspace forward, so it can never start.
+/// from the CLI. It needs to be, because a split made in a background workspace
+/// has no running terminal (`surface-health` reports `healthy=false`) until its
+/// workspace is selected or input is sent to it. Without this verb a purely
+/// CLI-driven fleet cannot bring its own workspace forward.
 async fn run_select_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())

@@ -434,6 +434,7 @@ for regression in \
   terminal::tests::keys_without_a_limux_action_reach_the_program \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
   window::pane_create_tests::terminal_commands_retry_until_ready_then_reply_without_a_timer \
+  window::pane_create_tests::input_starts_a_terminal_that_was_never_shown_or_is_rejected \
   window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
   window::pane_close_tests::opening_keybinds_again_shows_the_open_tab \
   window::pane_close_tests::localized_split_and_remove_keep_sibling_gl_areas_realized \
