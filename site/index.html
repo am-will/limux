@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limux: know which terminal needs you</title>
+<meta name="description" content="Limux is a native terminal workspace manager for Linux. Run coding agents, dev servers and shells side by side, and jump straight to the one that is waiting.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0e1118" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f3f5fa" media="(prefers-color-scheme: light)">
+<link rel="canonical" href="https://am-will.github.io/limux/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Limux: know which terminal needs you">
+<meta property="og:description" content="A native terminal workspace manager for Linux, rendered by Ghostty and scriptable from any shell.">
+<meta property="og:url" content="https://am-will.github.io/limux/">
+<meta property="og:image" content="https://am-will.github.io/limux/img/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" sizes="32x32" href="img/icon-32.png">
+<link rel="apple-touch-icon" href="img/icon-128.png">
+<link rel="preload" href="fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="style.css">
+<script src="demo.js" defer></script>
+<script src="page.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="bar">
+  <a class="brand" href="#top"><img src="img/icon-128.png" width="26" height="26" alt="">Limux</a>
+  <nav aria-label="Page">
+    <a href="#tour">Tour</a>
+    <a href="#agents">Agents</a>
+    <a href="#keys">Keys</a>
+    <a href="#install">Install</a>
+  </nav>
+  <a class="bar-gh" href="https://github.com/am-will/limux">GitHub</a>
+</header>
+
+<main id="main">
+
+<section class="hero" id="top">
+  <div class="hero-copy">
+    <h1>Know which terminal <span class="needs">needs you.</span></h1>
+    <p class="lede">Limux is a native terminal workspace manager for Linux. Run coding agents, dev servers and shells side by side. When one of them is waiting on you, it lights up, and one shortcut takes you there.</p>
+    <p class="cta">
+      <a class="btn btn-primary" href="#install">Install Limux</a>
+      <a class="btn" href="https://github.com/am-will/limux">Read the source</a>
+    </p>
+    <p class="fine">Free and MIT licensed. GTK4 and libadwaita. Wayland and X11. Terminals drawn on the GPU by Ghostty.</p>
+  </div>
+
+  <div class="demo-wrap">
+    <div id="demo" class="demo" aria-label="Interactive Limux demo">
+      <noscript><img src="img/overview.webp" alt="Limux window with a sidebar of workspaces and several split terminal panes" width="1600" height="1000"></noscript>
+    </div>
+    <div class="demo-tools" id="demo-tools" hidden>
+      <p id="demo-hint">A working miniature. Click it, then use the real shortcuts or type <code>help</code>.</p>
+      <div class="demo-btns">
+        <button type="button" data-act="split-right">Split right <kbd>Ctrl+Alt+D</kbd></button>
+        <button type="button" data-act="zoom">Zoom pane <kbd>Ctrl+Shift+Z</kbd></button>
+        <button type="button" data-act="next-unread" class="is-unread">Next unread <kbd>Ctrl+Alt+U</kbd></button>
+        <button type="button" data-act="reset">Reset</button>
+      </div>
+    </div>
+    <p class="visually-hidden" id="demo-live" aria-live="polite"></p>
+  </div>
+</section>
+
+<section class="tour" id="tour" aria-labelledby="tour-h">
+  <div class="pane pane-intro">
+    <div class="tab" aria-hidden="true"><span>tour</span></div>
+    <div class="pane-body">
+      <h2 id="tour-h">A tab bar only knows what is open</h2>
+      <p>Limux also knows what finished, what broke and what is asking you a question. It tells you where you can see it, and keeps the output until you have read it.</p>
+    </div>
+  </div>
+
+  <div class="pane pane-shot">
+    <div class="tab" aria-hidden="true"><span class="dot"></span><span>attention</span></div>
+    <figure>
+      <img src="img/attention.webp" width="1600" height="1000" loading="lazy" alt="Limux with one workspace in the sidebar highlighted in amber, its message below the name, and another that reports an exited process">
+      <figcaption>
+        <h3>The waiting one is amber</h3>
+        <p>Notifications mark the tab, the workspace row and the top bar. Background tabs spin while they print. A process that dies out of sight keeps its output and exit code, with <b>Restart</b> and <b>Close</b> ready.</p>
+      </figcaption>
+    </figure>
+  </div>
+
+  <div class="pane pane-shot">
+    <div class="tab" aria-hidden="true"><span>layout</span></div>
+    <figure>
+      <img src="img/layout.webp" width="1600" height="1000" loading="lazy" alt="Limux window with grouped workspaces and a split layout of an editor, a git log and a test run">
+      <figcaption>
+        <h3>One workspace per project</h3>
+        <p>Each workspace keeps its folder, splits, tabs and names. Color them, group them, pin favorites, drag them around. Quit and come back: the layout returns, and supported agents resume their session.</p>
+      </figcaption>
+    </figure>
+  </div>
+
+  <div class="pane pane-shot">
+    <div class="tab" aria-hidden="true"><span>browser</span></div>
+    <figure>
+      <img src="img/browser.webp" width="1600" height="1000" loading="lazy" alt="Limux with a terminal on the left and the embedded browser showing a local web page on the right">
+      <figcaption>
+        <h3>A browser in the next pane</h3>
+        <p>Put the dev server and the page it serves in one window. It is WebKitGTK with its sandbox on by default and the Web Inspector one shortcut away.</p>
+      </figcaption>
+    </figure>
+  </div>
+
+  <div class="pane pane-list">
+    <div class="tab" aria-hidden="true"><span>also in the box</span></div>
+    <dl class="pane-body">
+      <div><dt>Your Ghostty config</dt><dd>Limux reads it. Fonts, colors, palette and terminal behavior carry over.</dd></div>
+      <div><dt>SSH that survives</dt><dd>Opt in to tmux-backed remote tabs that reconnect after a drop and reattach after a restart. <a href="https://github.com/am-will/limux/blob/main/docs/ssh.md">How it works</a></dd></div>
+      <div><dt>Paste an image</dt><dd>Paste a screenshot into a terminal and Limux inserts a file path. In a persistent SSH tab it uploads the file first.</dd></div>
+      <div><dt>Autostart per workspace</dt><dd>Give a workspace a command and every new terminal in it runs that command.</dd></div>
+      <div><dt>Hooks on your actions</dt><dd>Run your own script when a workspace is created or deleted. Good for git worktrees.</dd></div>
+      <div><dt>Dead keys work</dt><dd>Accents, Compose sequences and input methods reach the terminal on Wayland and X11.</dd></div>
+    </dl>
+  </div>
+</section>
+
+<section class="agents" id="agents" aria-labelledby="agents-h">
+  <div class="pane agents-copy">
+    <div class="tab" aria-hidden="true"><span>agents</span></div>
+    <div class="pane-body">
+      <h2 id="agents-h">Agents can use the window too</h2>
+      <p>Every terminal in Limux knows its own workspace, pane and surface. The <code>limux</code> command uses that, so an agent can open a pane beside itself, start a helper, type into it, read its screen, and tell you when it is stuck. No flags, no keys, no server to run.</p>
+      <p>Install hooks once and your agents report in by themselves:</p>
+      <div class="cmd"><pre><code>limux hooks setup</code></pre></div>
+      <ul class="agent-list" aria-label="Supported agents">
+        <li>Codex</li><li>Claude Code</li><li>Gemini CLI</li><li>Antigravity</li><li>OpenCode <small>opt-in</small></li>
+      </ul>
+    </div>
+  </div>
+  <div class="pane agents-code">
+    <div class="tab" aria-hidden="true"><span>recipes.sh</span></div>
+    <div class="recipes" role="tablist" aria-label="Recipes">
+      <button role="tab" aria-selected="true" aria-controls="r-drive" id="t-drive">Drive a pane</button>
+      <button role="tab" aria-selected="false" aria-controls="r-team" id="t-team" tabindex="-1">Start a team</button>
+      <button role="tab" aria-selected="false" aria-controls="r-ask" id="t-ask" tabindex="-1">Ask for help</button>
+      <button role="tab" aria-selected="false" aria-controls="r-save" id="t-save" tabindex="-1">Survive a restart</button>
+    </div>
+    <div role="tabpanel" id="r-drive" aria-labelledby="t-drive"><pre><code><i># Open a pane on the right and run the test watcher.</i>
+limux new-pane --direction right --command "npm test -- --watch"
+
+<i># List what is open here, then talk to one of them.</i>
+limux list-panels
+limux send --surface "$PEER" "npm run lint"
+limux send-key --surface "$PEER" Enter
+
+<i># Read its screen back.</i>
+limux read-screen --surface "$PEER" --lines 40</code></pre></div>
+    <div role="tabpanel" id="r-team" aria-labelledby="t-team" hidden><pre><code><i># One pane per agent, beside the pane you are in.</i>
+<i># Writes AGENTS.md so they know how to talk to each other.</i>
+limux agent-team --agents codex,claude --cwd "$PWD"
+
+<i># Look before you leap: nothing is written or launched.</i>
+limux --json agent-team --dry-run</code></pre></div>
+    <div role="tabpanel" id="r-ask" aria-labelledby="t-ask" hidden><pre><code><i># Toast, sidebar message and unread marks, from any script.</i>
+limux notify --subtitle "needs review" \
+  --body "blocked on auth choice" "Input needed"
+
+<i># Works at the end of a slow build too.</i>
+cargo build --release; limux notify "Build done"</code></pre></div>
+    <div role="tabpanel" id="r-save" aria-labelledby="t-save" hidden><pre><code><i># Record running agent sessions, then flush the layout.</i>
+limux hooks snapshot --save-session
+
+<i># See what would be recorded first.</i>
+limux hooks snapshot --dry-run</code></pre></div>
+  </div>
+</section>
+
+<section class="keys" id="keys" aria-labelledby="keys-h">
+  <div class="pane">
+    <div class="tab" aria-hidden="true"><span>keys</span></div>
+    <div class="pane-body">
+      <div class="keys-head">
+        <div>
+          <h2 id="keys-h">Keys that stay out of your shell's way</h2>
+          <p>Most defaults use <kbd>Ctrl</kbd>+<kbd>Alt</kbd>, so plain <kbd>Ctrl</kbd> editing keys still reach the program you are running. Change any of them in <b>Settings &gt; Keybindings</b>.</p>
+        </div>
+        <label class="key-search"><span>Find a shortcut</span><input id="key-filter" type="search" placeholder="split, unread, browser" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <div class="key-cols" id="key-cols">
+        <table><caption>Workspaces</caption><tbody>
+          <tr><th scope="row">New workspace</th><td><kbd>Ctrl+Alt+Shift+N</kbd></td></tr>
+          <tr><th scope="row">Switch to workspace 1 to 9</th><td><kbd>Ctrl+Alt+1-9</kbd></td></tr>
+          <tr><th scope="row">Next or previous workspace</th><td><kbd>Ctrl+Alt+PageDown/Up</kbd></td></tr>
+          <tr><th scope="row">Most recent workspace</th><td><kbd>Ctrl+Alt+O</kbd></td></tr>
+          <tr class="is-unread"><th scope="row">Next unread terminal</th><td><kbd>Ctrl+Alt+U</kbd></td></tr>
+          <tr class="is-unread"><th scope="row">Previous unread terminal</th><td><kbd>Ctrl+Alt+Shift+U</kbd></td></tr>
+          <tr><th scope="row">Close workspace</th><td><kbd>Ctrl+Alt+Shift+W</kbd></td></tr>
+          <tr><th scope="row">Toggle sidebar</th><td><kbd>Ctrl+Alt+M</kbd></td></tr>
+        </tbody></table>
+        <table><caption>Panes and tabs</caption><tbody>
+          <tr><th scope="row">Split right</th><td><kbd>Ctrl+Alt+D</kbd></td></tr>
+          <tr><th scope="row">Split down</th><td><kbd>Ctrl+Alt+Shift+D</kbd></td></tr>
+          <tr><th scope="row">Focus pane by direction</th><td><kbd>Ctrl+Alt+Arrow</kbd></td></tr>
+          <tr><th scope="row">Zoom pane</th><td><kbd>Ctrl+Shift+Z</kbd></td></tr>
+          <tr><th scope="row">New terminal tab</th><td><kbd>Ctrl+Alt+T</kbd></td></tr>
+          <tr><th scope="row">Cycle tabs</th><td><kbd>Ctrl+Alt+Shift+Left/Right</kbd></td></tr>
+          <tr><th scope="row">Close tab</th><td><kbd>Ctrl+Shift+W</kbd></td></tr>
+          <tr><th scope="row">Close pane</th><td><kbd>Ctrl+Alt+W</kbd></td></tr>
+        </tbody></table>
+        <table><caption>Terminal and browser</caption><tbody>
+          <tr><th scope="row">Copy, paste</th><td><kbd>Ctrl+Shift+C/V</kbd></td></tr>
+          <tr><th scope="row">Find</th><td><kbd>Ctrl+Alt+F</kbd></td></tr>
+          <tr><th scope="row">Clear scrollback</th><td><kbd>Ctrl+Alt+K</kbd></td></tr>
+          <tr><th scope="row">Font size</th><td><kbd>Ctrl+Alt++/-</kbd></td></tr>
+          <tr><th scope="row">Browser page in a new split</th><td><kbd>Ctrl+Shift+L</kbd></td></tr>
+          <tr><th scope="row">Browser address bar</th><td><kbd>Ctrl+L</kbd></td></tr>
+          <tr><th scope="row">Web Inspector</th><td><kbd>Ctrl+Alt+I</kbd></td></tr>
+          <tr><th scope="row">Fullscreen</th><td><kbd>F11</kbd></td></tr>
+        </tbody></table>
+      </div>
+      <p class="key-none" id="key-none" hidden>No default shortcut matches that.</p>
+    </div>
+  </div>
+</section>
+
+<section class="install" id="install" aria-labelledby="install-h">
+  <div class="pane">
+    <div class="tab" aria-hidden="true"><span>install</span></div>
+    <div class="pane-body install-grid">
+      <div>
+        <h2 id="install-h">Install</h2>
+        <p>Release packages need glibc 2.39 or newer: Ubuntu 24.04, Debian 13, Fedora 40, Arch, or a newer release of any of them.</p>
+        <p class="fine">Version <span data-version>0.1.36</span>. <a href="https://github.com/am-will/limux/releases/latest">All downloads and checksums</a></p>
+      </div>
+      <div class="installer">
+        <div class="distros" role="tablist" aria-label="Package">
+          <button role="tab" id="d-deb" aria-controls="p-deb" aria-selected="true">Debian, Ubuntu</button>
+          <button role="tab" id="d-rpm" aria-controls="p-rpm" aria-selected="false" tabindex="-1">Fedora</button>
+          <button role="tab" id="d-aur" aria-controls="p-aur" aria-selected="false" tabindex="-1">Arch</button>
+          <button role="tab" id="d-app" aria-controls="p-app" aria-selected="false" tabindex="-1">AppImage</button>
+          <button role="tab" id="d-tar" aria-controls="p-tar" aria-selected="false" tabindex="-1">Tarball</button>
+          <button role="tab" id="d-src" aria-controls="p-src" aria-selected="false" tabindex="-1">Source</button>
+        </div>
+        <div role="tabpanel" id="p-deb" aria-labelledby="d-deb"><div class="cmd"><pre><code>curl -fLO https://github.com/am-will/limux/releases/download/v<span data-version>0.1.36</span>/limux_<span data-version>0.1.36</span>_amd64.deb
+sudo apt install ./limux_<span data-version>0.1.36</span>_amd64.deb</code></pre></div><p class="fine">Remove it with <code>sudo apt remove limux</code>.</p></div>
+        <div role="tabpanel" id="p-rpm" aria-labelledby="d-rpm" hidden><div class="cmd"><pre><code>sudo dnf install https://github.com/am-will/limux/releases/download/v<span data-version>0.1.36</span>/limux-<span data-version>0.1.36</span>-1.x86_64.rpm</code></pre></div><p class="fine">Remove it with <code>sudo dnf remove limux</code>.</p></div>
+        <div role="tabpanel" id="p-aur" aria-labelledby="d-aur" hidden><div class="cmd"><pre><code>yay -S limux-bin</code></pre></div><p class="fine">Any AUR helper works.</p></div>
+        <div role="tabpanel" id="p-app" aria-labelledby="d-app" hidden><div class="cmd"><pre><code>curl -fLO https://github.com/am-will/limux/releases/download/v<span data-version>0.1.36</span>/Limux-<span data-version>0.1.36</span>-x86_64.AppImage
+chmod +x Limux-<span data-version>0.1.36</span>-x86_64.AppImage
+./Limux-<span data-version>0.1.36</span>-x86_64.AppImage</code></pre></div><p class="fine">Uses the GTK4, libadwaita, <code>bubblewrap</code> and <code>xdg-dbus-proxy</code> from your system.</p></div>
+        <div role="tabpanel" id="p-tar" aria-labelledby="d-tar" hidden><div class="cmd"><pre><code>curl -fLO https://github.com/am-will/limux/releases/download/v<span data-version>0.1.36</span>/limux-<span data-version>0.1.36</span>-linux-x86_64.tar.gz
+tar xzf limux-<span data-version>0.1.36</span>-linux-x86_64.tar.gz
+cd limux-<span data-version>0.1.36</span>-linux-x86_64
+./install.sh --prefix="$HOME/.local"</code></pre></div><p class="fine">Or <code>sudo ./install.sh</code> for a system install. Add <code>--uninstall</code> to remove it.</p></div>
+        <div role="tabpanel" id="p-src" aria-labelledby="d-src" hidden><div class="cmd"><pre><code>git clone --recurse-submodules https://github.com/am-will/limux
+cd limux
+./scripts/build-ghostty.sh
+cargo build --release</code></pre></div><p class="fine">Needs Rust and Zig 0.16.0. <a href="https://github.com/am-will/limux#build-from-source">Full steps</a></p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="faq" aria-labelledby="faq-h">
+  <div class="pane">
+    <div class="tab" aria-hidden="true"><span>faq</span></div>
+    <div class="pane-body faq-grid">
+      <h2 id="faq-h">Before you ask</h2>
+      <div class="faq-items">
+        <details><summary>Is this tmux with a GUI?</summary><p>No. tmux multiplexes inside one terminal. Limux is the terminal: native panes, a browser, notifications and a socket API around Ghostty surfaces. It can use tmux on a remote host to keep SSH sessions alive, and it runs tmux like any other program.</p></details>
+        <details><summary>I do not use coding agents. Is it still for me?</summary><p>Yes. Agents are programs in a terminal. Everything here works for a build, a log tail or an editor.</p></details>
+        <details><summary>Does it phone home?</summary><p>No. Limux has no telemetry and no account. The control API is a Unix socket on your machine. It makes SSH connections and loads web pages when you ask it to.</p></details>
+        <details><summary>Will it run on Ubuntu 22.04?</summary><p>No. It needs GTK 4.10 or newer, libadwaita, WebKitGTK 6.0 and, for release packages, glibc 2.39. <a href="https://github.com/am-will/limux/issues/10">Issue 10</a> tracks the request.</p></details>
+        <details><summary>What about macOS?</summary><p>Limux is a Linux port of the ideas in <a href="https://github.com/manaflow-ai/cmux">cmux</a>, which is a native macOS app. Use that.</p></details>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <p><a href="https://github.com/am-will/limux">Source</a><a href="https://github.com/am-will/limux/releases">Releases</a><a href="https://github.com/am-will/limux/issues">Issues</a><a href="https://github.com/am-will/limux/blob/main/CONTRIBUTING.md">Contributing</a><a href="https://github.com/am-will/limux/blob/main/LICENSE">MIT license</a></p>
+  <p class="fine">Built on <a href="https://ghostty.org">Ghostty</a>. Inspired by <a href="https://github.com/manaflow-ai/cmux">cmux</a>.</p>
+</footer>
+</body>
+</html>
