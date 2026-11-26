@@ -1,9 +1,12 @@
+use std::collections::BTreeSet;
 use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::gui_hooks::GuiHooksConfig;
 use crate::shortcut_config;
@@ -618,19 +621,87 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
     }
 }
 
-pub fn save(config: &AppConfig) -> Result<(), String> {
+/// Save what changed from `previous` to `updated`. Everything else in the file
+/// stays as it is, because another instance or the user can have written it.
+pub fn save(previous: &AppConfig, updated: &AppConfig) -> Result<(), String> {
     let Some(path) = settings_path() else {
         return Err("config_dir unavailable; cannot save app settings".to_string());
     };
 
-    save_to_path(&path, config)
+    save_to_path(&path, previous, updated)
         .map_err(|err| format!("failed to save app config `{}`: {err}", path.display()))
 }
 
-fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
-    let mut root = read_existing_config_root_for_save(path)?;
+fn save_to_path(path: &Path, previous: &AppConfig, updated: &AppConfig) -> Result<(), String> {
+    let updated = config_to_map(updated);
+    let root = match read_existing_config_root_for_save(path)? {
+        Some(mut root) => {
+            let mut previous = config_to_map(previous);
+            // Without a value of its own, the Ghostty scheme follows the GTK
+            // scheme. Store it, so that a new GTK scheme does not change it.
+            if value_at(&previous, "appearance", "color_scheme")
+                != value_at(&updated, "appearance", "color_scheme")
+                && value_at(&root, "appearance", "ghostty_color_scheme").is_none()
+            {
+                if let Some(Value::Object(appearance)) = previous.get_mut("appearance") {
+                    appearance.remove("ghostty_color_scheme");
+                }
+            }
+            merge_changes(&mut root, &previous, &updated);
+            root
+        }
+        None => updated,
+    };
 
-    let mut appearance = serde_json::Map::new();
+    let serialized =
+        serde_json::to_string_pretty(&Value::Object(root)).expect("config should serialize");
+    write_config_root_atomically(path, &serialized)
+}
+
+fn value_at<'a>(root: &'a Map<String, Value>, section: &str, key: &str) -> Option<&'a Value> {
+    root.get(section)?.get(key)
+}
+
+/// Apply the differences between `previous` and `updated` to `target`.
+fn merge_changes(
+    target: &mut Map<String, Value>,
+    previous: &Map<String, Value>,
+    updated: &Map<String, Value>,
+) {
+    let empty = Map::new();
+    let keys: BTreeSet<&String> = previous.keys().chain(updated.keys()).collect();
+    for key in keys {
+        let (before, after) = (previous.get(key), updated.get(key));
+        if before == after {
+            continue;
+        }
+        let is_section = before.or(after).is_some_and(Value::is_object);
+        if !is_section {
+            match after {
+                Some(value) => target.insert(key.clone(), value.clone()),
+                None => target.remove(key),
+            };
+            continue;
+        }
+
+        let mut section = match target.remove(key) {
+            Some(Value::Object(section)) => section,
+            _ => Map::new(),
+        };
+        merge_changes(
+            &mut section,
+            before.and_then(Value::as_object).unwrap_or(&empty),
+            after.and_then(Value::as_object).unwrap_or(&empty),
+        );
+        if !section.is_empty() {
+            target.insert(key.clone(), Value::Object(section));
+        }
+    }
+}
+
+fn config_to_map(config: &AppConfig) -> Map<String, Value> {
+    let mut root = Map::new();
+    let mut appearance = Map::new();
     appearance.insert(
         "color_scheme".to_string(),
         json!(config.appearance.color_scheme.as_str()),
@@ -701,45 +772,36 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
 
     if let Some(size) = config.font_size {
         root.insert("font_size".to_string(), json!(size));
-    } else {
-        root.remove("font_size");
     }
 
     if let Some(terminal_font) = config.terminal_font.to_json() {
         root.insert("terminal_font".to_string(), terminal_font);
-    } else {
-        root.remove("terminal_font");
     }
 
     if let Some(hooks) = config.hooks.to_value() {
         root.insert("hooks".to_string(), hooks);
-    } else {
-        root.remove("hooks");
     }
 
-    let serialized =
-        serde_json::to_string_pretty(&Value::Object(root)).expect("config should serialize");
-    write_config_root_atomically(path, &serialized)
+    root
 }
 
-fn read_existing_config_root_for_save(
-    path: &Path,
-) -> Result<serde_json::Map<String, Value>, String> {
+/// `None` when there is no usable file to keep settings from.
+fn read_existing_config_root_for_save(path: &Path) -> Result<Option<Map<String, Value>>, String> {
     if !path.exists() {
-        return Ok(serde_json::Map::new());
+        return Ok(None);
     }
 
     let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
     match serde_json::from_str::<Value>(&raw) {
-        Ok(Value::Object(map)) => Ok(map),
+        Ok(Value::Object(map)) => Ok(Some(map)),
         Ok(_) => {
             backup_invalid_existing_config(path)?;
-            Ok(serde_json::Map::new())
+            Ok(None)
         }
         Err(err) => {
             let detail = format!("existing app config is invalid JSON: {err}");
             backup_invalid_existing_config_with_detail(path, &detail)?;
-            Ok(serde_json::Map::new())
+            Ok(None)
         }
     }
 }
@@ -753,7 +815,8 @@ fn backup_invalid_existing_config(path: &Path) -> Result<(), String> {
 
 fn backup_invalid_existing_config_with_detail(path: &Path, detail: &str) -> Result<(), String> {
     let backup_path = invalid_config_backup_path(path);
-    fs::rename(path, &backup_path).map_err(|err| {
+    // A copy, because the path can be a symlink to the file to keep.
+    fs::copy(path, &backup_path).map_err(|err| {
         format!(
             "{detail}; failed to back up `{}` to `{}`: {err}",
             path.display(),
@@ -774,15 +837,41 @@ fn write_config_root_atomically(path: &Path, serialized: &str) -> Result<(), Str
     };
     fs::create_dir_all(parent).map_err(|err| err.to_string())?;
 
+    // Keep a symlink and replace the file it points to, unless that place is
+    // read-only.
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    replace_file(&target, serialized)
+        .or_else(|err| {
+            if target == path {
+                return Err(err);
+            }
+            replace_file(path, serialized)
+        })
+        .map_err(|err| err.to_string())
+}
+
+fn replace_file(path: &Path, serialized: &str) -> io::Result<()> {
     let temp_path = temp_config_path(path);
-    fs::write(&temp_path, format!("{serialized}\n")).map_err(|err| err.to_string())?;
-
-    if let Err(err) = fs::rename(&temp_path, path) {
+    let permissions = fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.permissions());
+    let write = || {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(permissions.as_ref().map_or(0o666, |p| p.mode()))
+            .open(&temp_path)?;
+        file.write_all(format!("{serialized}\n").as_bytes())?;
+        if let Some(permissions) = permissions {
+            // The umask can have removed some of these.
+            file.set_permissions(permissions)?;
+        }
+        fs::rename(&temp_path, path)
+    };
+    write().inspect_err(|_| {
         let _ = fs::remove_file(&temp_path);
-        return Err(err.to_string());
-    }
-
-    Ok(())
+    })
 }
 
 fn temp_config_path(path: &Path) -> std::path::PathBuf {
@@ -860,6 +949,11 @@ mod tests {
 
     use tempfile::TempDir;
 
+    /// Save `config` the way an instance that loaded the file would.
+    fn save_over(path: &Path, config: &AppConfig) -> Result<(), String> {
+        save_to_path(path, &load_from_path(path).config, config)
+    }
+
     #[test]
     fn interface_preferences_round_trip_without_losing_link_settings() {
         let dir = TempDir::new().expect("temp dir");
@@ -879,7 +973,7 @@ mod tests {
                 ..Default::default()
             };
 
-            save_to_path(&path, &config).expect("save config");
+            save_over(&path, &config).expect("save config");
             let loaded = load_from_path(&path);
             assert!(loaded.warnings.is_empty());
             assert_eq!(loaded.config, config);
@@ -903,11 +997,11 @@ mod tests {
             ..Default::default()
         };
 
-        save_to_path(&path, &config).expect("save config");
+        save_over(&path, &config).expect("save config");
         assert_eq!(load_from_path(&path).config, config);
 
         config.hooks = GuiHooksConfig::default();
-        save_to_path(&path, &config).expect("save config");
+        save_over(&path, &config).expect("save config");
         let root: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(root.get("hooks").is_none(), "{root}");
     }
@@ -1127,7 +1221,7 @@ mod tests {
             UnreadColor::AccentBlue,
         ] {
             config.appearance.unread_color = color;
-            save_to_path(&path, &config).expect("save config");
+            save_over(&path, &config).expect("save config");
             let loaded = load_from_path(&path);
             assert!(loaded.warnings.is_empty());
             assert_eq!(loaded.config.appearance.unread_color, color);
@@ -1310,7 +1404,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.appearance.color_scheme = ColorScheme::Light;
         config.appearance.ghostty_color_scheme = ColorScheme::Dark;
-        save(&config).expect("save config");
+        save(&AppConfig::default(), &config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1333,7 +1427,7 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.appearance.ui_scale = UiScale::new(1.5).expect("valid scale");
-        save_to_path(&path, &config).expect("save config");
+        save_over(&path, &config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1348,7 +1442,7 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.appearance.show_workspace_path = false;
-        save_to_path(&path, &config).expect("save workspace path visibility");
+        save_over(&path, &config).expect("save workspace path visibility");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1366,7 +1460,7 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.workspace.keep_open_after_last_terminal_closes = true;
-        save_to_path(&path, &config).expect("save workspace lifecycle preference");
+        save_over(&path, &config).expect("save workspace lifecycle preference");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1397,7 +1491,7 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.appearance.color_scheme = ColorScheme::Dark;
-        save_to_path(&path, &config).expect("save config");
+        save_over(&path, &config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1418,14 +1512,14 @@ mod tests {
             font_size: Some(16.25),
             ..AppConfig::default()
         };
-        save_to_path(&path, &config).expect("save font size");
+        save_over(&path, &config).expect("save font size");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
         assert_eq!(parsed["font_size"], json!(16.25));
 
         config.font_size = None;
-        save_to_path(&path, &config).expect("clear font size");
+        save_over(&path, &config).expect("clear font size");
 
         let raw = fs::read_to_string(&path).expect("read cleared config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse cleared config");
@@ -1441,7 +1535,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.notifications.enabled = false;
         config.notifications.sound = NotificationSound::Alert;
-        save_to_path(&path, &config).expect("save notifications");
+        save_over(&path, &config).expect("save notifications");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1460,7 +1554,7 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.clipboard.copy_selection_to_clipboard = false;
-        save_to_path(&path, &config).expect("save clipboard");
+        save_over(&path, &config).expect("save clipboard");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1478,7 +1572,7 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.links.open_destination = LinkOpenDestination::BrowserTab;
-        save_to_path(&path, &config).expect("save link destination");
+        save_over(&path, &config).expect("save link destination");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
@@ -1518,7 +1612,7 @@ mod tests {
         fs::write(&path, "not json").expect("write invalid config");
 
         let config = AppConfig::default();
-        save_to_path(&path, &config).expect("save should recover");
+        save_over(&path, &config).expect("save should recover");
 
         let raw = fs::read_to_string(&path).expect("read repaired config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse repaired config");
@@ -1574,7 +1668,7 @@ mod tests {
             },
             ..AppConfig::default()
         };
-        save_to_path(&path, &config).expect("save terminal font");
+        save_over(&path, &config).expect("save terminal font");
 
         let loaded = load_from_path(&path);
         assert!(loaded.warnings.is_empty());
@@ -1582,10 +1676,129 @@ mod tests {
         assert_eq!(loaded.config.effective_font_size(12.0), 13.0);
 
         config.terminal_font = TerminalFontConfig::default();
-        save_to_path(&path, &config).expect("clear terminal font");
+        save_over(&path, &config).expect("clear terminal font");
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("read cleared config"))
                 .expect("parse cleared config");
         assert!(parsed.get("terminal_font").is_none());
+    }
+
+    fn saved_root(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).expect("read config")).expect("parse config")
+    }
+
+    #[test]
+    fn saving_keeps_what_another_instance_or_the_user_wrote() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+  "appearance": { "color_scheme": "dark", "ghostty_color_scheme": "dark", "newer": 1 },
+  "font_size": 15.0,
+  "hooks": { "on_workspace_create": { "command": "create.sh" } },
+  "newer": { "keep": true }
+}"#,
+        )
+        .expect("write config");
+        let first = load_from_path(&path).config;
+        let second = first.clone();
+
+        let mut updated = first.clone();
+        updated.appearance.color_scheme = ColorScheme::Light;
+        updated.font_size = None;
+        updated.hooks.on_workspace_delete.command = "delete.sh".to_string();
+        save_to_path(&path, &first, &updated).expect("save from the first instance");
+
+        let mut zoomed = second.clone();
+        zoomed.interface.show_top_bar = false;
+        zoomed.hooks.after_workspace_create.command = "after.sh".to_string();
+        save_to_path(&path, &second, &zoomed).expect("save from the second instance");
+
+        let root = saved_root(&path);
+        assert_eq!(root["appearance"]["color_scheme"], "light");
+        assert_eq!(root["appearance"]["newer"], 1);
+        assert_eq!(root["newer"]["keep"], true);
+        assert_eq!(root["interface"]["show_top_bar"], false);
+        assert!(root.get("font_size").is_none(), "{root}");
+        for (hook, command) in [
+            ("on_workspace_create", "create.sh"),
+            ("on_workspace_delete", "delete.sh"),
+            ("after_workspace_create", "after.sh"),
+        ] {
+            assert_eq!(root["hooks"][hook]["command"], command);
+        }
+    }
+
+    #[test]
+    fn saving_a_gtk_scheme_keeps_the_ghostty_scheme_that_followed_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"appearance": {"color_scheme": "dark"}}"#).expect("write config");
+        let previous = load_from_path(&path).config;
+        let mut updated = previous.clone();
+        updated.appearance.color_scheme = ColorScheme::Light;
+        save_to_path(&path, &previous, &updated).expect("save color scheme");
+
+        assert_eq!(load_from_path(&path).config, updated);
+    }
+
+    #[test]
+    fn unrelated_save_does_not_inject_ghostty_color_scheme() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"appearance": {"color_scheme": "dark"}}"#).expect("write config");
+        let previous = load_from_path(&path).config;
+
+        fs::write(&path, r#"{"appearance": {"color_scheme": "light"}}"#).expect("edit config");
+
+        let mut updated = previous.clone();
+        updated.font_size = Some(16.0);
+        save_to_path(&path, &previous, &updated).expect("save unrelated setting");
+
+        let root = saved_root(&path);
+        assert_eq!(root["appearance"]["color_scheme"], "light");
+        assert!(
+            root["appearance"].get("ghostty_color_scheme").is_none(),
+            "{root}"
+        );
+        assert_eq!(root["font_size"], json!(16.0));
+        let reloaded = load_from_path(&path).config;
+        assert_eq!(reloaded.appearance.color_scheme, ColorScheme::Light);
+        assert_eq!(reloaded.appearance.ghostty_color_scheme, ColorScheme::Light);
+
+        let mut changed_scheme = reloaded.clone();
+        changed_scheme.appearance.color_scheme = ColorScheme::Dark;
+        save_to_path(&path, &reloaded, &changed_scheme).expect("save color scheme");
+
+        let root = saved_root(&path);
+        assert_eq!(root["appearance"]["color_scheme"], "dark");
+        assert_eq!(root["appearance"]["ghostty_color_scheme"], "light");
+        assert_eq!(load_from_path(&path).config, changed_scheme);
+    }
+
+    #[test]
+    fn saving_follows_a_symlink_and_keeps_the_file_mode() {
+        let dir = TempDir::new().expect("temp dir");
+        let dotfiles = dir.path().join("dotfiles");
+        fs::create_dir(&dotfiles).expect("create dotfiles dir");
+        let real = dotfiles.join("limux.json");
+        let path = dir.path().join("settings.json");
+        fs::write(&real, "{}").expect("write config");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).expect("set mode");
+        std::os::unix::fs::symlink(&real, &path).expect("link config");
+
+        let mut config = AppConfig::default();
+        for (contents, size) in [("{}", 14.0), ("broken", 15.0)] {
+            fs::write(&real, contents).expect("write config");
+            config.font_size = Some(size);
+            save_over(&path, &config).expect("save config");
+
+            assert!(path.symlink_metadata().expect("link").is_symlink());
+            assert_eq!(saved_root(&real)["font_size"], json!(size));
+            let mode = fs::metadata(&real).expect("config").permissions().mode();
+            assert_eq!(mode & 0o777, 0o640);
+        }
+        assert_eq!(fs::read_dir(&dotfiles).expect("list dotfiles").count(), 1);
     }
 }
