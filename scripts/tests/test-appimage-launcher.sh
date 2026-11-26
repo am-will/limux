@@ -30,6 +30,9 @@ cat > "$APP/usr/libexec/limux/limux-host" <<'HOST'
 printf '%s' "${WEBKIT_EXEC_PATH:-}" > "$LIMUX_LAUNCHER_TEST_DIR/runtime"
 printf '%s' "${LIMUX_HOST_BIN-unset}" > "$LIMUX_LAUNCHER_TEST_DIR/override"
 printf '%s' "${LD_LIBRARY_PATH-unset}" > "$LIMUX_LAUNCHER_TEST_DIR/ld_library_path"
+printf '%s' "${GDK_PIXBUF_MODULE_FILE-unset}" > "$LIMUX_LAUNCHER_TEST_DIR/pixbuf"
+cat "${GDK_PIXBUF_MODULE_FILE:-/dev/null}" > "$LIMUX_LAUNCHER_TEST_DIR/pixbuf_contents"
+pwd > "$LIMUX_LAUNCHER_TEST_DIR/cwd"
 if [ "$LIMUX_LAUNCHER_TEST_MODE" = once ]; then
     IFS= read -r input
     printf '%s' "$input"
@@ -62,6 +65,12 @@ rm -rf "$XDG_CACHE_HOME"
 
 unset LIMUX_HOST_BIN
 unset LD_LIBRARY_PATH
+unset GDK_PIXBUF_MODULE_FILE
+PIXBUF_DIR="$APP/usr/lib/gdk-pixbuf-2.0/2.10.0"
+mkdir -p "$PIXBUF_DIR/loaders" "$TEST_DIR/project"
+touch "$PIXBUF_DIR/loaders/libpixbufloader_svg.so"
+printf '# Loaders\n"@LOADER_DIR@/libpixbufloader_svg.so"\n"svg" 6 "LGPL"\n' > "$PIXBUF_DIR/loaders.cache.template"
+cd "$TEST_DIR/project"
 "$APP/AppRun" --help > "$TEST_DIR/help"
 grep -qF 'limux CLI' "$TEST_DIR/help"
 [ ! -e "$XDG_CACHE_HOME/limux" ]
@@ -75,14 +84,33 @@ once() {
     [ "$result" -eq 37 ]
     [ "$(cat "$TEST_DIR/output")" = 'preserved launcher input' ]
 }
+mkdir -p "$XDG_CACHE_HOME/limux"
+printf '"%s"\n' "$TEST_DIR/unmounted/libpixbufloader_svg.so" > "$XDG_CACHE_HOME/limux/pixbuf-loaders.cache.1"
+printf '"%s"\n' "$APP/AppRun" > "$XDG_CACHE_HOME/limux/pixbuf-loaders.cache.2"
 once
 [ "$(cat "$TEST_DIR/override")" = unset ]
 [ ! -e "$(cat "$TEST_DIR/runtime")" ]
+[ "$(cat "$TEST_DIR/cwd")" = "$TEST_DIR/project" ]
+pixbuf="$(cat "$TEST_DIR/pixbuf")"
+[[ "$pixbuf" = "$XDG_CACHE_HOME/limux/pixbuf-loaders.cache."* ]]
+grep -Fxq "\"$PIXBUF_DIR/loaders/libpixbufloader_svg.so\"" "$TEST_DIR/pixbuf_contents"
+# The cache of this mount stays for windows that outlive the launcher, and the
+# cache of another live mount is not ours to remove.
+[ -s "$pixbuf" ]
+[ ! -e "$XDG_CACHE_HOME/limux/pixbuf-loaders.cache.1" ]
+[ -e "$XDG_CACHE_HOME/limux/pixbuf-loaders.cache.2" ]
 [[ "$(cat "$TEST_DIR/ld_library_path")" != *: ]]
 [[ "$(cat "$TEST_DIR/ld_library_path")" != *::* ]]
 once --socket-mode runtime --id-format refs
 [ "$(cat "$TEST_DIR/override")" = unset ]
 [ ! -e "$(cat "$TEST_DIR/runtime")" ]
+[ "$(cat "$TEST_DIR/pixbuf")" = "$pixbuf" ]
+[ "$(find "$XDG_CACHE_HOME/limux" -name 'pixbuf-loaders.cache.*' | wc -l)" -eq 2 ]
+rm "$XDG_CACHE_HOME"/limux/pixbuf-loaders.cache.*
+chmod 555 "$XDG_CACHE_HOME/limux"
+once
+chmod 755 "$XDG_CACHE_HOME/limux"
+[ "$(cat "$TEST_DIR/pixbuf")" = unset ]
 
 cp "$APP/usr/libexec/limux/limux-host" "$TEST_DIR/custom-host"
 export LIMUX_HOST_BIN="$TEST_DIR/custom-host"
@@ -118,4 +146,4 @@ if kill -0 "$(cat "$TEST_DIR/host.pid")" 2>/dev/null; then
     echo 'FAIL: the GUI host survived AppImage launcher cleanup.' >&2
     exit 1
 fi
-echo 'AppImage launch routing, stdin, signal forwarding, and runtime lifetime: OK'
+echo 'AppImage launch routing, directory, stdin, signal forwarding, and runtime lifetime: OK'
