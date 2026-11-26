@@ -86,8 +86,11 @@ The generated `AGENTS.md` has the peer table, the `<agent-msg>` message format, 
 
 ```bash
 limux send --surface "<peer-surface-id>" \
-  $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
+  '<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>'
+limux send-key --surface "<peer-surface-id>" Enter
 ```
+
+`limux send` pastes the text. A program that uses bracketed paste, such as most shells and agents, submits it only when it receives Enter.
 
 `agent-team` refuses to replace an existing `AGENTS.md`, including one from a previous team, before it creates any panes. Move your existing instructions before you run it, then merge the project policies that you want to keep. To preview the protocol without writing files or contacting the app:
 
