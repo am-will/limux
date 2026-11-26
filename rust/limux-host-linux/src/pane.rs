@@ -4971,33 +4971,62 @@ fn build_live_browser_widget(
 fn unavailable_browser_widget(error: &str) -> (gtk::Widget, String, BrowserHandles) {
     let placeholder = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
         .hexpand(true)
         .vexpand(true)
         .focusable(true)
         .build();
-    let title = gtk::Label::new(Some("Browser unavailable"));
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .spacing(12)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+    let title = gtk::Label::builder()
+        .label("Browser unavailable")
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .build();
     title.add_css_class("title-3");
     let guidance = gtk::Label::builder()
         .label("WebKit could not start its sandbox. Check this installation's user-namespace policy and sandbox helpers, then restart Limux.")
         .wrap(true)
+        .justify(gtk::Justification::Center)
         .max_width_chars(75)
         .build();
     let explanation = gtk::Label::builder()
         .label(error)
         .wrap(true)
+        // A path has no spaces to break at.
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
         .selectable(true)
         .max_width_chars(75)
+        .margin_top(6)
         .build();
     let details = gtk::Expander::new(Some("Technical details"));
+    details.set_halign(gtk::Align::Center);
     details.set_child(Some(&explanation));
-    let saved = gtk::Label::new(Some(
-        "Your browser tab is saved. Terminals remain available.",
-    ));
-    placeholder.append(&title);
-    placeholder.append(&guidance);
-    placeholder.append(&saved);
-    placeholder.append(&details);
+    let saved = gtk::Label::builder()
+        .label("Your browser tab is saved. Terminals remain available.")
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .build();
+    content.append(&title);
+    content.append(&guidance);
+    content.append(&saved);
+    content.append(&details);
+    // The details can be taller than the pane.
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&content)
+        .build();
+    placeholder.append(&scroller);
     let widget = placeholder.upcast::<gtk::Widget>();
     (
         widget.clone(),
@@ -5008,29 +5037,38 @@ fn unavailable_browser_widget(error: &str) -> (gtk::Widget, String, BrowserHandl
 
 #[cfg(any(feature = "webkit", test))]
 fn normalize_browser_entry_input(input: &str) -> String {
-    if input.starts_with("http://") || input.starts_with("https://") {
+    let input = input.trim();
+    if link_uri::is_typed_browser_url(input) {
         return input.to_string();
     }
-
-    if is_localhost_input(input) {
-        format!("http://{input}")
-    } else if input.contains('.') {
-        format!("https://{input}")
-    } else {
-        format!(
-            "https://www.google.com/search?q={}",
-            input.replace(' ', "+")
-        )
+    if let Some(scheme) = browser_entry_host_scheme(input) {
+        return format!("{scheme}://{input}");
     }
+    let query = glib::Uri::escape_string(input, Some(" "), false).replace(' ', "+");
+    format!("https://www.google.com/search?q={query}")
 }
 
+/// The scheme to open address-bar input with, or `None` when it names no host
+/// and is a search.
 #[cfg(any(feature = "webkit", test))]
-fn is_localhost_input(input: &str) -> bool {
-    input == "localhost"
-        || input
-            .strip_prefix("localhost")
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|ch| matches!(ch, ':' | '/' | '?' | '#'))
+fn browser_entry_host_scheme(input: &str) -> Option<&'static str> {
+    if input.contains(char::is_whitespace) {
+        return None;
+    }
+    let uri = glib::Uri::parse(&format!("http://{input}"), glib::UriFlags::PARSE_RELAXED).ok()?;
+    let host = uri.host().filter(|host| !host.is_empty())?;
+    // As in other browsers, only public names default to https. One word
+    // without a port stays a search.
+    let single_label_with_port = uri.port() != -1
+        && !host.contains('.')
+        && host.starts_with(|ch: char| ch.is_ascii_alphabetic());
+    if host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || single_label_with_port
+    {
+        return Some("http");
+    }
+    input.contains('.').then_some("https")
 }
 
 #[cfg(not(feature = "webkit"))]
@@ -5072,7 +5110,7 @@ fn create_browser_widget(
 mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, is_usable_autostart_runtime_dir,
+        effective_drop_target_dimensions, is_usable_autostart_runtime_dir,
         next_active_after_tab_removal, normalize_browser_entry_input,
         normalize_reorder_insert_index, pane_action_tooltip, resolve_surface_hint,
         resolved_link_destination, select_terminal_commands, select_terminal_tab,
@@ -5564,36 +5602,14 @@ mod tests {
     }
 
     #[test]
-    fn localhost_inputs_only_match_real_localhost_hosts() {
-        for input in [
-            "localhost",
-            "localhost:3000",
-            "localhost/path",
-            "localhost?q=1",
-        ] {
-            assert!(is_localhost_input(input), "{input} should be localhost");
-        }
-
-        for input in [
-            "localhost.run",
-            "localhost.example.com",
-            "localhost docs",
-            "mylocalhost:3000",
-        ] {
-            assert!(
-                !is_localhost_input(input),
-                "{input} should not be treated as localhost"
-            );
-        }
-    }
-
-    #[test]
     fn normalize_browser_entry_input_preserves_search_and_domain_behavior() {
         let cases = [
             ("https://example.com", "https://example.com"),
             ("localhost", "http://localhost"),
             ("localhost:3000", "http://localhost:3000"),
             ("localhost/path", "http://localhost/path"),
+            ("localhost?q=1", "http://localhost?q=1"),
+            ("LOCALHOST:3000", "http://LOCALHOST:3000"),
             ("localhost.run", "https://localhost.run"),
             ("localhost.example.com", "https://localhost.example.com"),
             (
@@ -5604,6 +5620,37 @@ mod tests {
             (
                 "example search",
                 "https://www.google.com/search?q=example+search",
+            ),
+            // Plain hosts and addresses, where development servers run.
+            ("127.0.0.1:3000", "http://127.0.0.1:3000"),
+            ("192.168.1.10:8000/x", "http://192.168.1.10:8000/x"),
+            ("[::1]:3000", "http://[::1]:3000"),
+            ("devbox:3000/path", "http://devbox:3000/path"),
+            ("example.com:8443", "https://example.com:8443"),
+            (
+                "example.com/?to=http://a.test",
+                "https://example.com/?to=http://a.test",
+            ),
+            // A scheme the user typed stays.
+            ("HTTPS://example.com", "HTTPS://example.com"),
+            (" https://example.com ", "https://example.com"),
+            ("file:///home/me/index.html", "file:///home/me/index.html"),
+            ("about:blank", "about:blank"),
+            // Searches keep every character.
+            (
+                "node.js tutorial",
+                "https://www.google.com/search?q=node.js+tutorial",
+            ),
+            (
+                "C# & C++ 100%",
+                "https://www.google.com/search?q=C%23+%26+C%2B%2B+100%25",
+            ),
+            ("caf\u{e9}", "https://www.google.com/search?q=caf%C3%A9"),
+            ("devbox", "https://www.google.com/search?q=devbox"),
+            ("std::vec", "https://www.google.com/search?q=std%3A%3Avec"),
+            (
+                "site:example.com",
+                "https://www.google.com/search?q=site%3Aexample.com",
             ),
         ];
 

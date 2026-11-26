@@ -23,6 +23,21 @@ pub fn is_embedded_browser_url(url: &str) -> bool {
     matches!(scheme.as_str(), "http" | "https") && rest.starts_with("://")
 }
 
+/// Whether text typed in the address bar is a URL with its own scheme. Wider
+/// than the link checks above: the user asked for this page.
+#[cfg(any(feature = "webkit", test))]
+pub fn is_typed_browser_url(text: &str) -> bool {
+    let Some((scheme, rest)) = scheme_and_rest(text) else {
+        return false;
+    };
+
+    match scheme.as_str() {
+        "http" | "https" | "file" => rest.starts_with("://"),
+        "about" => !rest.contains(char::is_whitespace),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
