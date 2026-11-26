@@ -2220,8 +2220,11 @@ fn install_json_hooks(
 
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
-        agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Agy => 5,
-        agent_hooks::AgentKind::Codex | agent_hooks::AgentKind::Gemini => 5000,
+        // Gemini reads milliseconds. The others read seconds.
+        agent_hooks::AgentKind::Claude
+        | agent_hooks::AgentKind::Codex
+        | agent_hooks::AgentKind::Agy => 5,
+        agent_hooks::AgentKind::Gemini => 5000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
 }
@@ -5702,7 +5705,7 @@ mod cli_arg_tests {
             serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
         let entry = &root["hooks"]["SessionStart"][0];
         assert!(entry.get("matcher").is_none());
-        assert_eq!(entry["hooks"][0]["timeout"], 5000);
+        assert_eq!(entry["hooks"][0]["timeout"], 5);
         assert!(entry["hooks"][0]["command"]
             .as_str()
             .expect("command")
