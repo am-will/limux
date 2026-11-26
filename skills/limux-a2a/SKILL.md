@@ -136,6 +136,8 @@ Codex child note: if a callback fails with `failed to connect to socket`, retry 
 
 ## Send And Coordinate
 
+`limux send` pastes text. A newline in the text does not submit it, so press Enter with `limux send-key` after each message.
+
 Send text:
 
 ```bash
