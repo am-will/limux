@@ -5280,8 +5280,11 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         }
         app_state.active_idx = app_state.workspaces.len() - 1;
         sync_indicator_active_state(&app_state);
-        app_state.stack.set_visible_child_name(&stack_name);
     }
+    // Without the borrow: the switch unmaps the old workspace, and handlers
+    // that run then read the state.
+    let stack = state.borrow().stack.clone();
+    stack.set_visible_child_name(&stack_name);
 
     {
         let sidebar_list = state.borrow().sidebar_list.clone();
@@ -5994,8 +5997,11 @@ fn break_tabs_into_new_workspace(
             .push_workspace(new_workspace_id.clone(), false);
         app_state.active_idx = app_state.workspaces.len() - 1;
         sync_indicator_active_state(&app_state);
-        app_state.stack.set_visible_child_name(&stack_name);
     }
+    // Without the borrow: the switch unmaps the old workspace, and handlers
+    // that run then read the state.
+    let stack = state.borrow().stack.clone();
+    stack.set_visible_child_name(&stack_name);
 
     {
         let sidebar_list = state.borrow().sidebar_list.clone();
