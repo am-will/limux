@@ -191,6 +191,9 @@ That means terminal-native combos like these should pass through unless you expl
 - `Ctrl+R`
 - plain typing
 - `Enter`
+- `Ctrl+Enter`
+
+Ghostty consumes the keys of its own keybinds. Limux removes the Ghostty defaults for actions that Limux does not implement, such as `Ctrl+Enter` for fullscreen, so that those keys reach the program in the terminal. A keybind in your Ghostty config still applies.
 
 Editable browser fields should also retain native behavior for:
 
