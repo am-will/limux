@@ -328,6 +328,26 @@ fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Opt
     }
 }
 
+/// The error for a name that several workspaces share: picking one could send
+/// input to the wrong terminal.
+fn ambiguous_workspace_name(state: &AppState, target: &WorkspaceTarget) -> Option<BridgeError> {
+    let WorkspaceTarget::Name(name) = target else {
+        return None;
+    };
+    let ids: Vec<&str> = state
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.name == *name)
+        .map(|workspace| workspace.id.as_str())
+        .collect();
+    (ids.len() > 1).then(|| {
+        BridgeError::invalid_params(format!(
+            "several workspaces are named {name:?}; use the workspace id: {}",
+            ids.join(", ")
+        ))
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SurfaceTargetError {
     WorkspaceNotFound,
@@ -6040,6 +6060,13 @@ fn break_tabs_into_new_workspace(
 }
 
 fn handle_control_command(state: &State, command: ControlCommand) {
+    let ambiguous = command
+        .workspace_target()
+        .and_then(|target| ambiguous_workspace_name(&state.borrow(), target));
+    if let Some(error) = ambiguous {
+        command.respond(Err(error));
+        return;
+    }
     match command {
         ControlCommand::Identify { caller, reply } => {
             let result = {

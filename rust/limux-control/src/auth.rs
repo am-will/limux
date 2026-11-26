@@ -23,28 +23,49 @@ pub enum SocketControlMode {
 
 impl SocketControlMode {
     pub fn from_env() -> Self {
-        std::env::var("LIMUX_SOCKET_MODE")
-            .ok()
-            .or_else(|| std::env::var("CMUX_SOCKET_MODE").ok())
-            .as_deref()
-            .map(Self::parse)
+        Self::configured()
+            .and_then(|value| Self::parse(&value))
             .unwrap_or(Self::LocalUser)
     }
 
-    fn parse(value: &str) -> Self {
+    /// The mode a server enforces. An unknown value falls back to `localUser`,
+    /// which may admit more clients than the user meant, so name it on stderr.
+    pub fn from_env_for_server() -> Self {
+        if let Some(warning) = Self::configured().and_then(|value| unknown_mode_warning(&value)) {
+            eprintln!("{warning}");
+        }
+        Self::from_env()
+    }
+
+    fn configured() -> Option<String> {
+        std::env::var("LIMUX_SOCKET_MODE")
+            .ok()
+            .or_else(|| std::env::var("CMUX_SOCKET_MODE").ok())
+    }
+
+    fn parse(value: &str) -> Option<Self> {
         match value.trim() {
-            "allowAll" | "allow-all" | "allow_all" => Self::AllowAll,
-            "localUser" | "local-user" | "local_user" => Self::LocalUser,
-            "cmuxOnly" | "limuxOnly" | "descendantOnly" | "descendant-only" | "descendant_only" => {
-                Self::LimuxOnly
-            }
-            _ => Self::LocalUser,
+            "allowAll" | "allow-all" | "allow_all" => Some(Self::AllowAll),
+            "localUser" | "local-user" | "local_user" => Some(Self::LocalUser),
+            "cmuxOnly" | "cmux-only" | "cmux_only" | "limuxOnly" | "limux-only" | "limux_only"
+            | "descendantOnly" | "descendant-only" | "descendant_only" => Some(Self::LimuxOnly),
+            _ => None,
         }
     }
 
     pub fn requires_owner_only_socket(self) -> bool {
         matches!(self, Self::LimuxOnly | Self::LocalUser)
     }
+}
+
+fn unknown_mode_warning(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && SocketControlMode::parse(value).is_none()).then(|| {
+        format!(
+            "limux: unknown socket mode {value:?}; using localUser \
+             (known modes: limuxOnly, localUser, allowAll)"
+        )
+    })
 }
 
 pub fn authorize_peer<S: AsRawFd>(stream: &S, mode: SocketControlMode) -> io::Result<PeerInfo> {
@@ -205,9 +226,35 @@ mod tests {
     #[test]
     fn descendant_aliases_map_to_limux_only() {
         let _lock = ENV_TEST_LOCK.lock().expect("env lock");
-        let _limux = EnvGuard::set("LIMUX_SOCKET_MODE", Some("cmuxOnly"));
         let _cmux = EnvGuard::set("CMUX_SOCKET_MODE", None);
-        assert_eq!(SocketControlMode::from_env(), SocketControlMode::LimuxOnly);
+        for alias in [
+            "cmuxOnly",
+            "cmux-only",
+            "cmux_only",
+            "limuxOnly",
+            "limux-only",
+            "limux_only",
+        ] {
+            let _limux = EnvGuard::set("LIMUX_SOCKET_MODE", Some(alias));
+            assert_eq!(
+                SocketControlMode::from_env(),
+                SocketControlMode::LimuxOnly,
+                "{alias}"
+            );
+            assert_eq!(unknown_mode_warning(alias), None, "{alias}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_mode_is_named_and_falls_back_to_local_user() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env lock");
+        let _cmux = EnvGuard::set("CMUX_SOCKET_MODE", None);
+        let _limux = EnvGuard::set("LIMUX_SOCKET_MODE", Some("limuxonly"));
+        assert_eq!(SocketControlMode::from_env(), SocketControlMode::LocalUser);
+        assert!(unknown_mode_warning("limuxonly").is_some_and(|text| text.contains("limuxonly")));
+        for known in ["", " ", "localUser", "allow-all"] {
+            assert_eq!(unknown_mode_warning(known), None, "{known:?}");
+        }
     }
 
     #[test]

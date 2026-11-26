@@ -54,7 +54,8 @@ dispatcher parity.
 - `surface.send_text` and `notification.create` now pass `allow_name=true`
   to `parse_optional_workspace_target`, so peers can address each other
   by workspace name (`--workspace claude`) without juggling runtime
-  UUIDs. This is what made phase 5 practical.
+  UUIDs. This is what made phase 5 practical. A name that several
+  workspaces share is an error that lists their ids.
 - `pane.list`, `pane.surfaces`, and `surface.list` now route on the live
   GTK bridge, so agents can discover peer panes/surfaces in a running
   Limux window.

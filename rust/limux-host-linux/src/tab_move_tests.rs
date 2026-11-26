@@ -399,3 +399,51 @@ fn a_surface_hidden_by_a_zoom_is_reported_not_found() {
     let window = state.borrow().window.clone();
     window.close();
 }
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn a_workspace_name_that_several_workspaces_share_is_rejected_with_their_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.SharedWorkspaceNameTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    for name in ["api", "api", "2024"] {
+        add_workspace_from_state(&state, &workspace_state_with_folder(name, "/"));
+    }
+    let ids: Vec<String> = {
+        let s = state.borrow();
+        s.workspaces.iter().map(|ws| ws.id.clone()).collect()
+    };
+    let list_panes = |target| {
+        let (reply, rx) = std::sync::mpsc::channel();
+        handle_control_command(&state, ControlCommand::ListPanes { target, reply });
+        rx.try_recv().expect("pane.list replies at once")
+    };
+    let name = |name: &str| WorkspaceTarget::Name(name.to_string());
+
+    assert_eq!(
+        list_panes(name("api")),
+        Err(BridgeError::invalid_params(format!(
+            "several workspaces are named \"api\"; use the workspace id: {}, {}",
+            ids[1], ids[2]
+        )))
+    );
+    for target in [name("2024"), WorkspaceTarget::Handle(ids[1].clone())] {
+        assert!(list_panes(target).is_ok());
+    }
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
