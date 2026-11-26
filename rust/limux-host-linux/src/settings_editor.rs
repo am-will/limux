@@ -6,7 +6,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config::{
-    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UnreadColor,
+    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UiTheme, UnreadColor,
     WindowControlsSide, DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS, MIN_TAB_ACTIVITY_SECONDS,
 };
 use crate::gui_hooks::{GuiHook, GuiHookEvent, GuiHooksConfig};
@@ -452,6 +452,21 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
 
     let group = adw::PreferencesGroup::new();
 
+    let theme_row = adw::ActionRow::builder()
+        .title("Interface theme")
+        .subtitle(
+            "Choose the Limux UI style (Omarchy follows your active Omarchy theme colors automatically)",
+        )
+        .build();
+    theme_row.set_title_lines(1);
+    theme_row.set_subtitle_lines(2);
+    let theme_dropdown = gtk::DropDown::from_strings(UiTheme::labels());
+    theme_dropdown.set_selected(input.config.borrow().appearance.ui_theme.dropdown_index());
+    theme_dropdown.set_valign(gtk::Align::Center);
+    theme_row.add_suffix(&theme_dropdown);
+    theme_row.set_activatable_widget(Some(&theme_dropdown));
+    group.add(&theme_row);
+
     let color_row = adw::ActionRow::builder()
         .title("GTK color scheme")
         .subtitle("Choose whether the GTK interface follows system, dark, or light")
@@ -725,6 +740,30 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
         input, &page,
     ));
 
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        theme_dropdown.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            let ui_theme = UiTheme::from_dropdown_index(dropdown.selected());
+            if ui_theme == config.borrow().appearance.ui_theme {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.appearance.ui_theme = ui_theme;
+            })
+            .appearance
+            .ui_theme;
+            if dropdown.selected() != effective.dropdown_index() {
+                syncing.set(true);
+                dropdown.set_selected(effective.dropdown_index());
+                syncing.set(false);
+            }
+        });
+    }
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
