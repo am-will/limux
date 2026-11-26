@@ -316,14 +316,14 @@ fn main() {
 }
 
 #[cfg(test)]
+pub(crate) static GHOSTTY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static GHOSTTY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct GhosttyEnvGuard {
         resources: Option<std::ffi::OsString>,
