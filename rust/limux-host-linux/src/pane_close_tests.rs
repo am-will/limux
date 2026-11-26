@@ -1364,6 +1364,55 @@ fn localized_split_and_remove_keep_sibling_gl_areas_realized() {
     pump_until(wait, || !window.is_visible());
 }
 
+// Growing a pane into its neighbor's minimum stops there: the first resize
+// back takes effect, and repeating the first one changes nothing.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn pane_resize_stops_at_the_neighbor_minimum() {
+    let (state, _temp) = held_tab_test_window("dev.limux.PaneResizeLimitTest");
+    let (ws_id, root) = show_focused_workspace(
+        &state,
+        LayoutNodeState::Split(SplitState {
+            orientation: SplitOrientation::Horizontal,
+            ratio: 0.5,
+            start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+            end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        }),
+    );
+    let first = find_leaf_pane(&root, gtk::Orientation::Horizontal, true);
+    let container = {
+        let s = state.borrow();
+        let workspace = s.workspaces.iter().find(|w| w.id == ws_id).unwrap();
+        workspace.split_container.clone()
+    };
+    let resize = |units: f64| {
+        let outcome = container
+            .resize_pane(&first, gtk::Orientation::Horizontal, units)
+            .expect("the pane is in the workspace");
+        pump_for(std::time::Duration::from_millis(200));
+        assert_eq!(first.width(), outcome.width);
+        outcome
+    };
+
+    let limit = resize(200.0);
+    assert!(limit.changed);
+    let again = resize(200.0);
+    assert!(!again.changed, "already at the limit");
+    assert_eq!(again.width, limit.width);
+    // 10 px per unit, within a pixel of rounding.
+    let back = resize(-5.0);
+    assert!(back.changed);
+    assert!(
+        (limit.width - 50 - back.width).abs() <= 1,
+        "shrinking by 50 px from {} gave {}",
+        limit.width,
+        back.width
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
 fn buttons_labelled(root: &gtk::Widget, label: &str) -> Vec<gtk::Button> {
     widget_tree(root)
         .into_iter()
