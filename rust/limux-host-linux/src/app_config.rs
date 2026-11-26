@@ -639,7 +639,10 @@ fn save_to_path(path: &Path, previous: &AppConfig, updated: &AppConfig) -> Resul
             let mut previous = config_to_map(previous);
             // Without a value of its own, the Ghostty scheme follows the GTK
             // scheme. Store it, so that a new GTK scheme does not change it.
-            if value_at(&root, "appearance", "ghostty_color_scheme").is_none() {
+            if value_at(&previous, "appearance", "color_scheme")
+                != value_at(&updated, "appearance", "color_scheme")
+                && value_at(&root, "appearance", "ghostty_color_scheme").is_none()
+            {
                 if let Some(Value::Object(appearance)) = previous.get_mut("appearance") {
                     appearance.remove("ghostty_color_scheme");
                 }
@@ -1738,6 +1741,40 @@ mod tests {
         save_to_path(&path, &previous, &updated).expect("save color scheme");
 
         assert_eq!(load_from_path(&path).config, updated);
+    }
+
+    #[test]
+    fn unrelated_save_does_not_inject_ghostty_color_scheme() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"appearance": {"color_scheme": "dark"}}"#).expect("write config");
+        let previous = load_from_path(&path).config;
+
+        fs::write(&path, r#"{"appearance": {"color_scheme": "light"}}"#).expect("edit config");
+
+        let mut updated = previous.clone();
+        updated.font_size = Some(16.0);
+        save_to_path(&path, &previous, &updated).expect("save unrelated setting");
+
+        let root = saved_root(&path);
+        assert_eq!(root["appearance"]["color_scheme"], "light");
+        assert!(
+            root["appearance"].get("ghostty_color_scheme").is_none(),
+            "{root}"
+        );
+        assert_eq!(root["font_size"], json!(16.0));
+        let reloaded = load_from_path(&path).config;
+        assert_eq!(reloaded.appearance.color_scheme, ColorScheme::Light);
+        assert_eq!(reloaded.appearance.ghostty_color_scheme, ColorScheme::Light);
+
+        let mut changed_scheme = reloaded.clone();
+        changed_scheme.appearance.color_scheme = ColorScheme::Dark;
+        save_to_path(&path, &reloaded, &changed_scheme).expect("save color scheme");
+
+        let root = saved_root(&path);
+        assert_eq!(root["appearance"]["color_scheme"], "dark");
+        assert_eq!(root["appearance"]["ghostty_color_scheme"], "light");
+        assert_eq!(load_from_path(&path).config, changed_scheme);
     }
 
     #[test]
