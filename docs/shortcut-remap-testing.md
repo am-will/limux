@@ -447,7 +447,8 @@ Launch a browser tab and verify:
 Verify with a terminal tab focused:
 
 - `Ctrl+Alt+F` opens terminal search
-- `Ctrl+Alt+G` and `Ctrl+Alt+Shift+G` move through terminal search results
+- `Ctrl+Alt+G` and `Ctrl+Alt+Shift+G` move through terminal search results, also while the find field has focus
+- `Ctrl+Alt+Shift+F` and `Escape` hide terminal search and return focus to the terminal
 - `Ctrl+Alt+E` uses the current terminal selection for search
 - `Ctrl+Alt+K`, `Ctrl+Shift+C`, `Ctrl+Shift+V`, `Ctrl+Alt++`, `Ctrl+Alt+-`, and `Ctrl+Alt+Shift+0` affect only the terminal
 

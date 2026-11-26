@@ -753,10 +753,12 @@ impl TerminalHandle {
         if !self.search_bar.is_search_mode() {
             return false;
         }
-        self.perform_binding_action("end_search");
         self.search_bar.set_search_mode(false);
-        self.gl_area.grab_focus();
         true
+    }
+
+    pub fn is_find_active(&self) -> bool {
+        self.search_bar.is_search_mode()
     }
 
     pub fn use_selection_for_find(&self) -> bool {
@@ -2516,22 +2518,20 @@ pub fn create_terminal(
     }
     {
         let surface_cell = surface_cell.clone();
-        let search_bar = search_bar.downgrade();
         let gl_area = gl_area.downgrade();
-        let handler = search_entry.connect_stop_search(move |_| {
-            let Some(search_bar) = search_bar.upgrade() else {
-                return;
-            };
-            if !search_bar.is_search_mode() {
+        // GTK itself hides the bar on Escape and on its close button. The hidden
+        // entry keeps the focus, and takes what is typed, until its animation
+        // ends, so give the focus back as soon as the mode changes.
+        let handler = search_bar.connect_search_mode_enabled_notify(move |search_bar| {
+            if search_bar.is_search_mode() {
                 return;
             }
             surface_action(*surface_cell.borrow(), "end_search");
-            search_bar.set_search_mode(false);
             if let Some(gl_area) = gl_area.upgrade() {
                 gl_area.grab_focus();
             }
         });
-        track_signal(&signal_handlers, &search_entry, handler);
+        track_signal(&signal_handlers, &search_bar, handler);
     }
     {
         let surface_cell = surface_cell.clone();

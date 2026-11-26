@@ -355,6 +355,10 @@ impl TerminalShortcutTarget {
         self.handle.hide_find()
     }
 
+    pub fn is_find_active(&self) -> bool {
+        self.handle.is_find_active()
+    }
+
     pub fn use_selection_for_find(&self) -> bool {
         self.handle.use_selection_for_find()
     }
