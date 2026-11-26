@@ -32,6 +32,7 @@ use libadwaita as adw;
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 pub(crate) const APP_ID: &str = "dev.limux.linux";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -146,7 +147,31 @@ fn sanitize_terminal_child_env() {
     std::env::remove_var("NO_COLOR");
 }
 
-pub(crate) fn terminal_child_environment_overrides() -> Vec<(String, String)> {
+const PIXBUF_MODULE_FILE: &str = "GDK_PIXBUF_MODULE_FILE";
+
+/// The variables this process changes for itself, as they were at launch.
+pub(crate) fn launch_environment() -> &'static [(&'static str, Option<String>)] {
+    static LAUNCH_ENVIRONMENT: OnceLock<Vec<(&str, Option<String>)>> = OnceLock::new();
+    LAUNCH_ENVIRONMENT.get_or_init(|| {
+        ["GDK_DEBUG", "GDK_DISABLE", PIXBUF_MODULE_FILE]
+            .map(|name| (name, std::env::var(name).ok()))
+            .into()
+    })
+}
+
+/// Let children find their own image loaders. gdk-pixbuf reads the launcher's
+/// list once, so read it now and drop the variable. Call this before any thread
+/// starts.
+fn release_pixbuf_module_file() {
+    if std::env::var("LIMUX_ORIGINAL_GDK_PIXBUF_MODULE_FILE_SET").as_deref() == Ok("0") {
+        gtk4::gdk_pixbuf::Pixbuf::formats();
+        std::env::remove_var(PIXBUF_MODULE_FILE);
+    }
+}
+
+/// The user's values of the variables that the launcher or this process set for
+/// the GTK host. `None`: the user had none.
+pub(crate) fn original_child_environment() -> Vec<(&'static str, Option<String>)> {
     const RESTORE_VARS: &[(&str, &str, &str)] = &[
         (
             "LD_LIBRARY_PATH",
@@ -154,7 +179,7 @@ pub(crate) fn terminal_child_environment_overrides() -> Vec<(String, String)> {
             "LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET",
         ),
         (
-            "GDK_PIXBUF_MODULE_FILE",
+            PIXBUF_MODULE_FILE,
             "LIMUX_ORIGINAL_GDK_PIXBUF_MODULE_FILE",
             "LIMUX_ORIGINAL_GDK_PIXBUF_MODULE_FILE_SET",
         ),
@@ -180,17 +205,35 @@ pub(crate) fn terminal_child_environment_overrides() -> Vec<(String, String)> {
         ),
     ];
 
-    RESTORE_VARS
+    let from_launcher = RESTORE_VARS
         .iter()
         .filter(|(_, _, marker)| std::env::var(marker).is_ok())
         .map(|(target, value_key, marker)| {
-            let value = if std::env::var(marker).ok().as_deref() == Some("1") {
-                std::env::var(value_key).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            ((*target).to_string(), value)
-        })
+            let value = (std::env::var(marker).ok().as_deref() == Some("1"))
+                .then(|| std::env::var(value_key).unwrap_or_default());
+            (*target, value)
+        });
+    let from_this_process = launch_environment()
+        .iter()
+        .filter(|(name, value)| *name != PIXBUF_MODULE_FILE && std::env::var(name).ok() != *value)
+        .cloned();
+    from_launcher.chain(from_this_process).collect()
+}
+
+pub(crate) fn terminal_child_environment_overrides() -> Vec<(String, String)> {
+    // A terminal's environment can set a variable but not unset it. Libraries
+    // read an empty value of these as a path, so the terminal keeps the host's:
+    // none for the loaders, and the distribution's own directories for the drivers.
+    const KEPT_WHEN_UNSET: [&str; 3] = [
+        PIXBUF_MODULE_FILE,
+        "GBM_BACKENDS_PATH",
+        "LIBGL_DRIVERS_PATH",
+    ];
+
+    original_child_environment()
+        .into_iter()
+        .filter(|(name, value)| value.is_some() || !KEPT_WHEN_UNSET.contains(name))
+        .map(|(name, value)| (name.to_string(), value.unwrap_or_default()))
         .collect()
 }
 
@@ -211,6 +254,7 @@ fn gtk_runtime_at_least(major: u32, minor: u32, micro: u32) -> bool {
 /// Configure the embedded renderer before GTK initializes, including in tests.
 fn prepare_ghostty_runtime() {
     limux_ghostty_sys::ensure_glad_symbols_linked();
+    launch_environment();
 
     // Ghostty requires desktop OpenGL, not GLES. Must set the GTK renderer
     // environment before GTK initializes, and the exact knobs differ by GTK
@@ -241,6 +285,7 @@ fn main() {
     }
 
     prepare_ghostty_runtime();
+    release_pixbuf_module_file();
     sanitize_terminal_child_env();
     // Snapshot browser runtime flags before stripping the launcher sentinel so
     // shells never inherit it while deferring the WebKit sandbox probe until a
@@ -423,11 +468,43 @@ mod tests {
         let overrides = terminal_child_environment_overrides();
 
         assert!(overrides.contains(&("LD_LIBRARY_PATH".to_string(), "/host/lib".to_string())));
-        assert!(overrides.contains(&("GDK_PIXBUF_MODULE_FILE".to_string(), String::new())));
         assert!(overrides.contains(&("WEBKIT_EXEC_PATH".to_string(), "/host/webkit".to_string())));
         assert!(overrides.contains(&("WEBKIT_INJECTED_BUNDLE_PATH".to_string(), String::new())));
-        assert!(overrides.contains(&("GBM_BACKENDS_PATH".to_string(), String::new())));
         assert!(overrides.contains(&("LIBGL_DRIVERS_PATH".to_string(), "/host/dri".to_string())));
+        // gdk-pixbuf and Mesa would read an empty value as a path.
+        for name in ["GDK_PIXBUF_MODULE_FILE", "GBM_BACKENDS_PATH"] {
+            assert!(!overrides.iter().any(|(overridden, _)| overridden == name));
+        }
+        let original = original_child_environment();
+        assert!(original.contains(&("GDK_PIXBUF_MODULE_FILE", None)));
+        assert!(original.contains(&("GBM_BACKENDS_PATH", None)));
+    }
+
+    #[test]
+    fn children_get_the_gdk_renderer_flags_from_before_launch() {
+        let _lock = GHOSTTY_ENV_LOCK
+            .lock()
+            .expect("terminal env test lock poisoned");
+        let _guard = EnvGuard::capture(&["GDK_DEBUG", "GDK_DISABLE"]);
+        for (name, at_launch) in launch_environment() {
+            if *name == "GDK_PIXBUF_MODULE_FILE" {
+                continue;
+            }
+            let overridden = || {
+                terminal_child_environment_overrides()
+                    .into_iter()
+                    .find(|(overridden, _)| overridden == name)
+                    .map(|(_, value)| value)
+            };
+            match at_launch {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            assert_eq!(overridden(), None);
+            append_env(name, "vulkan");
+            assert_eq!(overridden(), Some(at_launch.clone().unwrap_or_default()));
+            assert!(original_child_environment().contains(&(name, at_launch.clone())));
+        }
     }
 
     #[test]

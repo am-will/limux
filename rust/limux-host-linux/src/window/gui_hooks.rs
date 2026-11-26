@@ -85,7 +85,13 @@ fn launch_hook(
     context: &GuiHookContext,
 ) {
     let mut env = hook_environment(event, default_action_runs, context);
-    env.extend(crate::terminal_child_environment_overrides());
+    let mut unset = Vec::new();
+    for (name, value) in crate::original_child_environment() {
+        match value {
+            Some(value) => env.push((name.to_string(), value)),
+            None => unset.push(name),
+        }
+    }
     if let Some(socket) = limux_control::socket_path::resolve_socket_path(
         None,
         limux_control::socket_path::SocketMode::Runtime,
@@ -94,11 +100,12 @@ fn launch_hook(
     {
         env.push(("LIMUX_SOCKET".to_string(), socket.to_string()));
     }
-    let unset: Vec<&str> = INHERITED_IDENTITY_VARS
-        .iter()
-        .copied()
-        .filter(|name| !env.iter().any(|(set, _)| set == name))
-        .collect();
+    unset.extend(
+        INHERITED_IDENTITY_VARS
+            .iter()
+            .copied()
+            .filter(|name| !env.iter().any(|(set, _)| set == name)),
+    );
     let cwd = context
         .folder
         .as_deref()
