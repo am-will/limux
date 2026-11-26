@@ -3249,6 +3249,11 @@ fn apply_surface_key_input(
     surface_id: u64,
     key: &str,
 ) -> Result<SurfaceInfo, CommandError> {
+    // Enter submits the line that earlier text typed, as in a shell.
+    if matches!(key.trim().to_ascii_lowercase().as_str(), "enter" | "return") {
+        return apply_surface_text_input(state, workspace_id, surface_id, "\n");
+    }
+
     let marker = format!("<key:{key}>");
     let mut request_close = false;
     let updated =
@@ -6469,6 +6474,18 @@ mod tests {
             .await;
         assert!(sent.result.is_some(), "send_text should succeed");
         assert!(marker.exists(), "touch command should create marker file");
+        let _ = std::fs::remove_file(&marker);
+
+        let command = command.trim_end();
+        for (method, params) in [
+            ("surface.send_text", json!({ "text": command })),
+            ("surface.send_key", json!({ "key": "Enter" })),
+        ] {
+            assert!(!marker.exists(), "the line ran before Enter");
+            let sent = dispatcher.dispatch(request(method, params)).await;
+            assert!(sent.result.is_some(), "{method} should succeed");
+        }
+        assert!(marker.exists(), "Enter should submit the typed line");
         let _ = std::fs::remove_file(marker);
     }
 

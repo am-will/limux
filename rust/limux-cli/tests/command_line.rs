@@ -18,20 +18,22 @@ fn cli(home: &Path) -> Command {
     command
 }
 
-/// The params of the one request that `args` make from a terminal in `ws-caller`.
-fn caller_request(home: &Path, args: &[&str]) -> Value {
+/// The requests that `args` make from a terminal in `ws-caller`. Replies name
+/// the terminal `7:took-it`.
+fn caller_requests(home: &Path, args: &[&str]) -> Vec<Value> {
     let socket = home.join("cli.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        let reply = json!({"id": request["id"], "ok": true, "result": {"text": ""}});
-        writeln!(stream, "{reply}").unwrap();
-        request["params"].clone()
+        let mut requests = Vec::new();
+        for line in BufReader::new(stream.try_clone().unwrap()).lines() {
+            let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let result = json!({"text": "", "surface_id": "7:took-it"});
+            let reply = json!({"id": request["id"], "ok": true, "result": result});
+            writeln!(stream, "{reply}").unwrap();
+            requests.push(request);
+        }
+        requests
     });
     let output = cli(home)
         .env("LIMUX_WORKSPACE_ID", "ws-caller")
@@ -56,16 +58,37 @@ fn untargeted_tmux_commands_act_on_the_callers_workspace() {
         &["respawn-pane", "--command", "make"],
         &["pipe-pane", "--command", "cat"],
     ] {
-        let params = caller_request(home.path(), args);
-        assert_eq!(params["workspace_id"], "ws-caller", "{args:?}");
+        for request in caller_requests(home.path(), args) {
+            assert_eq!(request["params"]["workspace_id"], "ws-caller", "{args:?}");
+        }
     }
     for args in [
         &["clear-history", "--surface", "9:other"][..],
         &["break-pane", "--pane", "9"],
     ] {
-        let params = caller_request(home.path(), args);
+        let params = &caller_requests(home.path(), args)[0]["params"];
         assert!(params.get("workspace_id").is_none(), "{args:?}: {params}");
     }
+}
+
+#[test]
+fn respawn_pane_presses_enter_in_the_terminal_that_took_the_command() {
+    let home = tempfile::tempdir().unwrap();
+    let requests = caller_requests(home.path(), &["respawn-pane", "--command", "make"]);
+    let sent: Vec<_> = requests
+        .iter()
+        .map(|request| (request["method"].as_str().unwrap(), &request["params"]))
+        .collect();
+    let text = json!({"workspace_id": "ws-caller", "text": "make"});
+    let enter = json!({"workspace_id": "ws-caller", "surface_id": "7:took-it", "key": "Enter"});
+    assert_eq!(
+        sent,
+        [("surface.send_text", &text), ("surface.send_key", &enter)]
+    );
+
+    let requests = caller_requests(home.path(), &["respawn-pane"]);
+    assert_eq!(requests.len(), 1, "no command types nothing: {requests:?}");
+    assert_eq!(requests[0]["params"]["key"], "Enter");
 }
 
 #[test]

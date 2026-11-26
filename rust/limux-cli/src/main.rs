@@ -355,7 +355,8 @@ Agent integrations:
       as the orchestrator on the left, peers stack down the right), launches
       each CLI in its pane, and writes AGENTS.md describing the <agent-msg>
       XML protocol so peers can talk via
-      `limux send --surface <peer-surface-id> <envelope>`."#;
+      `limux send --surface <peer-surface-id> <envelope>`, then
+      `limux send-key --surface <peer-surface-id> Enter`."#;
 
 /// The usage of one command, as `HELP` lists it.
 fn command_help(command: &str) -> Option<String> {
@@ -2713,7 +2714,8 @@ async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value
 // The protocol (codified in AGENTS.md):
 //   To send a message to a peer, run from any terminal:
 //     limux send --surface <peer-surface-id> \\
-//       $'<agent-msg from="<me>" to="<peer>" ts="<iso-8601>">\\n...\\n</agent-msg>\\n'
+//       $'<agent-msg from="<me>" to="<peer>" ts="<iso-8601>">\\n...\\n</agent-msg>'
+//     limux send-key --surface <peer-surface-id> Enter
 //
 // Peers read their own terminals normally — the text appears at the prompt.
 // Each agent should watch for <agent-msg from="..."> blocks and reply with
@@ -3028,12 +3030,13 @@ fn build_agents_md(
          shell, including the agent's own terminal — `limux` is on PATH):\n\n",
     );
     out.push_str("```bash\n");
-    out.push_str("limux send --surface <peer-surface-id> $'<agent-msg from=\"<me>\" to=\"<peer>\" id=\"<uuid>\" ts=\"<iso8601>\">\\n<body/>\\n</agent-msg>\\n'\n");
+    out.push_str("limux send --surface <peer-surface-id> $'<agent-msg from=\"<me>\" to=\"<peer>\" id=\"<uuid>\" ts=\"<iso8601>\">\\n<body/>\\n</agent-msg>'\n");
+    out.push_str("limux send-key --surface <peer-surface-id> Enter\n");
     out.push_str("```\n\n");
     out.push_str(
-        "The message appears at the peer's prompt as plain stdin, so the\n\
-         peer's agent CLI picks it up like a normal user message. Trailing\n\
-         newline is required so the agent's read-line actually fires.\n\n",
+        "The message appears at the peer's prompt as pasted text. A newline in\n\
+         pasted text does not submit it. The `Enter` key does, and the peer's\n\
+         agent CLI then reads it like a normal user message.\n\n",
     );
 
     out.push_str("### Envelope format\n\n");
@@ -3057,7 +3060,8 @@ fn build_agents_md(
     out.push_str("### Replying\n\n");
     out.push_str("Reply with the envelope reversed and `reply-to` set to the original `id`:\n\n");
     out.push_str("```bash\n");
-    out.push_str("limux send --surface <orig-sender-surface-id> $'<agent-msg from=\"claude\" to=\"codex\" id=\"<new-uuid>\" reply-to=\"<orig-uuid>\" ts=\"<iso8601>\">\\n<response>...</response>\\n</agent-msg>\\n'\n");
+    out.push_str("limux send --surface <orig-sender-surface-id> $'<agent-msg from=\"claude\" to=\"codex\" id=\"<new-uuid>\" reply-to=\"<orig-uuid>\" ts=\"<iso8601>\">\\n<response>...</response>\\n</agent-msg>'\n");
+    out.push_str("limux send-key --surface <orig-sender-surface-id> Enter\n");
     out.push_str("```\n\n");
 
     out.push_str("## Pinging the human\n\n");
@@ -4791,8 +4795,24 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             if let Some(surface) = surface {
                 p.insert("surface_id".to_string(), Value::String(surface));
             }
-            p.insert("text".to_string(), Value::String(format!("{}\n", command)));
-            call_in_workspace_scope(client, workspace, "surface.send_text", Value::Object(p)).await
+            // Text arrives as a paste, where a newline does not submit. Press Enter
+            // in the terminal that took the text, even if the focus moved since.
+            if !command.is_empty() {
+                let mut text = p.clone();
+                text.insert("text".to_string(), Value::String(command));
+                let sent = call_in_workspace_scope(
+                    client,
+                    workspace.clone(),
+                    "surface.send_text",
+                    Value::Object(text),
+                )
+                .await?;
+                if let Some(surface) = get_string(&sent, &["surface_id"]) {
+                    p.insert("surface_id".to_string(), Value::String(surface));
+                }
+            }
+            p.insert("key".to_string(), Value::String("Enter".to_string()));
+            call_in_workspace_scope(client, workspace, "surface.send_key", Value::Object(p)).await
         }
         "display-message" => {
             let (_, msg) = split_text_args(args, &[], &["-p"]);
@@ -6274,6 +6294,17 @@ mod agent_team_tests {
         assert!(md.contains("<agent-msg from=\"codex\" to=\"claude\""));
         assert!(md.contains("limux send --surface"));
         assert!(!md.contains("limux send --workspace"));
+        // A pasted message waits at the prompt until Enter: each send has one.
+        for recipient in ["peer-surface-id", "orig-sender-surface-id"] {
+            let enter = format!("limux send-key --surface <{recipient}> Enter\n");
+            let send = format!("limux send --surface <{recipient}> ");
+            let (_, after_send) = md.split_once(&send).expect("send example");
+            assert_eq!(
+                after_send.lines().nth(1),
+                Some(enter.trim_end()),
+                "{recipient}"
+            );
+        }
         assert!(md.contains("reply-to"));
 
         // Notify + env contract
