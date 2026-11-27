@@ -179,6 +179,7 @@ impl UnreadColor {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UiTheme {
     #[default]
+    Auto,
     Default,
     Omarchy,
 }
@@ -186,6 +187,7 @@ pub enum UiTheme {
 impl UiTheme {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Default => "default",
             Self::Omarchy => "omarchy",
         }
@@ -193,6 +195,7 @@ impl UiTheme {
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "auto" => Some(Self::Auto),
             "default" => Some(Self::Default),
             "omarchy" => Some(Self::Omarchy),
             _ => None,
@@ -200,20 +203,22 @@ impl UiTheme {
     }
 
     pub fn labels() -> &'static [&'static str] {
-        &["Default", "Omarchy"]
+        &["Auto", "Default", "Omarchy"]
     }
 
     pub fn dropdown_index(self) -> u32 {
         match self {
-            Self::Default => 0,
-            Self::Omarchy => 1,
+            Self::Auto => 0,
+            Self::Default => 1,
+            Self::Omarchy => 2,
         }
     }
 
     pub fn from_dropdown_index(index: u32) -> Self {
         match index {
-            1 => Self::Omarchy,
-            _ => Self::Default,
+            1 => Self::Default,
+            2 => Self::Omarchy,
+            _ => Self::Auto,
         }
     }
 }
@@ -1866,24 +1871,28 @@ mod tests {
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
 
         let default_config = AppConfig::default();
+        assert_eq!(default_config.appearance.ui_theme, UiTheme::Auto);
         save_over(&path, &default_config).expect("save default config");
         let raw_default = fs::read_to_string(&path).expect("read default config");
         let parsed_default: Value = serde_json::from_str(&raw_default).expect("parse default");
         assert!(parsed_default["appearance"].get("ui_theme").is_none());
 
-        let mut omarchy_config = AppConfig::default();
-        omarchy_config.appearance.ui_theme = UiTheme::Omarchy;
-        save_over(&path, &omarchy_config).expect("save omarchy config");
-        let raw_omarchy = fs::read_to_string(&path).expect("read omarchy config");
-        let parsed_omarchy: Value = serde_json::from_str(&raw_omarchy).expect("parse omarchy");
-        assert_eq!(
-            parsed_omarchy["appearance"]["ui_theme"],
-            Value::String("omarchy".to_string())
-        );
+        for (theme, expected_str) in [(UiTheme::Default, "default"), (UiTheme::Omarchy, "omarchy")]
+        {
+            let mut config = AppConfig::default();
+            config.appearance.ui_theme = theme;
+            save_over(&path, &config).expect("save theme config");
+            let raw = fs::read_to_string(&path).expect("read theme config");
+            let parsed: Value = serde_json::from_str(&raw).expect("parse theme");
+            assert_eq!(
+                parsed["appearance"]["ui_theme"],
+                Value::String(expected_str.to_string())
+            );
 
-        let loaded = load_from_path(&path);
-        assert!(loaded.warnings.is_empty());
-        assert_eq!(loaded.config.appearance.ui_theme, UiTheme::Omarchy);
+            let loaded = load_from_path(&path);
+            assert!(loaded.warnings.is_empty());
+            assert_eq!(loaded.config.appearance.ui_theme, theme);
+        }
     }
 
     #[test]
@@ -1895,6 +1904,6 @@ mod tests {
 
         let loaded = load_from_path(&path);
         assert!(loaded.warnings.is_empty());
-        assert_eq!(loaded.config.appearance.ui_theme, UiTheme::Default);
+        assert_eq!(loaded.config.appearance.ui_theme, UiTheme::Auto);
     }
 }

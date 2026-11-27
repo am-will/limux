@@ -156,6 +156,7 @@ pub(crate) struct AppState {
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
     omarchy_theme_watcher: Option<crate::omarchy_theme::OmarchyThemeWatcher>,
+    _reload_signal: Option<glib::SourceId>,
     _desktop_notification_token_signal: Option<gio::SignalSubscription>,
     _desktop_notification_action_signal: Option<gio::SignalSubscription>,
     _desktop_notification_closed_signal: Option<gio::SignalSubscription>,
@@ -1683,6 +1684,42 @@ const BASE_CSS: &str = r#"
     background-color: alpha(@accent_bg_color, 0.28);
     border-color: alpha(@accent_bg_color, 0.9);
 }
+.limux-sidebar-ssh-btn {
+    background: transparent;
+    color: alpha(@window_fg_color, 0.55);
+    border: 1px solid alpha(@window_fg_color, 0.09);
+    border-radius: 6px;
+    padding: 3px 8px;
+    margin: 2px 6px 6px 6px;
+    min-height: 0;
+    font-size: 11.5px;
+    font-weight: 500;
+    transition: all 150ms ease;
+}
+.limux-sidebar-ssh-btn:hover {
+    background: alpha(@window_fg_color, 0.07);
+    color: alpha(@window_fg_color, 0.9);
+    border-color: alpha(@window_fg_color, 0.16);
+}
+.limux-sidebar-ssh-btn image {
+    -gtk-icon-size: 13px;
+    opacity: 0.72;
+}
+.limux-sidebar-ssh-btn:hover image {
+    opacity: 1.0;
+}
+.limux-dialog-secondary-btn {
+    padding: 4px 8px;
+    min-height: 26px;
+    font-size: 12px;
+    color: alpha(@window_fg_color, 0.7);
+    border: 1px solid alpha(@window_fg_color, 0.12);
+    border-radius: 6px;
+}
+.limux-dialog-secondary-btn:hover {
+    background: alpha(@window_fg_color, 0.07);
+    color: @window_fg_color;
+}
 .limux-ws-path {
     color: alpha(@window_fg_color, 0.3);
     font-size: 11px;
@@ -1735,7 +1772,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         ""
     };
     let (content_bg_rgb, omarchy_css) =
-        if config.appearance.ui_theme == app_config::UiTheme::Omarchy {
+        if crate::omarchy_theme::is_omarchy_active(config.appearance.ui_theme) {
             let palette = crate::omarchy_theme::load_active_palette();
             let bg_rgb = palette
                 .map(|p| (p.background.r, p.background.g, p.background.b))
@@ -2076,8 +2113,28 @@ pub fn build_window(app: &adw::Application) {
     sidebar.append(&sidebar_drag_area);
     sidebar.append(&sidebar_header_handle);
     sidebar.append(&sidebar_scroll);
-    let ssh_button = gtk::Button::with_label("Connect via SSH…");
-    ssh_button.set_tooltip_text(Some("Open an SSH connection in a new workspace"));
+    let ssh_button_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    let ssh_button_icon = gtk::Image::from_icon_name("network-server-symbolic");
+    let ssh_button_label = gtk::Label::builder()
+        .label("Connect via SSH…")
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .single_line_mode(true)
+        .build();
+    ssh_button_box.append(&ssh_button_icon);
+    ssh_button_box.append(&ssh_button_label);
+    let ssh_button = gtk::Button::builder()
+        .child(&ssh_button_box)
+        .focus_on_click(false)
+        .tooltip_text("Open an SSH connection in a new workspace")
+        .build();
+    ssh_button.add_css_class("flat");
+    ssh_button.add_css_class("limux-sidebar-ssh-btn");
+    ssh_button.update_property(&[gtk::accessible::Property::Label("Connect via SSH…")]);
     sidebar.append(&ssh_button);
 
     let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
@@ -2146,6 +2203,7 @@ pub fn build_window(app: &adw::Application) {
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
         omarchy_theme_watcher: None,
+        _reload_signal: None,
         _desktop_notification_token_signal: None,
         _desktop_notification_action_signal: None,
         _desktop_notification_closed_signal: None,
@@ -2236,6 +2294,18 @@ pub fn build_window(app: &adw::Application) {
         s._theme_gnome_signal = theme_gnome_signal;
     }
     sync_omarchy_theme_watcher(&state);
+    {
+        let weak_state = Rc::downgrade(&state);
+        let style_manager = style_manager.clone();
+        let source_id = attach_unix_signal_handler(libc::SIGUSR2, move || {
+            let Some(state) = weak_state.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            reload_theme_and_terminal_config(&state, &style_manager);
+            glib::ControlFlow::Continue
+        });
+        state.borrow_mut()._reload_signal = source_id;
+    }
     connect_portal_appearance_watch_async(
         gnome_interface_settings.clone(),
         state.clone(),
@@ -2393,6 +2463,9 @@ pub fn build_window(app: &adw::Application) {
             stop_session_saves_for_shutdown(&state);
             if let Some(watcher) = state.borrow_mut().omarchy_theme_watcher.take() {
                 watcher.stop();
+            }
+            if let Some(signal_source) = state.borrow_mut()._reload_signal.take() {
+                signal_source.remove();
             }
             let split_containers: Vec<_> = state
                 .borrow()
@@ -3106,14 +3179,19 @@ fn handle_config_change(
     let style_manager = adw::StyleManager::default();
     let system_prefers_dark = state.borrow().system_prefers_dark.get();
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
+    if updated.appearance.ui_theme != previous.appearance.ui_theme {
+        crate::terminal::reload_config(crate::omarchy_theme::is_omarchy_active(
+            updated.appearance.ui_theme,
+        ));
+        let opacity = sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
+        apply_window_background_class(&state.borrow().window, opacity);
+        sync_omarchy_theme_watcher(state);
+    }
     if updated.appearance.ui_scale != previous.appearance.ui_scale
         || updated.appearance.unread_color != previous.appearance.unread_color
         || updated.appearance.ui_theme != previous.appearance.ui_theme
     {
         reload_app_css(state, updated);
-    }
-    if updated.appearance.ui_theme != previous.appearance.ui_theme {
-        sync_omarchy_theme_watcher(state);
     }
     if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
         sync_workspace_path_visibility(state, updated.appearance.show_workspace_path);
@@ -3128,14 +3206,20 @@ fn handle_config_change(
     if let Err(err) = app_config::save(previous, updated) {
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
+        if updated.appearance.ui_theme != previous.appearance.ui_theme {
+            crate::terminal::reload_config(crate::omarchy_theme::is_omarchy_active(
+                previous.appearance.ui_theme,
+            ));
+            let opacity =
+                sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
+            apply_window_background_class(&state.borrow().window, opacity);
+            sync_omarchy_theme_watcher(state);
+        }
         if updated.appearance.ui_scale != previous.appearance.ui_scale
             || updated.appearance.unread_color != previous.appearance.unread_color
             || updated.appearance.ui_theme != previous.appearance.ui_theme
         {
             reload_app_css(state, previous);
-        }
-        if updated.appearance.ui_theme != previous.appearance.ui_theme {
-            sync_omarchy_theme_watcher(state);
         }
         if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
             sync_workspace_path_visibility(state, previous.appearance.show_workspace_path);
@@ -3702,9 +3786,82 @@ fn ghostty_prefers_dark(
     }
 }
 
+fn attach_unix_signal_handler<F>(signum: libc::c_int, callback: F) -> Option<glib::SourceId>
+where
+    F: FnMut() -> glib::ControlFlow + 'static,
+{
+    use glib::translate::{FromGlib, IntoGlib};
+
+    extern "C" {
+        fn g_unix_signal_add_full(
+            priority: libc::c_int,
+            signum: libc::c_int,
+            handler: unsafe extern "C" fn(glib::ffi::gpointer) -> glib::ffi::gboolean,
+            user_data: glib::ffi::gpointer,
+            notify: unsafe extern "C" fn(glib::ffi::gpointer),
+        ) -> u32;
+    }
+
+    unsafe extern "C" fn trampoline<F: FnMut() -> glib::ControlFlow + 'static>(
+        user_data: glib::ffi::gpointer,
+    ) -> glib::ffi::gboolean {
+        let callback = unsafe { &mut *(user_data as *mut F) };
+        match callback() {
+            glib::ControlFlow::Continue => glib::ffi::GTRUE,
+            glib::ControlFlow::Break => glib::ffi::GFALSE,
+        }
+    }
+
+    unsafe extern "C" fn destroy_notify<F>(user_data: glib::ffi::gpointer) {
+        unsafe {
+            drop(Box::from_raw(user_data as *mut F));
+        }
+    }
+
+    let boxed = Box::into_raw(Box::new(callback)) as glib::ffi::gpointer;
+    let id = unsafe {
+        g_unix_signal_add_full(
+            glib::Priority::DEFAULT.into_glib(),
+            signum,
+            trampoline::<F>,
+            boxed,
+            destroy_notify::<F>,
+        )
+    };
+    if id == 0 {
+        unsafe {
+            drop(Box::from_raw(boxed as *mut F));
+        }
+        return None;
+    }
+    Some(unsafe { glib::SourceId::from_glib(id) })
+}
+
+fn reload_theme_and_terminal_config(state: &State, style_manager: &adw::StyleManager) {
+    let (config_snapshot, system_prefers_dark, window) = {
+        let s = state.borrow();
+        let cfg = s.config.borrow().clone();
+        let prefers_dark = s.system_prefers_dark.get();
+        (cfg, prefers_dark, s.window.clone())
+    };
+    let omarchy_active =
+        crate::omarchy_theme::is_omarchy_active(config_snapshot.appearance.ui_theme);
+    crate::terminal::reload_config(omarchy_active);
+    let background_opacity =
+        sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
+    apply_window_background_class(&window, background_opacity);
+    apply_appearance(
+        style_manager,
+        system_prefers_dark,
+        &config_snapshot.appearance,
+    );
+    reload_app_css(state, &config_snapshot);
+}
+
 fn sync_omarchy_theme_watcher(state: &State) {
-    let want_watcher =
-        state.borrow().config.borrow().appearance.ui_theme == app_config::UiTheme::Omarchy;
+    let want_watcher = crate::omarchy_theme::should_watch_omarchy(
+        state.borrow().config.borrow().appearance.ui_theme,
+    );
     if !want_watcher {
         if let Some(watcher) = state.borrow_mut().omarchy_theme_watcher.take() {
             watcher.stop();
@@ -3720,19 +3877,9 @@ fn sync_omarchy_theme_watcher(state: &State) {
         let Some(state) = weak_state.upgrade() else {
             return;
         };
-        let (config_snapshot, system_prefers_dark) = {
-            let s = state.borrow();
-            let cfg = s.config.borrow().clone();
-            let prefers_dark = s.system_prefers_dark.get();
-            (cfg, prefers_dark)
-        };
-        if config_snapshot.appearance.ui_theme == app_config::UiTheme::Omarchy {
-            apply_appearance(
-                &style_manager,
-                system_prefers_dark,
-                &config_snapshot.appearance,
-            );
-            reload_app_css(&state, &config_snapshot);
+        let ui_theme = state.borrow().config.borrow().appearance.ui_theme;
+        if crate::omarchy_theme::should_watch_omarchy(ui_theme) {
+            reload_theme_and_terminal_config(&state, &style_manager);
         }
     });
     state.borrow_mut().omarchy_theme_watcher = Some(watcher);
@@ -3742,7 +3889,7 @@ fn effective_system_prefers_dark_for_appearance(
     system_prefers_dark: Option<bool>,
     appearance: &app_config::AppearanceConfig,
 ) -> Option<bool> {
-    if appearance.ui_theme == app_config::UiTheme::Omarchy {
+    if crate::omarchy_theme::is_omarchy_active(appearance.ui_theme) {
         crate::omarchy_theme::load_active_palette()
             .map(|palette| palette.is_dark)
             .or(system_prefers_dark)
@@ -3771,7 +3918,7 @@ fn apply_appearance(
     system_prefers_dark: Option<bool>,
     appearance: &app_config::AppearanceConfig,
 ) {
-    let effective_scheme = if appearance.ui_theme == app_config::UiTheme::Omarchy
+    let effective_scheme = if crate::omarchy_theme::is_omarchy_active(appearance.ui_theme)
         && appearance.color_scheme == app_config::ColorScheme::System
     {
         crate::omarchy_theme::load_active_palette()

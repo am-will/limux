@@ -66,6 +66,16 @@ const UI_SCALE_DESCRIPTORS: &[UiScaleDescriptor] = &[
         base_size: 12.0,
     },
     UiScaleDescriptor {
+        selector: ".limux-sidebar-ssh-btn",
+        property: "font-size",
+        base_size: 11.5,
+    },
+    UiScaleDescriptor {
+        selector: ".limux-sidebar-ssh-btn image",
+        property: "-gtk-icon-size",
+        base_size: 13.0,
+    },
+    UiScaleDescriptor {
         selector: ".limux-tab",
         property: "font-size",
         base_size: 12.0,
@@ -455,7 +465,7 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     let theme_row = adw::ActionRow::builder()
         .title("Interface theme")
         .subtitle(
-            "Choose the Limux UI style (Omarchy follows your active Omarchy theme colors automatically)",
+            "Choose the Limux UI style (Auto follows Omarchy when present, otherwise Default)",
         )
         .build();
     theme_row.set_title_lines(1);
