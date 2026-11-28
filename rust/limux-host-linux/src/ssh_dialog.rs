@@ -78,10 +78,25 @@ pub fn show(
     persist.connect_toggled(move |button| reconnect_toggle.set_sensitive(button.is_active()));
     content.append(&persist);
     content.append(&reconnect);
-    let persistence_hint = gtk::Label::new(Some("Requires tmux on the remote host. Saved sessions reconnect when Limux starts. Close the tab to stop retries; remote sessions remain running."));
-    persistence_hint.set_wrap(true);
+    let persistence_hint = gtk::Label::builder()
+        .label("Requires tmux on the remote host. Saved sessions reconnect when Limux starts. Close the tab to stop retries; remote sessions remain running.")
+        .wrap(true)
+        .halign(gtk::Align::Start)
+        .build();
+    persistence_hint.add_css_class("dim-label");
+    persistence_hint.add_css_class("caption");
     content.append(&persistence_hint);
-    let helper = gtk::Button::with_label("Install remote agent helper…");
+    let helper_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let helper_icon = gtk::Image::from_icon_name("system-software-install-symbolic");
+    let helper_label = gtk::Label::new(Some("Install remote agent helper…"));
+    helper_box.append(&helper_icon);
+    helper_box.append(&helper_label);
+    let helper = gtk::Button::builder()
+        .child(&helper_box)
+        .halign(gtk::Align::Start)
+        .build();
+    helper.add_css_class("flat");
+    helper.add_css_class("limux-dialog-secondary-btn");
     content.append(&helper);
     let helper_target = destination.clone();
     let helper_port = port.clone();

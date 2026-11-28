@@ -9,6 +9,8 @@ use gtk4::glib;
 use gtk4::prelude::FileExt;
 use gtk4::prelude::FileMonitorExt;
 
+use crate::app_config::UiTheme;
+
 const OMARCHY_RELOAD_DEBOUNCE_MS: u64 = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,28 +95,96 @@ impl Rgb {
 pub struct OmarchyPalette {
     pub is_dark: bool,
     pub background: Rgb,
+    pub dark_background: Option<Rgb>,
+    pub darker_background: Option<Rgb>,
+    pub lighter_background: Option<Rgb>,
     pub foreground: Rgb,
+    pub dark_foreground: Option<Rgb>,
+    pub bright_foreground: Option<Rgb>,
+    pub muted: Option<Rgb>,
+    pub selection: Option<Rgb>,
     pub accent: Rgb,
     pub accent_fg: Rgb,
     pub unread: Rgb,
     pub error: Rgb,
 }
 
-/// Resolve Omarchy's active `colors.toml` path from XDG state or config dirs.
-pub fn omarchy_colors_path() -> Option<PathBuf> {
-    omarchy_colors_path_in(dirs::state_dir().as_deref(), dirs::config_dir().as_deref())
+#[cfg(test)]
+fn omarchy_colors_path_in(state_dir: Option<&Path>, config_dir: Option<&Path>) -> Option<PathBuf> {
+    omarchy_theme_file_in(state_dir, config_dir, "colors.toml")
 }
 
-fn omarchy_colors_path_in(state_dir: Option<&Path>, config_dir: Option<&Path>) -> Option<PathBuf> {
-    let state_candidate = state_dir.map(|d| d.join("omarchy/current/theme/colors.toml"));
+fn omarchy_theme_file_in(
+    state_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+    file_name: &str,
+) -> Option<PathBuf> {
+    let rel = format!("omarchy/current/theme/{file_name}");
+    let state_candidate = state_dir.map(|d| d.join(&rel));
     if let Some(path) = state_candidate.as_ref().filter(|p| p.is_file()) {
         return Some(path.clone());
     }
-    let config_candidate = config_dir.map(|d| d.join("omarchy/current/theme/colors.toml"));
+    let config_candidate = config_dir.map(|d| d.join(&rel));
     if let Some(path) = config_candidate.as_ref().filter(|p| p.is_file()) {
         return Some(path.clone());
     }
     state_candidate.or(config_candidate)
+}
+
+fn omarchy_dir_exists_in(state_dir: Option<&Path>, config_dir: Option<&Path>) -> bool {
+    [state_dir, config_dir]
+        .into_iter()
+        .flatten()
+        .any(|base| base.join("omarchy").is_dir())
+}
+
+/// Returns whether the Omarchy UI and terminal theme should be active for `ui_theme`.
+///
+/// - `UiTheme::Omarchy` always enables the Omarchy theme (falling back to structural CSS if absent).
+/// - `UiTheme::Default` always uses Limux's stock Adwaita appearance.
+/// - `UiTheme::Auto` activates Omarchy automatically when a valid Omarchy `colors.toml` exists.
+pub fn is_omarchy_active(ui_theme: UiTheme) -> bool {
+    is_omarchy_active_in(
+        ui_theme,
+        dirs::state_dir().as_deref(),
+        dirs::config_dir().as_deref(),
+    )
+}
+
+fn is_omarchy_active_in(
+    ui_theme: UiTheme,
+    state_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> bool {
+    match ui_theme {
+        UiTheme::Omarchy => true,
+        UiTheme::Default => false,
+        UiTheme::Auto => load_active_palette_in(state_dir, config_dir).is_some(),
+    }
+}
+
+/// Returns whether the Omarchy live-reload directory watcher should run.
+///
+/// In `UiTheme::Auto`, only attaches file monitors when an `omarchy` directory exists
+/// under XDG state or config dirs so non-Omarchy systems incur zero background watches.
+pub fn should_watch_omarchy(ui_theme: UiTheme) -> bool {
+    should_watch_omarchy_in(
+        ui_theme,
+        dirs::state_dir().as_deref(),
+        dirs::config_dir().as_deref(),
+    )
+}
+
+fn should_watch_omarchy_in(
+    ui_theme: UiTheme,
+    state_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> bool {
+    match ui_theme {
+        UiTheme::Omarchy => true,
+        UiTheme::Default => false,
+        UiTheme::Auto => omarchy_dir_exists_in(state_dir, config_dir),
+    }
 }
 
 /// Return watchable Omarchy directories, falling back to existing parent
@@ -153,22 +223,129 @@ fn push_unique_dir(out: &mut Vec<PathBuf>, dir: PathBuf) {
 
 /// Load and parse the active Omarchy theme palette from disk, if present.
 pub fn load_active_palette() -> Option<OmarchyPalette> {
-    let path = omarchy_colors_path()?;
-    let contents = fs::read_to_string(path).ok()?;
-    parse_colors_toml(&contents)
+    load_active_palette_in(dirs::state_dir().as_deref(), dirs::config_dir().as_deref())
+}
+
+fn load_active_palette_in(
+    state_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> Option<OmarchyPalette> {
+    let path = omarchy_theme_file_in(state_dir, config_dir, "colors.toml")?;
+    let contents = fs::read_to_string(&path).ok()?;
+    let light_mode_marker = path
+        .parent()
+        .is_some_and(|dir| dir.join("light.mode").is_file());
+    parse_colors_toml_with_light_marker(&contents, light_mode_marker)
+}
+
+/// Load a sanitized Ghostty color overlay from the active Omarchy theme so
+/// embedded terminals follow Omarchy even without a `~/.config/ghostty/config`.
+///
+/// Only strictly validated color and ANSI palette assignments are emitted; any
+/// command, keybind, or `config-file` directives in `ghostty.conf` are ignored.
+pub fn load_ghostty_theme_overlay() -> Option<String> {
+    load_ghostty_theme_overlay_in(dirs::state_dir().as_deref(), dirs::config_dir().as_deref())
+}
+
+fn load_ghostty_theme_overlay_in(
+    state_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> Option<String> {
+    if let Some(path) = omarchy_theme_file_in(state_dir, config_dir, "ghostty.conf") {
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if let Some(sanitized) = sanitize_ghostty_theme_conf(&contents) {
+                return Some(sanitized);
+            }
+        }
+    }
+    let palette = load_active_palette_in(state_dir, config_dir)?;
+    Some(build_ghostty_theme_from_palette(&palette))
+}
+
+fn sanitize_ghostty_theme_conf(contents: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((raw_key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        let val = raw_val.trim();
+        match key {
+            "background"
+            | "foreground"
+            | "cursor-color"
+            | "cursor-text"
+            | "selection-background"
+            | "selection-foreground" => {
+                if let Some(rgb) = Rgb::parse_hex(val) {
+                    lines.push(format!("{key} = {}", rgb.to_hex()));
+                }
+            }
+            "palette" => {
+                if let Some((idx_raw, color_raw)) = val.split_once('=') {
+                    if let (Ok(idx), Some(rgb)) =
+                        (idx_raw.trim().parse::<u8>(), Rgb::parse_hex(color_raw))
+                    {
+                        lines.push(format!("palette = {idx}={}", rgb.to_hex()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (!lines.is_empty()).then(|| format!("{}\n", lines.join("\n")))
+}
+
+fn build_ghostty_theme_from_palette(palette: &OmarchyPalette) -> String {
+    let cursor = palette.bright_foreground.unwrap_or(palette.foreground);
+    let selection_bg = palette
+        .selection
+        .unwrap_or_else(|| palette.background.mix(palette.foreground, 0.16));
+    format!(
+        "background = {}\nforeground = {}\ncursor-color = {}\nselection-background = {}\nselection-foreground = {}\n",
+        palette.background.to_hex(),
+        palette.foreground.to_hex(),
+        cursor.to_hex(),
+        selection_bg.to_hex(),
+        cursor.to_hex(),
+    )
 }
 
 /// Parse Omarchy's `colors.toml` into an `OmarchyPalette`.
 ///
 /// Only strictly validated ASCII `#RGB` / `#RRGGBB` / `#RRGGBBAA` hex values
 /// are accepted so malformed theme files cannot panic or inject arbitrary CSS.
+#[cfg(test)]
 pub fn parse_colors_toml(contents: &str) -> Option<OmarchyPalette> {
+    parse_colors_toml_with_light_marker(contents, false)
+}
+
+fn parse_colors_toml_with_light_marker(
+    contents: &str,
+    light_mode_marker: bool,
+) -> Option<OmarchyPalette> {
     let mut mode: Option<&str> = None;
     let mut background: Option<Rgb> = None;
     let mut bg: Option<Rgb> = None;
+    let mut dark_background: Option<Rgb> = None;
+    let mut dark_bg: Option<Rgb> = None;
+    let mut darker_background: Option<Rgb> = None;
+    let mut darker_bg: Option<Rgb> = None;
+    let mut lighter_background: Option<Rgb> = None;
+    let mut lighter_bg: Option<Rgb> = None;
     let mut foreground: Option<Rgb> = None;
     let mut fg: Option<Rgb> = None;
+    let mut dark_foreground: Option<Rgb> = None;
+    let mut dark_fg: Option<Rgb> = None;
+    let mut bright_foreground: Option<Rgb> = None;
+    let mut bright_fg: Option<Rgb> = None;
+    let mut muted: Option<Rgb> = None;
     let mut accent: Option<Rgb> = None;
+    let mut selection: Option<Rgb> = None;
     let mut selection_background: Option<Rgb> = None;
     let mut selection_foreground: Option<Rgb> = None;
     let mut blue: Option<Rgb> = None;
@@ -197,12 +374,22 @@ pub fn parse_colors_toml(contents: &str) -> Option<OmarchyPalette> {
             "mode" => mode = Some(val),
             "background" => background = Rgb::parse_hex(val),
             "bg" => bg = Rgb::parse_hex(val),
+            "dark_background" => dark_background = Rgb::parse_hex(val),
+            "dark_bg" => dark_bg = Rgb::parse_hex(val),
+            "darker_background" => darker_background = Rgb::parse_hex(val),
+            "darker_bg" => darker_bg = Rgb::parse_hex(val),
+            "lighter_background" => lighter_background = Rgb::parse_hex(val),
+            "lighter_bg" => lighter_bg = Rgb::parse_hex(val),
             "foreground" => foreground = Rgb::parse_hex(val),
             "fg" => fg = Rgb::parse_hex(val),
+            "dark_foreground" => dark_foreground = Rgb::parse_hex(val),
+            "dark_fg" => dark_fg = Rgb::parse_hex(val),
+            "bright_foreground" => bright_foreground = Rgb::parse_hex(val),
+            "bright_fg" => bright_fg = Rgb::parse_hex(val),
+            "muted" => muted = Rgb::parse_hex(val),
             "accent" => accent = Rgb::parse_hex(val),
-            "selection_background" | "selection" if selection_background.is_none() => {
-                selection_background = Rgb::parse_hex(val);
-            }
+            "selection" => selection = Rgb::parse_hex(val),
+            "selection_background" => selection_background = Rgb::parse_hex(val),
             "selection_foreground" => selection_foreground = Rgb::parse_hex(val),
             "blue" => blue = Rgb::parse_hex(val),
             "color4" => color4 = Rgb::parse_hex(val),
@@ -220,10 +407,12 @@ pub fn parse_colors_toml(contents: &str) -> Option<OmarchyPalette> {
     let is_dark = match mode {
         Some("light") => false,
         Some("dark") => true,
+        _ if light_mode_marker => false,
         _ => background.is_dark(),
     };
+    let selection = selection.or(selection_background);
     let accent = accent
-        .or(selection_background)
+        .or(selection)
         .or(blue)
         .or(color4)
         .unwrap_or_else(|| Rgb::new(0x3b, 0x82, 0xf6));
@@ -234,7 +423,14 @@ pub fn parse_colors_toml(contents: &str) -> Option<OmarchyPalette> {
     Some(OmarchyPalette {
         is_dark,
         background,
+        dark_background: dark_background.or(dark_bg),
+        darker_background: darker_background.or(darker_bg),
+        lighter_background: lighter_background.or(lighter_bg),
         foreground,
+        dark_foreground: dark_foreground.or(dark_fg),
+        bright_foreground: bright_foreground.or(bright_fg),
+        muted,
+        selection,
         accent,
         accent_fg,
         unread,
@@ -272,30 +468,71 @@ pub fn build_omarchy_css(
 
     let bg = p.background;
     let fg = p.foreground;
+    let active_fg = p.bright_foreground.unwrap_or(fg);
     let accent = p.accent;
     let accent_fg = p.accent_fg;
 
-    // Subtle tonal steps that work identically for dark and light themes:
-    // mixing bg toward fg lifts surfaces on dark themes and shades them on light themes.
-    let sidebar_bg = bg.mix(fg, 0.015);
-    let list_bg = bg.mix(fg, 0.025);
-    let dialog_bg = bg.mix(fg, 0.03);
-    let card_bg = bg.mix(fg, 0.04);
-    let popover_bg = bg.mix(fg, 0.045);
-    let row_hover_bg = bg.mix(fg, 0.05);
+    // Prefer Omarchy's authored semantic surface ramp when present (Quattro+),
+    // falling back to tonal mixes that work identically for dark and light themes.
+    let chrome_bg = p
+        .dark_background
+        .filter(|&c| c != bg)
+        .unwrap_or_else(|| bg.mix(fg, 0.015));
+    let sidebar_bg = chrome_bg;
+    let list_bg = chrome_bg.mix(bg, 0.45);
+    let card_bg = p
+        .lighter_background
+        .filter(|&c| c != bg)
+        .unwrap_or_else(|| bg.mix(fg, 0.04));
+    let dialog_bg = bg.mix(card_bg, 0.45);
+    let popover_bg = card_bg;
+    let row_hover_bg = p
+        .lighter_background
+        .filter(|&c| c != chrome_bg && c != bg)
+        .map(|c| chrome_bg.mix(c, 0.55))
+        .unwrap_or_else(|| chrome_bg.mix(fg, 0.055));
     let switch_bg = bg.mix(fg, 0.06);
-    let row_selected_bg = bg.mix(fg, 0.075);
-    let border_subtle = bg.mix(fg, 0.09);
-    let btn_border = bg.mix(fg, 0.12);
-    let btn_hover_bg = bg.mix(fg, 0.095);
-    let popover_border = bg.mix(fg, 0.14);
-    let switch_border = bg.mix(fg, 0.17);
+    let row_selected_bg = p
+        .selection
+        .filter(|&c| c != chrome_bg && c != bg)
+        .map(|c| chrome_bg.mix(c, 0.72))
+        .unwrap_or_else(|| chrome_bg.mix(fg, 0.085));
+    let border_subtle = p
+        .muted
+        .filter(|&c| c != chrome_bg && c != bg)
+        .map(|m| chrome_bg.mix(m, 0.40))
+        .unwrap_or_else(|| bg.mix(fg, 0.09));
+    let btn_border = p
+        .muted
+        .filter(|&c| c != chrome_bg && c != bg)
+        .map(|m| chrome_bg.mix(m, 0.55))
+        .unwrap_or_else(|| bg.mix(fg, 0.12));
+    let btn_hover_bg = row_hover_bg.mix(fg, 0.04);
+    let popover_border = p
+        .muted
+        .filter(|&c| c != chrome_bg && c != bg)
+        .map(|m| chrome_bg.mix(m, 0.65))
+        .unwrap_or_else(|| bg.mix(fg, 0.14));
+    let switch_border = p
+        .muted
+        .filter(|&c| c != chrome_bg && c != bg)
+        .map(|m| bg.mix(m, 0.70))
+        .unwrap_or_else(|| bg.mix(fg, 0.17));
     let slider_inactive = fg.mix(bg, 0.22);
-    let ws_name_inactive = fg.mix(bg, 0.38);
-    let placeholder_fg = fg.mix(bg, 0.48);
+    let ws_name_inactive = p
+        .dark_foreground
+        .filter(|&c| c != chrome_bg && c != bg)
+        .map(|c| fg.mix(c, 0.42))
+        .unwrap_or_else(|| fg.mix(bg, 0.38));
+    let placeholder_fg = p
+        .dark_foreground
+        .filter(|&c| c != chrome_bg && c != bg)
+        .unwrap_or_else(|| fg.mix(bg, 0.48));
 
     let bg_hex = bg.to_hex();
+    let chrome_bg_hex = chrome_bg.to_hex();
     let fg_hex = fg.to_hex();
+    let active_fg_hex = active_fg.to_hex();
     let sidebar_bg_hex = sidebar_bg.to_hex();
     let list_bg_hex = list_bg.to_hex();
     let dialog_bg_hex = dialog_bg.to_hex();
@@ -343,18 +580,18 @@ pub fn build_omarchy_css(
 @define-color view_bg_color {bg_hex};
 @define-color view_fg_color {fg_hex};
 
-@define-color headerbar_bg_color {bg_hex};
+@define-color headerbar_bg_color {chrome_bg_hex};
 @define-color headerbar_fg_color {fg_hex};
 @define-color headerbar_border_color {border_hex};
-@define-color headerbar_backdrop_color {bg_hex};
+@define-color headerbar_backdrop_color {chrome_bg_hex};
 @define-color headerbar_shade_color transparent;
 
 @define-color sidebar_bg_color {sidebar_bg_hex};
 @define-color sidebar_fg_color {fg_hex};
-@define-color sidebar_backdrop_color {bg_hex};
+@define-color sidebar_backdrop_color {sidebar_bg_hex};
 @define-color sidebar_shade_color transparent;
 
-@define-color secondary_sidebar_bg_color {bg_hex};
+@define-color secondary_sidebar_bg_color {chrome_bg_hex};
 @define-color secondary_sidebar_fg_color {fg_hex};
 
 @define-color card_bg_color {card_bg_hex};
@@ -501,7 +738,7 @@ scrollbar slider {{
 }}
 
 .limux-top-bar {{
-    background-color: {bg_hex};
+    background-color: {chrome_bg_hex};
     border-bottom: 1px solid {border_hex};
 }}
 
@@ -519,11 +756,11 @@ scrollbar slider {{
 
 .limux-indicator-pill-active {{
     background: {row_selected_hex};
-    color: {fg_hex};
+    color: {active_fg_hex};
 }}
 
 .limux-pane-header {{
-    background-color: {bg_hex};
+    background-color: {chrome_bg_hex};
     border-bottom: 1px solid {border_hex};
 }}
 
@@ -532,7 +769,7 @@ scrollbar slider {{
 }}
 
 .limux-tab-active {{
-    color: {fg_hex};
+    color: {active_fg_hex};
     background: {row_selected_hex};
 }}
 
@@ -543,6 +780,14 @@ scrollbar slider {{
 .limux-sidebar {{
     background-color: {sidebar_bg_hex};
     border-right: 1px solid {border_hex};
+}}
+
+.limux-sidebar-handle {{
+    background-color: transparent;
+}}
+
+.limux-sidebar-handle:hover {{
+    background-color: alpha({accent_hex}, 0.45);
 }}
 
 .limux-sidebar-row-box {{
@@ -570,7 +815,7 @@ scrollbar slider {{
 }}
 
 .limux-sidebar-list row:selected .limux-ws-name {{
-    color: {fg_hex};
+    color: {active_fg_hex};
     font-weight: 600;
 }}
 
@@ -604,7 +849,35 @@ scrollbar slider {{
 .limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover):hover {{
     background: {btn_hover_hex};
     border-color: {accent_hex};
-    color: {fg_hex};
+    color: {active_fg_hex};
+}}
+
+.limux-sidebar-ssh-btn {{
+    border-radius: 2px;
+    background: transparent;
+    border: 1px solid {border_hex};
+    color: {ws_name_inactive_hex};
+    padding: 3px 8px;
+    margin: 2px 4px 6px 4px;
+    min-height: 0;
+}}
+
+.limux-sidebar-ssh-btn:hover {{
+    background: {row_hover_hex};
+    border-color: {accent_hex};
+    color: {active_fg_hex};
+}}
+
+.limux-dialog-secondary-btn {{
+    border-radius: 2px;
+    border: 1px solid {border_hex};
+    color: {ws_name_inactive_hex};
+}}
+
+.limux-dialog-secondary-btn:hover {{
+    background: {row_hover_hex};
+    border-color: {accent_hex};
+    color: {active_fg_hex};
 }}
 
 .limux-ws-star-btn,
@@ -754,6 +1027,28 @@ scrollbar slider {{
 .limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover):hover {{
     border-color: @accent_bg_color;
 }}
+
+.limux-sidebar-ssh-btn {{
+    border-radius: 2px;
+    background: transparent;
+    border: 1px solid alpha(@window_fg_color, 0.10);
+    padding: 3px 8px;
+    margin: 2px 4px 6px 4px;
+    min-height: 0;
+}}
+
+.limux-sidebar-ssh-btn:hover {{
+    border-color: @accent_bg_color;
+}}
+
+.limux-dialog-secondary-btn {{
+    border-radius: 2px;
+    border: 1px solid alpha(@window_fg_color, 0.10);
+}}
+
+.limux-dialog-secondary-btn:hover {{
+    border-color: @accent_bg_color;
+}}
 "#
     )
 }
@@ -897,6 +1192,8 @@ fn is_relevant_omarchy_theme_change(changed: &gio::File, other: Option<&gio::Fil
                         | "theme.name"
                         | "theme.generation"
                         | "colors.toml"
+                        | "ghostty.conf"
+                        | "light.mode"
                 )
             })
     };
@@ -915,9 +1212,12 @@ fn is_omarchy_dir_or_symlink_change(changed: &gio::File, other: Option<&gio::Fil
 #[cfg(test)]
 mod tests {
     use super::{
-        build_omarchy_css, omarchy_colors_path_in, omarchy_watch_dirs_in, parse_colors_toml,
-        OmarchyPalette, Rgb,
+        build_omarchy_css, is_omarchy_active_in, load_active_palette_in,
+        load_ghostty_theme_overlay_in, omarchy_colors_path_in, omarchy_watch_dirs_in,
+        parse_colors_toml, sanitize_ghostty_theme_conf, should_watch_omarchy_in, OmarchyPalette,
+        Rgb,
     };
+    use crate::app_config::UiTheme;
 
     const SAMPLE_DARK_COLORS_TOML: &str = r##"
 # Generated by omarchy-themes.
@@ -931,6 +1231,22 @@ selection_background = "#e37057"
 yellow = "#ffbe71"
 red = "#dc5d44"
 color3 = "#ffbe71"
+"##;
+
+    const SAMPLE_QUATTRO_COLORS_TOML: &str = r##"
+mode = "dark"
+accent = "#7aa2f7"
+selection = "#292e42"
+muted = "#414868"
+background = "#1a1b26"
+dark_background = "#13141c"
+darker_background = "#0e0e14"
+lighter_background = "#24283b"
+foreground = "#a9b1d6"
+dark_foreground = "#565f89"
+bright_foreground = "#c0caf5"
+red = "#f7768e"
+yellow = "#e0af68"
 "##;
 
     const SAMPLE_LIGHT_COLORS_TOML: &str = r#"
@@ -1060,7 +1376,14 @@ red = '#d20f39'
         let dark = OmarchyPalette {
             is_dark: true,
             background: Rgb::new(10, 8, 22),
+            dark_background: None,
+            darker_background: None,
+            lighter_background: None,
             foreground: Rgb::new(255, 254, 255),
+            dark_foreground: None,
+            bright_foreground: None,
+            muted: None,
+            selection: None,
             accent: Rgb::new(227, 112, 87),
             accent_fg: Rgb::new(255, 255, 255),
             unread: Rgb::new(255, 190, 113),
@@ -1072,7 +1395,14 @@ red = '#d20f39'
         let light = OmarchyPalette {
             is_dark: false,
             background: Rgb::new(239, 241, 245),
+            dark_background: None,
+            darker_background: None,
+            lighter_background: None,
             foreground: Rgb::new(76, 79, 105),
+            dark_foreground: None,
+            bright_foreground: None,
+            muted: None,
+            selection: None,
             accent: Rgb::new(30, 102, 245),
             accent_fg: Rgb::new(255, 255, 255),
             unread: Rgb::new(223, 142, 29),
@@ -1080,6 +1410,127 @@ red = '#d20f39'
         };
         let light_shaded = light.background.mix(light.foreground, 0.05);
         assert!(light_shaded.luminance() < light.background.luminance());
+    }
+
+    #[test]
+    fn parses_quattro_semantic_ramp_and_styles_chrome_and_ssh_button() {
+        let palette = parse_colors_toml(SAMPLE_QUATTRO_COLORS_TOML).expect("quattro palette");
+        assert_eq!(palette.dark_background, Some(Rgb::new(0x13, 0x14, 0x1c)));
+        assert_eq!(palette.lighter_background, Some(Rgb::new(0x24, 0x28, 0x3b)));
+        assert_eq!(palette.muted, Some(Rgb::new(0x41, 0x48, 0x68)));
+        assert_eq!(palette.selection, Some(Rgb::new(0x29, 0x2e, 0x42)));
+        assert_eq!(palette.bright_foreground, Some(Rgb::new(0xc0, 0xca, 0xf5)));
+
+        let css = build_omarchy_css(Some(&palette), None);
+        assert!(css.contains("@define-color window_bg_color #1a1b26;"));
+        assert!(css.contains("@define-color headerbar_bg_color #13141c;"));
+        assert!(css.contains("@define-color sidebar_bg_color #13141c;"));
+        assert!(css.contains("@define-color card_bg_color #24283b;"));
+        assert!(css.contains(".limux-sidebar-ssh-btn"));
+        assert!(css.contains(".limux-dialog-secondary-btn"));
+    }
+
+    #[test]
+    fn auto_theme_activates_and_watches_only_when_omarchy_is_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        assert!(!is_omarchy_active_in(
+            UiTheme::Auto,
+            Some(&state_dir),
+            Some(&config_dir)
+        ));
+        assert!(!should_watch_omarchy_in(
+            UiTheme::Auto,
+            Some(&state_dir),
+            Some(&config_dir)
+        ));
+        assert!(is_omarchy_active_in(
+            UiTheme::Omarchy,
+            Some(&state_dir),
+            Some(&config_dir)
+        ));
+        assert!(!is_omarchy_active_in(
+            UiTheme::Default,
+            Some(&state_dir),
+            Some(&config_dir)
+        ));
+
+        let colors = state_dir.join("omarchy/current/theme/colors.toml");
+        std::fs::create_dir_all(colors.parent().unwrap()).unwrap();
+        std::fs::write(&colors, SAMPLE_QUATTRO_COLORS_TOML).unwrap();
+
+        assert!(is_omarchy_active_in(
+            UiTheme::Auto,
+            Some(&state_dir),
+            Some(&config_dir)
+        ));
+        assert!(should_watch_omarchy_in(
+            UiTheme::Auto,
+            Some(&state_dir),
+            Some(&config_dir)
+        ));
+        assert!(!is_omarchy_active_in(
+            UiTheme::Default,
+            Some(&state_dir),
+            Some(&config_dir)
+        ));
+    }
+
+    #[test]
+    fn legacy_light_mode_marker_file_sets_light_mode_when_mode_key_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let theme_dir = state_dir.join("omarchy/current/theme");
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        std::fs::write(
+            theme_dir.join("colors.toml"),
+            "background = \"#404040\"\nforeground = \"#101010\"\n",
+        )
+        .unwrap();
+        std::fs::write(theme_dir.join("light.mode"), "").unwrap();
+
+        let palette = load_active_palette_in(Some(&state_dir), None).expect("palette");
+        assert!(!palette.is_dark);
+    }
+
+    #[test]
+    fn sanitizes_ghostty_theme_conf_and_falls_back_to_colors_toml() {
+        let raw = r#"
+background = #1a1b26
+foreground = #a9b1d6
+cursor-color = #c0caf5
+selection-background = #292e42
+selection-foreground = #c0caf5
+palette = 0=#1a1b26
+palette = 1=#f7768e
+palette = 999=#ffffff
+command = /bin/evil
+config-file = /etc/passwd
+background = not-a-color
+"#;
+        let sanitized = sanitize_ghostty_theme_conf(raw).expect("sanitized");
+        assert!(sanitized.contains("background = #1a1b26\n"));
+        assert!(sanitized.contains("palette = 0=#1a1b26\n"));
+        assert!(sanitized.contains("palette = 1=#f7768e\n"));
+        assert!(!sanitized.contains("command"));
+        assert!(!sanitized.contains("config-file"));
+        assert!(!sanitized.contains("999"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let theme_dir = state_dir.join("omarchy/current/theme");
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        std::fs::write(theme_dir.join("colors.toml"), SAMPLE_QUATTRO_COLORS_TOML).unwrap();
+
+        let fallback = load_ghostty_theme_overlay_in(Some(&state_dir), None).expect("fallback");
+        assert!(fallback.contains("background = #1a1b26\n"));
+        assert!(fallback.contains("foreground = #a9b1d6\n"));
+        assert!(fallback.contains("cursor-color = #c0caf5\n"));
+        assert!(fallback.contains("selection-background = #292e42\n"));
     }
 
     #[test]

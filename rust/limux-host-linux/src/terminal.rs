@@ -45,7 +45,7 @@ use input_keys::*;
 
 struct GhosttyState {
     app: ghostty_app_t,
-    background_opacity: f64,
+    background_opacity: std::sync::atomic::AtomicU64,
 }
 
 // Safety: ghostty_app_t is thread-safe for the operations we perform
@@ -55,6 +55,7 @@ unsafe impl Sync for GhosttyState {}
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
+static CURRENT_OMARCHY_THEME_ENABLED: AtomicBool = AtomicBool::new(false);
 static CURRENT_AUTOSTART_SHELL_KIND: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(1);
 static CURRENT_TERMINAL_FONT: LazyLock<Mutex<crate::terminal_font::TerminalFontConfig>> =
@@ -978,6 +979,16 @@ fn load_ghostty_config_with_font(
     unsafe {
         let config = ghostty_config_new();
         unbind_unsupported_default_keybinds(config);
+        if CURRENT_OMARCHY_THEME_ENABLED.load(Ordering::Relaxed) {
+            if let Some(omarchy_overlay) = crate::omarchy_theme::load_ghostty_theme_overlay() {
+                ghostty_config_load_string(
+                    config,
+                    omarchy_overlay.as_ptr().cast::<c_char>(),
+                    omarchy_overlay.len(),
+                    c"/limux/omarchy-theme.ghostty".as_ptr(),
+                );
+            }
+        }
         ghostty_config_load_default_files(config);
         ghostty_config_load_recursive_files(config);
         let base_contents = serialized_config(config);
@@ -1129,12 +1140,20 @@ pub fn init_ghostty() {
             let mut current = CURRENT_TERMINAL_FONT
                 .lock()
                 .expect("terminal font lock poisoned");
-            if current.is_default() {
-                if let Some(path) = crate::app_config::settings_path() {
-                    *current = crate::app_config::load_from_path(&path)
-                        .config
-                        .terminal_font;
+            if let Some(path) = crate::app_config::settings_path() {
+                let loaded = crate::app_config::load_from_path(&path).config;
+                if current.is_default() {
+                    *current = loaded.terminal_font;
                 }
+                CURRENT_OMARCHY_THEME_ENABLED.store(
+                    crate::omarchy_theme::is_omarchy_active(loaded.appearance.ui_theme),
+                    Ordering::Relaxed,
+                );
+            } else {
+                CURRENT_OMARCHY_THEME_ENABLED.store(
+                    crate::omarchy_theme::is_omarchy_active(crate::app_config::UiTheme::default()),
+                    Ordering::Relaxed,
+                );
             }
         }
 
@@ -1158,9 +1177,40 @@ pub fn init_ghostty() {
 
         GhosttyState {
             app,
-            background_opacity,
+            background_opacity: std::sync::atomic::AtomicU64::new(background_opacity.to_bits()),
         }
     });
+}
+
+fn refresh_mapped_surfaces() {
+    let surfaces: Vec<(ghostty_surface_t, gtk::GLArea)> = SURFACE_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter(|(_, entry)| entry.gl_area.is_mapped())
+            .map(|(&key, entry)| (key as ghostty_surface_t, entry.gl_area.clone()))
+            .collect()
+    });
+    for (surface, gl_area) in surfaces {
+        refresh_surface_display(surface, &gl_area);
+    }
+}
+
+pub fn reload_config(omarchy_theme_enabled: bool) {
+    CURRENT_OMARCHY_THEME_ENABLED.store(omarchy_theme_enabled, Ordering::Relaxed);
+    let Some(state) = GHOSTTY.get() else {
+        return;
+    };
+    let config = load_ghostty_config();
+    let background_opacity = load_background_opacity(config);
+    state
+        .background_opacity
+        .store(background_opacity.to_bits(), Ordering::Relaxed);
+    CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
+    unsafe {
+        ghostty_app_update_config(state.app, config);
+        ghostty_config_free(config);
+    }
+    refresh_mapped_surfaces();
 }
 
 pub fn apply_terminal_font_config(
@@ -1198,16 +1248,7 @@ pub fn apply_terminal_font_config(
         broadcast_binding_action("reset_font_size");
     }
 
-    let surfaces: Vec<(ghostty_surface_t, gtk::GLArea)> = SURFACE_MAP.with(|map| {
-        map.borrow()
-            .iter()
-            .filter(|(_, entry)| entry.gl_area.is_mapped())
-            .map(|(&key, entry)| (key as ghostty_surface_t, entry.gl_area.clone()))
-            .collect()
-    });
-    for (surface, gl_area) in surfaces {
-        refresh_surface_display(surface, &gl_area);
-    }
+    refresh_mapped_surfaces();
 }
 
 fn ghostty_app() -> ghostty_app_t {
@@ -1218,7 +1259,7 @@ pub fn ghostty_background_opacity() -> f64 {
     init_ghostty();
     GHOSTTY
         .get()
-        .map(|state| state.background_opacity)
+        .map(|state| f64::from_bits(state.background_opacity.load(Ordering::Relaxed)))
         .unwrap_or(1.0)
 }
 
@@ -1904,6 +1945,11 @@ unsafe extern "C" fn ghostty_action_cb(
         }
         GHOSTTY_ACTION_RELOAD_CONFIG => {
             let config = load_ghostty_config();
+            if let Some(state) = GHOSTTY.get() {
+                state
+                    .background_opacity
+                    .store(load_background_opacity(config).to_bits(), Ordering::Relaxed);
+            }
             CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
             match target.tag {
                 GHOSTTY_TARGET_APP => unsafe {
